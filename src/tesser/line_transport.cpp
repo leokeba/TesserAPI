@@ -6,6 +6,13 @@ namespace tesser {
 
 LineTransport::LineTransport(Api& api, Output output) : api_(api), output_(std::move(output)) {}
 
+LineTransport::~LineTransport() { api_.dropSubscriber(this); }
+
+bool LineTransport::notify(const std::string& message, Delivery) {
+    send(message);
+    return true;
+}
+
 void LineTransport::feed(const char* data, size_t len) {
     for (size_t i = 0; i < len; i++) feed(data[i]);
 }
@@ -48,7 +55,7 @@ void LineTransport::handleLine() {
     if (!text.empty() && text.back() == '\r') text.remove_suffix(1);
     Client client;
     client.transport = TransportKind::Serial;
-    handleEnvelope(api_, text, client, [this](const std::string& m) { send(m); });
+    handleEnvelope(api_, text, client, [this](const std::string& m) { send(m); }, this);
 }
 
 void LineTransport::send(const std::string& message) {

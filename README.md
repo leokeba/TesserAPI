@@ -2,7 +2,7 @@
 
 Describe your ESP32 firmware's state and operations **once**, as a tree of values and actions. Serve it as JSON over HTTP, over ESP-NOW (with [NowTP](https://github.com/leokeba/NowTP)), or over serial, from Arduino or ESP-IDF.
 
-> **Status: early development.** The design is in [docs/DESIGN.md](docs/DESIGN.md). The core (tree, get/set/patch, shapes, schema) and the serial, HTTP and NowTP transports work and are tested on hardware; subscriptions and persistence follow. The API will change before 1.0.
+> **Status: early development.** The design is in [docs/DESIGN.md](docs/DESIGN.md). The core (tree, get/set/patch, shapes, schema), subscriptions and events, and the serial, HTTP, WebSocket and NowTP transports work and are tested on hardware; persistence and access control follow. The API will change before 1.0.
 
 ```cpp
 #include <TesserAPI.h>
@@ -36,6 +36,25 @@ Every subtree is addressable. These examples use HTTP; the same requests work ov
 | `POST /api/lamp` body `{"on":true,"brightness":10}` | patch several values: all are validated before any is applied |
 | `POST /api/lamp/toggle` | call an action |
 
+## Live updates
+
+Message transports (serial, WebSocket, NowTP) can subscribe to any subtree, and get sparse change notifications and events:
+
+```cpp
+auto& button = api.object("button");
+auto& pressed = button.event("pressed");
+api.value("temperature", temperature).watch();   // sampled: notices plain variable changes
+api.startTask();                                   // or call api.poll() from loop()
+
+pressed.emit(3);                                   // → {"op":"event","path":"/button/pressed","body":3}
+```
+
+```json
+→ {"id":1,"op":"sub","path":"/","keys":"temperature","interval":500}
+← {"id":1,"status":"ok","body":{"temperature":21.5}}
+← {"op":"change","path":"/","body":{"temperature":22.0}}
+```
+
 ## Composition
 
 A component describes itself once and can be mounted any number of times:
@@ -58,7 +77,7 @@ api.mount("right", rightMotor);
 | Serial (`LineTransport`, `StreamTransport`, `UartTransport`) | one JSON envelope per line | done |
 | HTTP (`HttpServer`, on `esp_http_server`, also usable under PsychicHttp) | REST mapping, streamed chunked responses, CORS | done |
 | NowTP (`NowTpTransport`, ESP-NOW) | one JSON envelope per message, reliable unicast; also a client for other nodes | done |
-| WebSocket | JSON envelope, subscriptions | planned |
+| WebSocket (`HttpServer::enableWebSocket`) | JSON envelope, subscriptions | done |
 
 ## Examples
 

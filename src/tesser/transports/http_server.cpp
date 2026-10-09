@@ -10,6 +10,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "lwip/sockets.h"
+#include "sdkconfig.h"
+#include "tesser/envelope.h"
 
 namespace tesser {
 
@@ -218,9 +220,152 @@ private:
     DeferredState* deferred_ = nullptr;
 };
 
+// One WebSocket connection: a client that can subscribe.
+class HttpServer::WsClient : public Subscriber {
+public:
+    WsClient(HttpServer& server, int socket) : server_(server), fd(socket) {}
+    bool notify(const std::string& message, Delivery) override { return server_.wsSend(fd, message); }
+
+private:
+    HttpServer& server_;
+
+public:
+    int fd;
+};
+
 HttpServer::HttpServer(Api& api) : api_(api) {}
 
 HttpServer::~HttpServer() { end(); }
+
+size_t HttpServer::webSocketClients() const {
+    MutexGuard guard(wsMutex_);
+    return wsClients_.size();
+}
+
+HttpServer::WsClient* HttpServer::wsClient(int fd, bool create) {
+    MutexGuard guard(wsMutex_);
+    for (WsClient* c : wsClients_) {
+        if (c->fd == fd) return c;
+    }
+    if (!create) return nullptr;
+    auto* c = new WsClient(*this, fd);
+    wsClients_.push_back(c);
+    return c;
+}
+
+void HttpServer::dropWsClient(int fd) {
+    WsClient* gone = nullptr;
+    {
+        MutexGuard guard(wsMutex_);
+        for (size_t i = 0; i < wsClients_.size(); i++) {
+            if (wsClients_[i]->fd == fd) {
+                gone = wsClients_[i];
+                wsClients_.erase(wsClients_.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+        }
+    }
+    if (!gone) return;
+    api_.dropSubscriber(gone);  // waits for any notify() in progress
+    delete gone;
+}
+
+#if CONFIG_HTTPD_WS_SUPPORT
+namespace {
+struct WsWork {
+    HttpServer* server;
+    httpd_handle_t handle;
+    int fd;
+    std::string message;
+};
+}  // namespace
+#endif
+
+// Frames are written only from the httpd task (httpd_queue_work), so
+// notifications and deferred replies from other tasks never interleave
+// with the server's own writes.
+bool HttpServer::wsSend(int fd, const std::string& message) {
+#if CONFIG_HTTPD_WS_SUPPORT
+    httpd_handle_t handle = server_;
+    if (!handle) return false;
+    auto* work = new WsWork{this, handle, fd, message};
+    esp_err_t err = httpd_queue_work(
+        handle,
+        [](void* arg) {
+            auto* w = static_cast<WsWork*>(arg);
+            bool ok = httpd_ws_get_fd_info(w->handle, w->fd) == HTTPD_WS_CLIENT_WEBSOCKET;
+            if (ok) {
+                httpd_ws_frame_t frame = {};
+                frame.type = HTTPD_WS_TYPE_TEXT;
+                frame.final = true;
+                frame.payload = reinterpret_cast<uint8_t*>(&w->message[0]);
+                frame.len = w->message.size();
+                ok = httpd_ws_send_frame_async(w->handle, w->fd, &frame) == ESP_OK;
+            }
+            if (!ok) w->server->dropWsClient(w->fd);
+            delete w;
+        },
+        work);
+    if (err != ESP_OK) {
+        delete work;
+        return false;
+    }
+    return true;
+#else
+    (void)fd;
+    (void)message;
+    return false;
+#endif
+}
+
+void HttpServer::onClose(httpd_handle_t server, int fd) {
+    auto* self = static_cast<HttpServer*>(httpd_get_global_user_ctx(server));
+    if (self) self->dropWsClient(fd);
+    close(fd);
+}
+
+esp_err_t HttpServer::onWebSocket(httpd_req_t* req) {
+    return static_cast<HttpServer*>(req->user_ctx)->serveWebSocket(req);
+}
+
+esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
+#if CONFIG_HTTPD_WS_SUPPORT
+    int fd = httpd_req_to_sockfd(req);
+    if (req->method == HTTP_GET) {  // handshake
+        wsClient(fd, true);
+        return ESP_OK;
+    }
+    httpd_ws_frame_t frame = {};
+    if (httpd_ws_recv_frame(req, &frame, 0) != ESP_OK) return ESP_FAIL;
+    if (frame.len > api_.config().maxRequestBody) {
+        EnvelopeId noId;
+        EnvelopeReply reply(noId, 0, [this, fd](const std::string& m) { wsSend(fd, m); });
+        writeError(reply, Status::TooLarge, std::string_view(), "message too large");
+        // The payload is still unread: drop the connection.
+        return ESP_FAIL;
+    }
+    std::string text(frame.len, '\0');
+    if (frame.len) {
+        frame.payload = reinterpret_cast<uint8_t*>(&text[0]);
+        if (httpd_ws_recv_frame(req, &frame, frame.len) != ESP_OK) return ESP_FAIL;
+    }
+    if (frame.type != HTTPD_WS_TYPE_TEXT) return ESP_OK;
+
+    Client client;
+    client.transport = TransportKind::WebSocket;
+    struct sockaddr_in6 addr = {};
+    socklen_t addrLen = sizeof(addr);
+    if (getpeername(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen) == 0 && addr.sin6_family == AF_INET) {
+        memcpy(client.address, &reinterpret_cast<struct sockaddr_in*>(&addr)->sin_addr.s_addr, 4);
+        client.addressLength = 4;
+    }
+    handleEnvelope(api_, text, client, [this, fd](const std::string& m) { wsSend(fd, m); }, wsClient(fd, true));
+    return ESP_OK;
+#else
+    (void)req;
+    return ESP_FAIL;
+#endif
+}
 
 esp_err_t HttpServer::begin(uint16_t port, const char* basePath) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -228,12 +373,19 @@ esp_err_t HttpServer::begin(uint16_t port, const char* basePath) {
     config.ctrl_port = static_cast<uint16_t>(config.ctrl_port + port % 1000);
     config.stack_size = 6144;
     config.lru_purge_enable = true;
+    config.max_uri_handlers = 10;
     return begin(config, basePath);
 }
 
 esp_err_t HttpServer::begin(httpd_config_t config, const char* basePath) {
     if (server_) return ESP_ERR_INVALID_STATE;
     config.uri_match_fn = httpd_uri_match_wildcard;
+    if (wsUri_) {
+        // Notices closed WebSocket connections at once.
+        config.global_user_ctx = this;
+        config.global_user_ctx_free_fn = [](void*) {};
+        config.close_fn = &HttpServer::onClose;
+    }
     httpd_handle_t handle = nullptr;
     esp_err_t err = httpd_start(&handle, &config);
     if (err != ESP_OK) return err;
@@ -251,6 +403,20 @@ esp_err_t HttpServer::attach(httpd_handle_t server, const char* basePath) {
     base_ = basePath ? basePath : "";
     while (!base_.empty() && base_.back() == '/') base_.pop_back();
     pattern_ = base_ + "*";
+
+    // First, so the API's wildcard (e.g. "/*" for an empty base) can't shadow it.
+#if CONFIG_HTTPD_WS_SUPPORT
+    if (wsUri_) {
+        httpd_uri_t uri = {};
+        uri.uri = wsUri_;
+        uri.method = HTTP_GET;
+        uri.handler = &HttpServer::onWebSocket;
+        uri.user_ctx = this;
+        uri.is_websocket = true;
+        esp_err_t err = httpd_register_uri_handler(server, &uri);
+        if (err != ESP_OK) return err;
+    }
+#endif
 
     const httpd_method_t methods[] = {HTTP_GET, HTTP_POST, HTTP_PUT, HTTP_PATCH};
     for (httpd_method_t m : methods) {
@@ -282,11 +448,21 @@ esp_err_t HttpServer::attach(httpd_handle_t server, const char* basePath) {
 
 void HttpServer::end() {
     if (!server_) return;
+    for (;;) {
+        int fd = -1;
+        {
+            MutexGuard guard(wsMutex_);
+            if (wsClients_.empty()) break;
+            fd = wsClients_.front()->fd;
+        }
+        dropWsClient(fd);
+    }
     if (ownsServer_) {
         httpd_stop(server_);
     } else {
         const httpd_method_t methods[] = {HTTP_GET, HTTP_POST, HTTP_PUT, HTTP_PATCH, HTTP_OPTIONS};
         for (httpd_method_t m : methods) httpd_unregister_uri_handler(server_, pattern_.c_str(), m);
+        if (wsUri_) httpd_unregister_uri_handler(server_, wsUri_, HTTP_GET);
     }
     server_ = nullptr;
     ownsServer_ = false;

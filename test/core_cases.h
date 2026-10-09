@@ -571,7 +571,7 @@ TEST(envelope_errors) {
              "{\"id\":3,\"status\":\"not_found\",\"body\":{\"error\":\"not_found\",\"path\":\"/x\",\"message\":\"no such node\"}}");
     CHECK_EQ(roundTrip(d.api, "{\"id\":3,\"op\":\"delete\"}"),
              "{\"id\":3,\"status\":\"bad_request\",\"body\":{\"error\":\"bad_request\",\"path\":\"/\",\"message\":"
-             "\"op must be \\\"get\\\" or \\\"set\\\"\"}}");
+             "\"op must be \\\"get\\\", \\\"set\\\", \\\"sub\\\" or \\\"unsub\\\"\"}}");
     CHECK_EQ(roundTrip(d.api, "{\"op\":\"get\""),
              "{\"status\":\"bad_request\",\"body\":{\"error\":\"bad_request\",\"path\":\"/\",\"message\":\"malformed JSON\"}}");
     CHECK(roundTrip(d.api, "{\"id\":{},\"op\":\"get\"}").find("id must be a scalar") != std::string::npos);

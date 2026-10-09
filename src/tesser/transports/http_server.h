@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #include <string>
+#include <vector>
 
 #include "esp_http_server.h"
 #include "tesser/api.h"
@@ -37,14 +38,30 @@ public:
     // Call before begin()/attach().
     void enableCors(const char* origin = "*") { corsOrigin_ = origin; }
 
+    // Serves the JSON envelope protocol, including subscriptions, over
+    // WebSocket at `uri` (one more handler slot). Needs
+    // CONFIG_HTTPD_WS_SUPPORT (on in Arduino-ESP32 3.x; enable it in
+    // menuconfig on ESP-IDF). Call before begin()/attach(). With attach(),
+    // closed connections are noticed on the next send to them.
+    void enableWebSocket(const char* uri = "/ws") { wsUri_ = uri; }
+    size_t webSocketClients() const;
+
     httpd_handle_t handle() const { return server_; }
     Api& api() { return api_; }
 
 private:
+    class WsClient;
+
     static esp_err_t onRequest(httpd_req_t* req);
     static esp_err_t onOptions(httpd_req_t* req);
+    static esp_err_t onWebSocket(httpd_req_t* req);
+    static void onClose(httpd_handle_t server, int fd);
     esp_err_t serve(httpd_req_t* req);
+    esp_err_t serveWebSocket(httpd_req_t* req);
     void addCorsHeaders(httpd_req_t* req);
+    WsClient* wsClient(int fd, bool create);
+    void dropWsClient(int fd);
+    bool wsSend(int fd, const std::string& message);
 
     Api& api_;
     httpd_handle_t server_ = nullptr;
@@ -52,6 +69,9 @@ private:
     std::string base_;
     std::string pattern_;
     const char* corsOrigin_ = nullptr;
+    const char* wsUri_ = nullptr;
+    mutable Mutex wsMutex_;
+    std::vector<WsClient*> wsClients_;
     friend class HttpReply;
 };
 

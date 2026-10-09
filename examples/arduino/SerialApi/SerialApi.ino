@@ -4,6 +4,7 @@
 //   {"id":2,"op":"set","path":"/lamp/brightness","body":200}
 //   {"id":3,"op":"set","path":"/lamp/toggle"}
 //   {"id":4,"op":"get","path":"/","view":"schema"}
+//   {"id":5,"op":"sub","path":"/lamp"}       (then change something)
 #include <TesserAPI.h>
 
 #ifndef LED_BUILTIN
@@ -37,5 +38,6 @@ void setup() {
 
 void loop() {
     serialApi.poll();
+    api.poll();  // change notifications for subscribers
     analogWrite(LED_BUILTIN, lamp.on ? lamp.brightness : 0);
 }

@@ -40,6 +40,34 @@ const char* kindName(ValueKind k) {
 
 int declarationErrors() { return g_declarationErrors.load(); }
 
+namespace {
+std::atomic<uint16_t> g_generation{0};
+
+uint16_t nextGeneration() {
+    uint16_t g = static_cast<uint16_t>(g_generation.fetch_add(1) + 1);
+    if (g == 0) g = static_cast<uint16_t>(g_generation.fetch_add(1) + 1);  // 0 means "never changed"
+    return g;
+}
+}  // namespace
+
+uint16_t currentGeneration() { return g_generation.load(); }
+
+void Node::changed() {
+    uint16_t g = nextGeneration();
+    if (type_ != NodeType::Object) {
+        generation_.store(g, std::memory_order_relaxed);
+        return;
+    }
+    // Every node below an object; recursion depth is bounded by the tree.
+    for (Node* n = static_cast<Object*>(this)->first(); n; n = n->next_) {
+        if (n->type_ == NodeType::Object) {
+            n->changed();
+        } else {
+            n->generation_.store(g, std::memory_order_relaxed);
+        }
+    }
+}
+
 Node::~Node() { delete meta_; }
 
 NodeMeta& Node::editMeta() {
@@ -70,6 +98,12 @@ ValueNode& ValueNode::readOnly() {
 
 ValueNode& ValueNode::persist() {
     flags_ |= kPersist;
+    return *this;
+}
+
+ValueNode& ValueNode::watch() {
+    flags_ |= kWatch;
+    editMeta();
     return *this;
 }
 

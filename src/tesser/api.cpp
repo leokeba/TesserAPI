@@ -9,6 +9,10 @@ bool parseOp(std::string_view s, Op& out) {
         out = Op::Get;
     } else if (s == "set") {
         out = Op::Set;
+    } else if (s == "sub") {
+        out = Op::Subscribe;
+    } else if (s == "unsub") {
+        out = Op::Unsubscribe;
     } else {
         return false;
     }
@@ -26,7 +30,15 @@ bool parseView(std::string_view s, View& out) {
     return true;
 }
 
-const char* toString(Op op) { return op == Op::Set ? "set" : "get"; }
+const char* toString(Op op) {
+    switch (op) {
+        case Op::Get: return "get";
+        case Op::Set: return "set";
+        case Op::Subscribe: return "sub";
+        case Op::Unsubscribe: return "unsub";
+    }
+    return "get";
+}
 
 bool Api::pendingBegin() {
     int n = pending_.fetch_add(1);
@@ -83,10 +95,11 @@ public:
     void run() {
         Node* target = resolve();
         if (!target) return;
-        if (req_.op == Op::Get) {
-            get(*target);
-        } else {
-            set(*target);
+        switch (req_.op) {
+            case Op::Get: get(*target); break;
+            case Op::Set: set(*target); break;
+            case Op::Subscribe: subscribe(*target); break;
+            case Op::Unsubscribe: unsubscribe(); break;
         }
     }
 
@@ -161,7 +174,8 @@ private:
 
     // ---- get ----------------------------------------------------------
 
-    void get(Node& target) {
+    // Replies with the target's representation; true if that was a success.
+    bool get(Node& target) {
         const Query& q = req_.query;
         bool hasShape = !req_.body.isNull();
         View view = q.view;
@@ -169,38 +183,38 @@ private:
         if (target.type() != NodeType::Object) {
             if (!q.keys.empty() || !q.exclude.empty() || hasShape) {
                 replyError(Status::BadRequest, "keys, exclude and shapes apply to objects", base_);
-                return;
+                return false;
             }
             if (view == View::Value && (target.type() == NodeType::Action || target.type() == NodeType::Event)) {
                 replyError(Status::NotAllowed, "no value to read; use view=schema", base_);
-                return;
+                return false;
             }
             JsonWriter w(reply_.begin(Status::Ok));
             renderAny(w, target, depth_, Filter(), view);
             detail::finishBody(reply_, w, base_);
-            return;
+            return true;
         }
 
         const Object& obj = static_cast<const Object&>(target);
         Filter f;
         if (!q.keys.empty() && !q.exclude.empty()) {
             replyError(Status::BadRequest, "keys and exclude are exclusive", base_);
-            return;
+            return false;
         }
         if (hasShape) {
             if (!q.keys.empty() || !q.exclude.empty()) {
                 replyError(Status::BadRequest, "a shape replaces keys and exclude", base_);
-                return;
+                return false;
             }
             if (!req_.body.is<JsonObjectConst>()) {
                 replyError(Status::BadRequest, "shape must be an object", base_);
-                return;
+                return false;
             }
             f.shape = req_.body.as<JsonObjectConst>();
             f.hasShape = true;
             if (!validateShape(obj, f.shape)) {
                 replyError();
-                return;
+                return false;
             }
         } else {
             f.keys = q.keys;
@@ -215,13 +229,14 @@ private:
             });
             if (!ok) {
                 replyError();
-                return;
+                return false;
             }
         }
 
         JsonWriter w(reply_.begin(Status::Ok));
         renderAny(w, target, depth_, f, view);
         detail::finishBody(reply_, w, base_);
+        return true;
     }
 
     bool validateShape(const Object& obj, JsonObjectConst shape) {
@@ -354,6 +369,48 @@ private:
         w.endObject();
     }
 
+    // ---- subscriptions ------------------------------------------------
+
+    void subscribe(Node& target) {
+        if (!req_.subscriber) {
+            return replyError(Status::NotAllowed, "this transport can't deliver notifications", base_);
+        }
+        if (!req_.body.isNull()) {
+            return replyError(Status::BadRequest, "subscriptions take keys, exclude and depth, not shapes", base_);
+        }
+        if (req_.query.view != View::Value) return replyError(Status::BadRequest, "subscriptions are on values", base_);
+        if (target.type() == NodeType::Action) {
+            return replyError(Status::NotAllowed, "actions can't be subscribed to", base_);
+        }
+        Status allowed = api_.subscriptionAllowed(req_.subscriber);
+        if (allowed != Status::Ok) return replyError(allowed, "too many subscriptions", base_);
+        if (target.type() == NodeType::Event) {
+            // Nothing to snapshot.
+            JsonWriter w(reply_.begin(Status::Ok));
+            w.null();
+            detail::finishBody(reply_, w, base_);
+        } else if (!get(target)) {
+            return;
+        }
+        Subscription sub;
+        sub.subscriber = req_.subscriber;
+        sub.node = &target;
+        sub.path.assign(base_.data(), base_.size());
+        sub.keys.assign(req_.query.keys.data(), req_.query.keys.size());
+        sub.exclude.assign(req_.query.exclude.data(), req_.query.exclude.size());
+        sub.depth = req_.query.depth;
+        sub.interval = req_.query.interval;
+        sub.events = req_.query.events;
+        api_.addSubscription(std::move(sub));
+    }
+
+    void unsubscribe() {
+        size_t removed = req_.subscriber ? api_.removeSubscriptions(req_.subscriber, base_) : 0;
+        JsonWriter w(reply_.begin(Status::Ok));
+        w.uinteger(removed);
+        detail::finishBody(reply_, w, base_);
+    }
+
     // ---- set ----------------------------------------------------------
 
     void set(Node& target) {
@@ -370,6 +427,7 @@ private:
                 Check c = v.check(body);
                 if (c.isOk()) c = v.apply(body);
                 if (!c.isOk()) return replyError(c.status, c.message, base_);
+                v.changed();
                 JsonWriter w(reply_.begin(Status::Ok));
                 v.write(w);
                 detail::finishBody(reply_, w, base_);
@@ -382,6 +440,7 @@ private:
                 if (!chk.isOk()) return replyError(chk.status, chk.message, base_);
                 Status s = c.apply(body);
                 if (s != Status::Ok) return replyError(s, "rejected", base_);
+                c.changed();
                 JsonWriter w(reply_.begin(Status::Ok));
                 c.write(w);
                 detail::finishBody(reply_, w, base_);
@@ -479,6 +538,7 @@ private:
                 if (actions) return true;
                 Check c = static_cast<ValueNode&>(n).apply(v);
                 if (!c.isOk()) return error(c.status, c.message);
+                n.changed();
                 applied_++;
                 return true;
             }
@@ -486,6 +546,7 @@ private:
                 if (actions) return true;
                 Status s = static_cast<CustomNode&>(n).apply(v);
                 if (s != Status::Ok) return error(s, "rejected");
+                n.changed();
                 applied_++;
                 return true;
             }

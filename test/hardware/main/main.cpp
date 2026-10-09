@@ -13,6 +13,7 @@
 
 #include "core_cases.h"
 #include "datagram_cases.h"
+#include "subscription_cases.h"
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
@@ -107,6 +108,11 @@ void measureLatency() {
 // ---- demo API served over UART0 -------------------------------------------
 
 cases::Device* g_demo;
+bool g_running = false;
+uint32_t g_counter = 0;
+uint32_t g_ticks = 0;
+tesser::ValueNode* g_ticksNode;
+tesser::EventNode* g_fired;
 tesser::UartTransport* g_uart;
 
 void delayedReply(void* arg) {
@@ -131,6 +137,31 @@ void serveDemo() {
         if (!p) return;
         xTaskCreate(delayedReply, "later", 3072, new tesser::Pending(p), 5, nullptr);
     });
+    sys.value("subscriptions", [] { return uint32_t(g_demo->api.subscriptionCount()); });
+
+    // Change sources for the subscription tests: a counter only watch() notices,
+    // a value reported with changed(), and an event.
+    auto& demo = g_demo->api.object("demo");
+    demo.value("running", g_running);
+    demo.value("counter", g_counter).watch();
+    g_ticksNode = &demo.value("ticks", g_ticks);
+    g_fired = &demo.event("fired");
+    demo.action("fire", [](JsonVariantConst payload) { g_fired->emit(payload); });
+    esp_timer_create_args_t timer = {};
+    timer.callback = [](void*) {
+        if (!g_running) return;
+        g_counter++;
+        if (g_counter % 10 == 0) {
+            g_ticks++;
+            g_ticksNode->changed();
+        }
+    };
+    timer.name = "demo";
+    esp_timer_handle_t handle;
+    esp_timer_create(&timer, &handle);
+    esp_timer_start_periodic(handle, 100 * 1000);
+    g_demo->api.startTask(20);
+
     startNetwork(g_demo->api);
     g_uart = new tesser::UartTransport(g_demo->api);
     esp_err_t err = g_uart->begin();

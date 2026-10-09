@@ -75,7 +75,7 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
 
     JsonVariantConst op = env["op"];
     if (!op.is<const char*>() || !parseOp(view(op), request.op)) {
-        message = "op must be \"get\" or \"set\"";
+        message = "op must be \"get\", \"set\", \"sub\" or \"unsub\"";
         return Status::BadRequest;
     }
     JsonVariantConst path = env["path"];
@@ -116,6 +116,22 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
     if (!v.isNull() && (!v.is<const char*>() || !parseView(view(v), request.query.view))) {
         message = "view must be \"value\" or \"schema\"";
         return Status::BadRequest;
+    }
+    JsonVariantConst interval = env["interval"];
+    if (!interval.isNull()) {
+        if (!interval.is<uint32_t>()) {
+            message = "interval must be a non-negative integer (ms)";
+            return Status::BadRequest;
+        }
+        request.query.interval = interval.as<uint32_t>();
+    }
+    JsonVariantConst events = env["events"];
+    if (!events.isNull()) {
+        if (!events.is<bool>()) {
+            message = "events must be a boolean";
+            return Status::BadRequest;
+        }
+        request.query.events = events.as<bool>();
     }
     request.body = env["body"];
     return Status::Ok;
@@ -166,10 +182,12 @@ void EnvelopeReply::release() {
     if (detached_) delete this;
 }
 
-void handleEnvelope(Api& api, std::string_view text, const Client& client, const EnvelopeReply::Send& send) {
+void handleEnvelope(Api& api, std::string_view text, const Client& client, const EnvelopeReply::Send& send,
+                    Subscriber* subscriber) {
     JsonDocument doc;
     Request req;
     req.client = client;
+    req.subscriber = subscriber;
     EnvelopeId id;
     const char* message = nullptr;
     Status s = parseEnvelope(text, doc, api.config().maxDepth, req, id, message);

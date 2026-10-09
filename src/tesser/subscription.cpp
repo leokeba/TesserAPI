@@ -1,0 +1,375 @@
+// Change tracking, subscriptions and events (docs/DESIGN.md section 11).
+#include <string.h>
+
+#include "tesser/api.h"
+
+namespace tesser {
+
+namespace {
+
+// Registry of live APIs, so an EventNode can find the tree it belongs to.
+Mutex g_apisMutex;
+Api* g_apis = nullptr;
+
+bool findPath(const Object& o, const Node* target, std::string& path) {
+    for (const Node* c = o.first(); c; c = c->next()) {
+        size_t len = path.size();
+        path += '/';
+        path += c->name();
+        if (c == target) return true;
+        if (c->type() == NodeType::Object && findPath(static_cast<const Object&>(*c), target, path)) return true;
+        path.resize(len);
+    }
+    return false;
+}
+
+// FNV-1a over everything written to it.
+class HashSink : public Sink {
+public:
+    bool write(const char* data, size_t len) override {
+        for (size_t i = 0; i < len; i++) {
+            hash ^= static_cast<uint8_t>(data[i]);
+            hash *= 16777619u;
+        }
+        return true;
+    }
+    uint32_t hash = 2166136261u;
+};
+
+bool inList(std::string_view list, std::string_view name) {
+    size_t pos = 0;
+    while (pos <= list.size()) {
+        size_t comma = list.find(',', pos);
+        if (comma == std::string_view::npos) comma = list.size();
+        std::string_view item = list.substr(pos, comma - pos);
+        while (!item.empty() && item.front() == ' ') item.remove_prefix(1);
+        while (!item.empty() && item.back() == ' ') item.remove_suffix(1);
+        if (item == name) return true;
+        pos = comma + 1;
+    }
+    return false;
+}
+
+bool passesFilter(const Subscription& sub, std::string_view name) {
+    if (!sub.keys.empty() && !inList(sub.keys, name)) return false;
+    if (!sub.exclude.empty() && inList(sub.exclude, name)) return false;
+    return true;
+}
+
+// Writes a sparse object: an object's key is written only once something
+// changed below it, so unchanged branches cost nothing.
+class LazyPatch {
+public:
+    static constexpr int kMax = 32;
+    explicit LazyPatch(JsonWriter& w) : w_(w) {}
+
+    bool enter(const char* name) {
+        if (depth_ >= kMax) return false;
+        stack_[depth_++] = name;
+        return true;
+    }
+    void leave() {
+        depth_--;
+        if (opened_ > depth_) {
+            w_.endObject();
+            opened_ = depth_;
+        }
+    }
+    // Opens the enclosing objects and writes the key of a changed value.
+    void key(const char* name) {
+        if (!rootOpen_) {
+            w_.beginObject();
+            rootOpen_ = true;
+        }
+        for (; opened_ < depth_; opened_++) {
+            w_.key(stack_[opened_]);
+            w_.beginObject();
+        }
+        w_.key(name);
+    }
+    // Returns true if anything was written.
+    bool finish() {
+        while (opened_ > 0) {
+            w_.endObject();
+            opened_--;
+        }
+        if (rootOpen_) w_.endObject();
+        return rootOpen_;
+    }
+
+private:
+    JsonWriter& w_;
+    const char* stack_[kMax];
+    int depth_ = 0;
+    int opened_ = 0;
+    bool rootOpen_ = false;
+};
+
+void writeLeaf(JsonWriter& w, const Node& n) {
+    if (n.type() == NodeType::Value) {
+        static_cast<const ValueNode&>(n).write(w);
+    } else {
+        static_cast<const CustomNode&>(n).write(w);
+    }
+}
+
+void changesIn(const Object& o, uint16_t since, int depth, const Subscription* top, LazyPatch& lp, JsonWriter& w) {
+    if (depth <= 0) return;
+    for (const Node* c = o.first(); c; c = c->next()) {
+        if (c->type() == NodeType::Action || c->type() == NodeType::Event) continue;
+        if (top && !passesFilter(*top, c->name())) continue;
+        if (c->type() == NodeType::Object) {
+            if (!lp.enter(c->name())) continue;
+            changesIn(static_cast<const Object&>(*c), since, depth - 1, nullptr, lp, w);
+            lp.leave();
+        } else if (newerGeneration(c->generation(), since)) {
+            lp.key(c->name());
+            writeLeaf(w, *c);
+        }
+    }
+}
+
+// Appends the closing of a notification envelope.
+void closeEnvelope(std::string& msg, bool overflow) {
+    if (overflow) msg += ",\"overflow\":true";
+    msg += '}';
+}
+
+}  // namespace
+
+// ---- registry ---------------------------------------------------------------
+
+Api::Api() : Object("") {
+    MutexGuard guard(g_apisMutex);
+    nextApi_ = g_apis;
+    g_apis = this;
+}
+
+Api::~Api() {
+    MutexGuard guard(g_apisMutex);
+    for (Api** p = &g_apis; *p; p = &(*p)->nextApi_) {
+        if (*p == this) {
+            *p = nextApi_;
+            break;
+        }
+    }
+}
+
+Api* Api::owner(const Node& node, std::string& path) {
+    MutexGuard guard(g_apisMutex);
+    for (Api* a = g_apis; a; a = a->nextApi_) {
+        path.clear();
+        if (&node == a) return a;
+        MutexGuard apiGuard(a->mutex_);
+        if (findPath(*a, &node, path)) return a;
+    }
+    path.clear();
+    return nullptr;
+}
+
+bool Api::changed(std::string_view path) {
+    MutexGuard guard(mutex_);
+    Node* node = this;
+    size_t pos = 0;
+    while (pos < path.size()) {
+        if (path[pos] == '/') {
+            pos++;
+            continue;
+        }
+        size_t slash = path.find('/', pos);
+        if (slash == std::string_view::npos) slash = path.size();
+        if (node->type() != NodeType::Object) return false;
+        node = static_cast<Object*>(node)->child(path.substr(pos, slash - pos));
+        if (!node) return false;
+        pos = slash;
+    }
+    node->changed();
+    return true;
+}
+
+// ---- subscriptions ----------------------------------------------------------
+
+Status Api::subscriptionAllowed(Subscriber* subscriber) const {
+    MutexGuard guard(mutex_);
+    if (subs_.size() >= config_.maxSubscriptions) return Status::Busy;
+    size_t mine = 0;
+    for (const Subscription& s : subs_) {
+        if (s.subscriber == subscriber) mine++;
+    }
+    return mine >= config_.maxSubscriptionsPerClient ? Status::Busy : Status::Ok;
+}
+
+void Api::addSubscription(Subscription&& sub) {
+    MutexGuard guard(mutex_);
+    sub.since = currentGeneration();
+    subs_.push_back(std::move(sub));
+}
+
+size_t Api::removeSubscriptions(Subscriber* subscriber, std::string_view path) {
+    MutexGuard guard(mutex_);
+    size_t removed = 0;
+    for (size_t i = 0; i < subs_.size();) {
+        if (subs_[i].subscriber == subscriber && subs_[i].path == path) {
+            subs_.erase(subs_.begin() + static_cast<std::ptrdiff_t>(i));
+            removed++;
+        } else {
+            i++;
+        }
+    }
+    return removed;
+}
+
+void Api::dropSubscriber(Subscriber* subscriber) {
+    MutexGuard guard(mutex_);
+    for (size_t i = 0; i < subs_.size();) {
+        if (subs_[i].subscriber == subscriber) {
+            subs_.erase(subs_.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            i++;
+        }
+    }
+}
+
+size_t Api::subscriptionCount() const {
+    MutexGuard guard(mutex_);
+    return subs_.size();
+}
+
+void Api::poll() { poll(millis32()); }
+
+void Api::poll(uint32_t nowMs) {
+    MutexGuard guard(mutex_);
+    if (subs_.empty()) return;
+    if (nowMs - lastWatchMs_ >= config_.watchIntervalMs) {
+        lastWatchMs_ = nowMs;
+        sampleWatched(*this);
+    }
+    for (Subscription& sub : subs_) flush(sub, nowMs);
+}
+
+void Api::sampleWatched(Node& node) {
+    if (node.type() == NodeType::Object) {
+        for (Node* c = static_cast<Object&>(node).first(); c; c = c->next()) sampleWatched(*c);
+        return;
+    }
+    if (node.type() != NodeType::Value || !node.watched() || !node.meta_) return;
+    HashSink sink;
+    JsonWriter w(sink);
+    static_cast<ValueNode&>(node).write(w);
+    NodeMeta& m = *node.meta_;
+    if (m.hashed && m.hash != sink.hash) node.changed();
+    m.hash = sink.hash;
+    m.hashed = true;
+}
+
+void Api::flush(Subscription& sub, uint32_t nowMs) {
+    if (sub.interval && nowMs - sub.lastFlushMs < sub.interval) return;
+    uint16_t gen = currentGeneration();
+    if (gen == sub.since) return;
+
+    std::string body;
+    StringSink sink(body);
+    JsonWriter w(sink);
+    bool any = false;
+    const Node& n = *sub.node;
+    if (n.type() == NodeType::Object) {
+        LazyPatch lp(w);
+        int depth = sub.depth < 0 || sub.depth > config_.maxDepth ? config_.maxDepth : sub.depth;
+        changesIn(static_cast<const Object&>(n), sub.since, depth, &sub, lp, w);
+        any = lp.finish();
+    } else if ((n.type() == NodeType::Value || n.type() == NodeType::Custom) &&
+               newerGeneration(n.generation(), sub.since)) {
+        writeLeaf(w, n);
+        any = true;
+    }
+    if (!any) {
+        sub.since = gen;
+        return;
+    }
+
+    std::string msg;
+    StringSink msgSink(msg);
+    JsonWriter m(msgSink);
+    m.beginObject();
+    m.key("op");
+    m.string("change");
+    m.key("path");
+    m.string(sub.path.empty() ? std::string_view("/") : std::string_view(sub.path));
+    m.key("body");
+    m.raw(body);
+    bool overflow = sub.subscriber->missed.exchange(false);
+    closeEnvelope(msg, overflow);
+    if (sub.subscriber->notify(msg, Delivery::Reliable)) {
+        sub.since = gen;
+        sub.lastFlushMs = nowMs;
+    } else {
+        // Not advancing `since` makes the next flush resend these changes,
+        // merged with newer ones.
+        sub.subscriber->missed = true;
+    }
+}
+
+// ---- events -----------------------------------------------------------------
+
+void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter&)>& write) {
+    MutexGuard guard(mutex_);
+    if (subs_.empty()) return;
+
+    std::string base;
+    StringSink sink(base);
+    JsonWriter w(sink);
+    w.beginObject();
+    w.key("op");
+    w.string("event");
+    w.key("path");
+    w.string(path);
+    w.key("body");
+    if (write) {
+        write(w);
+    } else {
+        w.null();
+    }
+
+    std::vector<Subscriber*> notified;
+    for (const Subscription& sub : subs_) {
+        if (!sub.events) continue;
+        // The subscription's path must be a prefix of the event's, at a
+        // segment boundary, within its depth and key filter.
+        std::string_view ev(path);
+        std::string_view sp(sub.path);
+        if (ev.size() < sp.size() || ev.compare(0, sp.size(), sp) != 0) continue;
+        std::string_view rest = ev.substr(sp.size());
+        if (!rest.empty() && rest.front() != '/') continue;
+        if (!rest.empty()) {
+            rest.remove_prefix(1);
+            size_t slash = rest.find('/');
+            std::string_view first = rest.substr(0, slash);
+            if (!passesFilter(sub, first)) continue;
+            int segments = 1;
+            for (char c : rest) segments += c == '/';
+            if (sub.depth >= 0 && segments > sub.depth) continue;
+        }
+        bool seen = false;
+        for (Subscriber* s : notified) seen = seen || s == sub.subscriber;
+        if (seen) continue;
+        notified.push_back(sub.subscriber);
+
+        std::string msg = base;
+        bool overflow = sub.subscriber->missed.exchange(false);
+        closeEnvelope(msg, overflow);
+        if (!sub.subscriber->notify(msg, Delivery::Reliable)) sub.subscriber->missed = true;
+    }
+}
+
+void EventNode::emitWith(const std::function<void(JsonWriter&)>& write) {
+    if (!api_) api_ = Api::owner(*this, path_);
+    if (api_) api_->emitEvent(path_, write);
+}
+
+void EventNode::emit() { emitWith(nullptr); }
+
+void EventNode::emit(JsonVariantConst payload) {
+    emitWith([payload](JsonWriter& w) { w.variant(payload); });
+}
+
+}  // namespace tesser

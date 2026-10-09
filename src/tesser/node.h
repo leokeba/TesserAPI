@@ -3,7 +3,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <atomic>
 #include <functional>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -17,6 +19,7 @@
 
 namespace tesser {
 
+class Api;
 class Object;
 
 enum class NodeType : uint8_t { Object, Value, Action, Event, Custom };
@@ -26,8 +29,17 @@ struct NodeMeta {
     double min = 0;
     double max = 0;
     bool hasRange = false;
+    bool hashed = false;  // watch(): `hash` holds the last sample
     const char* doc = nullptr;
+    uint32_t hash = 0;
 };
+
+// Change tracking: a global generation counter, stamped on nodes as they
+// change. 16 bits, compared with wrap-around; 0 means "never changed".
+uint16_t currentGeneration();
+
+// True if generation `a` is newer than `b`.
+inline bool newerGeneration(uint16_t a, uint16_t b) { return a != 0 && static_cast<int16_t>(a - b) > 0; }
 
 // Number of declaration mistakes (duplicate or invalid names) since boot.
 // Each one is also logged.
@@ -45,12 +57,20 @@ public:
     Node* next() const { return next_; }
     const NodeMeta* meta() const { return meta_; }
     bool persisted() const { return flags_ & kPersist; }
+    bool watched() const { return flags_ & kWatch; }
+
+    // Marks this node (for an object: every value below it) as changed, so
+    // subscribers get it on the next Api::poll(). Writes through the API do
+    // this automatically; call it when the application changes bound state.
+    // Thread-safe and cheap.
+    void changed();
+    uint16_t generation() const { return generation_.load(std::memory_order_relaxed); }
 
 protected:
     friend class Object;
     friend class Api;
 
-    enum Flags : uint8_t { kReadOnly = 1, kPersist = 2, kDeferring = 4, kLinked = 8 };
+    enum Flags : uint8_t { kReadOnly = 1, kPersist = 2, kDeferring = 4, kLinked = 8, kWatch = 16 };
 
     NodeMeta& editMeta();
     void setDoc(const char* text);
@@ -60,7 +80,7 @@ protected:
     NodeMeta* meta_ = nullptr;
     NodeType type_;
     uint8_t flags_ = 0;
-    uint16_t generation_ = 0;  // reserved for change tracking
+    std::atomic<uint16_t> generation_{0};
 };
 
 // A typed scalar. Concrete classes bind it to a variable or to functions.
@@ -73,6 +93,10 @@ public:
     ValueNode& readOnly();
     ValueNode& persist();
     ValueNode& doc(const char* text);
+    // Samples the value periodically (Config::watchIntervalMs, while anyone
+    // is subscribed) and marks it changed when it differs. For bound state
+    // the application doesn't report with changed().
+    ValueNode& watch();
 
     bool writable() const { return canWrite() && !(flags_ & kReadOnly); }
 
@@ -213,6 +237,31 @@ protected:
 
 private:
     Getter get_;
+};
+
+// Something that happens: emit() pushes it to subscribers right away, never
+// coalesced. Events have no value; they appear only in the schema.
+class EventNode : public Node {
+public:
+    explicit EventNode(const char* name) : Node(name, NodeType::Event) {}
+
+    void emit();  // null payload
+    void emit(JsonVariantConst payload);
+    template <class T>
+    void emit(const T& payload) {
+        emitWith([&payload](JsonWriter& w) { ValueTraits<std::remove_cv_t<T>>::write(w, payload); });
+    }
+    // Arbitrary JSON payload. Thread-safe; takes the API lock.
+    void emitWith(const std::function<void(JsonWriter&)>& write);
+
+    EventNode& doc(const char* text) {
+        setDoc(text);
+        return *this;
+    }
+
+private:
+    Api* api_ = nullptr;  // found on the first emit()
+    std::string path_;
 };
 
 class ActionNode : public Node {
@@ -450,6 +499,8 @@ public:
             }
         }
     }
+
+    EventNode& event(const char* name) { return add(new EventNode(name)); }
 
     // Writer renders the node; the optional applier accepts writes.
     CustomNode& custom(const char* name, CustomNode::Writer writer, CustomNode::Applier applier = nullptr) {

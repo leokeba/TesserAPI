@@ -65,6 +65,8 @@ private:
 };
 
 // Handles one envelope end to end: parse, dispatch, reply through `send`.
-void handleEnvelope(Api& api, std::string_view text, const Client& client, const EnvelopeReply::Send& send);
+// `subscriber` enables "sub"/"unsub" for transports with a persistent client.
+void handleEnvelope(Api& api, std::string_view text, const Client& client, const EnvelopeReply::Send& send,
+                    Subscriber* subscriber = nullptr);
 
 }  // namespace tesser

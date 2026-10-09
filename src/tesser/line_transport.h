@@ -18,11 +18,17 @@ class Api;
 // don't start with '{' are ignored, so log output on a shared port is
 // harmless. Responses are written atomically with respect to each other, so
 // deferred replies from other tasks never interleave.
-class LineTransport {
+//
+// The line is one client: it can subscribe, and notifications are written to
+// the output like responses.
+class LineTransport : public Subscriber {
 public:
     using Output = std::function<void(const char* data, size_t len)>;
 
     LineTransport(Api& api, Output output);
+    ~LineTransport() override;
+
+    bool notify(const std::string& message, Delivery delivery) override;
 
     void feed(const char* data, size_t len);
     void feed(char c);

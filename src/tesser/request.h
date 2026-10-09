@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <atomic>
+#include <string>
 #include <string_view>
 
 #include <ArduinoJson.h>
@@ -12,11 +14,11 @@
 
 namespace tesser {
 
-enum class Op : uint8_t { Get, Set };
+enum class Op : uint8_t { Get, Set, Subscribe, Unsubscribe };
 
 enum class View : uint8_t { Value, Schema };
 
-// "get" / "set"; false if unknown.
+// "get" / "set" / "sub" / "unsub"; false if unknown.
 bool parseOp(std::string_view s, Op& out);
 bool parseView(std::string_view s, View& out);
 const char* toString(Op op);
@@ -27,6 +29,9 @@ struct Query {
     std::string_view keys;     // comma-separated direct children to include
     std::string_view exclude;  // comma-separated direct children to omit
     View view = View::Value;
+    // Subscribe only.
+    uint32_t interval = 0;  // minimum ms between change notifications
+    bool events = true;     // also deliver events under the path
 };
 
 enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket };
@@ -39,12 +44,37 @@ struct Client {
     bool authenticated = false;
 };
 
+// How a message to a client should be delivered, for transports that offer
+// a choice (NowTP).
+enum class Delivery : uint8_t {
+    Reliable,    // retransmitted until acknowledged (requests, responses, events)
+    LatestOnly,  // a newer message supersedes older ones
+    BestEffort,  // broadcast
+};
+
+// A client that can receive notifications: one per persistent connection
+// (serial line, WebSocket connection, NowTP peer). Implemented by transports,
+// which must call Api::dropSubscriber() before destroying one.
+class Subscriber {
+public:
+    virtual ~Subscriber() = default;
+    // Sends one notification envelope. Called under the API lock, from
+    // Api::poll() or from an event's emit(); must not block for long.
+    // Returns false if it couldn't be queued.
+    virtual bool notify(const std::string& message, Delivery delivery) = 0;
+    // Set when a notification was lost (by the core when notify() fails, or by
+    // the transport when a queued one fails later). The next notification
+    // carries "overflow": true so the client knows to re-read.
+    std::atomic<bool> missed{false};
+};
+
 struct Request {
     Op op = Op::Get;
     std::string_view path;  // "/lamp/brightness"; "" or "/" is the root
     Query query;
     JsonVariantConst body;  // Set: value or patch. Get: optional shape.
     Client client;
+    Subscriber* subscriber = nullptr;  // persistent transports; required for Subscribe
 };
 
 // Receives a response. Implemented by transports. The core calls begin()

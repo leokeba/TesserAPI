@@ -3,6 +3,8 @@
 // The only platform-specific pieces the core needs: a recursive mutex and
 // logging.
 
+#include <stdint.h>
+
 #if defined(ESP_PLATFORM)
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -47,6 +49,9 @@ public:
 private:
     Mutex& m_;
 };
+
+// Milliseconds since boot (wraps after ~49 days).
+uint32_t millis32();
 
 void logWarning(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void logError(const char* fmt, ...) __attribute__((format(printf, 1, 2)));

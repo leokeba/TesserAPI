@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include <deque>
+#include <memory>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -32,12 +33,6 @@ struct PeerAddress {
     }
     bool operator==(const PeerAddress& o) const { return length == o.length && memcmp(bytes, o.bytes, length) == 0; }
     bool operator!=(const PeerAddress& o) const { return !(*this == o); }
-};
-
-enum class Delivery : uint8_t {
-    Reliable,    // retransmitted until acknowledged (requests, responses, events)
-    LatestOnly,  // a newer message supersedes older ones (state changes)
-    BestEffort,  // broadcast
 };
 
 // Serves the API and acts as a client over a datagram link: one JSON envelope
@@ -95,8 +90,14 @@ public:
     bool request(const PeerAddress& to, Op op, std::string_view path, JsonVariantConst body, ResponseHandler done,
                  const Query& query = Query(), uint32_t timeoutMs = 0);
 
-    // Drops pending calls to a peer (e.g. NowTP reported it lost); their
-    // handlers get Status::Timeout.
+    // Notifications ("change" / "event" envelopes) from nodes this one
+    // subscribed to. Runs in process().
+    using NotificationHandler = std::function<void(const PeerAddress& from, JsonObjectConst envelope)>;
+    void onNotification(NotificationHandler fn) { onNotification_ = std::move(fn); }
+
+    // The peer is gone (e.g. NowTP reported it lost): its pending calls get
+    // Status::Timeout and its subscriptions are dropped. Safe from any task,
+    // including link callbacks: the work happens in the next process().
     void forgetPeer(const PeerAddress& peer);
 
     Stats stats() const;
@@ -108,6 +109,20 @@ private:
         std::string text;
         bool reliable;
     };
+    class PeerSubscriber : public Subscriber {
+    public:
+        PeerSubscriber(DatagramEndpoint& ep, const PeerAddress& address) : ep_(ep), peer(address) {}
+        bool notify(const std::string& message, Delivery delivery) override {
+            return ep_.send_ && ep_.send_(peer, message, delivery);
+        }
+
+    private:
+        DatagramEndpoint& ep_;
+
+    public:
+        PeerAddress peer;
+    };
+
     struct CallSlot {
         uint32_t id;
         PeerAddress to;
@@ -120,6 +135,8 @@ private:
     void handle(Incoming& msg);
     void reject(const Incoming& msg, Status status, const char* message);
     void expire(uint32_t now, bool all, const PeerAddress* peer);
+    Subscriber* subscriberFor(const PeerAddress& peer, bool create);
+    void dropPeer(const PeerAddress& peer);
 
     Api* api_;
     TransportKind kind_;
@@ -127,10 +144,14 @@ private:
     ClockFn clock_;
     Options options_;
     std::function<void()> onQueued_;
+    NotificationHandler onNotification_;
 
     mutable Mutex mutex_;
     std::deque<Incoming> queue_;
     std::vector<CallSlot> calls_;
+    std::vector<PeerAddress> lostPeers_;  // forgetPeer() → process()
+    Mutex subscribersMutex_;              // taken before the API lock, never after
+    std::vector<PeerSubscriber*> subscribers_;
     uint32_t nextId_ = 1;
     Stats stats_;
 };

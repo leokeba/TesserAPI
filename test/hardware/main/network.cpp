@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <string>
+
 #include "esp_event.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -66,6 +68,11 @@ bool connectWifi() {
 #endif
 }
 
+// Notifications received from nodes this one subscribed to over NowTP.
+uint32_t g_notifications = 0;
+std::string g_lastNotification = "null";
+tesser::Mutex g_notifMutex;
+
 bool parseMac(const char* s, nowtp::Mac& out) {
     unsigned b[6];
     if (!s || sscanf(s, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return false;
@@ -102,6 +109,13 @@ void describeNet(tesser::Object& net) {
     stats.value("timeouts", [] { return g_nowApi ? g_nowApi->endpoint().stats().timeouts : 0u; });
     stats.value("dropped", [] { return g_nowApi ? g_nowApi->endpoint().stats().dropped : 0u; });
 
+    auto& notif = net.object("notifications");
+    notif.value("count", [] { return g_notifications; });
+    notif.custom("last", [](tesser::JsonWriter& w) {
+        tesser::MutexGuard guard(g_notifMutex);
+        w.raw(g_lastNotification);
+    });
+
     net.action("remote", [](tesser::Call& call) {
         JsonVariantConst a = call.arg();
         nowtp::Mac mac;
@@ -116,6 +130,8 @@ void describeNet(tesser::Object& net) {
         if (a["keys"].is<const char*>()) q.keys = a["keys"].as<const char*>();
         if (a["exclude"].is<const char*>()) q.exclude = a["exclude"].as<const char*>();
         if (a["view"].is<const char*>()) tesser::parseView(a["view"].as<const char*>(), q.view);
+        if (a["interval"].is<uint32_t>()) q.interval = a["interval"].as<uint32_t>();
+        if (a["events"].is<bool>()) q.events = a["events"].as<bool>();
         tesser::Pending pending = call.defer();
         if (!pending) return;
         int64_t t0 = esp_timer_get_time();
@@ -168,6 +184,12 @@ void startNetwork(tesser::Api& api) {
     nowtp::Status ns = g_now->begin(cfg);
     g_nowApi = new tesser::NowTpTransport(&api, *g_now);
     bool nowOk = ns == nowtp::Status::Ok && g_nowApi->begin();
+    g_nowApi->endpoint().onNotification([](const tesser::PeerAddress&, JsonObjectConst env) {
+        tesser::MutexGuard guard(g_notifMutex);
+        g_lastNotification.clear();
+        serializeJson(env, g_lastNotification);
+        g_notifications++;
+    });
     g_now->onPeerEvent([](nowtp::PeerEvent e, const nowtp::PeerInfo& p) {
         if (e == nowtp::PeerEvent::Lost) g_nowApi->peerLost(p.mac);
     });
@@ -179,6 +201,7 @@ void startNetwork(tesser::Api& api) {
     if (wifi) {
         g_http = new tesser::HttpServer(api);
         g_http->enableCors();
+        g_http->enableWebSocket("/ws");
         printf("HTTP err=%d url=http://%s/api/\n", int(g_http->begin(80, "/api")), g_ip);
     }
 }

@@ -35,6 +35,16 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
         w.key("view");
         w.string("schema");
     }
+    if (op == Op::Subscribe) {
+        if (query.interval) {
+            w.key("interval");
+            w.uinteger(query.interval);
+        }
+        if (!query.events) {
+            w.key("events");
+            w.boolean(false);
+        }
+    }
     if (!bodyJson.empty()) {
         w.key("body");
         w.raw(bodyJson);
@@ -49,8 +59,39 @@ DatagramEndpoint::DatagramEndpoint(Api* api, TransportKind kind, SendFn send, Cl
 // Pending handlers are dropped without being called: whatever they capture
 // may already be gone. (A captured Pending still answers its own client.)
 DatagramEndpoint::~DatagramEndpoint() {
-    MutexGuard guard(mutex_);
-    calls_.clear();
+    {
+        MutexGuard guard(mutex_);
+        calls_.clear();
+    }
+    MutexGuard guard(subscribersMutex_);
+    for (PeerSubscriber* s : subscribers_) {
+        if (api_) api_->dropSubscriber(s);
+        delete s;
+    }
+    subscribers_.clear();
+}
+
+Subscriber* DatagramEndpoint::subscriberFor(const PeerAddress& peer, bool create) {
+    MutexGuard guard(subscribersMutex_);
+    for (PeerSubscriber* s : subscribers_) {
+        if (s->peer == peer) return s;
+    }
+    if (!create) return nullptr;
+    auto* s = new PeerSubscriber(*this, peer);
+    subscribers_.push_back(s);
+    return s;
+}
+
+void DatagramEndpoint::dropPeer(const PeerAddress& peer) {
+    expire(0, true, &peer);
+    MutexGuard guard(subscribersMutex_);
+    for (size_t i = 0; i < subscribers_.size(); i++) {
+        if (subscribers_[i]->peer != peer) continue;
+        if (api_) api_->dropSubscriber(subscribers_[i]);
+        delete subscribers_[i];
+        subscribers_.erase(subscribers_.begin() + static_cast<std::ptrdiff_t>(i));
+        break;
+    }
 }
 
 void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t len, bool reliable) {
@@ -75,6 +116,15 @@ void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t
 
 bool DatagramEndpoint::process() {
     bool worked = false;
+    std::vector<PeerAddress> lost;
+    {
+        MutexGuard guard(mutex_);
+        lost.swap(lostPeers_);
+    }
+    for (const PeerAddress& p : lost) {
+        dropPeer(p);
+        worked = true;
+    }
     for (;;) {
         Incoming msg;
         {
@@ -153,8 +203,15 @@ void DatagramEndpoint::handle(Incoming& msg) {
         return;
     }
 
+    // Notification from a node we subscribed to: never answered.
+    std::string_view op = env["op"].is<const char*>() ? std::string_view(env["op"].as<const char*>()) : "";
+    if (op == "change" || op == "event") {
+        if (onNotification_) onNotification_(msg.from, env);
+        return;
+    }
+
     // Request.
-    if (!env["op"].is<const char*>() || !api_) {
+    if (op.empty() || !api_) {
         MutexGuard guard(mutex_);
         stats_.dropped++;
         return;
@@ -179,9 +236,12 @@ void DatagramEndpoint::handle(Incoming& msg) {
         writeError(reply, s, std::string_view(), message);
         return;
     }
-    if (req.op == Op::Set && options_.requireReliableSet && !msg.reliable) {
-        writeError(reply, Status::NotAllowed, req.path, "set requests must be sent reliably");
+    if ((req.op == Op::Set || req.op == Op::Subscribe) && options_.requireReliableSet && !msg.reliable) {
+        writeError(reply, Status::NotAllowed, req.path, "set and sub requests must be sent reliably");
         return;
+    }
+    if (req.op == Op::Subscribe || req.op == Op::Unsubscribe) {
+        req.subscriber = subscriberFor(msg.from, req.op == Op::Subscribe);
     }
     api_->handle(req, reply);
 }
@@ -223,7 +283,13 @@ bool DatagramEndpoint::request(const PeerAddress& to, Op op, std::string_view pa
     return request(to, op, path, std::string_view(json), std::move(done), query, timeoutMs);
 }
 
-void DatagramEndpoint::forgetPeer(const PeerAddress& peer) { expire(0, true, &peer); }
+void DatagramEndpoint::forgetPeer(const PeerAddress& peer) {
+    {
+        MutexGuard guard(mutex_);
+        lostPeers_.push_back(peer);
+    }
+    if (onQueued_) onQueued_();
+}
 
 void DatagramEndpoint::expire(uint32_t now, bool all, const PeerAddress* peer) {
     std::vector<ResponseHandler> expired;

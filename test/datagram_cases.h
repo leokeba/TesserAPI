@@ -143,6 +143,8 @@ TEST(datagram_timeouts_and_forget) {
     CHECK_EQ(r1.status, Status::Timeout);
     CHECK(!r2.called);
     client.forgetPeer(addr(8));
+    CHECK(!r2.called);  // takes effect in process(), never inside a link callback
+    client.process();
     CHECK(r2.called);
     CHECK_EQ(r2.status, Status::Timeout);
     CHECK_EQ(client.stats().timeouts, 2u);

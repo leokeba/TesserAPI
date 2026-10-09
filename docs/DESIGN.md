@@ -229,7 +229,7 @@ The response is the patched keys read back, which is the patch used as a shape. 
 
 This mirrors the predecessor's model, where a POST body mixed values and triggers, but with validation done before anything is applied.
 
-### 6.4 Subscribe and Unsubscribe *(planned)*
+### 6.4 Subscribe and Unsubscribe
 
 See §11.
 
@@ -313,12 +313,12 @@ These transports are message-based and two-way, so they share one JSON envelope.
 → {"id": 9, "op": "get", "path": "/motor1", "body": {"control": true}}          // shape
 ← {"id": 7, "status": "ok", "body": {"on": true, "brightness": 128}}
 ← {"id": 8, "status": "invalid_value", "body": {"error": "invalid_value", "path": "/lamp/brightness", "message": "..."}}
-← {"op": "change", "path": "/sensors", "body": {"temperature": 22.5}}           // planned, no id
-← {"op": "event",  "path": "/button/pressed", "body": null}                      // planned, no id
+← {"op": "change", "path": "/sensors", "body": {"temperature": 22.5}}           // notification, no id
+← {"op": "event",  "path": "/button/pressed", "body": null}                      // notification, no id
 ```
 
 - **`id`:** any JSON scalar, echoed verbatim. It may be omitted, in which case the response also has no `id`.
-- **`op`:** `get` or `set` (planned: `sub`, `unsub`, `ping`). The keys `path`, `depth`, `keys`, `exclude`, `view` and `body` map one-to-one onto `Request`.
+- **`op`:** `get`, `set`, `sub` or `unsub`. The keys `path`, `depth`, `keys`, `exclude`, `view`, `interval`, `events` and `body` map one-to-one onto `Request`.
 - **Unknown envelope keys** are ignored, for forward compatibility.
 - **Response:** the response is written as a stream: `{"id":…,"status":"…","body":` followed by the body and then `}`. Buffered transports can still replace it with an error if the body overflows the limit.
 - **Framing** is the transport's job:
@@ -359,9 +359,7 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 - **Requests:** one envelope per NowTP message on the configured port (default 84). `set` requests must arrive in NowTP's reliable mode, which is unicast-only, so a broadcast or unreliable `set` is answered `not_allowed`. A broadcast `get` is answered by every node.
 - **Responses:** reliable unicast to the sender's MAC.
 - **Response size:** buffered in full (NowTP has no streaming), up to `min(maxResponse, nowtp maxMessageSize)`. Anything larger gets a `too_large` reply. Clients on NowTP should use `depth`, `keys` and shapes.
-- **Notifications** *(planned)*:
-  - `change` notifications use **latest-only** mode, because a newer state supersedes an older one.
-  - `event` notifications use **reliable** mode.
+- **Notifications** use reliable mode, like responses (§11 explains why not latest-only). `sub` requests, like `set`, must arrive reliably.
 - **Client identity:** the MAC address. NowTP's "peer lost" discovery event drops that client's subscriptions.
 - **Security:** ESP-NOW frames aren't authenticated. Writes over NowTP should be restricted with an allowlist of MACs or encrypted peers (§13).
 - **Threading:** NowTP runs its receive callbacks while holding its own lock, so the adapter never handles a request there. It copies each message into a bounded queue (default 8, then `busy`), and a worker task (or `poll()`) handles it under the API lock. The lock order is therefore always API, then NowTP, and replies sent from any API context can't deadlock.
@@ -376,33 +374,61 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 - Leading control and non-ASCII bytes are skipped, since a UART picks them up while the peer resets.
 - When the UART is also the console, log output from other tasks can interleave with a reply on the same line. Use a dedicated UART, or lower the log level once the transport is serving.
 
-### 10.5 WebSocket *(planned)*
+### 10.5 WebSocket
 
-`esp_http_server`'s WebSocket support (`CONFIG_HTTPD_WS_SUPPORT`, enabled in Arduino-ESP32 3.x) on the same server as the HTTP transport, using the same envelope as §10.1. This is where browser subscriptions live.
+`http.enableWebSocket("/ws")` serves the §10.1 envelope over WebSocket on the HTTP transport's server. This is where browser subscriptions live.
+- Needs `CONFIG_HTTPD_WS_SUPPORT`, which is enabled in Arduino-ESP32 3.x and must be turned on in menuconfig on ESP-IDF.
+- One text frame per envelope. Each connection is a client (`Subscriber`).
+- **Ordering:** every frame (responses, deferred replies, notifications) is written from the httpd task through `httpd_queue_work`, so writes from other tasks never interleave.
+- **Cleanup:** when `begin()` owns the server, `close_fn` drops a closed connection's subscriptions at once. With `attach()`, a closed connection is noticed on the next send to it.
 
-## 11. Change tracking and subscriptions *(planned)*
+## 11. Change tracking and subscriptions
 
 **Tracking changes:**
-- Each node has a 16-bit "changed at" generation, and the API has a global generation counter.
-- A value is marked changed:
-  - automatically, when a set goes through the API
-  - explicitly, with `node.changed()` or `api.changed("/path")`
-  - by polling, with `.watch(intervalMs)`: the runtime samples the value and compares a 32-bit hash, at a cost of 4 bytes per watched leaf.
+- A global 16-bit generation counter is stamped on a node when it changes (compared with wrap-around; 0 means "never changed"). It costs no extra memory: the field fits in the node's padding.
+- A node is marked changed:
+  - automatically, when a set or patch goes through the API
+  - explicitly, with `node.changed()` or `api.changed("/path")`. On an object, `changed()` marks every value below it. Both are thread-safe and cheap.
+  - by sampling, with `.watch()`: while anyone is subscribed, `Api::poll()` renders each watched value every `Config::watchIntervalMs` (200 ms) and compares a 32-bit hash, kept in the node's metadata.
 - Bound plain variables can't announce their own changes, so either `changed()` or `watch()` is needed for push updates.
 
-**Subscribing:**
+**Delivering:** `Api::poll()` sends pending change notifications. Call it from `loop()`, or let `api.startTask(periodMs)` (ESP, default 20 ms) do it. It does nothing while nobody is subscribed.
+
+**Subscribing** (message transports: serial, NowTP, WebSocket; plain HTTP answers `not_allowed`):
 
 ```json
 → {"id": 3, "op": "sub", "path": "/sensors", "keys": "temperature,humidity", "interval": 500}
 ← {"id": 3, "status": "ok", "body": {"temperature": 22.5, "humidity": 48}}    // initial snapshot
 ← {"op": "change", "path": "/sensors", "body": {"temperature": 22.7}}         // later, only changed leaves
+→ {"id": 4, "op": "unsub", "path": "/sensors"}
+← {"id": 4, "status": "ok", "body": 1}                                       // subscriptions removed
 ```
 
-- A change notification is a **merge patch** rooted at the subscription path, containing only the leaves whose generation is newer than the subscription's last flush. Clients apply it exactly like a `set` body, so one format serves writes, notifications and persistence.
-- **Rate limit:** at most one notification per subscription per `interval` ms. Intermediate states are coalesced, which suits NowTP's latest-only mode.
-- **Events** are never coalesced. Each client has a bounded queue (default 8). On overflow the oldest event is dropped and the next delivery carries `"overflow": true`.
-- **Limits:** the maximum number of subscriptions per client and in total is configured. A slow client never causes unbounded allocation.
-- **Cleanup:** subscriptions die with their client: WebSocket close, NowTP peer lost, or an explicit `unsub`.
+**Options:**
+
+| Option | Meaning |
+|---|---|
+| `keys`, `exclude`, `depth` | Same as for get, applied to both the snapshot and the notifications. Shapes are not supported. |
+| `interval` | At most one change notification per `interval` ms (default 0: every `poll()`). Intermediate states are coalesced. |
+| `events` | Also deliver events under the path (default `true`). |
+
+**Notifications:**
+- A change notification is a **sparse merge patch** rooted at the subscription path, holding only the values changed since the last notification. Clients apply it exactly like a `set` body, so one format serves writes, notifications and persistence. For a subscription to a single value, the body is the value.
+- Change notifications are deltas, so they are sent **reliably**. NowTP's latest-only mode would lose a superseded delta's values.
+- **Failure:** if a notification can't be queued, the subscription isn't advanced. The next one carries the missed changes merged with newer ones, plus `"overflow": true`. The same flag follows when a transport reports a queued notification lost, and tells the client to re-read.
+
+**Events:** an event (`o.event("pressed")`, then `node.emit(value)`) is never coalesced. It goes out at once, reliably, to every subscriber whose path covers it and that didn't ask for `"events": false`. It reaches a client once even when several of its subscriptions match:
+
+```json
+← {"op": "event", "path": "/button/pressed", "body": 3}
+```
+
+**Limits and cleanup:**
+- At most `maxSubscriptions` (16) subscriptions in total, and `maxSubscriptionsPerClient` (4) per client. Beyond that, `busy`.
+- Notifications go through each transport's own bounded queue: NowTP's transmit queue, `httpd_queue_work` for WebSocket. A slow client never causes unbounded allocation.
+- Subscriptions die with their client: WebSocket close, NowTP peer lost, a `LineTransport` destroyed, or an explicit `unsub`.
+
+**Client side:** `DatagramEndpoint` (NowTP) sends `sub` requests like any other, with `interval` and `events` in its `Query`. Incoming notifications go to `onNotification(handler)`; they are never answered, so two nodes subscribed to each other can't ping-pong.
 
 ## 12. Persistence *(planned)*
 
@@ -480,8 +506,8 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 
 1. **Host tests** (CMake + ctest, ASan and UBSan, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror` on the library). They cover the core, the envelope codec and the line transport, and run against NowTP's simulated network for the NowTP adapter.
 2. **On-target tests** (`test/hardware`, ESP-IDF): the same core cases on the chip, plus heap and stack measurements.
-3. **End-to-end on hardware:** `test/hardware` serves a demo API over UART, HTTP (with Wi-Fi credentials from the gitignored `test/secrets.h`) and NowTP. `test/e2e_serial.py`, `test/e2e_http.py` and `test/e2e_nowtp.py` (two boards) drive it.
-4. **Transport conformance:** `test/conformance.py` sends the same request vectors through serial, HTTP and NowTP (both directions), and every transport must give the same results.
+3. **End-to-end on hardware:** `test/hardware` serves a demo API over UART, HTTP and WebSocket (with Wi-Fi credentials from the gitignored `test/secrets.h`), and NowTP. `test/e2e_serial.py`, `test/e2e_http.py`, `test/e2e_ws.py` and `test/e2e_nowtp.py` (two boards) drive it, subscriptions and events included.
+4. **Transport conformance:** `test/conformance.py` sends the same request vectors through serial, HTTP, WebSocket and NowTP (both directions), and every transport must give the same results.
 5. **CI:** host tests, plus ESP-IDF 5.1 / 5.4 / 5.5 / latest × ESP32 / ESP32-C3 (test firmware and examples), plus Arduino-ESP32 3.x × ESP32 / ESP32-C3 (example sketches).
 
 ## 18. Roadmap
@@ -490,7 +516,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 |---|---|---|
 | 1 | Core: tree, values, actions, custom nodes, get / set / patch / shape / schema, streaming writer, envelope, line transport, host + on-target tests | done |
 | 2 | HTTP and NowTP transports, conformance tests, footprint measurements | done |
-| 3 | Change tracking, subscriptions, events, WebSocket | |
+| 3 | Change tracking, subscriptions, events, WebSocket | done |
 | 4 | Persistence, authorizer, NowTP allowlist | |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | |
 

@@ -154,6 +154,21 @@ def main():
 
     conformance.run(b, 'serial', check)
 
+    # Subscriptions: the serial line is one client.
+    r = b.request('sub', '/lamp', keys='brightness')
+    check('sub snapshot', r['status'] == 'ok' and r['body'] == {'brightness': 128}, r)
+    b.request('set', '/lamp/brightness', body=12)
+    note = None
+    for line in b.lines(2):
+        start = line.find('{"op":"change"')
+        if start >= 0:
+            note = json.loads(line[start:])
+            break
+    check('change notification', note == {'op': 'change', 'path': '/lamp', 'body': {'brightness': 12}}, note)
+    r = b.request('unsub', '/lamp')
+    check('unsub', r['status'] == 'ok' and r['body'] == 1, r)
+    b.request('set', '/lamp/brightness', body=128)
+
     print(f'E2E pass={sum(results)} fail={len(results) - sum(results)}')
     sys.exit(0 if all(results) else 1)
 
