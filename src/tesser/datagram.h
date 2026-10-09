@@ -19,6 +19,7 @@
 namespace tesser {
 
 class Api;
+class RemoteNode;
 
 // Address of a peer on a datagram link: a MAC for NowTP, IP and port for UDP.
 struct PeerAddress {
@@ -85,17 +86,26 @@ public:
     // Sends a request; `done` runs later in process() with the response, or
     // with Status::Timeout / Status::Busy. `body` is JSON text (or empty).
     // Returns false (without calling `done`) if it couldn't be sent.
+    // `owner` tags the call so cancelCalls(owner) can drop it.
     bool request(const PeerAddress& to, Op op, std::string_view path, std::string_view bodyJson,
-                 ResponseHandler done, const Query& query = Query(), uint32_t timeoutMs = 0);
+                 ResponseHandler done, const Query& query = Query(), uint32_t timeoutMs = 0,
+                 const void* owner = nullptr);
     bool request(const PeerAddress& to, Op op, std::string_view path, JsonVariantConst body, ResponseHandler done,
-                 const Query& query = Query(), uint32_t timeoutMs = 0);
+                 const Query& query = Query(), uint32_t timeoutMs = 0, const void* owner = nullptr);
+    // Drops (without calling) the pending calls tagged with `owner`.
+    void cancelCalls(const void* owner);
+
+    // Used by RemoteNode.
+    void addRemote(RemoteNode* remote);
+    void removeRemote(RemoteNode* remote);
 
     // Requests from peers for which `fn` returns true count as authenticated
     // (see Api::authorize()). Without it, none do.
     void trust(std::function<bool(const PeerAddress&)> fn) { trust_ = std::move(fn); }
 
     // Notifications ("change" / "event" envelopes) from nodes this one
-    // subscribed to. Runs in process().
+    // subscribed to, all of them, including those a mirrored RemoteNode
+    // also consumes. Runs in process().
     using NotificationHandler = std::function<void(const PeerAddress& from, JsonObjectConst envelope)>;
     void onNotification(NotificationHandler fn) { onNotification_ = std::move(fn); }
 
@@ -132,10 +142,11 @@ private:
         PeerAddress to;
         uint32_t deadline;
         ResponseHandler done;
+        const void* owner;
     };
 
     bool sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope, ResponseHandler done,
-                     uint32_t timeoutMs);
+                     uint32_t timeoutMs, const void* owner);
     void handle(Incoming& msg);
     void reject(const Incoming& msg, Status status, const char* message);
     void expire(uint32_t now, bool all, const PeerAddress* peer);
@@ -157,6 +168,7 @@ private:
     std::vector<PeerAddress> lostPeers_;  // forgetPeer() → process()
     Mutex subscribersMutex_;              // taken before the API lock, never after
     std::vector<PeerSubscriber*> subscribers_;
+    std::vector<RemoteNode*> remotes_;  // guarded by mutex_
     uint32_t nextId_ = 1;
     Stats stats_;
 };

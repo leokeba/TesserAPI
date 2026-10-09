@@ -4,6 +4,7 @@
 #include "tesser/call.h"
 #include "tesser/envelope.h"
 #include "tesser/json_writer.h"
+#include "tesser/remote.h"
 
 namespace tesser {
 
@@ -35,6 +36,10 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
         w.key("view");
         w.string("schema");
     }
+    if (!query.remotes) {
+        w.key("remotes");
+        w.boolean(false);
+    }
     if (op == Op::Subscribe) {
         if (query.interval) {
             w.key("interval");
@@ -62,6 +67,8 @@ DatagramEndpoint::~DatagramEndpoint() {
     {
         MutexGuard guard(mutex_);
         calls_.clear();
+        for (RemoteNode* r : remotes_) r->detach();
+        remotes_.clear();
     }
     MutexGuard guard(subscribersMutex_);
     for (PeerSubscriber* s : subscribers_) {
@@ -137,7 +144,14 @@ bool DatagramEndpoint::process() {
         worked = true;
     }
     size_t before = pendingCalls();
-    expire(clock_ ? clock_() : 0, false, nullptr);
+    uint32_t now = clock_ ? clock_() : 0;
+    expire(now, false, nullptr);
+    std::vector<RemoteNode*> remotes;
+    {
+        MutexGuard guard(mutex_);
+        remotes = remotes_;
+    }
+    for (RemoteNode* r : remotes) r->tick(now);
     return worked || pendingCalls() != before;
 }
 
@@ -206,6 +220,16 @@ void DatagramEndpoint::handle(Incoming& msg) {
     // Notification from a node we subscribed to: never answered.
     std::string_view op = env["op"].is<const char*>() ? std::string_view(env["op"].as<const char*>()) : "";
     if (op == "change" || op == "event") {
+        std::vector<RemoteNode*> remotes;
+        {
+            MutexGuard guard(mutex_);
+            remotes = remotes_;
+        }
+        // Remote nodes take what concerns their mirror; the application's
+        // handler still sees everything.
+        for (RemoteNode* r : remotes) {
+            if (r->handleNotification(msg.from, env)) break;
+        }
         if (onNotification_) onNotification_(msg.from, env);
         return;
     }
@@ -248,12 +272,13 @@ void DatagramEndpoint::handle(Incoming& msg) {
 }
 
 bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope,
-                                   ResponseHandler done, uint32_t timeoutMs) {
+                                   ResponseHandler done, uint32_t timeoutMs, const void* owner) {
     uint32_t now = clock_ ? clock_() : 0;
     {
         MutexGuard guard(mutex_);
         if (calls_.size() >= options_.maxCalls) return false;
-        calls_.push_back(CallSlot{id, to, now + (timeoutMs ? timeoutMs : options_.timeoutMs), std::move(done)});
+        calls_.push_back(
+            CallSlot{id, to, now + (timeoutMs ? timeoutMs : options_.timeoutMs), std::move(done), owner});
     }
     if (send_ && send_(to, envelope, Delivery::Reliable)) return true;
     MutexGuard guard(mutex_);
@@ -267,21 +292,48 @@ bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, const std
 }
 
 bool DatagramEndpoint::request(const PeerAddress& to, Op op, std::string_view path, std::string_view bodyJson,
-                               ResponseHandler done, const Query& query, uint32_t timeoutMs) {
+                               ResponseHandler done, const Query& query, uint32_t timeoutMs, const void* owner) {
     uint32_t id;
     {
         MutexGuard guard(mutex_);
         id = nextId_++;
         if (nextId_ == 0) nextId_ = 1;
     }
-    return sendRequest(to, id, buildRequestEnvelope(id, op, path, query, bodyJson), std::move(done), timeoutMs);
+    return sendRequest(to, id, buildRequestEnvelope(id, op, path, query, bodyJson), std::move(done), timeoutMs,
+                       owner);
 }
 
 bool DatagramEndpoint::request(const PeerAddress& to, Op op, std::string_view path, JsonVariantConst body,
-                               ResponseHandler done, const Query& query, uint32_t timeoutMs) {
+                               ResponseHandler done, const Query& query, uint32_t timeoutMs, const void* owner) {
     std::string json;
     if (!body.isNull()) serializeJson(body, json);
-    return request(to, op, path, std::string_view(json), std::move(done), query, timeoutMs);
+    return request(to, op, path, std::string_view(json), std::move(done), query, timeoutMs, owner);
+}
+
+void DatagramEndpoint::cancelCalls(const void* owner) {
+    MutexGuard guard(mutex_);
+    for (size_t i = 0; i < calls_.size();) {
+        if (calls_[i].owner == owner) {
+            calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            i++;
+        }
+    }
+}
+
+void DatagramEndpoint::addRemote(RemoteNode* remote) {
+    MutexGuard guard(mutex_);
+    remotes_.push_back(remote);
+}
+
+void DatagramEndpoint::removeRemote(RemoteNode* remote) {
+    MutexGuard guard(mutex_);
+    for (size_t i = 0; i < remotes_.size(); i++) {
+        if (remotes_[i] == remote) {
+            remotes_.erase(remotes_.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
 }
 
 void DatagramEndpoint::forgetPeer(const PeerAddress& peer) {

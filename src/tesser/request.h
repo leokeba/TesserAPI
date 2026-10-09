@@ -29,6 +29,9 @@ struct Query {
     std::string_view keys;     // comma-separated direct children to include
     std::string_view exclude;  // comma-separated direct children to omit
     View view = View::Value;
+    // Include mirrored remote nodes' copies (false: leave remote nodes out).
+    // Mirrors subscribe with false, so copies are never re-exported.
+    bool remotes = true;
     // Subscribe only.
     uint32_t interval = 0;  // minimum ms between change notifications
     bool events = true;     // also deliver events under the path

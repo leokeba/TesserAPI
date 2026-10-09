@@ -2,7 +2,7 @@
 
 Describe your ESP32 firmware's state and operations **once**, as a tree of values and actions. Serve it as JSON over HTTP, over ESP-NOW (with [NowTP](https://github.com/leokeba/NowTP)), or over serial, from Arduino or ESP-IDF.
 
-> **Status: early development.** The design is in [docs/DESIGN.md](docs/DESIGN.md). The core (tree, get/set/patch, shapes, schema), subscriptions and events, persistence, access control, and the serial, HTTP, WebSocket and NowTP transports work and are tested on hardware. The API will change before 1.0.
+> **Status: early development.** The design is in [docs/DESIGN.md](docs/DESIGN.md). Everything in the design works and is tested on hardware: the core (tree, get/set/patch, shapes, schema, lists), subscriptions and events, persistence, access control, the serial, HTTP, WebSocket and NowTP transports, and gateways that mount other nodes. The API will change before 1.0.
 
 ```cpp
 #include <TesserAPI.h>
@@ -55,6 +55,23 @@ pressed.emit(3);                                   // → {"op":"event","path":"
 ← {"op":"change","path":"/","body":{"temperature":22.0}}
 ```
 
+## Lists
+
+```cpp
+std::vector<Remote> remotes;
+api.list("remotes", remotes);    // GET /remotes, /remotes/1/host; PUT /remotes [...] replaces the list
+```
+
+## Gateway
+
+A node can graft another node's tree into its own, reached over ESP-NOW:
+
+```cpp
+nowApi.remote(api, "kitchen", kitchenMac).mirror();   // GET /api/kitchen/lamp is forwarded over ESP-NOW
+```
+
+With a mirror, the remote's state also appears in local reads and subscriptions, events included.
+
 ## Persistence and access control
 
 ```cpp
@@ -94,7 +111,7 @@ api.mount("right", rightMotor);
 ## Examples
 
 - [examples/arduino/SerialApi](examples/arduino/SerialApi): the API over the serial monitor.
-- [examples/arduino/HttpAndNowTP](examples/arduino/HttpAndNowTP): the same API over HTTP and ESP-NOW, with boards querying each other.
+- [examples/arduino/HttpAndNowTP](examples/arduino/HttpAndNowTP): the same API over HTTP, WebSocket and ESP-NOW; each board mounts the boards it discovers (a gateway).
 - [examples/idf/http_api](examples/idf/http_api): ESP-IDF, HTTP.
 
 ## Requirements

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "tesser/detail/lazy_patch.h"
+#include "tesser/remote.h"
 
 namespace tesser {
 
@@ -98,15 +99,16 @@ struct Filter {
 
 namespace detail {
 
-void renderValue(JsonWriter& w, const Node& n, int depth) {
+void renderValue(JsonWriter& w, const Node& n, int depth, bool remotes) {
     switch (n.type()) {
         case NodeType::Object:
             w.beginObject();
             if (depth > 0) {
                 for (const Node* c = static_cast<const Object&>(n).first(); c; c = c->next()) {
                     if (c->type() == NodeType::Action || c->type() == NodeType::Event) continue;
+                    if (!remotes && c->type() == NodeType::Remote) continue;
                     w.key(c->name());
-                    renderValue(w, *c, depth - 1);
+                    renderValue(w, *c, depth - 1, remotes);
                 }
             }
             w.endObject();
@@ -115,14 +117,14 @@ void renderValue(JsonWriter& w, const Node& n, int depth) {
             const auto& l = static_cast<const ListNode&>(n);
             w.beginArray();
             if (depth > 0) {
-                for (size_t i = 0; i < l.size(); i++) renderValue(w, *l.element(i), depth);
+                for (size_t i = 0; i < l.size(); i++) renderValue(w, *l.element(i), depth, remotes);
             }
             w.endArray();
             break;
         }
         case NodeType::Value: static_cast<const ValueNode&>(n).write(w); break;
         case NodeType::Custom: static_cast<const CustomNode&>(n).write(w); break;
-        case NodeType::Remote:
+        case NodeType::Remote: static_cast<const RemoteNode&>(n).writeCopy(w, depth); break;
         case NodeType::Action:
         case NodeType::Event: w.null(); break;
     }
@@ -151,6 +153,15 @@ public:
         if (!target) return;
         if (req_.op != Op::Unsubscribe && !allowed(*target)) {
             return replyError(Status::Unauthorized, "not authorized", base_);
+        }
+        if (target->type() == NodeType::Remote) {
+            auto& remote = static_cast<RemoteNode&>(*target);
+            bool itself = remoteRest_.empty();
+            if (req_.op == Op::Get || req_.op == Op::Set) return forward(remote);
+            // Subscriptions: to a mirrored remote node itself, locally.
+            if (!itself || !remote.mirrored()) {
+                return replyError(Status::NotAllowed, "subscribe to a mirrored remote node itself", base_);
+            }
         }
         switch (req_.op) {
             case Op::Get: get(*target); break;
@@ -221,6 +232,10 @@ private:
         size_t pos = 1;
         std::string_view p = base_;
         while (pos < p.size()) {
+            if (node->type() == NodeType::Remote) {
+                remoteRest_ = p.substr(pos - 1);  // forwarded as is
+                break;
+            }
             size_t slash = p.find('/', pos);
             if (slash == std::string_view::npos) slash = p.size();
             std::string_view seg = p.substr(pos, slash - pos);
@@ -344,7 +359,7 @@ private:
         }
         switch (n.type()) {
             case NodeType::Object: renderChildren(w, static_cast<const Object&>(n), depth, f, view); break;
-            default: detail::renderValue(w, n, depth); break;
+            default: detail::renderValue(w, n, depth, req_.query.remotes); break;
         }
     }
 
@@ -368,6 +383,7 @@ private:
                     if (view == View::Value && (c->type() == NodeType::Action || c->type() == NodeType::Event)) {
                         continue;
                     }
+                    if (view == View::Value && c->type() == NodeType::Remote && !req_.query.remotes) continue;
                     if (!f.keys.empty() && !listContains(f.keys, c->name())) continue;
                     if (!f.exclude.empty() && listContains(f.exclude, c->name())) continue;
                     w.key(c->name());
@@ -434,7 +450,14 @@ private:
                 w.uinteger(static_cast<const ListNode&>(n).maxSize());
                 break;
             }
-            case NodeType::Remote: w.string("remote"); break;
+            case NodeType::Remote: {
+                w.string("remote");
+                if (static_cast<const RemoteNode&>(n).mirrored()) {
+                    w.key("mirror");
+                    w.boolean(true);
+                }
+                break;
+            }
         }
         if (n.persisted()) {
             w.key("persist");
@@ -453,6 +476,65 @@ private:
             renderSchema(w, *static_cast<const ListNode&>(n).prototype(), depth, Filter());
         }
         w.endObject();
+    }
+
+    // ---- remote nodes -------------------------------------------------
+
+    void forward(RemoteNode& remote) {
+        if (!remote.endpoint()) return replyError(Status::Internal, "no endpoint", base_);
+        if (!api_.pendingBegin()) return replyError(Status::Busy, "too many pending calls", base_);
+        Reply* detached = reply_.detach();
+        if (!detached) {
+            api_.pendingDone();
+            return replyError(Status::NotAllowed, "this transport can't wait for remote nodes", base_);
+        }
+        std::string remoteBase = remote.remotePath() == "/" ? std::string() : remote.remotePath();
+        std::string remotePath = remoteBase + std::string(remoteRest_);
+        if (remotePath.empty()) remotePath = "/";
+        // The local path of the remote node: error paths in its replies are
+        // mapped back under it.
+        std::string localBase(base_.substr(0, base_.size() - remoteRest_.size()));
+        Api* api = &api_;
+        auto done = [detached, api, localBase, remoteBase](Status s, JsonVariantConst body) {
+            JsonWriter w(detached->begin(s));
+            if (s == Status::Timeout && body.isNull()) {
+                w.beginObject();
+                w.key("error");
+                w.string("timeout");
+                w.key("path");
+                w.string(localBase.empty() ? std::string_view("/") : std::string_view(localBase));
+                w.key("message");
+                w.string("remote node didn't answer");
+                w.endObject();
+            } else if (s != Status::Ok && body.is<JsonObjectConst>()) {
+                w.beginObject();
+                for (JsonPairConst kv : body.as<JsonObjectConst>()) {
+                    w.key(std::string_view(kv.key().c_str(), kv.key().size()));
+                    if (kv.key() == "path" && kv.value().is<const char*>()) {
+                        std::string_view p(kv.value().as<const char*>());
+                        if (p.compare(0, remoteBase.size(), remoteBase) == 0) p.remove_prefix(remoteBase.size());
+                        if (p == "/") p = std::string_view();
+                        std::string local = localBase + std::string(p);
+                        w.string(local.empty() ? std::string_view("/") : std::string_view(local));
+                    } else {
+                        w.variant(kv.value());
+                    }
+                }
+                w.endObject();
+            } else {
+                w.variant(body);
+            }
+            detail::finishBody(*detached, w, localBase);
+            detached->release();
+            api->pendingDone();
+        };
+        if (!remote.endpoint()->request(remote.peer(), req_.op, remotePath, req_.body, done, req_.query,
+                                        remote.timeoutMs(), &remote)) {
+            writeError(*detached, Status::Busy, base_.empty() ? std::string_view("/") : base_,
+                       "couldn't send to the remote node");
+            detached->release();
+            api_.pendingDone();
+        }
     }
 
     // ---- subscriptions ------------------------------------------------
@@ -490,6 +572,7 @@ private:
         sub.depth = req_.query.depth;
         sub.interval = req_.query.interval;
         sub.events = req_.query.events;
+        sub.remotes = req_.query.remotes;
         api_.addSubscription(std::move(sub));
     }
 
@@ -561,7 +644,7 @@ private:
                 }
                 markLists();
                 JsonWriter w(reply_.begin(Status::Ok));
-                detail::renderValue(w, list, api_.config().maxDepth);
+                detail::renderValue(w, list, api_.config().maxDepth, req_.query.remotes);
                 detail::finishBody(reply_, w, base_);
                 return;
             }
@@ -728,6 +811,7 @@ private:
     std::vector<std::unique_ptr<Object>> temps_;  // list elements on the request path
     std::vector<ListNode*> lists_;                // lists the path went through
     std::deque<std::string> names_;               // list indexes in the error trail
+    std::string_view remoteRest_;                 // path below a remote node, forwarded as is
 };
 
 }  // namespace

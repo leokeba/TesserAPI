@@ -15,6 +15,8 @@
 #include "datagram_cases.h"
 #include "subscription_cases.h"
 #include "persistence_cases.h"
+#include "list_cases.h"
+#include "remote_cases.h"
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"

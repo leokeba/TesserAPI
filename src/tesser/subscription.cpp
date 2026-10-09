@@ -9,8 +9,14 @@ namespace tesser {
 namespace {
 
 // Registry of live APIs, so an EventNode can find the tree it belongs to.
-Mutex g_apisMutex;
-Api* g_apis = nullptr;
+// Registration is a lock-free push: APIs are often globals, constructed
+// before any mutex in another translation unit is guaranteed to exist.
+std::atomic<Api*> g_apis{nullptr};
+
+Mutex& apisMutex() {
+    static Mutex m;  // constructed on first use
+    return m;
+}
 
 bool findPath(const Object& o, const Node* target, std::string& path) {
     for (const Node* c = o.first(); c; c = c->next()) {
@@ -57,18 +63,20 @@ bool passesFilter(const Subscription& sub, std::string_view name) {
     return true;
 }
 
-void changesIn(const Object& o, uint16_t since, int depth, const Subscription* top, detail::LazyPatch& lp, JsonWriter& w) {
+void changesIn(const Object& o, uint16_t since, int depth, const Subscription* top, bool remotes, detail::LazyPatch& lp,
+               JsonWriter& w) {
     if (depth <= 0) return;
     for (const Node* c = o.first(); c; c = c->next()) {
         if (c->type() == NodeType::Action || c->type() == NodeType::Event) continue;
+        if (c->type() == NodeType::Remote && !remotes) continue;
         if (top && !passesFilter(*top, c->name())) continue;
         if (c->type() == NodeType::Object) {
             if (!lp.enter(c->name())) continue;
-            changesIn(static_cast<const Object&>(*c), since, depth - 1, nullptr, lp, w);
+            changesIn(static_cast<const Object&>(*c), since, depth - 1, nullptr, remotes, lp, w);
             lp.leave();
         } else if (detail::isLeaf(*c) && newerGeneration(c->generation(), since)) {
             lp.key(c->name());
-            detail::writeLeaf(w, *c);
+            detail::writeLeaf(w, *c, remotes);
         }
     }
 }
@@ -84,9 +92,10 @@ void closeEnvelope(std::string& msg, bool overflow) {
 // ---- registry ---------------------------------------------------------------
 
 Api::Api() : Object("") {
-    MutexGuard guard(g_apisMutex);
-    nextApi_ = g_apis;
-    g_apis = this;
+    Api* head = g_apis.load();
+    do {
+        nextApi_ = head;
+    } while (!g_apis.compare_exchange_weak(head, this));
 }
 
 Api::~Api() {
@@ -98,18 +107,21 @@ Api::~Api() {
         }
         queue_.clear();
     }
-    MutexGuard guard(g_apisMutex);
-    for (Api** p = &g_apis; *p; p = &(*p)->nextApi_) {
-        if (*p == this) {
-            *p = nextApi_;
+    MutexGuard guard(apisMutex());
+    Api* self = this;
+    if (g_apis.compare_exchange_strong(self, nextApi_)) return;
+    // Not the head (a push may have happened meanwhile): unlink in place.
+    for (Api* p = g_apis.load(); p; p = p->nextApi_) {
+        if (p->nextApi_ == this) {
+            p->nextApi_ = nextApi_;
             break;
         }
     }
 }
 
 Api* Api::owner(const Node& node, std::string& path) {
-    MutexGuard guard(g_apisMutex);
-    for (Api* a = g_apis; a; a = a->nextApi_) {
+    MutexGuard guard(apisMutex());
+    for (Api* a = g_apis.load(); a; a = a->nextApi_) {
         path.clear();
         if (&node == a) return a;
         MutexGuard apiGuard(a->mutex_);
@@ -242,7 +254,7 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
     if (n.type() == NodeType::Object) {
         detail::LazyPatch lp(w);
         int depth = sub.depth < 0 || sub.depth > config_.maxDepth ? config_.maxDepth : sub.depth;
-        changesIn(static_cast<const Object&>(n), sub.since, depth, &sub, lp, w);
+        changesIn(static_cast<const Object&>(n), sub.since, depth, &sub, sub.remotes, lp, w);
         any = lp.finish();
     } else if (detail::isLeaf(n) && newerGeneration(n.generation(), sub.since)) {
         detail::writeLeaf(w, n);

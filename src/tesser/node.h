@@ -22,7 +22,10 @@
 namespace tesser {
 
 class Api;
+class DatagramEndpoint;
 class Object;
+class RemoteNode;
+struct PeerAddress;
 
 enum class NodeType : uint8_t { Object, Value, Action, Event, Custom, List, Remote };
 
@@ -544,6 +547,11 @@ public:
     // for mount()).
     template <class T>
     ListNode& list(const char* name, std::vector<T>& items);
+
+    // Another node's tree, reached through a datagram endpoint (NowTP, ...),
+    // grafted here: requests below it are forwarded. See tesser/remote.h.
+    RemoteNode& remote(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer,
+                       const char* remotePath = "/");
 
     // Writer renders the node; the optional applier accepts writes.
     CustomNode& custom(const char* name, CustomNode::Writer writer, CustomNode::Applier applier = nullptr) {

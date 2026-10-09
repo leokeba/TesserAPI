@@ -19,6 +19,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tesser/datagram.h"
+#include "tesser/remote.h"
 
 namespace tesser {
 
@@ -61,6 +62,12 @@ public:
             }
             return false;
         });
+    }
+
+    // Grafts another node's tree (at its `remotePath`) under `parent`: a
+    // gateway's GET /api/<name>/... is forwarded to that node over ESP-NOW.
+    RemoteNode& remote(Object& parent, const char* name, const nowtp::Mac& mac, const char* remotePath = "/") {
+        return parent.remote(name, endpoint_, address(mac), remotePath);
     }
 
     DatagramEndpoint& endpoint() { return endpoint_; }

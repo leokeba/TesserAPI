@@ -189,6 +189,7 @@ struct Request {
 | `keys` | comma-separated names | Only these direct children of the target. An unknown name is `not_found`. |
 | `exclude` | comma-separated names | All direct children except these. |
 | `view` | `value` (default), `schema` | The representation to return (§7). |
+| `remotes` | `true` (default), `false` | Include mirrored remote nodes' copies (§14). |
 
 `keys` and `exclude` apply only at the target level. Nested selection uses a shape (§5.3). `keys` together with `exclude` is `bad_request`. With `depth`, the target itself is level 0.
 
@@ -339,7 +340,7 @@ These transports are message-based and two-way, so they share one JSON envelope.
 ```
 
 - **`id`:** any JSON scalar, echoed verbatim. It may be omitted, in which case the response also has no `id`.
-- **`op`:** `get`, `set`, `sub` or `unsub`. The keys `path`, `depth`, `keys`, `exclude`, `view`, `interval`, `events` and `body` map one-to-one onto `Request`.
+- **`op`:** `get`, `set`, `sub` or `unsub`. The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `events` and `body` map one-to-one onto `Request`.
 - **Unknown envelope keys** are ignored, for forward compatibility.
 - **Response:** the response is written as a stream: `{"id":…,"status":"…","body":` followed by the body and then `}`. Buffered transports can still replace it with an error if the body overflows the limit.
 - **Framing** is the transport's job:
@@ -488,14 +489,33 @@ api.load();                               // once the tree is declared
 - Hiding nodes from the schema is not access control: the authorizer runs on every access.
 - TLS is the application's choice of server.
 
-## 14. Remote trees and the client *(planned)*
+## 14. Remote trees and the client
 
-- **Client:** `tesser::Client` issues envelope requests over a message transport and matches responses by `id`:
-  ```cpp
-  client.get(mac, "/lamp", [](tesser::Status s, JsonVariantConst body) { ... });
-  ```
-- **Remote mount:** `api.mount("kitchen", tesser::remote(client, kitchenMac))` grafts a remote node's tree into the local one. Get and set on `/kitchen/...` are forwarded with the path rewritten and complete through deferral. A gateway thereby exposes ESP-NOW nodes over HTTP.
-- **Caveat:** on a gateway, Wi-Fi station mode and ESP-NOW share one channel.
+**Client.** `DatagramEndpoint` (and `NowTpTransport` on top of it) sends requests to other nodes and matches responses by `id`:
+
+```cpp
+nowApi.get(mac, "/lamp", [](tesser::Status s, JsonVariantConst body) { ... });
+nowApi.endpoint().request(addr, tesser::Op::Subscribe, "/sensors", "", done, query);
+nowApi.endpoint().onNotification([](const tesser::PeerAddress& from, JsonObjectConst msg) { ... });
+```
+
+**Remote mount (gateway).** A remote node grafts another node's tree into the local one:
+
+```cpp
+nowApi.remote(api, "kitchen", kitchenMac);              // or api.remote("kitchen", endpoint, address, "/")
+nowApi.remote(api, "light", kitchenMac, "/lamp").mirror(200);
+```
+
+- **Forwarding:** get and set on `/kitchen/...` are forwarded with the path rewritten, and complete through a deferred reply (`maxPending` applies). Error paths in the remote's reply are mapped back under the local path (`/kitchen/nope`). A silent node answers `timeout` after the node's `timeout()` (default: the endpoint's 3 s). Transports that can't wait get `not_allowed`.
+- **Writes** must target the remote subtree: a patch of the parent can't include a remote node.
+- **Without a mirror**, a remote node renders as `null` in a parent read, and as `{"type": "remote"}` in the schema; reads below it are always forwarded live.
+- **`.mirror(intervalMs, refreshMs)`** keeps a local copy through a subscription. The copy is renewed every `refreshMs`, in case the remote node restarted.
+  - Parent reads include the copy, respecting `depth`.
+  - Local subscribers get the remote's changes as changes of the remote node, and its events under the local path (`/kitchen/button/pressed`).
+  - Subscribing to a mirrored remote node itself is allowed; subscribing below a remote node is not.
+- **No loops:** the `remotes: false` request option leaves mirrored remote nodes out of a read or subscription. Mirrors always subscribe with it, so a mirrored copy never contains copies of copies, and two gateways mounting each other stay flat. Requests below a remote node are forwarded live and may cross several hops.
+- **Lifetime:** the API must outlive its transports. A remote node and its endpoint may be destroyed in either order: a destroyed endpoint detaches its remote nodes.
+- **Channel:** on a gateway, Wi-Fi station mode and ESP-NOW share one channel, so every node must be on the router's channel.
 
 ## 15. Memory budget
 
@@ -549,7 +569,10 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 
 1. **Host tests** (CMake + ctest, ASan and UBSan, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror` on the library). They cover the core, the envelope codec and the line transport, and run against NowTP's simulated network for the NowTP adapter.
 2. **On-target tests** (`test/hardware`, ESP-IDF): the same core cases on the chip, plus heap and stack measurements.
-3. **End-to-end on hardware:** `test/hardware` serves a demo API over UART, HTTP and WebSocket (with Wi-Fi credentials from the gitignored `test/secrets.h`), and NowTP. `test/e2e_serial.py`, `test/e2e_http.py`, `test/e2e_ws.py`, `test/e2e_nowtp.py` (two boards) and `test/e2e_persist.py` (reboot through the serial port) drive it, including subscriptions, events, access control and persistence.
+3. **End-to-end on hardware:** `test/hardware` serves a demo API over UART, HTTP and WebSocket (with Wi-Fi credentials from the gitignored `test/secrets.h`), and NowTP. It drives subscriptions, events, access control, persistence and the gateway:
+   - `test/e2e_serial.py`, `test/e2e_http.py`, `test/e2e_ws.py`
+   - `test/e2e_nowtp.py` and `test/e2e_gateway.py`, on two boards
+   - `test/e2e_persist.py`, which reboots the board through the serial port
 4. **Transport conformance:** `test/conformance.py` sends the same request vectors through serial, HTTP, WebSocket and NowTP (both directions), and every transport must give the same results.
 5. **CI:** host tests, plus ESP-IDF 5.1 / 5.4 / 5.5 / latest × ESP32 / ESP32-C3 (test firmware and examples), plus Arduino-ESP32 3.x × ESP32 / ESP32-C3 (example sketches).
 
@@ -561,7 +584,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 2 | HTTP and NowTP transports, conformance tests, footprint measurements | done |
 | 3 | Change tracking, subscriptions, events, WebSocket | done |
 | 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
-| 5 | Client, remote mount (gateway), queued execution mode, lists of objects | in progress (lists, queued mode and the client done) |
+| 5 | Client, remote mount (gateway), queued execution mode, lists of objects | done |
 
 ## 19. Open questions
 

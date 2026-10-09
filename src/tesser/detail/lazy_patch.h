@@ -57,8 +57,9 @@ private:
     bool rootOpen_ = false;
 };
 
-// Value view of any node, without filters (defined in api.cpp).
-void renderValue(JsonWriter& w, const Node& n, int depth);
+// Value view of any node, without filters (defined in api.cpp). `remotes`:
+// include mirrored remote nodes.
+void renderValue(JsonWriter& w, const Node& n, int depth, bool remotes = true);
 
 // A node subscriptions and persistence treat as one value.
 inline bool isLeaf(const Node& n) {
@@ -66,7 +67,7 @@ inline bool isLeaf(const Node& n) {
            n.type() == NodeType::Remote;
 }
 
-inline void writeLeaf(JsonWriter& w, const Node& n) { renderValue(w, n, 16); }
+inline void writeLeaf(JsonWriter& w, const Node& n, bool remotes = true) { renderValue(w, n, 16, remotes); }
 
 }  // namespace detail
 }  // namespace tesser

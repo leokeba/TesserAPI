@@ -13,7 +13,11 @@ std::atomic<int> g_declarationErrors{0};
 // Nodes rejected at declaration time. Their reference was already handed out,
 // so they can't be deleted; keeping them reachable makes that explicit.
 Node* g_orphans = nullptr;
-Mutex g_orphanMutex;
+
+Mutex& orphanMutex() {
+    static Mutex m;  // constructed on first use: declarations may run in global constructors
+    return m;
+}
 
 bool validName(const char* name) {
     if (!name || !*name) return false;
@@ -152,7 +156,7 @@ void Object::link(Node* node) {
         g_declarationErrors++;
         logError("%s \"%s\" in object \"%s\": node ignored", problem, node->name_ ? node->name_ : "(null)",
                  name_ ? name_ : "");
-        MutexGuard guard(g_orphanMutex);
+        MutexGuard guard(orphanMutex());
         node->next_ = g_orphans;
         g_orphans = node;
         return;

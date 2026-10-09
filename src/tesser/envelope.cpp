@@ -125,6 +125,14 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
         }
         request.query.interval = interval.as<uint32_t>();
     }
+    JsonVariantConst remotes = env["remotes"];
+    if (!remotes.isNull()) {
+        if (!remotes.is<bool>()) {
+            message = "remotes must be a boolean";
+            return Status::BadRequest;
+        }
+        request.query.remotes = remotes.as<bool>();
+    }
     JsonVariantConst events = env["events"];
     if (!events.isNull()) {
         if (!events.is<bool>()) {

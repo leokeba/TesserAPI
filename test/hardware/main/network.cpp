@@ -32,6 +32,7 @@ char g_mac[18] = "";
 nowtp::EspNowTransport* g_now;
 tesser::NowTpTransport* g_nowApi;
 tesser::HttpServer* g_http;
+tesser::Api* g_api;
 
 void onEvent(void*, esp_event_base_t base, int32_t id, void* data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -116,6 +117,25 @@ void describeNet(tesser::Object& net) {
         w.raw(g_lastNotification);
     });
 
+    // Mounts another board's tree as /peer (once), optionally mirrored: the
+    // gateway feature, driven by test/e2e_gateway.py.
+    net.action("mount", [](tesser::Call& call) {
+        JsonVariantConst a = call.arg();
+        nowtp::Mac mac;
+        if (!g_nowApi || !parseMac(a["mac"].as<const char*>(), mac)) {
+            call.fail(tesser::Status::InvalidValue, "expected {mac, mirror}");
+            return;
+        }
+        if (g_api->child("peer")) {
+            call.fail(tesser::Status::NotAllowed, "already mounted");
+            return;
+        }
+        // Runs under the API lock, so growing the tree here is safe.
+        tesser::RemoteNode& peer = g_nowApi->remote(*g_api, "peer", mac);
+        if (a["mirror"] | false) peer.mirror(a["interval"] | 200u, 30000);
+        call.reply(true);
+    });
+
     net.action("remote", [](tesser::Call& call) {
         JsonVariantConst a = call.arg();
         nowtp::Mac mac;
@@ -159,6 +179,7 @@ void describeNet(tesser::Object& net) {
 
 // Brings up Wi-Fi (when test/secrets.h exists), NowTP and HTTP, and adds /net.
 void startNetwork(tesser::Api& api) {
+    g_api = &api;
     g_events = xEventGroupCreate();
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {

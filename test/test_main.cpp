@@ -4,5 +4,6 @@
 #include "subscription_cases.h"
 #include "persistence_cases.h"
 #include "list_cases.h"
+#include "remote_cases.h"
 
 int main(int argc, char** argv) { return check::run(argc > 1 ? argv[1] : nullptr) ? 1 : 0; }

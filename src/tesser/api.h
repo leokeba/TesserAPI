@@ -41,6 +41,7 @@ struct Subscription {
     int depth = Query::kUnlimited;
     uint32_t interval = 0;
     bool events = true;
+    bool remotes = true;
     uint16_t since = 0;  // generation of the last flush
     uint32_t lastFlushMs = 0;
 };
