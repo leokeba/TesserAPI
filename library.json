@@ -1,0 +1,26 @@
+{
+  "name": "TesserAPI",
+  "version": "0.1.0",
+  "description": "Describe firmware state once, serve it as a queryable JSON tree over HTTP, ESP-NOW (NowTP) or serial. Arduino and ESP-IDF.",
+  "keywords": ["api", "json", "rest", "esp32", "esp-now", "espnow", "http", "schema"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/leokeba/TesserAPI.git"
+  },
+  "authors": [{ "name": "Leo Baque", "maintainer": true }],
+  "license": "MIT",
+  "frameworks": ["arduino", "espidf"],
+  "platforms": ["espressif32"],
+  "headers": ["TesserAPI.h"],
+  "dependencies": [
+    { "owner": "bblanchon", "name": "ArduinoJson", "version": "^7.4.3" }
+  ],
+  "build": {
+    "srcDir": "src",
+    "includeDir": "src",
+    "flags": ["-std=gnu++17"]
+  },
+  "export": {
+    "exclude": ["test", "build", ".github"]
+  }
+}

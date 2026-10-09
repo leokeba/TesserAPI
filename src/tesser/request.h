@@ -1,0 +1,96 @@
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <string_view>
+
+#include <ArduinoJson.h>
+
+#include "tesser/sink.h"
+#include "tesser/status.h"
+
+namespace tesser {
+
+enum class Op : uint8_t { Get, Set };
+
+enum class View : uint8_t { Value, Schema };
+
+// "get" / "set"; false if unknown.
+bool parseOp(std::string_view s, Op& out);
+bool parseView(std::string_view s, View& out);
+const char* toString(Op op);
+
+struct Query {
+    static constexpr int kUnlimited = -1;
+    int depth = kUnlimited;  // levels of objects expanded below the target
+    std::string_view keys;     // comma-separated direct children to include
+    std::string_view exclude;  // comma-separated direct children to omit
+    View view = View::Value;
+};
+
+enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket };
+
+// Who sent a request, as far as the transport knows.
+struct Client {
+    TransportKind transport = TransportKind::Local;
+    uint8_t address[16] = {};  // IPv4/IPv6 or MAC, transport-defined
+    uint8_t addressLength = 0;
+    bool authenticated = false;
+};
+
+struct Request {
+    Op op = Op::Get;
+    std::string_view path;  // "/lamp/brightness"; "" or "/" is the root
+    Query query;
+    JsonVariantConst body;  // Set: value or patch. Get: optional shape.
+    Client client;
+};
+
+// Receives a response. Implemented by transports. The core calls begin()
+// exactly once, writes one JSON value (the body) to the returned sink, then
+// calls end(). Status and body encoding are the transport's business.
+class Reply {
+public:
+    virtual ~Reply() = default;
+    virtual Sink& begin(Status status) = 0;
+    virtual void end() = 0;
+    // Discards everything written since begin() so the core can start over
+    // with an error. Only buffered replies can do this.
+    virtual bool rollback() { return false; }
+    // Keeps the reply alive after the handler returns, for deferred actions.
+    // Returns a heap object the core completes later (begin/write/end, then
+    // release()), or nullptr if the transport can't defer.
+    virtual Reply* detach() { return nullptr; }
+    // Called on a detached reply after end(); typically `delete this`.
+    virtual void release() {}
+};
+
+// Reply that captures status and body into memory: handy for tests and for
+// transports that build their own framing around the body.
+class StringReply : public Reply {
+public:
+    explicit StringReply(size_t limit = 0) : sink_(body, limit) {}
+
+    Sink& begin(Status s) override {
+        status = s;
+        body.clear();
+        begun = true;
+        return sink_;
+    }
+    void end() override { ended = true; }
+    bool rollback() override {
+        body.clear();
+        return true;
+    }
+
+    Status status = Status::Internal;
+    std::string body;
+    bool begun = false;
+    bool ended = false;
+
+private:
+    StringSink sink_;
+};
+
+}  // namespace tesser

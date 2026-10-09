@@ -1,0 +1,14 @@
+version: "0.1.0"
+description: "Describe firmware state once, serve it as a queryable JSON tree over HTTP, ESP-NOW (NowTP) or serial"
+url: "https://github.com/leokeba/TesserAPI"
+license: "MIT"
+dependencies:
+  idf:
+    version: ">=5.1"
+  bblanchon/arduinojson:
+    version: "^7.4.3"
+files:
+  exclude:
+    - "test/**/*"
+    - "build/**/*"
+    - ".github/**/*"

@@ -160,7 +160,7 @@ struct Request {
 
 - `/` or the empty path is the root.
 - A trailing slash is ignored: `/lamp` and `/lamp/` are the same resource. An empty segment (`//`) is `bad_request`.
-- A path that leaves the tree, for example `/lamp/on/x`, is `not_found`. The error names the longest prefix that resolved.
+- A path that leaves the tree, for example `/lamp/nope/x`, is `not_found`. The error's `path` is the prefix up to the first segment that didn't resolve (`/lamp/nope`).
 - No percent-decoding inside the core, since names can't contain characters that need it. HTTP decodes the URL before handing over the path.
 
 ### 5.2 Query options (Get)
@@ -427,10 +427,23 @@ Targets to be measured on a classic ESP32 and a C3, and enforced in CI:
 | Item | Target |
 |---|---|
 | Flash, core + HTTP transport | ≤ 40 KB above the application's baseline, ArduinoJson included |
-| RAM per value leaf | ≤ 32 B with a bound variable, ≤ 48 B with a getter and setter |
-| RAM per object node | ≤ 24 B |
+| RAM per value leaf | ≤ 32 B with a bound variable, ≤ 56 B with a getter and setter, + 28 B with a range or description |
+| RAM per object node | ≤ 32 B |
 | Request handling | Request body document (bounded by `maxRequestBody`) + 512 B streaming buffer (HTTP), or the response buffer (NowTP, bounded by `maxResponse`) |
 | Stack | Rendering depth bounded by `maxDepth` (default 16) |
+
+Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware`):
+
+| Item | Measured |
+|---|---|
+| `Api` object | 148 B |
+| Value bound to a variable | 28 B |
+| Value with getter and setter (small captures) | 56 B |
+| Object | 32 B |
+| Value with a range | 56 B (28 B node + 28 B metadata) |
+| Full GET of a 13-leaf tree (227 B response) | 0.4 ms |
+| Envelope parse + keyed GET + reply | 0.6 ms |
+| Serial round trip at 115200 baud | 13 ms (mostly wire time) |
 
 Configuration (`tesser::Config`, at runtime):
 
@@ -465,7 +478,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 
 | Phase | Content | Status |
 |---|---|---|
-| 1 | Core: tree, values, actions, custom nodes, get / set / patch / shape / schema, streaming writer, envelope, line transport, host + on-target tests | in progress |
+| 1 | Core: tree, values, actions, custom nodes, get / set / patch / shape / schema, streaming writer, envelope, line transport, host + on-target tests | done |
 | 2 | HTTP and NowTP transports, conformance tests, footprint measurements | |
 | 3 | Change tracking, subscriptions, events, WebSocket | |
 | 4 | Persistence, authorizer, NowTP allowlist | |
