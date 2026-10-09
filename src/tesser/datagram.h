@@ -193,6 +193,8 @@ private:
     std::vector<CallSlot> calls_;
     std::vector<PeerAddress> lostPeers_;  // forgetPeer() → process()
     std::vector<Seen> seenPeers_;         // peerSeen() → process()
+    // Schema hashes peers advertised, for remote nodes created later.
+    std::vector<std::pair<PeerAddress, uint32_t>> advertised_;  // guarded by mutex_
     Object* mountParent_ = nullptr;
     uint32_t mountMirrorMs_ = 0;
     Mutex subscribersMutex_;              // taken before the API lock, never after

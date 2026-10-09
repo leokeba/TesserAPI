@@ -231,8 +231,11 @@ TEST(remote_forwarded_subscription_failures) {
     subscription_cases::FakeSubscriber gone;
     {
         // A detachable reply, as message transports have.
+        struct Detached : tesser::StringReply {
+            void release() override { delete this; }
+        };
         struct Detachable : tesser::StringReply {
-            Reply* detach() override { return new tesser::StringReply(); }
+            Reply* detach() override { return new Detached(); }
         } reply;
         tesser::Request req;
         req.op = tesser::Op::Subscribe;
@@ -263,22 +266,28 @@ TEST(remote_discovered_peers) {
     subscription_cases::FakeSubscriber watcher;
     CHECK_EQ(subscription_cases::subscribe(r.gateway, &watcher, "/peers", cases::depth(1)).body, "{}");
 
-    // A peer mounted already (as /kitchen) isn't mounted again, but shows
-    // the schema hash it advertises.
+    // A peer declared elsewhere (as /kitchen) is mounted too; every remote
+    // node of the peer shows the schema hash it advertises.
     r.gatewayEnd.peerSeen(addr(2), "kitchen", 0xabc);
     r.gatewayEnd.process();
     CHECK_EQ(stub("/", "kitchen"),
              "{\"type\":\"object\",\"children\":{\"kitchen\":{\"type\":\"remote\",\"schema\":\"00000abc\"}}}");
+    r.gateway.poll(900);
+    CHECK_EQ(watcher.last(), "{\"op\":\"change\",\"path\":\"/peers\",\"body\":{\"kitchen\":null}}");
 
     // An announcement mounts the peer under its name; repeats don't.
     r.gatewayEnd.peerSeen(addr(5), "kitchen lamp!", 0x1234abcd);
     r.gatewayEnd.process();
     r.gatewayEnd.peerSeen(addr(5), "kitchen lamp!", 0x1234abcd);
     r.gatewayEnd.process();
-    CHECK_EQ(cases::get(r.gateway, "/peers", cases::schema()).body,
+    CHECK_EQ(stub("/peers", "kitchen-lamp"),
              "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":{\"type\":\"remote\",\"schema\":\"1234abcd\"}}}");
     r.gateway.poll(1000);
     CHECK_EQ(watcher.last(), "{\"op\":\"change\",\"path\":\"/peers\",\"body\":{\"kitchen-lamp\":null}}");
+    // Remote nodes declared later know the hash too.
+    r.gateway.remote("lamp2", r.gatewayEnd, addr(5));
+    CHECK_EQ(stub("/", "lamp2"),
+             "{\"type\":\"object\",\"children\":{\"lamp2\":{\"type\":\"remote\",\"schema\":\"1234abcd\"}}}");
     CHECK_EQ(r.ask("{\"id\":1,\"op\":\"get\",\"path\":\"/peers/kitchen-lamp/lamp/on\"}"),
              "{\"id\":1,\"status\":\"ok\",\"body\":false}");
 
@@ -288,7 +297,7 @@ TEST(remote_discovered_peers) {
     r.gatewayEnd.peerSeen(addr(4), "", 0);
     r.gatewayEnd.process();
     CHECK_EQ(cases::get(r.gateway, "/peers", cases::depth(1)).body,
-             "{\"kitchen-lamp\":null,\"kitchen-lamp-75f303\":null,\"75f304\":null}");
+             "{\"kitchen\":null,\"kitchen-lamp\":null,\"kitchen-lamp-75f303\":null,\"75f304\":null}");
 
     // Lost peers show offline until they are heard from again.
     r.gateway.poll(1050);

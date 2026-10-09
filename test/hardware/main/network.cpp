@@ -232,13 +232,14 @@ void startNetwork(tesser::Api& api) {
         serializeJson(env, g_lastNotification);
         g_notifications++;
     });
-    g_now->onPeerEvent([](nowtp::PeerEvent e, const nowtp::PeerInfo& p) {
-        if (e == nowtp::PeerEvent::Lost) g_nowApi->peerLost(p.mac);
-    });
+    // TesserAPI peers are mounted under /peers as they are discovered
+    // (test/e2e_gateway.py), and shown offline when lost.
+    g_now->onPeerEvent([](nowtp::PeerEvent e, const nowtp::PeerInfo& p) { g_nowApi->peerEvent(e, p); });
     printf("NOWTP %s mac=%s channel=%u port=%u\n", nowOk ? "started" : nowtp::toString(ns), g_mac,
            unsigned(g_now->channel()), unsigned(g_nowApi->port()));
 
     describeNet(api.object("net"));
+    g_nowApi->mountPeers(api.object("peers").doc("TesserAPI boards around, mounted as they are discovered"));
     // Computed when the tree changes, not inside a request: rendering the
     // whole schema nested in a handler is heavy on the handler's stack.
     api.object("system").value("schemaHash", g_schemaHash);

@@ -571,7 +571,7 @@ nowApi.mountPeers(api.object("peers"));   // also mounts the peers already disco
 nowApi.advertise();                       // on every node, once its tree is complete
 ```
 
-- **Mounting:** each peer that advertises TesserAPI on the transport's port becomes a remote node under the parent, named after its NowTP discovery name. Characters a name can't hold become `-`. If the name is empty or taken, the last three address bytes are appended (`tesser-lamp-75f303`). `mountPeers(parent, intervalMs)` also mirrors them. A peer that already has a remote node, declared or mounted, isn't mounted again.
+- **Mounting:** each peer that advertises TesserAPI on the transport's port becomes a remote node under the parent, named after its NowTP discovery name. Characters a name can't hold become `-`. If the name is empty or taken, the last three address bytes are appended (`tesser-lamp-75f303`). `mountPeers(parent, intervalMs)` also mirrors them. A peer already mounted under the parent isn't mounted again. Remote nodes of the peer elsewhere in the tree (declared ones) don't prevent it, but they share its online state and schema hash, including remote nodes declared after the announcement.
 - **Nodes are never removed.** A lost peer stays mounted and shows offline; it comes back online as soon as it is heard from or announces itself again.
 - **Remote node stub:** the parent's schema shows each remote node's state. `"online": false` appears while the peer is lost, and `"schema"` is the hash the peer advertises, so a client can cache the peer's own schema under it:
 

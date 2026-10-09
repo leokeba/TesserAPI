@@ -6,8 +6,9 @@ Usage:
   python3 test/e2e_gateway.py <ip-A> <ip-B>
 
 Runs the conformance vectors through A's /peer prefix, then checks error
-paths, the mirror, and change notifications and events relayed to a
-WebSocket client on A. Prints "E2E pass=<n> fail=<n>".
+paths, the mirror, change notifications and events relayed to a WebSocket
+client on A, B's discovery mount under /peers, and subscriptions forwarded
+through it. Prints "E2E pass=<n> fail=<n>".
 """
 import json
 import statistics
@@ -58,7 +59,9 @@ def main():
 
     # The schema shows a mirrored remote node; its own schema is B's.
     _, schema = a.call('get', '/', {'view': 'schema', 'depth': 1}, ABSENT)
-    check('schema: remote', schema['children']['peer'] == {'type': 'remote', 'mirror': True}, schema)
+    stub = dict(schema['children']['peer'])
+    advertised = stub.pop('schema', '')
+    check('schema: remote', stub == {'type': 'remote', 'mirror': True} and len(advertised) == 8, schema)
     _, remote_schema = a.call('get', '/peer/lamp/brightness', {'view': 'schema'}, ABSENT)
     check('schema: forwarded', remote_schema.get('max') == 255, remote_schema)
 
@@ -82,6 +85,48 @@ def main():
     n = ws.wait_notification(lambda m: m.get('op') == 'event', 3)
     check('event relayed', n == {'op': 'event', 'path': '/peer/demo/fired', 'body': 'ping'}, n)
     ws.close()
+    b.call('set', '/lamp/brightness', {}, 128)
+
+    # Discovery: A mounted B under /peers, named after its NowTP name.
+    name_b = 'tesser-' + mac_b.replace(':', '')[-4:]
+    stub, peers = None, None
+    for _ in range(20):
+        _, peers = a.call('get', '/peers', {'view': 'schema', 'depth': 1}, ABSENT)
+        stub = (peers.get('children') or {}).get(name_b)
+        if stub:
+            break
+        time.sleep(0.5)
+    check('B discovered under /peers', stub == {'type': 'remote', 'schema': advertised}, peers)
+    base = f'/peers/{name_b}'
+    check('read through discovered B', a.call('get', base + '/lamp/label', {}, ABSENT) == ('ok', 'desk'))
+
+    # Forwarded subscriptions: two WebSocket clients on A share one upstream
+    # subscription to B, each with its own filter.
+    ws1, ws2 = WebSocket(ip_a), WebSocket(ip_a)
+    t0 = time.time()
+    r1 = ws1.request('sub', base + '/lamp', keys='brightness', timeout=5)
+    first_ms = (time.time() - t0) * 1000
+    check('forwarded sub snapshot', r1.get('status') == 'ok' and r1.get('body') == {'brightness': 128}, r1)
+    t0 = time.time()
+    r2 = ws2.request('sub', base + '/lamp')
+    shared_ms = (time.time() - t0) * 1000
+    check('shared sub snapshot', r2.get('status') == 'ok' and r2['body'].get('label') == 'desk', r2)
+    print(f'     forwarded sub: first {first_ms:.0f} ms (upstream), second {shared_ms:.0f} ms (from the copy)')
+    b.call('set', '/lamp/brightness', {}, 55)
+    n1 = ws1.wait_notification(lambda m: m.get('op') == 'change', 3)
+    n2 = ws2.wait_notification(lambda m: m.get('op') == 'change', 3)
+    check('forwarded change, filtered', n1 == {'op': 'change', 'path': base + '/lamp', 'body': {'brightness': 55}}, n1)
+    check('forwarded change, shared', n2 == {'op': 'change', 'path': base + '/lamp', 'body': {'brightness': 55}}, n2)
+    b.call('set', '/lamp/label', {}, 'fwd')
+    n1 = ws1.wait_notification(lambda m: m.get('op') == 'change', 1)
+    n2 = ws2.wait_notification(lambda m: m.get('op') == 'change', 3)
+    check('keys filter applied', n1 is None, n1)
+    check('other keys still relayed', n2 is not None and n2['body'] == {'label': 'fwd'}, n2)
+    r = ws1.request('unsub', base + '/lamp')
+    check('forwarded unsub', r.get('status') == 'ok' and r.get('body') == 1, r)
+    ws1.close()
+    ws2.close()
+    b.call('set', '/lamp/label', {}, 'desk')
     b.call('set', '/lamp/brightness', {}, 128)
 
     # Forwarded GET latency, end to end over HTTP + ESP-NOW.

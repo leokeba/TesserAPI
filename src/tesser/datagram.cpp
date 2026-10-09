@@ -364,6 +364,9 @@ void DatagramEndpoint::cancelCalls(const void* owner) {
 void DatagramEndpoint::addRemote(RemoteNode* remote) {
     MutexGuard guard(mutex_);
     remotes_.push_back(remote);
+    for (auto& a : advertised_) {
+        if (a.first == remote->peer()) remote->setAdvertisedSchema(a.second);
+    }
 }
 
 void DatagramEndpoint::removeRemote(RemoteNode* remote) {
@@ -446,25 +449,34 @@ std::string nodeName(std::string_view advertised) {
 }  // namespace
 
 void DatagramEndpoint::applySeen(const Seen& seen) {
-    bool known = false;
     Object* parent;
     uint32_t mirrorMs;
     {
         MutexGuard guard(mutex_);
         for (RemoteNode* r : remotes_) {
             if (r->peer() != seen.peer) continue;
-            known = true;
             r->setOnline(true);
             r->setAdvertisedSchema(seen.schemaHash);
         }
+        bool found = false;
+        for (auto& a : advertised_) {
+            if (a.first == seen.peer) {
+                a.second = seen.schemaHash;
+                found = true;
+            }
+        }
+        if (!found) advertised_.emplace_back(seen.peer, seen.schemaHash);
         parent = mountParent_;
         mirrorMs = mountMirrorMs_;
     }
-    if (known || !parent || !api_) return;
+    if (!parent || !api_) return;
 
+    MutexGuard apiGuard(api_->mutex());
+    for (const Node* c = parent->first(); c; c = c->next()) {
+        if (c->type() == NodeType::Remote && static_cast<const RemoteNode*>(c)->peer() == seen.peer) return;
+    }
     // Named after the peer; when that is taken or empty, the last three bytes
     // of its address are added.
-    MutexGuard apiGuard(api_->mutex());
     std::string name = nodeName(seen.name);
     if (name.empty() || parent->child(name)) {
         char suffix[8] = "";
@@ -475,7 +487,6 @@ void DatagramEndpoint::applySeen(const Seen& seen) {
     }
     if (name.empty() || parent->child(name)) return;
     RemoteNode& node = parent->add(new RemoteNode(std::move(name), *this, seen.peer, "/"));
-    node.setAdvertisedSchema(seen.schemaHash);
     if (mirrorMs) node.mirror(mirrorMs);
     node.changed();  // subscribers of the parent see the new key
 }
