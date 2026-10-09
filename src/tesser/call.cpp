@@ -77,6 +77,26 @@ void Pending::reply() {
     finish(r, w);
 }
 
+void Pending::reply(JsonVariantConst body) {
+    replyWith([body](JsonWriter& w) { w.variant(body); });
+}
+
+void Pending::replyWith(const std::function<void(JsonWriter&)>& write) {
+    Reply* r = take();
+    if (!r) return;
+    JsonWriter w(r->begin(Status::Ok));
+    write(w);
+    finish(r, w);
+}
+
+void Call::replyWith(const std::function<void(JsonWriter&)>& write) {
+    if (!reply_ || replied_ || deferred_) return;
+    replied_ = true;
+    JsonWriter w(reply_->begin(Status::Ok));
+    write(w);
+    detail::finishBody(*reply_, w, path_);
+}
+
 void Pending::fail(Status status, const char* message) {
     Reply* r = take();
     if (!r) return;

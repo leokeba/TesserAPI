@@ -7,7 +7,8 @@ set(TESSER_CORE_SRCS
     src/tesser/call.cpp
     src/tesser/api.cpp
     src/tesser/envelope.cpp
-    src/tesser/line_transport.cpp)
+    src/tesser/line_transport.cpp
+    src/tesser/datagram.cpp)
 
 if(ESP_PLATFORM)
     # The UART driver moved out of "driver" in ESP-IDF 5.3.
@@ -16,12 +17,33 @@ if(ESP_PLATFORM)
     else()
         set(TESSER_UART_REQ driver)
     endif()
+    set(TESSER_SRCS ${TESSER_CORE_SRCS}
+        src/tesser/transports/uart_transport.cpp
+        src/tesser/transports/http_server.cpp)
+    set(TESSER_REQS ${TESSER_UART_REQ} esp_http_server)
+    # The NowTP transport is built when a NowTP component is part of the build.
+    idf_build_get_property(TESSER_BUILD_COMPONENTS BUILD_COMPONENTS)
+    set(TESSER_NOWTP "")
+    foreach(c ${TESSER_BUILD_COMPONENTS})
+        if(c MATCHES "(^|__)nowtp$" OR c STREQUAL "NowTP")
+            set(TESSER_NOWTP ${c})
+        endif()
+    endforeach()
+    if(TESSER_NOWTP)
+        list(APPEND TESSER_SRCS src/tesser/transports/nowtp_transport.cpp)
+    endif()
     idf_component_register(
-        SRCS ${TESSER_CORE_SRCS}
-             src/tesser/transports/uart_transport.cpp
+        SRCS ${TESSER_SRCS}
         INCLUDE_DIRS "src"
-        REQUIRES ${TESSER_UART_REQ}
-        PRIV_REQUIRES log)
+        REQUIRES ${TESSER_REQS}
+        PRIV_REQUIRES log esp_timer lwip)
+    if(TESSER_NOWTP)
+        # Requirements are resolved before the component list is known, so
+        # NowTP is linked here rather than listed in REQUIRES.
+        idf_component_get_property(TESSER_NOWTP_LIB ${TESSER_NOWTP} COMPONENT_LIB)
+        target_link_libraries(${COMPONENT_LIB} PUBLIC ${TESSER_NOWTP_LIB})
+        target_compile_definitions(${COMPONENT_LIB} PUBLIC TESSER_HAVE_NOWTP=1)
+    endif()
     return()
 endif()
 

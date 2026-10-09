@@ -8,7 +8,7 @@ jobs:
   host-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build and run tests (ASan + UBSan)
         run: |
           cmake -S . -B build
@@ -23,13 +23,19 @@ jobs:
         idf: [release-v5.1, release-v5.4, release-v5.5, latest]
         target: [esp32, esp32c3]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build on-target test
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: ${{ matrix.idf }}
           target: ${{ matrix.target }}
           path: test/hardware
+      - name: Build HTTP example
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ matrix.idf }}
+          target: ${{ matrix.target }}
+          path: examples/idf/http_api
 
   arduino:
     runs-on: ubuntu-latest
@@ -39,7 +45,7 @@ jobs:
         core: ["3.3.7"]
         fqbn: ["esp32:esp32:esp32", "esp32:esp32:esp32c3"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: arduino/compile-sketches@v1
         with:
           fqbn: ${{ matrix.fqbn }}
@@ -51,3 +57,4 @@ jobs:
           libraries: |
             - source-path: ./
             - name: ArduinoJson
+            - source-url: https://github.com/leokeba/NowTP.git

@@ -3,19 +3,25 @@
 // 1. Runs the core test cases (shared with the host tests) on the chip:
 //    real compiler, no exceptions, no RTTI, real heap.
 // 2. Measures heap per node, request latency and heap stability.
-// 3. Serves a demo API over UART0 for test/e2e_serial.py.
+// 3. Serves a demo API over UART0 (test/e2e_serial.py), HTTP when
+//    test/secrets.h provides Wi-Fi credentials (test/e2e_http.py), and NowTP
+//    (test/e2e_nowtp.py, two boards).
 //
 // Results are printed as "PASS <name>" / "FAIL <name>: ..." lines followed by
 // "DONE pass=<n> fail=<n>", then "MEM ..." / "PERF ..." lines and "SERVING".
 #include <stdio.h>
 
 #include "core_cases.h"
+#include "datagram_cases.h"
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+void startNetwork(tesser::Api& api);
 
 namespace {
 
@@ -125,8 +131,11 @@ void serveDemo() {
         if (!p) return;
         xTaskCreate(delayedReply, "later", 3072, new tesser::Pending(p), 5, nullptr);
     });
+    startNetwork(g_demo->api);
     g_uart = new tesser::UartTransport(g_demo->api);
     esp_err_t err = g_uart->begin();
+    // UART0 is also the console: keep logs from interleaving with replies.
+    esp_log_level_set("*", ESP_LOG_WARN);
     printf("SERVING err=%d\n", int(err));
 }
 

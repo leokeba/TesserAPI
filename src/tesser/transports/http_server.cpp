@@ -1,0 +1,436 @@
+#include "tesser/transports/http_server.h"
+
+#if defined(ESP_PLATFORM)
+
+#include <stdlib.h>
+#include <string.h>
+
+#include <atomic>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "lwip/sockets.h"
+
+namespace tesser {
+
+namespace {
+
+constexpr size_t kChunk = 512;
+constexpr size_t kQueryValue = 160;
+
+const char* statusLine(Status s) {
+    switch (httpCode(s)) {
+        case 200: return "200 OK";
+        case 400: return "400 Bad Request";
+        case 403: return "403 Forbidden";
+        case 404: return "404 Not Found";
+        case 405: return "405 Method Not Allowed";
+        case 413: return "413 Payload Too Large";
+        case 422: return "422 Unprocessable Entity";
+        case 503: return "503 Service Unavailable";
+        case 504: return "504 Gateway Timeout";
+        default: return "500 Internal Server Error";
+    }
+}
+
+int hexValue(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Percent-decodes in place ('+' means space in query values only).
+size_t urlDecode(char* s, size_t len, bool plusIsSpace) {
+    size_t out = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (c == '%' && i + 2 < len && hexValue(s[i + 1]) >= 0 && hexValue(s[i + 2]) >= 0) {
+            c = static_cast<char>(hexValue(s[i + 1]) * 16 + hexValue(s[i + 2]));
+            i += 2;
+        } else if (c == '+' && plusIsSpace) {
+            c = ' ';
+        }
+        s[out++] = c;
+    }
+    return out;
+}
+
+// Reads one query parameter into buf (decoded). Returns false when absent;
+// sets `bad` when present but too long.
+bool queryParam(const char* query, const char* key, char* buf, size_t cap, size_t& len, bool& bad) {
+    if (!query) return false;
+    esp_err_t err = httpd_query_key_value(query, key, buf, cap);
+    if (err == ESP_ERR_NOT_FOUND) return false;
+    if (err != ESP_OK) {
+        bad = true;
+        return false;
+    }
+    len = urlDecode(buf, strlen(buf), true);
+    buf[len] = '\0';
+    return true;
+}
+
+// Shared between a parked HTTP handler and the deferred reply that completes
+// it. Whoever lets go last frees it.
+struct DeferredState {
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    std::atomic<int> refs{2};
+    Status status = Status::Internal;
+    std::string body;
+
+    void unref() {
+        if (refs.fetch_sub(1) == 1) {
+            vSemaphoreDelete(done);
+            delete this;
+        }
+    }
+};
+
+class DeferredHttpReply : public Reply {
+public:
+    DeferredHttpReply(DeferredState* st, size_t limit) : st_(st), sink_(st->body, limit) {}
+    Sink& begin(Status s) override {
+        st_->status = s;
+        st_->body.clear();
+        return sink_;
+    }
+    void end() override { xSemaphoreGive(st_->done); }
+    bool rollback() override {
+        st_->body.clear();
+        return true;
+    }
+    void release() override {
+        st_->unref();
+        delete this;
+    }
+
+private:
+    DeferredState* st_;
+    StringSink sink_;
+};
+
+}  // namespace
+
+// Streams the body in kChunk pieces. Responses that fit in one chunk go out
+// with a Content-Length; larger ones switch to chunked encoding.
+class HttpReply : public Reply {
+public:
+    HttpReply(HttpServer& server, httpd_req_t* req) : server_(server), req_(req) {}
+
+    Sink& begin(Status s) override {
+        status_ = s;
+        used_ = 0;
+        chunked_ = false;
+        return sink_;
+    }
+
+    void end() override {
+        if (failed_) return;
+        if (!chunked_) {
+            sendHeaders();
+            httpd_resp_send(req_, buf_, static_cast<ssize_t>(used_));
+        } else {
+            flush();
+            httpd_resp_send_chunk(req_, nullptr, 0);
+        }
+    }
+
+    bool rollback() override {
+        if (chunked_) return false;
+        used_ = 0;
+        return true;
+    }
+
+    Reply* detach() override {
+        if (deferred_) return nullptr;
+        deferred_ = new DeferredState();
+        if (!deferred_->done) {
+            delete deferred_;
+            deferred_ = nullptr;
+            return nullptr;
+        }
+        return new DeferredHttpReply(deferred_, server_.api().config().maxResponse);
+    }
+
+    DeferredState* deferred() const { return deferred_; }
+
+    // Sends a complete response produced elsewhere (deferred replies).
+    void sendWhole(Status s, const std::string& body) {
+        status_ = s;
+        sendHeaders();
+        httpd_resp_send(req_, body.data(), static_cast<ssize_t>(body.size()));
+    }
+
+private:
+    class ChunkSink : public Sink {
+    public:
+        explicit ChunkSink(HttpReply& r) : r_(r) {}
+        bool write(const char* data, size_t len) override { return r_.append(data, len); }
+
+    private:
+        HttpReply& r_;
+    };
+
+    void sendHeaders() {
+        httpd_resp_set_status(req_, statusLine(status_));
+        httpd_resp_set_type(req_, "application/json");
+        server_.addCorsHeaders(req_);
+    }
+
+    bool flush() {
+        if (used_ == 0) return true;
+        if (httpd_resp_send_chunk(req_, buf_, static_cast<ssize_t>(used_)) != ESP_OK) {
+            failed_ = true;
+            return false;
+        }
+        used_ = 0;
+        return true;
+    }
+
+    bool append(const char* data, size_t len) {
+        if (failed_) return false;
+        while (len) {
+            if (used_ == kChunk) {
+                if (!chunked_) {
+                    chunked_ = true;
+                    sendHeaders();
+                }
+                if (!flush()) return false;
+            }
+            size_t n = len < kChunk - used_ ? len : kChunk - used_;
+            memcpy(buf_ + used_, data, n);
+            used_ += n;
+            data += n;
+            len -= n;
+        }
+        return true;
+    }
+
+    HttpServer& server_;
+    httpd_req_t* req_;
+    ChunkSink sink_{*this};
+    char buf_[kChunk];
+    size_t used_ = 0;
+    Status status_ = Status::Ok;
+    bool chunked_ = false;
+    bool failed_ = false;
+    DeferredState* deferred_ = nullptr;
+};
+
+HttpServer::HttpServer(Api& api) : api_(api) {}
+
+HttpServer::~HttpServer() { end(); }
+
+esp_err_t HttpServer::begin(uint16_t port, const char* basePath) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = port;
+    config.ctrl_port = static_cast<uint16_t>(config.ctrl_port + port % 1000);
+    config.stack_size = 6144;
+    config.lru_purge_enable = true;
+    return begin(config, basePath);
+}
+
+esp_err_t HttpServer::begin(httpd_config_t config, const char* basePath) {
+    if (server_) return ESP_ERR_INVALID_STATE;
+    config.uri_match_fn = httpd_uri_match_wildcard;
+    httpd_handle_t handle = nullptr;
+    esp_err_t err = httpd_start(&handle, &config);
+    if (err != ESP_OK) return err;
+    err = attach(handle, basePath);
+    if (err != ESP_OK) {
+        httpd_stop(handle);
+        return err;
+    }
+    ownsServer_ = true;
+    return ESP_OK;
+}
+
+esp_err_t HttpServer::attach(httpd_handle_t server, const char* basePath) {
+    if (server_) return ESP_ERR_INVALID_STATE;
+    base_ = basePath ? basePath : "";
+    while (!base_.empty() && base_.back() == '/') base_.pop_back();
+    pattern_ = base_ + "*";
+
+    const httpd_method_t methods[] = {HTTP_GET, HTTP_POST, HTTP_PUT, HTTP_PATCH};
+    for (httpd_method_t m : methods) {
+        httpd_uri_t uri = {};
+        uri.uri = pattern_.c_str();
+        uri.method = m;
+        uri.handler = &HttpServer::onRequest;
+        uri.user_ctx = this;
+        esp_err_t err = httpd_register_uri_handler(server, &uri);
+        if (err != ESP_OK) {
+            for (httpd_method_t r : methods) {
+                if (r == m) break;
+                httpd_unregister_uri_handler(server, pattern_.c_str(), r);
+            }
+            return err;
+        }
+    }
+    if (corsOrigin_) {
+        httpd_uri_t uri = {};
+        uri.uri = pattern_.c_str();
+        uri.method = HTTP_OPTIONS;
+        uri.handler = &HttpServer::onOptions;
+        uri.user_ctx = this;
+        httpd_register_uri_handler(server, &uri);
+    }
+    server_ = server;
+    return ESP_OK;
+}
+
+void HttpServer::end() {
+    if (!server_) return;
+    if (ownsServer_) {
+        httpd_stop(server_);
+    } else {
+        const httpd_method_t methods[] = {HTTP_GET, HTTP_POST, HTTP_PUT, HTTP_PATCH, HTTP_OPTIONS};
+        for (httpd_method_t m : methods) httpd_unregister_uri_handler(server_, pattern_.c_str(), m);
+    }
+    server_ = nullptr;
+    ownsServer_ = false;
+}
+
+void HttpServer::addCorsHeaders(httpd_req_t* req) {
+    if (!corsOrigin_) return;
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", corsOrigin_);
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+esp_err_t HttpServer::onOptions(httpd_req_t* req) {
+    auto* self = static_cast<HttpServer*>(req->user_ctx);
+    httpd_resp_set_status(req, "204 No Content");
+    self->addCorsHeaders(req);
+    return httpd_resp_send(req, nullptr, 0);
+}
+
+esp_err_t HttpServer::onRequest(httpd_req_t* req) { return static_cast<HttpServer*>(req->user_ctx)->serve(req); }
+
+esp_err_t HttpServer::serve(httpd_req_t* req) {
+    HttpReply reply(*this, req);
+    const Config& cfg = api_.config();
+
+    // Path: strip the base, then the query string, then percent-decode.
+    const char* uri = req->uri;
+    size_t uriLen = strlen(uri);
+    size_t q = 0;
+    while (q < uriLen && uri[q] != '?') q++;
+    if (q < base_.size() || memcmp(uri, base_.data(), base_.size()) != 0 ||
+        (q > base_.size() && uri[base_.size()] != '/')) {
+        writeError(reply, Status::NotFound, std::string_view(uri, q), "outside the API");
+        return ESP_OK;
+    }
+    std::string path(uri + base_.size(), q - base_.size());
+    path.resize(urlDecode(&path[0], path.size(), false));
+    if (path.empty()) path = "/";
+
+    Request request;
+    request.op = req->method == HTTP_GET ? Op::Get : Op::Set;
+    request.path = path;
+    request.client.transport = TransportKind::Http;
+    int fd = httpd_req_to_sockfd(req);
+    struct sockaddr_in6 addr = {};
+    socklen_t addrLen = sizeof(addr);
+    if (fd >= 0 && getpeername(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen) == 0) {
+        if (addr.sin6_family == AF_INET) {
+            auto* a4 = reinterpret_cast<struct sockaddr_in*>(&addr);
+            memcpy(request.client.address, &a4->sin_addr.s_addr, 4);
+            request.client.addressLength = 4;
+        } else {
+            memcpy(request.client.address, &addr.sin6_addr, 16);
+            request.client.addressLength = 16;
+        }
+    }
+
+    // Query options.
+    char* query = nullptr;
+    size_t queryLen = httpd_req_get_url_query_len(req);
+    char keys[kQueryValue], exclude[kQueryValue], value[16];
+    std::string shapeText;
+    bool bad = false;
+    if (queryLen) {
+        query = static_cast<char*>(malloc(queryLen + 1));
+        if (!query || httpd_req_get_url_query_str(req, query, queryLen + 1) != ESP_OK) {
+            free(query);
+            writeError(reply, Status::Internal, path, "out of memory");
+            return ESP_OK;
+        }
+        size_t len = 0;
+        if (queryParam(query, "depth", value, sizeof(value), len, bad)) {
+            char* end = nullptr;
+            long d = strtol(value, &end, 10);
+            if (len == 0 || *end || d < 0 || d > 255) bad = true;
+            request.query.depth = static_cast<int>(d);
+        }
+        if (queryParam(query, "keys", keys, sizeof(keys), len, bad)) request.query.keys = std::string_view(keys, len);
+        if (queryParam(query, "exclude", exclude, sizeof(exclude), len, bad)) {
+            request.query.exclude = std::string_view(exclude, len);
+        }
+        if (queryParam(query, "view", value, sizeof(value), len, bad) &&
+            !parseView(std::string_view(value, len), request.query.view)) {
+            bad = true;
+        }
+        // Browsers can't send a GET body, so a shape may also come as ?shape=<json>.
+        shapeText.resize(queryLen + 1);
+        if (queryParam(query, "shape", &shapeText[0], shapeText.size(), len, bad)) {
+            shapeText.resize(len);
+        } else {
+            shapeText.clear();
+        }
+        free(query);
+        if (bad) {
+            writeError(reply, Status::BadRequest, path, "invalid query parameter");
+            return ESP_OK;
+        }
+    }
+
+    // Body.
+    if (req->content_len > cfg.maxRequestBody) {
+        writeError(reply, Status::TooLarge, path, "request body too large");
+        return ESP_OK;
+    }
+    std::string body;
+    if (req->content_len > 0) {
+        body.resize(req->content_len);
+        size_t got = 0;
+        while (got < body.size()) {
+            int n = httpd_req_recv(req, &body[got], body.size() - got);
+            if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            if (n <= 0) return ESP_FAIL;
+            got += static_cast<size_t>(n);
+        }
+    }
+    if (!body.empty() && !shapeText.empty()) {
+        writeError(reply, Status::BadRequest, path, "shape given twice");
+        return ESP_OK;
+    }
+    const std::string& json = body.empty() ? shapeText : body;
+    JsonDocument doc;
+    if (!json.empty()) {
+        DeserializationError err = deserializeJson(doc, json.data(), json.size(),
+                                                   DeserializationOption::NestingLimit(cfg.maxDepth + 1));
+        if (err) {
+            writeError(reply, Status::BadRequest, path, "malformed JSON body");
+            return ESP_OK;
+        }
+        request.body = doc.as<JsonVariantConst>();
+    }
+
+    api_.handle(request, reply);
+
+    if (DeferredState* st = reply.deferred()) {
+        if (xSemaphoreTake(st->done, pdMS_TO_TICKS(cfg.deferTimeoutMs)) == pdTRUE) {
+            reply.sendWhole(st->status, st->body);
+        } else {
+            writeError(reply, Status::Timeout, path, "deferred call timed out");
+        }
+        st->unref();
+    }
+    return ESP_OK;
+}
+
+}  // namespace tesser
+
+#endif

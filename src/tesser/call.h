@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -52,6 +53,9 @@ public:
         finish(r, w);
     }
     void reply();  // null body
+    void reply(JsonVariantConst body);
+    // Writes an arbitrary JSON body.
+    void replyWith(const std::function<void(JsonWriter&)>& write);
     void fail(Status status, const char* message = nullptr);
 
 private:
@@ -88,6 +92,10 @@ public:
         ValueTraits<std::remove_cv_t<std::remove_reference_t<T>>>::write(w, value);
         detail::finishBody(*reply_, w, path_);
     }
+    void reply(JsonVariantConst body) {
+        replyWith([body](JsonWriter& w) { w.variant(body); });
+    }
+    void replyWith(const std::function<void(JsonWriter&)>& write);
     void fail(Status status, const char* message = nullptr) {
         status_ = status;
         message_ = message;

@@ -1,0 +1,3 @@
+dependencies:
+  nowtp:
+    git: https://github.com/leokeba/NowTP.git

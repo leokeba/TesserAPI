@@ -338,14 +338,17 @@ http.attach(handle, "/api");     // registers a wildcard URI on an existing http
 
 | HTTP | Operation |
 |---|---|
-| `GET /api/<path>?depth=&keys=&exclude=&view=` | get. The body, if present, is a shape. |
+| `GET /api/<path>?depth=&keys=&exclude=&view=&shape=` | get. A shape comes either in the body or URL-encoded in `shape` (browsers can't send a GET body); both at once is `bad_request`. |
 | `PUT`, `PATCH` or `POST /api/<path>` | set. The body is JSON. |
 | `OPTIONS` | CORS preflight, when CORS is enabled |
 
-- Responses are streamed with chunked encoding through a 512-byte buffer, so there is no limit on response size.
+- Responses up to 512 bytes go out with a `Content-Length`. Larger ones are streamed with chunked encoding through the same 512-byte buffer, so there is no limit on response size.
 - Request bodies are capped by `maxRequestBody`.
 - The status is mapped as in §8.
 - The handler runs in the httpd task (inline mode).
+- `begin()` starts a dedicated server with wildcard URI matching and a 6 KB stack. `attach()` uses 4 handler slots (5 with CORS) on an existing server, which must use `httpd_uri_match_wildcard`.
+- `enableCors(origin)` adds `Access-Control-Allow-*` headers and answers `OPTIONS` preflights with 204.
+- The client's IP address is passed to the core in `Client`.
 
 ### 10.3 NowTP
 
@@ -353,7 +356,7 @@ http.attach(handle, "/api");     // registers a wildcard URI on an existing http
 tesser::NowTpTransport now(api, transport, /*port*/ 84);
 ```
 
-- **Requests:** one envelope per NowTP message on the configured port. Requests sent to the broadcast address are answered only for `get`. `set` sent by broadcast is rejected.
+- **Requests:** one envelope per NowTP message on the configured port (default 84). `set` requests must arrive in NowTP's reliable mode, which is unicast-only, so a broadcast or unreliable `set` is answered `not_allowed`. A broadcast `get` is answered by every node.
 - **Responses:** reliable unicast to the sender's MAC.
 - **Response size:** buffered in full (NowTP has no streaming), up to `min(maxResponse, nowtp maxMessageSize)`. Anything larger gets a `too_large` reply. Clients on NowTP should use `depth`, `keys` and shapes.
 - **Notifications** *(planned)*:
@@ -361,12 +364,17 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
   - `event` notifications use **reliable** mode.
 - **Client identity:** the MAC address. NowTP's "peer lost" discovery event drops that client's subscriptions.
 - **Security:** ESP-NOW frames aren't authenticated. Writes over NowTP should be restricted with an allowlist of MACs or encrypted peers (§13).
-- **Threading:** handlers run in NowTP's task (`runTask = true`) or in `transport.poll()`, under the API lock.
+- **Threading:** NowTP runs its receive callbacks while holding its own lock, so the adapter never handles a request there. It copies each message into a bounded queue (default 8, then `busy`), and a worker task (or `poll()`) handles it under the API lock. The lock order is therefore always API, then NowTP, and replies sent from any API context can't deadlock.
+- **Client:** the same endpoint sends requests to other nodes (`get`, `set`, or `endpoint().request()`) and matches responses by `id`, with a timeout per call (default 3 s) and at most 8 calls in flight. Handlers run in the worker task. `peerLost(mac)` fails a lost peer's calls at once.
+- **Generic core:** all of this lives in `tesser::DatagramEndpoint`, which is platform-independent and host-tested with an in-memory link. Another datagram transport (UDP, LoRa, ...) only needs a send function and a call to `receive()`.
 - **Optional:** the adapter is compiled only when NowTP is available. The core never includes NowTP.
 
 ### 10.4 Serial
 
-`tesser::LineTransport` is platform-independent: it is fed bytes, and it calls a write function for each response line. There are thin adapters for an Arduino `Stream` and an ESP-IDF UART. This is the debugging transport, and the harness for end-to-end tests on hardware.
+`tesser::LineTransport` is platform-independent: it is fed bytes, and it calls a write function for each response line. There are thin adapters for an Arduino `Stream` (`StreamTransport`, polled from `loop()`) and an ESP-IDF UART (`UartTransport`, with its own reader task). This is the debugging transport, and the harness for end-to-end tests on hardware.
+
+- Leading control and non-ASCII bytes are skipped, since a UART picks them up while the peer resets.
+- When the UART is also the console, log output from other tasks can interleave with a reply on the same line. Use a dedicated UART, or lower the log level once the transport is serving.
 
 ### 10.5 WebSocket *(planned)*
 
@@ -426,7 +434,7 @@ Targets to be measured on a classic ESP32 and a C3, and enforced in CI:
 
 | Item | Target |
 |---|---|
-| Flash, core + HTTP transport | ≤ 40 KB above the application's baseline, ArduinoJson included |
+| Flash, core + HTTP transport | ≤ 40 KB above the application's baseline, ArduinoJson included (measured: 34.6 KB, `examples/idf/http_api` against its `FOOTPRINT_BASELINE` build) |
 | RAM per value leaf | ≤ 32 B with a bound variable, ≤ 56 B with a getter and setter, + 28 B with a range or description |
 | RAM per object node | ≤ 32 B |
 | Request handling | Request body document (bounded by `maxRequestBody`) + 512 B streaming buffer (HTTP), or the response buffer (NowTP, bounded by `maxResponse`) |
@@ -444,6 +452,8 @@ Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware
 | Full GET of a 13-leaf tree (227 B response) | 0.4 ms |
 | Envelope parse + keyed GET + reply | 0.6 ms |
 | Serial round trip at 115200 baud | 13 ms (mostly wire time) |
+| HTTP GET over Wi-Fi, new TCP connection each time | 55 ms median |
+| NowTP request and response between two boards | 14 ms median, fragmented 1.5 KB responses included |
 
 Configuration (`tesser::Config`, at runtime):
 
@@ -464,22 +474,22 @@ The layout follows NowTP:
 - `idf_component.yml` depends on `bblanchon/arduinojson`.
 - `library.properties` and `library.json` for Arduino and PlatformIO.
 
-Optional transports (NowTP) compile only when their dependency is present: `__has_include` on Arduino and PlatformIO, and a check of the build components on ESP-IDF.
+Optional transports (NowTP) compile only when their dependency is present: `__has_include(<NowTP.h>)` on Arduino and PlatformIO. On ESP-IDF, the component looks for a `nowtp` component among the build components and links it, since requirements are resolved before that list is known.
 
 ## 17. Testing
 
 1. **Host tests** (CMake + ctest, ASan and UBSan, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror` on the library). They cover the core, the envelope codec and the line transport, and run against NowTP's simulated network for the NowTP adapter.
 2. **On-target tests** (`test/hardware`, ESP-IDF): the same core cases on the chip, plus heap and stack measurements.
-3. **End-to-end over serial:** a Python script (run with `uv`) drives a test firmware through `LineTransport` and checks the responses.
-4. **Transport conformance:** the same request vectors go through every transport and must produce equivalent responses.
-5. **CI:** host tests, plus ESP-IDF 5.1 / 5.4 / 5.5 / latest × ESP32 / ESP32-C3, plus Arduino-ESP32 3.x × ESP32 / ESP32-C3.
+3. **End-to-end on hardware:** `test/hardware` serves a demo API over UART, HTTP (with Wi-Fi credentials from the gitignored `test/secrets.h`) and NowTP. `test/e2e_serial.py`, `test/e2e_http.py` and `test/e2e_nowtp.py` (two boards) drive it.
+4. **Transport conformance:** `test/conformance.py` sends the same request vectors through serial, HTTP and NowTP (both directions), and every transport must give the same results.
+5. **CI:** host tests, plus ESP-IDF 5.1 / 5.4 / 5.5 / latest × ESP32 / ESP32-C3 (test firmware and examples), plus Arduino-ESP32 3.x × ESP32 / ESP32-C3 (example sketches).
 
 ## 18. Roadmap
 
 | Phase | Content | Status |
 |---|---|---|
 | 1 | Core: tree, values, actions, custom nodes, get / set / patch / shape / schema, streaming writer, envelope, line transport, host + on-target tests | done |
-| 2 | HTTP and NowTP transports, conformance tests, footprint measurements | |
+| 2 | HTTP and NowTP transports, conformance tests, footprint measurements | done |
 | 3 | Change tracking, subscriptions, events, WebSocket | |
 | 4 | Persistence, authorizer, NowTP allowlist | |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | |

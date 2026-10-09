@@ -28,6 +28,9 @@ struct EnvelopeId {
 Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth, Request& request, EnvelopeId& id,
                      const char*& message);
 
+// Same, from an already parsed envelope object.
+Status requestFromEnvelope(JsonObjectConst envelope, Request& request, EnvelopeId& id, const char*& message);
+
 // Buffers one response envelope and hands it to `send` when complete.
 // Detaching copies it, so deferred replies work for any message transport
 // whose `send` may be called from another task.

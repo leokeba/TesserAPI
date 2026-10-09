@@ -52,8 +52,11 @@ Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth,
         message = "envelope must be an object";
         return Status::BadRequest;
     }
-    JsonObjectConst env = doc.as<JsonObjectConst>();
+    return requestFromEnvelope(doc.as<JsonObjectConst>(), request, id, message);
+}
 
+Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id, const char*& message) {
+    id.length = 0;
     JsonVariantConst idv = env["id"];
     if (!idv.isUnbound() && !idv.isNull()) {
         if (idv.is<JsonObjectConst>() || idv.is<JsonArrayConst>()) {

@@ -13,6 +13,8 @@ import time
 
 import serial
 
+import conformance
+
 
 class Board:
     def __init__(self, port, reset):
@@ -55,6 +57,14 @@ class Board:
     def send_raw(self, text):
         self.s.write(text.encode() + b'\n')
 
+    def call(self, op, path, query, body):
+        """Conformance transport interface (see conformance.py)."""
+        kw = dict(query)
+        if body is not conformance.ABSENT:
+            kw['body'] = body
+        r = self.request(op, path, **kw)
+        return r['status'], r.get('body')
+
     def request(self, op, path, timeout=2.0, **kw):
         rid = self.next_id
         self.next_id += 1
@@ -62,10 +72,13 @@ class Board:
         t0 = time.time()
         self.send_raw(json.dumps(env))
         for line in self.lines(timeout):
-            if not line.startswith('{'):
+            # Log output from other tasks can share the line (UART0 is also
+            # the console): parse from the first '{'.
+            start = line.find('{"')
+            if start < 0:
                 continue
             try:
-                msg = json.loads(line)
+                msg = json.loads(line[start:])
             except ValueError:
                 continue
             if msg.get('id') == rid:
@@ -117,16 +130,17 @@ def main():
     check('not found', r['status'] == 'not_found', r)
 
     b.send_raw('{"id": 99, "op": "get"')  # malformed
-    line = b.wait_line(lambda l: l.startswith('{'), 2)
-    check('malformed', json.loads(line)['status'] == 'bad_request', line)
+    line = b.wait_line(lambda l: '{"status"' in l, 2)
+    check('malformed', json.loads(line[line.find('{"status"'):])['status'] == 'bad_request', line)
 
     # Burst: replies must come back complete and in order.
     for i in range(20):
         b.send_raw(json.dumps({'id': 1000 + i, 'op': 'get', 'path': '/sensors'}))
     ids = []
     for line in b.lines(3):
-        if line.startswith('{') and '"id":10' in line:
-            ids.append(json.loads(line)['id'])
+        start = line.find('{"id":10')
+        if start >= 0:
+            ids.append(json.loads(line[start:])['id'])
             if len(ids) == 20:
                 break
     check('burst of 20', ids == list(range(1000, 1020)), ids)
@@ -137,6 +151,8 @@ def main():
     heap = b.request('get', '/system/heap')['body']
     min_heap = b.request('get', '/system/minHeap')['body']
     print(f'     heap free: {heap} bytes, minimum since boot: {min_heap} bytes')
+
+    conformance.run(b, 'serial', check)
 
     print(f'E2E pass={sum(results)} fail={len(results) - sum(results)}')
     sys.exit(0 if all(results) else 1)

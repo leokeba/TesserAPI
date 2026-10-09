@@ -1,2 +1,2 @@
-# test/ holds check.h and core_cases.h, shared with the host tests.
-idf_component_register(SRCS "main.cpp" INCLUDE_DIRS "../..")
+# test/ holds check.h and the shared cases (and the gitignored secrets.h).
+idf_component_register(SRCS "main.cpp" "network.cpp" INCLUDE_DIRS "../..")
