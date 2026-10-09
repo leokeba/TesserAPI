@@ -66,7 +66,7 @@ void changesIn(const Object& o, uint16_t since, int depth, const Subscription* t
             if (!lp.enter(c->name())) continue;
             changesIn(static_cast<const Object&>(*c), since, depth - 1, nullptr, lp, w);
             lp.leave();
-        } else if (newerGeneration(c->generation(), since)) {
+        } else if (detail::isLeaf(*c) && newerGeneration(c->generation(), since)) {
             lp.key(c->name());
             detail::writeLeaf(w, *c);
         }
@@ -90,6 +90,14 @@ Api::Api() : Object("") {
 }
 
 Api::~Api() {
+    {
+        MutexGuard guard(queueMutex_);
+        for (QueuedRequest* q : queue_) {
+            q->reply->release();
+            delete q;
+        }
+        queue_.clear();
+    }
     MutexGuard guard(g_apisMutex);
     for (Api** p = &g_apis; *p; p = &(*p)->nextApi_) {
         if (*p == this) {
@@ -164,6 +172,19 @@ size_t Api::removeSubscriptions(Subscriber* subscriber, std::string_view path) {
 }
 
 void Api::dropSubscriber(Subscriber* subscriber) {
+    {
+        // Queued requests from this client can't be answered any more.
+        MutexGuard guard(queueMutex_);
+        for (size_t i = 0; i < queue_.size();) {
+            if (queue_[i]->request.subscriber == subscriber) {
+                queue_[i]->reply->release();
+                delete queue_[i];
+                queue_.erase(queue_.begin() + static_cast<std::ptrdiff_t>(i));
+            } else {
+                i++;
+            }
+        }
+    }
     MutexGuard guard(mutex_);
     for (size_t i = 0; i < subs_.size();) {
         if (subs_[i].subscriber == subscriber) {
@@ -182,6 +203,7 @@ size_t Api::subscriptionCount() const {
 void Api::poll() { poll(millis32()); }
 
 void Api::poll(uint32_t nowMs) {
+    runQueued();
     MutexGuard guard(mutex_);
     if (storage_) checkPersistence(nowMs);
     if (subs_.empty()) return;
@@ -222,8 +244,7 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
         int depth = sub.depth < 0 || sub.depth > config_.maxDepth ? config_.maxDepth : sub.depth;
         changesIn(static_cast<const Object&>(n), sub.since, depth, &sub, lp, w);
         any = lp.finish();
-    } else if ((n.type() == NodeType::Value || n.type() == NodeType::Custom) &&
-               newerGeneration(n.generation(), sub.since)) {
+    } else if (detail::isLeaf(n) && newerGeneration(n.generation(), sub.since)) {
         detail::writeLeaf(w, n);
         any = true;
     }

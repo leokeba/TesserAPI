@@ -1,6 +1,11 @@
 #include "tesser/api.h"
 
+#include <deque>
+#include <memory>
 #include <string>
+#include <vector>
+
+#include "tesser/detail/lazy_patch.h"
 
 namespace tesser {
 
@@ -71,12 +76,61 @@ bool listContains(std::string_view list, std::string_view name) {
     return !forEachItem(list, [&](std::string_view item) { return item != name; });
 }
 
+bool parseIndex(std::string_view s, size_t& out) {
+    if (s.empty() || s.size() > 9 || (s.size() > 1 && s[0] == '0')) return false;
+    size_t v = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + static_cast<size_t>(c - '0');
+    }
+    out = v;
+    return true;
+}
+
 struct Filter {
     std::string_view keys;
     std::string_view exclude;
     JsonObjectConst shape;
     bool hasShape = false;
 };
+
+}  // namespace
+
+namespace detail {
+
+void renderValue(JsonWriter& w, const Node& n, int depth) {
+    switch (n.type()) {
+        case NodeType::Object:
+            w.beginObject();
+            if (depth > 0) {
+                for (const Node* c = static_cast<const Object&>(n).first(); c; c = c->next()) {
+                    if (c->type() == NodeType::Action || c->type() == NodeType::Event) continue;
+                    w.key(c->name());
+                    renderValue(w, *c, depth - 1);
+                }
+            }
+            w.endObject();
+            break;
+        case NodeType::List: {
+            const auto& l = static_cast<const ListNode&>(n);
+            w.beginArray();
+            if (depth > 0) {
+                for (size_t i = 0; i < l.size(); i++) renderValue(w, *l.element(i), depth);
+            }
+            w.endArray();
+            break;
+        }
+        case NodeType::Value: static_cast<const ValueNode&>(n).write(w); break;
+        case NodeType::Custom: static_cast<const CustomNode&>(n).write(w); break;
+        case NodeType::Remote:
+        case NodeType::Action:
+        case NodeType::Event: w.null(); break;
+    }
+}
+
+}  // namespace detail
+
+namespace {
 
 // One request in flight. Holds the error state and the path trail used to
 // name the failing node in error replies.
@@ -107,6 +161,12 @@ public:
     }
 
 private:
+    // A write below a list element marks the list itself changed: element
+    // nodes are temporary, the list is what subscribers and persistence see.
+    void markLists() {
+        for (ListNode* l : lists_) l->changed();
+    }
+
     bool allowed(const Node& n) const {
         const Authorizer& a = api_.authorizer();
         return !a || a(req_.client, req_.op, n);
@@ -169,7 +229,17 @@ private:
                 return nullptr;
             }
             Node* next = nullptr;
-            if (node->type() == NodeType::Object) next = static_cast<Object*>(node)->child(seg);
+            if (node->type() == NodeType::Object) {
+                next = static_cast<Object*>(node)->child(seg);
+            } else if (node->type() == NodeType::List) {
+                auto* list = static_cast<ListNode*>(node);
+                size_t index;
+                if (parseIndex(seg, index) && index < list->size()) {
+                    temps_.push_back(list->element(index));
+                    lists_.push_back(list);
+                    next = temps_.back().get();
+                }
+            }
             if (!next) {
                 replyError(Status::NotFound, "no such node", p.substr(0, slash));
                 return nullptr;
@@ -274,10 +344,7 @@ private:
         }
         switch (n.type()) {
             case NodeType::Object: renderChildren(w, static_cast<const Object&>(n), depth, f, view); break;
-            case NodeType::Value: static_cast<const ValueNode&>(n).write(w); break;
-            case NodeType::Custom: static_cast<const CustomNode&>(n).write(w); break;
-            case NodeType::Action:
-            case NodeType::Event: w.null(); break;
+            default: detail::renderValue(w, n, depth); break;
         }
     }
 
@@ -361,6 +428,13 @@ private:
                 break;
             }
             case NodeType::Event: w.string("event"); break;
+            case NodeType::List: {
+                w.string("list");
+                w.key("maxSize");
+                w.uinteger(static_cast<const ListNode&>(n).maxSize());
+                break;
+            }
+            case NodeType::Remote: w.string("remote"); break;
         }
         if (n.persisted()) {
             w.key("persist");
@@ -373,6 +447,10 @@ private:
         if (n.type() == NodeType::Object && depth > 0) {
             w.key("children");
             renderChildren(w, static_cast<const Object&>(n), depth, f, View::Schema);
+        }
+        if (n.type() == NodeType::List && depth > 0) {
+            w.key("items");
+            renderSchema(w, *static_cast<const ListNode&>(n).prototype(), depth, Filter());
         }
         w.endObject();
     }
@@ -389,6 +467,9 @@ private:
         if (req_.query.view != View::Value) return replyError(Status::BadRequest, "subscriptions are on values", base_);
         if (target.type() == NodeType::Action) {
             return replyError(Status::NotAllowed, "actions can't be subscribed to", base_);
+        }
+        if (!temps_.empty()) {
+            return replyError(Status::NotAllowed, "subscribe to the list itself, not to its elements", base_);
         }
         Status allowed = api_.subscriptionAllowed(req_.subscriber);
         if (allowed != Status::Ok) return replyError(allowed, "too many subscriptions", base_);
@@ -436,6 +517,7 @@ private:
                 if (c.isOk()) c = v.apply(body);
                 if (!c.isOk()) return replyError(c.status, c.message, base_);
                 v.changed();
+                markLists();
                 JsonWriter w(reply_.begin(Status::Ok));
                 v.write(w);
                 detail::finishBody(reply_, w, base_);
@@ -449,6 +531,7 @@ private:
                 Status s = c.apply(body);
                 if (s != Status::Ok) return replyError(s, "rejected", base_);
                 c.changed();
+                markLists();
                 JsonWriter w(reply_.begin(Status::Ok));
                 c.write(w);
                 detail::finishBody(reply_, w, base_);
@@ -460,6 +543,7 @@ private:
                 if (!chk.isOk()) return replyError(chk.status, chk.message, base_);
                 Call call(api_, &reply_, body, req_.client, base_.empty() ? std::string_view("/") : base_);
                 a.invoke(body, call);
+                markLists();
                 if (call.deferred() || call.replied()) return;
                 if (call.status() != Status::Ok) return replyError(call.status(), call.message(), base_);
                 JsonWriter w(reply_.begin(Status::Ok));
@@ -468,6 +552,20 @@ private:
                 return;
             }
             case NodeType::Event: replyError(Status::NotAllowed, "events can't be set", base_); return;
+            case NodeType::List: {
+                auto& list = static_cast<ListNode&>(target);
+                if (!validatePatch(list, body)) return replyError();
+                if (!applyPatch(list, body, false) || !applyPatch(list, body, true)) {
+                    partial_ = applied_ > 0;
+                    return replyError();
+                }
+                markLists();
+                JsonWriter w(reply_.begin(Status::Ok));
+                detail::renderValue(w, list, api_.config().maxDepth);
+                detail::finishBody(reply_, w, base_);
+                return;
+            }
+            case NodeType::Remote: return;  // forwarded before set() is reached
         }
     }
 
@@ -483,6 +581,7 @@ private:
             partial_ = applied_ > 0;
             return replyError();
         }
+        markLists();
         Filter f;
         f.shape = body.as<JsonObjectConst>();
         f.hasShape = true;
@@ -526,6 +625,24 @@ private:
                 return c.isOk() || error(c.status, c.message);
             }
             case NodeType::Event: return error(Status::NotAllowed, "events can't be set");
+            case NodeType::Remote: return error(Status::NotAllowed, "write remote nodes directly");
+            case NodeType::List: {
+                auto& list = static_cast<ListNode&>(n);
+                if (!v.is<JsonArrayConst>()) return error(Status::InvalidValue, "expected array");
+                JsonArrayConst items = v.as<JsonArrayConst>();
+                if (items.size() > list.maxSize()) return error(Status::InvalidValue, "too many elements");
+                size_t i = 0;
+                for (JsonVariantConst item : items) {
+                    names_.push_back(std::to_string(i));
+                    if (!push(names_.back())) return error(Status::BadRequest, "patch too deep");
+                    if (!item.is<JsonObjectConst>()) return error(Status::InvalidValue, "expected object");
+                    std::unique_ptr<Object> element = i < list.size() ? list.element(i) : list.prototype();
+                    if (!validatePatch(*element, item)) return false;
+                    pop();
+                    i++;
+                }
+                return true;
+            }
         }
         return false;
     }
@@ -568,7 +685,28 @@ private:
                 applied_++;
                 return true;
             }
-            case NodeType::Event: return true;
+            case NodeType::Event:
+            case NodeType::Remote: return true;
+            case NodeType::List: {
+                // The array replaces the list: its length is the new size, and
+                // each element is patched (new ones start from defaults).
+                auto& list = static_cast<ListNode&>(n);
+                JsonArrayConst items = v.as<JsonArrayConst>();
+                if (!actions) list.resize(items.size());
+                size_t i = 0;
+                for (JsonVariantConst item : items) {
+                    names_.push_back(std::to_string(i));
+                    push(names_.back());
+                    if (!applyPatch(*list.element(i), item, actions)) return false;
+                    pop();
+                    i++;
+                }
+                if (!actions) {
+                    list.changed();
+                    applied_++;
+                }
+                return true;
+            }
         }
         return true;
     }
@@ -587,6 +725,9 @@ private:
     std::string errPath_;
     int applied_ = 0;
     bool partial_ = false;
+    std::vector<std::unique_ptr<Object>> temps_;  // list elements on the request path
+    std::vector<ListNode*> lists_;                // lists the path went through
+    std::deque<std::string> names_;               // list indexes in the error trail
 };
 
 }  // namespace
@@ -597,8 +738,87 @@ void Api::authorize(Authorizer fn) {
 }
 
 void Api::handle(const Request& request, Reply& reply) {
+    if (config_.queued && enqueue(request, reply)) return;
+    handleNow(request, reply);
+}
+
+void Api::handleNow(const Request& request, Reply& reply) {
     MutexGuard guard(mutex_);
     Handler(*this, request, reply).run();
+}
+
+// ---- queued mode ------------------------------------------------------------
+
+namespace {
+// Lets a queued request's action defer: the detached reply changes hands.
+class QueuedReply : public Reply {
+public:
+    explicit QueuedReply(Reply* inner) : inner_(inner) {}
+    Sink& begin(Status s) override { return inner_->begin(s); }
+    void end() override { inner_->end(); }
+    bool rollback() override { return inner_->rollback(); }
+    Reply* detach() override {
+        if (transferred) return nullptr;
+        transferred = true;
+        return inner_;
+    }
+    bool transferred = false;
+
+private:
+    Reply* inner_;
+};
+}  // namespace
+
+bool Api::enqueue(const Request& request, Reply& reply) {
+    {
+        MutexGuard guard(queueMutex_);
+        if (queue_.size() >= config_.maxQueued) {
+            writeError(reply, Status::Busy, request.path, "request queue full");
+            return true;
+        }
+    }
+    Reply* detached = reply.detach();
+    if (!detached) return false;  // the transport can't wait: handle inline
+    auto* q = new QueuedRequest();
+    q->request = request;
+    q->path.assign(request.path.data(), request.path.size());
+    q->keys.assign(request.query.keys.data(), request.query.keys.size());
+    q->exclude.assign(request.query.exclude.data(), request.query.exclude.size());
+    if (!request.body.isNull()) serializeJson(request.body, q->body);
+    q->request.path = q->path;
+    q->request.query.keys = q->keys;
+    q->request.query.exclude = q->exclude;
+    q->request.body = JsonVariantConst();
+    q->reply = detached;
+    MutexGuard guard(queueMutex_);
+    queue_.push_back(q);
+    return true;
+}
+
+void Api::runQueued() {
+    for (;;) {
+        QueuedRequest* q;
+        {
+            MutexGuard guard(queueMutex_);
+            if (queue_.empty()) return;
+            q = queue_.front();
+            queue_.pop_front();
+        }
+        JsonDocument doc;
+        if (!q->body.empty()) {
+            deserializeJson(doc, q->body);
+            q->request.body = doc.as<JsonVariantConst>();
+        }
+        QueuedReply reply(q->reply);
+        handleNow(q->request, reply);
+        if (!reply.transferred) q->reply->release();
+        delete q;
+    }
+}
+
+size_t Api::queuedRequests() const {
+    MutexGuard guard(queueMutex_);
+    return queue_.size();
 }
 
 }  // namespace tesser

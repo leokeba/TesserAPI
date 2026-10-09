@@ -311,4 +311,54 @@ TEST(sub_client_receives_notifications) {
     CHECK_EQ(client.stats().dropped, 0u);
 }
 
+TEST(queued_mode) {
+    cases::Device d;
+    d.api.config().queued = true;
+    d.api.config().maxQueued = 2;
+    cases::Lines lines;
+    tesser::LineTransport t(d.api, [&](const char* data, size_t n) { lines.add(data, n); });
+    const char* set = "{\"id\":1,\"op\":\"set\",\"path\":\"/lamp/brightness\",\"body\":5}\n";
+    t.feed(set, strlen(set));
+    CHECK_EQ(lines.out.size(), 0u);  // waits for poll()
+    CHECK_EQ(d.api.queuedRequests(), 1u);
+    CHECK_EQ(d.lamp.brightness, 128);
+    t.feed(set, strlen(set));
+    t.feed(set, strlen(set));  // queue full
+    CHECK_EQ(lines.out.size(), 1u);
+    if (!lines.out.empty()) CHECK(lines.out[0].find("\"status\":\"busy\"") != std::string::npos);
+    d.api.poll(1000);
+    CHECK_EQ(lines.out.size(), 3u);
+    if (lines.out.size() == 3) CHECK_EQ(lines.out[1], "{\"id\":1,\"status\":\"ok\",\"body\":5}");
+    CHECK_EQ(d.lamp.brightness, 5);
+
+    // Replies that can't wait are handled inline.
+    CHECK_EQ(cases::set(d.api, "/lamp/brightness", "6").body, "6");
+
+    // Deferred actions still work from the queue.
+    tesser::Pending held;
+    d.api.action("slow", [&](tesser::Call& call) { held = call.defer(); });
+    lines.out.clear();
+    const char* slow = "{\"id\":2,\"op\":\"set\",\"path\":\"/slow\"}\n";
+    t.feed(slow, strlen(slow));
+    d.api.poll(1010);
+    CHECK_EQ(lines.out.size(), 0u);
+    held.reply(1);
+    CHECK_EQ(lines.out.size(), 1u);
+    if (!lines.out.empty()) CHECK_EQ(lines.out[0], "{\"id\":2,\"status\":\"ok\",\"body\":1}");
+}
+
+TEST(queued_requests_die_with_their_client) {
+    cases::Device d;
+    d.api.config().queued = true;
+    {
+        cases::Lines lines;
+        tesser::LineTransport t(d.api, [&](const char* data, size_t n) { lines.add(data, n); });
+        const char* get = "{\"id\":1,\"op\":\"get\",\"path\":\"/lamp\"}\n";
+        t.feed(get, strlen(get));
+        CHECK_EQ(d.api.queuedRequests(), 1u);
+    }
+    CHECK_EQ(d.api.queuedRequests(), 0u);
+    d.api.poll(1000);  // nothing left to run
+}
+
 }  // namespace subscription_cases

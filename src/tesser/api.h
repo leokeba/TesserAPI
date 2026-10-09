@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <string>
 #include <vector>
@@ -24,6 +25,10 @@ struct Config {
     uint8_t maxSubscriptions = 16;          // in total
     uint8_t maxSubscriptionsPerClient = 4;  // per Subscriber
     uint32_t watchIntervalMs = 200;         // sampling period for watch()ed values
+    // Queued mode (docs/DESIGN.md section 9): requests wait in a queue and run
+    // in poll(), in the application's task, instead of in the transport's.
+    bool queued = false;
+    uint8_t maxQueued = 8;
 };
 
 // One client's interest in a subtree (see docs/DESIGN.md section 11).
@@ -127,7 +132,20 @@ public:
     bool pendingBegin();
     void pendingDone() { pending_.fetch_sub(1); }
 
+    // Requests waiting for poll() in queued mode.
+    size_t queuedRequests() const;
+
+    // A request copied out of the transport's buffers, with its detached reply.
+    struct QueuedRequest {
+        Request request;
+        std::string path, keys, exclude, body;
+        Reply* reply = nullptr;
+    };
+
 private:
+    bool enqueue(const Request& request, Reply& reply);
+    void runQueued();
+    void handleNow(const Request& request, Reply& reply);
     void flush(Subscription& sub, uint32_t nowMs);
     void sampleWatched(Node& node);
     void checkPersistence(uint32_t nowMs);
@@ -144,6 +162,8 @@ private:
     uint16_t seenGen_ = 0;   // newest persisted change seen by poll()
     uint32_t changedAtMs_ = 0;
     uint32_t lastPersistCheckMs_ = 0;
+    mutable Mutex queueMutex_;  // never held with the API lock
+    std::deque<QueuedRequest*> queue_;
     Api* nextApi_ = nullptr;  // registry used by EventNode
 };
 

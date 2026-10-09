@@ -5,10 +5,12 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <ArduinoJson.h>
 
@@ -22,7 +24,7 @@ namespace tesser {
 class Api;
 class Object;
 
-enum class NodeType : uint8_t { Object, Value, Action, Event, Custom };
+enum class NodeType : uint8_t { Object, Value, Action, Event, Custom, List, Remote };
 
 // Optional per-node metadata, allocated only when a modifier needs it.
 struct NodeMeta {
@@ -339,6 +341,39 @@ private:
     Validator validator_;
 };
 
+// A std::vector of described objects (docs/DESIGN.md section 4.4). Elements
+// are described on demand into temporary objects, so a list costs one node
+// however long it is.
+class ListNode : public Node {
+public:
+    explicit ListNode(const char* name) : Node(name, NodeType::List) {}
+
+    virtual size_t size() const = 0;
+    // A temporary object describing element `i` (< size()).
+    virtual std::unique_ptr<Object> element(size_t i) const = 0;
+    // A temporary object describing a default element (schema, validation).
+    virtual std::unique_ptr<Object> prototype() const = 0;
+    virtual void resize(size_t n) = 0;
+
+    // Longest list a write may create (default 32).
+    ListNode& maxSize(size_t n) {
+        maxSize_ = n;
+        return *this;
+    }
+    size_t maxSize() const { return maxSize_; }
+    ListNode& persist() {
+        flags_ |= kPersist;
+        return *this;
+    }
+    ListNode& doc(const char* text) {
+        setDoc(text);
+        return *this;
+    }
+
+private:
+    size_t maxSize_ = 32;
+};
+
 namespace detail {
 
 // Signature of a callable: return type and (at most one) argument type.
@@ -502,6 +537,14 @@ public:
 
     EventNode& event(const char* name) { return add(new EventNode(name)); }
 
+    // A std::vector<T>, each element described by `describe(Object&, T&)`.
+    template <class T, class F>
+    ListNode& list(const char* name, std::vector<T>& items, F describe);
+    // Same, with the element type's own describe (member or free function, as
+    // for mount()).
+    template <class T>
+    ListNode& list(const char* name, std::vector<T>& items);
+
     // Writer renders the node; the optional applier accepts writes.
     CustomNode& custom(const char* name, CustomNode::Writer writer, CustomNode::Applier applier = nullptr) {
         return add(new CustomNode(name, std::move(writer), std::move(applier)));
@@ -557,6 +600,46 @@ Object& Object::mount(const char* name, T& thing) {
     Object& o = object(name);
     detail::describeInto(o, thing);
     return o;
+}
+
+template <class T>
+class VectorList final : public ListNode {
+public:
+    using Describe = std::function<void(Object&, T&)>;
+    VectorList(const char* name, std::vector<T>& items, Describe describe)
+        : ListNode(name), items_(items), describe_(std::move(describe)) {}
+
+    size_t size() const override { return items_.size(); }
+    std::unique_ptr<Object> element(size_t i) const override {
+        std::unique_ptr<Object> o(new Object(nullptr));
+        describe_(*o, items_[i]);
+        return o;
+    }
+    std::unique_ptr<Object> prototype() const override {
+        std::unique_ptr<Prototype> p(new Prototype());
+        describe_(*p, p->value);
+        return std::unique_ptr<Object>(p.release());
+    }
+    void resize(size_t n) override { items_.resize(n); }
+
+private:
+    // An object that owns the default element it describes.
+    struct Prototype : Object {
+        Prototype() : Object(nullptr) {}
+        T value{};
+    };
+    std::vector<T>& items_;
+    Describe describe_;
+};
+
+template <class T, class F>
+ListNode& Object::list(const char* name, std::vector<T>& items, F describe) {
+    return add(new VectorList<T>(name, items, std::move(describe)));
+}
+
+template <class T>
+ListNode& Object::list(const char* name, std::vector<T>& items) {
+    return add(new VectorList<T>(name, items, [](Object& o, T& item) { detail::describeInto(o, item); }));
 }
 
 }  // namespace tesser

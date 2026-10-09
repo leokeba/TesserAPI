@@ -138,7 +138,25 @@ api.mount("motor2", motor2);
 
 That replaces the roughly 140 lines of `DCMotorService` in the predecessor.
 
-### 4.4 Names and the tree's lifetime
+### 4.4 Lists
+
+```cpp
+struct Remote { std::string host; int port = 80; };
+void describe(tesser::Object& o, Remote& r) { o.value("host", r.host); o.value("port", r.port).range(1, 65535); }
+
+std::vector<Remote> remotes;
+api.list("remotes", remotes).maxSize(8);                                // uses describe(), like mount()
+api.list("levels", levels, [](tesser::Object& o, int& v) { o.value("v", v); });   // or a lambda
+```
+
+- **Cost:** a list is one node. Elements are described on demand into temporary objects, built for the request and freed after it, so a list costs nothing at rest however long it is. `T` must be default-constructible.
+- **Reading:** `GET /remotes` renders an array of objects; `/remotes/1` and `/remotes/1/port` address elements and fields by index (`/remotes/01` and out-of-range indexes are `not_found`).
+- **Writing:** set a field (`PUT /remotes/1/port 8080`) or patch an element (`{"port": 1}`), and actions inside elements work too.
+- **Replacing:** setting the list itself to an array replaces it. The array's length is the new size (capped by `maxSize`, default 32). Each array item is a patch for the element at that index; existing elements keep the fields the patch omits, new ones start from defaults. Every item is validated before anything changes. The same applies inside a parent patch.
+- **Schema:** `{"type": "list", "maxSize": n, "items": <element schema>}`.
+- **Subscriptions and persistence** treat the list as one value: a write anywhere in it marks the list changed, change notifications carry the whole list, and `.persist()` saves it whole. Subscribing below a list is `not_allowed`, since its elements are temporary.
+
+### 4.5 Names and the tree's lifetime
 
 - Names are `const char*` and are never copied. Use string literals or strings that outlive the `Api`.
 - A name contains only `[A-Za-z0-9_.-]`. Names are unique among siblings, and adding a duplicate fails, which is reported by `api.errors()` and on the log.
@@ -291,7 +309,10 @@ The error body is the same on every transport:
 **The core is single-threaded.** `Api` holds one recursive mutex. `Api::handle()` takes it, and so do the notification and persistence routines. On ESP32 several tasks touch the API: the HTTP server task, the NowTP task, `loop()`, and control tasks. The rules are:
 
 - **Inline mode** (the default): a transport calls `api.handle()` from its own task, and the handler runs there under the lock. This is the lowest-latency, lowest-memory option.
-- **Queued mode** *(planned)*: transports post requests into a bounded queue, which is drained by `api.poll()` (from `loop()`) or by `api.startTask()`. Use it when handlers must run in the application's context, for example when they touch code that isn't thread-safe. A full queue answers `busy`.
+- **Queued mode** (`api.config().queued = true`): transports post requests into a bounded queue (`maxQueued`, default 8, then `busy`), which `api.poll()` drains from `loop()` (or `api.startTask()` from its task). Use it when handlers must run in the application's context, for example when they touch code that isn't thread-safe.
+  - **How a request is queued:** the request is copied and its reply detached: message transports answer later, and HTTP parks the connection's handler up to `deferTimeoutMs`. Replies that can't be detached are handled inline.
+  - **Deferred actions** work from the queue.
+  - **Cleanup:** queued requests of a client that goes away (`dropSubscriber`) are discarded.
 - **Application code** that mutates bound state from another task while transports are running should hold `tesser::Lock lock(api);`. Aligned reads and writes of 32-bit-or-smaller variables are atomic on ESP32, so simple flags and counters are safe without it. Multi-field invariants and strings are not.
 - **Handlers must not block.** Long work belongs in a deferred action (§4.2) or a task, which reports completion through `pending.reply()` or through an event.
 
@@ -540,11 +561,10 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 2 | HTTP and NowTP transports, conformance tests, footprint measurements | done |
 | 3 | Change tracking, subscriptions, events, WebSocket | done |
 | 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
-| 5 | Client, remote mount (gateway), queued execution mode, lists of objects | |
+| 5 | Client, remote mount (gateway), queued execution mode, lists of objects | in progress (lists, queued mode and the client done) |
 
 ## 19. Open questions
 
-- **Lists of described objects** (the predecessor's remotes list). Arrays are `custom` nodes for now. A first-class list needs element-relative bindings.
 - **Enum values:** expose them as strings, with the allowed values in the schema.
 - **Binary envelope for NowTP:** only if measurements show the JSON overhead matters at 250-byte frames.
 - **Schema hash in NowTP discovery metadata,** so clients can cache schemas.

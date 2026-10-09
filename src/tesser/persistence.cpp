@@ -7,7 +7,9 @@ namespace tesser {
 
 namespace {
 
-bool isLeaf(const Node& n) { return n.type() == NodeType::Value || n.type() == NodeType::Custom; }
+bool isLeaf(const Node& n) {
+    return n.type() == NodeType::Value || n.type() == NodeType::Custom || n.type() == NodeType::List;
+}
 
 // Newest change among persisted values (0: none ever changed).
 void newestPersisted(const Object& o, bool inherited, uint16_t& newest) {
@@ -62,6 +64,26 @@ void applyStored(Object& o, JsonObjectConst stored, bool inherited, std::string&
             Check chk = v.check(kv.value());
             if (chk.isOk()) chk = v.apply(kv.value());  // readOnly() values are restored too
             if (!chk.isOk()) problem = chk.message ? chk.message : "rejected";
+        } else if (c->type() == NodeType::List) {
+            auto& list = static_cast<ListNode&>(*c);
+            if (!kv.value().is<JsonArrayConst>()) {
+                problem = "is now a list";
+            } else {
+                JsonArrayConst items = kv.value().as<JsonArrayConst>();
+                list.resize(items.size() < list.maxSize() ? items.size() : list.maxSize());
+                size_t i = 0;
+                for (JsonVariantConst item : items) {
+                    if (i >= list.size()) break;
+                    size_t at = path.size();
+                    path += '/';
+                    path += std::to_string(i);
+                    if (item.is<JsonObjectConst>()) {
+                        applyStored(*list.element(i), item.as<JsonObjectConst>(), true, path);
+                    }
+                    path.resize(at);
+                    i++;
+                }
+            }
         } else if (c->type() == NodeType::Custom) {
             auto& cu = static_cast<CustomNode&>(*c);
             Check chk = cu.check(kv.value());

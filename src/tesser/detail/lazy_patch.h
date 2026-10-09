@@ -57,13 +57,16 @@ private:
     bool rootOpen_ = false;
 };
 
-inline void writeLeaf(JsonWriter& w, const Node& n) {
-    if (n.type() == NodeType::Value) {
-        static_cast<const ValueNode&>(n).write(w);
-    } else {
-        static_cast<const CustomNode&>(n).write(w);
-    }
+// Value view of any node, without filters (defined in api.cpp).
+void renderValue(JsonWriter& w, const Node& n, int depth);
+
+// A node subscriptions and persistence treat as one value.
+inline bool isLeaf(const Node& n) {
+    return n.type() == NodeType::Value || n.type() == NodeType::Custom || n.type() == NodeType::List ||
+           n.type() == NodeType::Remote;
 }
+
+inline void writeLeaf(JsonWriter& w, const Node& n) { renderValue(w, n, 16); }
 
 }  // namespace detail
 }  // namespace tesser
