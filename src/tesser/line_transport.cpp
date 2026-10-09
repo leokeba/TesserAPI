@@ -55,6 +55,7 @@ void LineTransport::handleLine() {
     if (!text.empty() && text.back() == '\r') text.remove_suffix(1);
     Client client;
     client.transport = TransportKind::Serial;
+    client.authenticated = authenticated_;
     handleEnvelope(api_, text, client, [this](const std::string& m) { send(m); }, this);
 }
 

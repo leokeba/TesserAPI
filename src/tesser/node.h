@@ -518,6 +518,11 @@ public:
         setDoc(text);
         return *this;
     }
+    // Persists every value below this object (see Api::persistence()).
+    Object& persist() {
+        flags_ |= kPersist;
+        return *this;
+    }
 
     Node* first() const { return first_; }
     Node* child(std::string_view name) const;

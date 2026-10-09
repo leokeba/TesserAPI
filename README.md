@@ -2,7 +2,7 @@
 
 Describe your ESP32 firmware's state and operations **once**, as a tree of values and actions. Serve it as JSON over HTTP, over ESP-NOW (with [NowTP](https://github.com/leokeba/NowTP)), or over serial, from Arduino or ESP-IDF.
 
-> **Status: early development.** The design is in [docs/DESIGN.md](docs/DESIGN.md). The core (tree, get/set/patch, shapes, schema), subscriptions and events, and the serial, HTTP, WebSocket and NowTP transports work and are tested on hardware; persistence and access control follow. The API will change before 1.0.
+> **Status: early development.** The design is in [docs/DESIGN.md](docs/DESIGN.md). The core (tree, get/set/patch, shapes, schema), subscriptions and events, persistence, access control, and the serial, HTTP, WebSocket and NowTP transports work and are tested on hardware. The API will change before 1.0.
 
 ```cpp
 #include <TesserAPI.h>
@@ -53,6 +53,18 @@ pressed.emit(3);                                   // → {"op":"event","path":"
 → {"id":1,"op":"sub","path":"/","keys":"temperature","interval":500}
 ← {"id":1,"status":"ok","body":{"temperature":21.5}}
 ← {"op":"change","path":"/","body":{"temperature":22.0}}
+```
+
+## Persistence and access control
+
+```cpp
+tesser::NvsStorage storage;
+api.object("config").persist();                 // saved to NVS 2 s after a change
+api.persistence(storage);
+api.load();                                       // unknown or invalid stored keys are skipped
+
+http.setToken("s3cret");                          // Authorization: Bearer s3cret
+api.authorize(tesser::authorizers::readOnlyUnlessAuthenticated());
 ```
 
 ## Composition

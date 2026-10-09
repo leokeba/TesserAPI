@@ -33,6 +33,10 @@ public:
     void feed(const char* data, size_t len);
     void feed(char c);
 
+    // Requests on the line count as authenticated (physical access) unless
+    // this is set to false; see Api::authorize().
+    void setAuthenticated(bool authenticated) { authenticated_ = authenticated; }
+
     // Lines dropped for exceeding the limit (Config::maxRequestBody + 256).
     size_t overflows() const { return overflows_; }
 
@@ -45,6 +49,7 @@ private:
     std::string line_;
     Mutex outputMutex_;
     bool discarding_ = false;
+    bool authenticated_ = true;
     size_t overflows_ = 0;
 };
 

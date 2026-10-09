@@ -90,6 +90,10 @@ public:
     bool request(const PeerAddress& to, Op op, std::string_view path, JsonVariantConst body, ResponseHandler done,
                  const Query& query = Query(), uint32_t timeoutMs = 0);
 
+    // Requests from peers for which `fn` returns true count as authenticated
+    // (see Api::authorize()). Without it, none do.
+    void trust(std::function<bool(const PeerAddress&)> fn) { trust_ = std::move(fn); }
+
     // Notifications ("change" / "event" envelopes) from nodes this one
     // subscribed to. Runs in process().
     using NotificationHandler = std::function<void(const PeerAddress& from, JsonObjectConst envelope)>;
@@ -145,6 +149,7 @@ private:
     Options options_;
     std::function<void()> onQueued_;
     NotificationHandler onNotification_;
+    std::function<bool(const PeerAddress&)> trust_;
 
     mutable Mutex mutex_;
     std::deque<Incoming> queue_;

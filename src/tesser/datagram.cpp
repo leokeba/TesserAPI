@@ -224,6 +224,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
     req.client.transport = kind_;
     memcpy(req.client.address, msg.from.bytes, msg.from.length < 16 ? msg.from.length : 16);
     req.client.addressLength = msg.from.length < 16 ? msg.from.length : 16;
+    req.client.authenticated = trust_ && trust_(msg.from);
     EnvelopeId id;
     const char* message = nullptr;
     Status s = requestFromEnvelope(env, req, id, message);

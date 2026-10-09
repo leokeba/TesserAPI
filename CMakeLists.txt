@@ -9,7 +9,9 @@ set(TESSER_CORE_SRCS
     src/tesser/envelope.cpp
     src/tesser/line_transport.cpp
     src/tesser/datagram.cpp
-    src/tesser/subscription.cpp)
+    src/tesser/subscription.cpp
+    src/tesser/persistence.cpp
+    src/tesser/storage.cpp)
 
 if(ESP_PLATFORM)
     # The UART driver moved out of "driver" in ESP-IDF 5.3.
@@ -37,7 +39,7 @@ if(ESP_PLATFORM)
         SRCS ${TESSER_SRCS}
         INCLUDE_DIRS "src"
         REQUIRES ${TESSER_REQS}
-        PRIV_REQUIRES log esp_timer lwip)
+        PRIV_REQUIRES log esp_timer lwip nvs_flash)
     if(TESSER_NOWTP)
         # Requirements are resolved before the component list is known, so
         # NowTP is linked here rather than listed in REQUIRES.

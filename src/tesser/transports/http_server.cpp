@@ -224,6 +224,7 @@ private:
 class HttpServer::WsClient : public Subscriber {
 public:
     WsClient(HttpServer& server, int socket) : server_(server), fd(socket) {}
+    bool authenticated = false;
     bool notify(const std::string& message, Delivery) override { return server_.wsSend(fd, message); }
 
 private:
@@ -318,6 +319,30 @@ bool HttpServer::wsSend(int fd, const std::string& message) {
 #endif
 }
 
+bool HttpServer::authenticated(httpd_req_t* req) const {
+    if (!token_ || !*token_) return false;
+    size_t tokenLen = strlen(token_);
+    size_t len = httpd_req_get_hdr_value_len(req, "Authorization");
+    if (len == 7 + tokenLen) {
+        std::string value(len + 1, '\0');
+        if (httpd_req_get_hdr_value_str(req, "Authorization", &value[0], value.size()) == ESP_OK &&
+            memcmp(value.data(), "Bearer ", 7) == 0 && memcmp(value.data() + 7, token_, tokenLen) == 0) {
+            return true;
+        }
+    }
+    size_t qlen = httpd_req_get_url_query_len(req);
+    if (qlen) {
+        std::string query(qlen + 1, '\0');
+        std::string value(tokenLen + 2, '\0');
+        if (httpd_req_get_url_query_str(req, &query[0], query.size()) == ESP_OK &&
+            httpd_query_key_value(query.c_str(), "token", &value[0], value.size()) == ESP_OK &&
+            strcmp(value.c_str(), token_) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void HttpServer::onClose(httpd_handle_t server, int fd) {
     auto* self = static_cast<HttpServer*>(httpd_get_global_user_ctx(server));
     if (self) self->dropWsClient(fd);
@@ -332,7 +357,7 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
 #if CONFIG_HTTPD_WS_SUPPORT
     int fd = httpd_req_to_sockfd(req);
     if (req->method == HTTP_GET) {  // handshake
-        wsClient(fd, true);
+        wsClient(fd, true)->authenticated = authenticated(req);
         return ESP_OK;
     }
     httpd_ws_frame_t frame = {};
@@ -359,7 +384,9 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
         memcpy(client.address, &reinterpret_cast<struct sockaddr_in*>(&addr)->sin_addr.s_addr, 4);
         client.addressLength = 4;
     }
-    handleEnvelope(api_, text, client, [this, fd](const std::string& m) { wsSend(fd, m); }, wsClient(fd, true));
+    WsClient* ws = wsClient(fd, true);
+    client.authenticated = ws->authenticated;
+    handleEnvelope(api_, text, client, [this, fd](const std::string& m) { wsSend(fd, m); }, ws);
     return ESP_OK;
 #else
     (void)req;
@@ -506,6 +533,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
     request.op = req->method == HTTP_GET ? Op::Get : Op::Set;
     request.path = path;
     request.client.transport = TransportKind::Http;
+    request.client.authenticated = authenticated(req);
     int fd = httpd_req_to_sockfd(req);
     struct sockaddr_in6 addr = {};
     socklen_t addrLen = sizeof(addr);

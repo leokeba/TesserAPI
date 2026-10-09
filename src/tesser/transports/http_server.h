@@ -46,6 +46,11 @@ public:
     void enableWebSocket(const char* uri = "/ws") { wsUri_ = uri; }
     size_t webSocketClients() const;
 
+    // Requests carrying "Authorization: Bearer <token>" (or ?token=<token>,
+    // for WebSocket handshakes from browsers) count as authenticated; see
+    // Api::authorize(). The string must outlive the server.
+    void setToken(const char* token) { token_ = token; }
+
     httpd_handle_t handle() const { return server_; }
     Api& api() { return api_; }
 
@@ -62,6 +67,7 @@ private:
     WsClient* wsClient(int fd, bool create);
     void dropWsClient(int fd);
     bool wsSend(int fd, const std::string& message);
+    bool authenticated(httpd_req_t* req) const;
 
     Api& api_;
     httpd_handle_t server_ = nullptr;
@@ -70,6 +76,7 @@ private:
     std::string pattern_;
     const char* corsOrigin_ = nullptr;
     const char* wsUri_ = nullptr;
+    const char* token_ = nullptr;
     mutable Mutex wsMutex_;
     std::vector<WsClient*> wsClients_;
     friend class HttpReply;

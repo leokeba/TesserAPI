@@ -77,6 +77,20 @@ def main():
     got, data, headers, _ = h.raw('GET', '/lamp')
     check('CORS header on responses', headers.get('Access-Control-Allow-Origin') == '*', headers)
 
+    # Access control: writes under /secure need the bearer token.
+    got, data, _, _ = h.raw('PUT', '/secure/secret', None, 5)
+    check('write without token -> 403', got == 403 and json.loads(data)['error'] == 'unauthorized', (got, data))
+    got, data, _, _ = h.raw('PUT', '/secure/secret', None, 5, {'Authorization': 'Bearer wrong'})
+    check('wrong token -> 403', got == 403, got)
+    got, data, _, _ = h.raw('PUT', '/secure/secret', None, 5, {'Authorization': 'Bearer test-token'})
+    check('bearer token -> 200', got == 200 and json.loads(data) == 5, (got, data))
+    got, data, _, _ = h.raw('PUT', '/secure/secret', {'token': 'test-token'}, 6)
+    check('?token= -> 200', got == 200, got)
+    got, data, _, _ = h.raw('POST', '/', None, {'lamp': {'on': True}, 'secure': {'secret': 1}})
+    check('patch touching /secure -> 403, nothing applied', got == 403 and
+          h.call('get', '/lamp/on', {}, ABSENT) == ('ok', False), (got, data))
+    check('reads stay open', h.call('get', '/secure/secret', {}, ABSENT) == ('ok', 6))
+
     # Deferred action: the handler parks until the reply arrives.
     got, data, _, ms = h.raw('POST', '/system/later')
     check('deferred reply', got == 200 and json.loads(data) == 'done' and ms >= 180, (got, data, ms))

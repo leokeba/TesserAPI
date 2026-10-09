@@ -12,6 +12,9 @@
 #if defined(ESP_PLATFORM) && defined(TESSER_HAVE_NOWTP)
 
 #include <NowTP.h>
+#include <string.h>
+
+#include <vector>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -44,8 +47,21 @@ public:
              DatagramEndpoint::ResponseHandler done, uint32_t timeoutMs = 0);
 
     // Call from your NowTP peer-event handler when a peer is lost: fails its
-    // pending calls (and, later, drops its subscriptions).
+    // pending calls and drops its subscriptions.
     void peerLost(const nowtp::Mac& mac) { endpoint_.forgetPeer(address(mac)); }
+
+    // Requests from these peers count as authenticated (Api::authorize()).
+    // ESP-NOW frames carry no proof of origin, so this trusts MAC addresses:
+    // combine it with encrypted peers (EspNowTransport::addPeer) when that
+    // matters.
+    void trustPeers(std::vector<nowtp::Mac> peers) {
+        endpoint_.trust([peers = std::move(peers)](const PeerAddress& a) {
+            for (const nowtp::Mac& m : peers) {
+                if (a.length == 6 && memcmp(a.bytes, m.bytes, 6) == 0) return true;
+            }
+            return false;
+        });
+    }
 
     DatagramEndpoint& endpoint() { return endpoint_; }
     uint8_t port() const { return port_; }

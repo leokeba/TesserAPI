@@ -430,20 +430,42 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 
 **Client side:** `DatagramEndpoint` (NowTP) sends `sub` requests like any other, with `interval` and `events` in its `Query`. Incoming notifications go to `onNotification(handler)`; they are never answered, so two nodes subscribed to each other can't ping-pong.
 
-## 12. Persistence *(planned)*
+## 12. Persistence
 
-- Values and objects marked `.persist()` are saved as a single JSON patch, which is the value view filtered to persisted leaves.
-- Storage backends: NVS (one blob, available on both frameworks), or a file on LittleFS. Both implement `tesser::Storage`.
-- **Saving:** a save is debounced (default 2 s after the last change to a persisted leaf) and happens in `poll()` or in the API task, never in a request handler.
-- **Loading:** at startup, the stored patch is applied through the normal set path, so validation runs. Unknown keys are skipped with a warning, and values that fail validation keep their defaults. This is how renamed or removed fields stay harmless.
+```cpp
+tesser::NvsStorage storage;               // or FileStorage("/littlefs/state.json")
+api.object("config").persist();           // everything below it
+api.value("calibration", cal).readOnly().persist();
+api.persistence(storage, 2000);           // debounce: save 2 s after the last change
+api.load();                               // once the tree is declared
+```
 
-## 13. Security *(planned)*
+- **What is saved:** values and custom nodes marked `.persist()`, or below an object marked `.persist()`. They are stored as a single JSON document: the value view filtered to persisted nodes, the same sparse format as patches and change notifications. `api.persistedState()` returns it.
+- **Storage backends:** `tesser::Storage` has two methods, `load(std::string&)` and `save(const std::string&)`.
+  - `NvsStorage`: one NVS blob; the application initializes NVS.
+  - `FileStorage`: stdio, so any VFS mount on ESP and the host. It writes to a temporary file and renames it, so a power cut leaves either the old or the new state.
+  - `MemoryStorage`: tests.
+- **Saving:** `Api::poll()` notices changes to persisted values through their generations, at most every 50 ms. It saves once `debounceMs` has passed without a new change. Changes to values that aren't persisted never cause a save. `api.save()` saves immediately.
+- **Loading** is lenient: the stored state goes through each value's normal validation, but whatever no longer fits is skipped with a warning and the value keeps its default. That covers renamed or removed keys, values now out of range, a key that became an object, and a value no longer persisted. So schema changes never break a boot.
+- **Read-only values:** values marked `readOnly()` for the API (calibration data written by an action, a boot counter) are restored too. Getter-only values can't be.
 
-- `api.authorize(fn)`: `fn(const Client&, Op, const Node&) -> bool` is consulted for every get, set and subscribe.
-- The `Client` carries the transport kind, the address (IP or MAC), and whether the transport authenticated it.
-- **NowTP adapter options:** `allow` (a list of MACs) and `requireEncryption`. Unless configured otherwise, `set` from unknown peers is rejected.
-- **HTTP:** a bearer-token check is provided as a ready-made authorizer. TLS is the application's choice of server.
+## 13. Security
+
+- **Authorizer:** `api.authorize(fn)`, where `fn(const Client&, Op, const Node&) -> bool`, is consulted for the target of every get, set and subscribe, and for every node a patch touches (during validation, so a refused patch changes nothing). A refusal is `unauthorized` (HTTP 403).
+- **Default:** without an authorizer, everything is allowed.
+- **Ready-made authorizers:** `authorizers::readOnlyUnlessAuthenticated()` (anyone reads and subscribes; writes and actions need authentication) and `authorizers::authenticatedOnly()`.
+- **What makes a client authenticated** (`Client::authenticated`) is the transport's business:
+
+| Transport | Authenticated when |
+|---|---|
+| HTTP | `HttpServer::setToken(token)` is set and the request carries `Authorization: Bearer <token>` or `?token=<token>` |
+| WebSocket | Same check, on the handshake |
+| NowTP | The sender is in `NowTpTransport::trustPeers({...})`, or `DatagramEndpoint::trust(fn)` accepts it. ESP-NOW frames carry no proof of origin, so this trusts MAC addresses; combine it with encrypted NowTP peers when that matters. |
+| Serial | Always (physical access), unless `LineTransport::setAuthenticated(false)` |
+
+- `Client` also carries the transport kind and the address (IP or MAC), for authorizers that need more.
 - Hiding nodes from the schema is not access control: the authorizer runs on every access.
+- TLS is the application's choice of server.
 
 ## 14. Remote trees and the client *(planned)*
 
@@ -506,7 +528,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 
 1. **Host tests** (CMake + ctest, ASan and UBSan, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror` on the library). They cover the core, the envelope codec and the line transport, and run against NowTP's simulated network for the NowTP adapter.
 2. **On-target tests** (`test/hardware`, ESP-IDF): the same core cases on the chip, plus heap and stack measurements.
-3. **End-to-end on hardware:** `test/hardware` serves a demo API over UART, HTTP and WebSocket (with Wi-Fi credentials from the gitignored `test/secrets.h`), and NowTP. `test/e2e_serial.py`, `test/e2e_http.py`, `test/e2e_ws.py` and `test/e2e_nowtp.py` (two boards) drive it, subscriptions and events included.
+3. **End-to-end on hardware:** `test/hardware` serves a demo API over UART, HTTP and WebSocket (with Wi-Fi credentials from the gitignored `test/secrets.h`), and NowTP. `test/e2e_serial.py`, `test/e2e_http.py`, `test/e2e_ws.py`, `test/e2e_nowtp.py` (two boards) and `test/e2e_persist.py` (reboot through the serial port) drive it, including subscriptions, events, access control and persistence.
 4. **Transport conformance:** `test/conformance.py` sends the same request vectors through serial, HTTP, WebSocket and NowTP (both directions), and every transport must give the same results.
 5. **CI:** host tests, plus ESP-IDF 5.1 / 5.4 / 5.5 / latest × ESP32 / ESP32-C3 (test firmware and examples), plus Arduino-ESP32 3.x × ESP32 / ESP32-C3 (example sketches).
 
@@ -517,7 +539,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 1 | Core: tree, values, actions, custom nodes, get / set / patch / shape / schema, streaming writer, envelope, line transport, host + on-target tests | done |
 | 2 | HTTP and NowTP transports, conformance tests, footprint measurements | done |
 | 3 | Change tracking, subscriptions, events, WebSocket | done |
-| 4 | Persistence, authorizer, NowTP allowlist | |
+| 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | |
 
 ## 19. Open questions

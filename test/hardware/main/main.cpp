@@ -14,6 +14,7 @@
 #include "core_cases.h"
 #include "datagram_cases.h"
 #include "subscription_cases.h"
+#include "persistence_cases.h"
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
@@ -113,6 +114,12 @@ uint32_t g_counter = 0;
 uint32_t g_ticks = 0;
 tesser::ValueNode* g_ticksNode;
 tesser::EventNode* g_fired;
+char g_settingName[24] = "unnamed";
+uint32_t g_boots = 0;
+int g_secret = 0;
+tesser::Node* g_secureNode;
+tesser::Node* g_secretNode;
+tesser::NvsStorage* g_storage;
 tesser::UartTransport* g_uart;
 
 void delayedReply(void* arg) {
@@ -162,7 +169,27 @@ void serveDemo() {
     esp_timer_start_periodic(handle, 100 * 1000);
     g_demo->api.startTask(20);
 
-    startNetwork(g_demo->api);
+    // Persistence: /settings survives reboots (NVS, saved 500 ms after a change).
+    auto& settings = g_demo->api.object("settings").persist();
+    settings.value("name", g_settingName);
+    settings.value("boots", g_boots).readOnly();
+    // Access control: writes under /secure need an authenticated client
+    // (HTTP/WebSocket token "test-token", serial; no NowTP peer is trusted).
+    auto& secure = g_demo->api.object("secure");
+    g_secureNode = &secure;
+    g_secretNode = &secure.value("secret", g_secret);
+    g_demo->api.authorize([](const tesser::Client& c, tesser::Op op, const tesser::Node& n) {
+        if (op == tesser::Op::Get || op == tesser::Op::Subscribe || c.authenticated) return true;
+        return &n != g_secureNode && &n != g_secretNode;
+    });
+
+    startNetwork(g_demo->api);  // NVS is initialized there
+    g_storage = new tesser::NvsStorage("tesser_test");
+    g_demo->api.persistence(*g_storage, 500);
+    bool loaded = g_demo->api.load();
+    g_boots++;
+    g_demo->api.save();
+    printf("PERSIST loaded=%d boots=%u name=%s\n", int(loaded), unsigned(g_boots), g_settingName);
     g_uart = new tesser::UartTransport(g_demo->api);
     esp_err_t err = g_uart->begin();
     // UART0 is also the console: keep logs from interleaving with replies.

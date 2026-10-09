@@ -202,6 +202,7 @@ void startNetwork(tesser::Api& api) {
         g_http = new tesser::HttpServer(api);
         g_http->enableCors();
         g_http->enableWebSocket("/ws");
+        g_http->setToken("test-token");
         printf("HTTP err=%d url=http://%s/api/\n", int(g_http->begin(80, "/api")), g_ip);
     }
 }

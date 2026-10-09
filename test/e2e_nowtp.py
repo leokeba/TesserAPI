@@ -100,6 +100,12 @@ def main():
     check('B back to its subscriptions',
           b.call('get', '/system/subscriptions', {}, conformance.ABSENT)[1] == subs_b)
 
+    # B trusts no NowTP peer: writes to /secure are refused, reads are fine.
+    status, body = a_to_b.call('set', '/secure/secret', {}, 9)
+    check('untrusted peer -> unauthorized', status == 'unauthorized', (status, body))
+    status, body = a_to_b.call('get', '/secure/secret', {}, conformance.ABSENT)
+    check('untrusted peer can read', status == 'ok', (status, body))
+
     stats = b.call('get', '/net/endpoint', {}, conformance.ABSENT)[1]
     print(f'     B endpoint: {stats}')
     check('B dropped nothing', stats['dropped'] == 0, stats)

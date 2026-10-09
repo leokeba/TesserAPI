@@ -40,6 +40,24 @@ struct Subscription {
     uint32_t lastFlushMs = 0;
 };
 
+class Storage;
+
+// Decides whether a client may perform an operation on a node. Consulted for
+// the target of every request, and for every node a patch touches.
+using Authorizer = std::function<bool(const Client& client, Op op, const Node& node)>;
+
+namespace authorizers {
+// Anyone may read and subscribe; writes and actions need an authenticated
+// client (HTTP/WebSocket bearer token, trusted NowTP peer, serial line).
+inline Authorizer readOnlyUnlessAuthenticated() {
+    return [](const Client& c, Op op, const Node&) { return op != Op::Set || c.authenticated; };
+}
+// Every request needs an authenticated client.
+inline Authorizer authenticatedOnly() {
+    return [](const Client& c, Op, const Node&) { return c.authenticated; };
+}
+}  // namespace authorizers
+
 // The root of the tree and the request handler. All requests run under one
 // recursive mutex; see docs/DESIGN.md section 9.
 class Api : public Object {
@@ -74,6 +92,23 @@ public:
     bool startTask(uint32_t periodMs = 20, uint32_t stackSize = 4096, unsigned priority = 3);
 #endif
 
+    // Access control (docs/DESIGN.md section 13). Without an authorizer,
+    // everything is allowed.
+    void authorize(Authorizer fn);
+    const Authorizer& authorizer() const { return authorizer_; }
+
+    // Persistence (docs/DESIGN.md section 12): values and objects marked
+    // persist() are saved to `storage` by poll(), debounceMs after the last
+    // change to one of them. Call load() once the tree is declared.
+    void persistence(Storage& storage, uint32_t debounceMs = 2000);
+    // Applies the stored state. Unknown keys and invalid values are skipped
+    // with a warning. Returns false if nothing was stored or it didn't parse.
+    bool load();
+    // Saves now. Returns false on a storage error.
+    bool save();
+    // The JSON that save() would store.
+    std::string persistedState();
+
     // Removes every subscription of a client. Transports call it when a
     // connection closes and before destroying a Subscriber.
     void dropSubscriber(Subscriber* subscriber);
@@ -95,12 +130,20 @@ public:
 private:
     void flush(Subscription& sub, uint32_t nowMs);
     void sampleWatched(Node& node);
+    void checkPersistence(uint32_t nowMs);
 
     Config config_;
     mutable Mutex mutex_;
     std::atomic<int> pending_{0};
     std::vector<Subscription> subs_;
     uint32_t lastWatchMs_ = 0;
+    Authorizer authorizer_;
+    Storage* storage_ = nullptr;
+    uint32_t debounceMs_ = 2000;
+    uint16_t savedGen_ = 0;  // generation when the state was last saved or loaded
+    uint16_t seenGen_ = 0;   // newest persisted change seen by poll()
+    uint32_t changedAtMs_ = 0;
+    uint32_t lastPersistCheckMs_ = 0;
     Api* nextApi_ = nullptr;  // registry used by EventNode
 };
 

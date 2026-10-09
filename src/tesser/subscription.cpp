@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "tesser/api.h"
+#include "tesser/detail/lazy_patch.h"
 
 namespace tesser {
 
@@ -56,64 +57,7 @@ bool passesFilter(const Subscription& sub, std::string_view name) {
     return true;
 }
 
-// Writes a sparse object: an object's key is written only once something
-// changed below it, so unchanged branches cost nothing.
-class LazyPatch {
-public:
-    static constexpr int kMax = 32;
-    explicit LazyPatch(JsonWriter& w) : w_(w) {}
-
-    bool enter(const char* name) {
-        if (depth_ >= kMax) return false;
-        stack_[depth_++] = name;
-        return true;
-    }
-    void leave() {
-        depth_--;
-        if (opened_ > depth_) {
-            w_.endObject();
-            opened_ = depth_;
-        }
-    }
-    // Opens the enclosing objects and writes the key of a changed value.
-    void key(const char* name) {
-        if (!rootOpen_) {
-            w_.beginObject();
-            rootOpen_ = true;
-        }
-        for (; opened_ < depth_; opened_++) {
-            w_.key(stack_[opened_]);
-            w_.beginObject();
-        }
-        w_.key(name);
-    }
-    // Returns true if anything was written.
-    bool finish() {
-        while (opened_ > 0) {
-            w_.endObject();
-            opened_--;
-        }
-        if (rootOpen_) w_.endObject();
-        return rootOpen_;
-    }
-
-private:
-    JsonWriter& w_;
-    const char* stack_[kMax];
-    int depth_ = 0;
-    int opened_ = 0;
-    bool rootOpen_ = false;
-};
-
-void writeLeaf(JsonWriter& w, const Node& n) {
-    if (n.type() == NodeType::Value) {
-        static_cast<const ValueNode&>(n).write(w);
-    } else {
-        static_cast<const CustomNode&>(n).write(w);
-    }
-}
-
-void changesIn(const Object& o, uint16_t since, int depth, const Subscription* top, LazyPatch& lp, JsonWriter& w) {
+void changesIn(const Object& o, uint16_t since, int depth, const Subscription* top, detail::LazyPatch& lp, JsonWriter& w) {
     if (depth <= 0) return;
     for (const Node* c = o.first(); c; c = c->next()) {
         if (c->type() == NodeType::Action || c->type() == NodeType::Event) continue;
@@ -124,7 +68,7 @@ void changesIn(const Object& o, uint16_t since, int depth, const Subscription* t
             lp.leave();
         } else if (newerGeneration(c->generation(), since)) {
             lp.key(c->name());
-            writeLeaf(w, *c);
+            detail::writeLeaf(w, *c);
         }
     }
 }
@@ -239,6 +183,7 @@ void Api::poll() { poll(millis32()); }
 
 void Api::poll(uint32_t nowMs) {
     MutexGuard guard(mutex_);
+    if (storage_) checkPersistence(nowMs);
     if (subs_.empty()) return;
     if (nowMs - lastWatchMs_ >= config_.watchIntervalMs) {
         lastWatchMs_ = nowMs;
@@ -273,13 +218,13 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
     bool any = false;
     const Node& n = *sub.node;
     if (n.type() == NodeType::Object) {
-        LazyPatch lp(w);
+        detail::LazyPatch lp(w);
         int depth = sub.depth < 0 || sub.depth > config_.maxDepth ? config_.maxDepth : sub.depth;
         changesIn(static_cast<const Object&>(n), sub.since, depth, &sub, lp, w);
         any = lp.finish();
     } else if ((n.type() == NodeType::Value || n.type() == NodeType::Custom) &&
                newerGeneration(n.generation(), sub.since)) {
-        writeLeaf(w, n);
+        detail::writeLeaf(w, n);
         any = true;
     }
     if (!any) {

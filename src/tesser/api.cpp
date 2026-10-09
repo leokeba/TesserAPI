@@ -95,6 +95,9 @@ public:
     void run() {
         Node* target = resolve();
         if (!target) return;
+        if (req_.op != Op::Unsubscribe && !allowed(*target)) {
+            return replyError(Status::Unauthorized, "not authorized", base_);
+        }
         switch (req_.op) {
             case Op::Get: get(*target); break;
             case Op::Set: set(*target); break;
@@ -104,6 +107,11 @@ public:
     }
 
 private:
+    bool allowed(const Node& n) const {
+        const Authorizer& a = api_.authorizer();
+        return !a || a(req_.client, req_.op, n);
+    }
+
     // ---- errors -------------------------------------------------------
 
     std::string trailPath() const {
@@ -484,6 +492,7 @@ private:
     }
 
     bool validatePatch(Node& n, JsonVariantConst v) {
+        if (!allowed(n)) return error(Status::Unauthorized, "not authorized");
         switch (n.type()) {
             case NodeType::Object: {
                 if (!v.is<JsonObjectConst>()) return error(Status::InvalidValue, "expected object");
@@ -581,6 +590,11 @@ private:
 };
 
 }  // namespace
+
+void Api::authorize(Authorizer fn) {
+    MutexGuard guard(mutex_);
+    authorizer_ = std::move(fn);
+}
 
 void Api::handle(const Request& request, Reply& reply) {
     MutexGuard guard(mutex_);
