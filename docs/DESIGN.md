@@ -95,8 +95,10 @@ The getter has the form `T()`. The setter has the form `void(T)`, or `bool(T)` /
 |---|---|
 | `.range(min, max)` | Numeric bounds, checked on write and reported in the schema. |
 | `.readOnly()` | Rejects writes. |
-| `.persist()` | Included in the persisted snapshot *(planned)*. |
-| `.describe("text")` | Schema description. Compiled out with `TESSER_NO_DESCRIPTIONS`. |
+| `.persist()` | Included in the persisted snapshot (§12). |
+| `.watch()` | Sampled for changes while anyone is subscribed (§11). |
+| `.doc("text")` | Schema description. Compiled out with `TESSER_NO_DESCRIPTIONS`. |
+| `.label()`, `.unit()`, `.step()`, `.ui()` | Presentation metadata for user interfaces (§7.1). Every node type has them, like `.doc()`. |
 
 Integers are range-checked against `T` before any user range: writing `300` to a `uint8_t` is `invalid_value`, never a wrap-around. Integers are accepted for floating-point values. Nothing else is coerced: a string `"12"` is not a number.
 
@@ -118,6 +120,7 @@ o.action("calibrate", [](tesser::Call& call) {                   // deferred com
   - one typed argument: the body must convert as described for values
   - `JsonVariantConst`: the raw body
 - An action may return `void`, a supported value type, or `tesser::Status`.
+- `.range(min, max)` bounds a numeric argument. It is checked before the action runs, inside patches too, and reported in the schema.
 - More than one argument is not supported. Use an object body with a raw argument, or a nested object of values plus an action (see §6.3).
 
 ### 4.3 Composition
@@ -276,10 +279,40 @@ GET /lamp?view=schema
 ```
 
 - **Types:** `object`, `boolean`, `integer`, `number`, `string`, `action`, `event`, `custom`.
-- **Optional keys:** `writable` (only when true), `min`, `max`, `persist`, `description`, `arg` and `returns` (actions), `maxLength` (`char[N]`).
+- **Optional keys:** `writable` (only when true), `min`, `max` (values and action arguments), `persist`, `description`, `arg` and `returns` (actions), `maxLength` (`char[N]`), `enum`, and the presentation keys of §7.1.
 - `depth`, `keys` and the shape apply to `children` the same way.
 - A schema leaf is always an object containing `"type"`. Children are always under `"children"`, so a child named `type` can't be confused with a descriptor.
 - Schema output is compiled out with `TESSER_NO_SCHEMA` when flash is tight.
+
+### 7.1 Presentation metadata
+
+A schema is enough to build a user interface: types, ranges, enums, writability, actions and events say what controls a node needs, and children keep their declaration order. A few modifiers add what the data model can't say. TesserAPI only stores and emits them; renderers such as TesserUI give them meaning.
+
+```cpp
+api.label("Heliostat 3");                                   // the root's label names the device
+auto& m = api.object("motor").label("Motor");
+m.value("speed", speed).range(0, 100).label("Speed").unit("%").step(5).ui("widget", "knob");
+m.action("moveTo", [](float deg) { ... }).range(0, 360).unit("°").ui("confirm", "Move the mirror?");
+m.value("pidKp", kp).ui("advanced");
+```
+
+```json
+"speed": {"type": "integer", "writable": true, "min": 0, "max": 100,
+          "label": "Speed", "unit": "%", "step": 5, "ui": {"widget": "knob"}}
+```
+
+| Modifier | Schema key | Meaning |
+|---|---|---|
+| `.label("text")` | `label` | Human-readable name. Without one, renderers derive a name from the node's name. |
+| `.unit("text")` | `unit` | Unit of a value, or of an action's argument. |
+| `.step(n)` | `step` | Input granularity. A hint: writes are neither rounded nor rejected for it. |
+| `.ui("key")` | `ui: {"key": true}` | A flag hint. |
+| `.ui("key", "text")`, `.ui("key", n)` | `ui: {"key": ...}` | A string or number hint. Setting a key again replaces it. |
+
+- **Vocabulary:** the keys under `ui` are defined by the renderers (TesserUI's specification), not by TesserAPI. Clients ignore keys they don't know.
+- **Cost:** all of it is string literals and one optional allocation per annotated node: 16 bytes, plus 16 bytes per `ui` hint (32-bit targets, before heap overhead). Nodes without presentation metadata pay nothing.
+- **Hash:** presentation metadata is part of the schema, so it changes `schemaHash()`.
+- `TESSER_NO_UI` compiles it out: the modifiers remain and do nothing.
 
 ## 8. Status codes
 
@@ -568,7 +601,7 @@ Configuration (`tesser::Config`, at runtime):
 | `deferTimeoutMs` | 10000 |
 | `maxPending` | 4 |
 
-Compile-time switches: `TESSER_NO_SCHEMA`, `TESSER_NO_DESCRIPTIONS`, `TESSER_NO_MESSAGES`.
+Compile-time switches: `TESSER_NO_SCHEMA`, `TESSER_NO_DESCRIPTIONS`, `TESSER_NO_MESSAGES`, `TESSER_NO_UI`.
 
 ## 16. Packaging
 

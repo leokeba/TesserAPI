@@ -279,6 +279,36 @@ TEST(schema_view) {
     CHECK_EQ(get(d.api, "/config/gain", schema()).body, "{\"type\":\"number\",\"writable\":true,\"persist\":true}");
 }
 
+TEST(schema_presentation) {
+    Api api;
+    int level = 5;
+    float angle = 0;
+    api.label("Heliostat 3");
+    auto& m = api.object("motor").label("Motor").ui("card");
+    m.value("level", level).range(0, 10).label("Level").unit("%").step(0.5).ui("widget", "knob").ui("precision", 1);
+    m.action("moveTo", [&](float deg) { angle = deg; }).range(0, 360).unit("°").ui("confirm", "Move?");
+    m.event("stalled").label("Stalled");
+    m.value("level2", level).ui("advanced").ui("widget", "slider").ui("widget", "dial");  // set again: replaced
+    CHECK_EQ(get(api, "/", schema(0)).body, "{\"type\":\"object\",\"label\":\"Heliostat 3\"}");
+    CHECK_EQ(get(api, "/motor", schema()).body,
+             "{\"type\":\"object\",\"label\":\"Motor\",\"ui\":{\"card\":true},\"children\":{"
+             "\"level\":{\"type\":\"integer\",\"writable\":true,\"min\":0,\"max\":10,\"label\":\"Level\",\"unit\":\"%\","
+             "\"step\":0.5,\"ui\":{\"widget\":\"knob\",\"precision\":1}},"
+             "\"moveTo\":{\"type\":\"action\",\"arg\":\"number\",\"min\":0,\"max\":360,\"unit\":\"°\","
+             "\"ui\":{\"confirm\":\"Move?\"}},"
+             "\"stalled\":{\"type\":\"event\",\"label\":\"Stalled\"},"
+             "\"level2\":{\"type\":\"integer\",\"writable\":true,\"ui\":{\"advanced\":true,\"widget\":\"dial\"}}}}");
+    // An action's range is checked before it runs.
+    CHECK_EQ(set(api, "/motor/moveTo", "400").status, Status::InvalidValue);
+    CHECK_EQ(set(api, "/motor/moveTo", "90").status, Status::Ok);
+    CHECK_EQ(angle, 90.0f);
+    // Hints are part of the schema, so they change its hash.
+    uint32_t before = api.schemaHash();
+    m.value("level3", level).step(0.1);
+    CHECK(api.schemaHash() != before);
+    CHECK_EQ(get(api, "/motor/level3", schema()).body, "{\"type\":\"integer\",\"writable\":true,\"step\":0.1}");
+}
+
 // ---- set ---------------------------------------------------------------
 
 TEST(set_values) {

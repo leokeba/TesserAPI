@@ -460,6 +460,12 @@ private:
                     w.key("arg");
                     w.string(a.argKind());
                 }
+                if (const NodeMeta* m = a.meta(); m && m->hasRange) {
+                    w.key("min");
+                    w.number(m->min);
+                    w.key("max");
+                    w.number(m->max);
+                }
                 if (a.returnKind()) {
                     w.key("returns");
                     w.string(a.returnKind());
@@ -502,6 +508,7 @@ private:
             w.key("description");
             w.string(m->doc);
         }
+        if (const NodeMeta* m = n.meta(); m && m->ui) renderUi(w, *m->ui);
         if (n.type() == NodeType::Object && depth > 0) {
             w.key("children");
             renderChildren(w, static_cast<const Object&>(n), depth, f, View::Schema);
@@ -509,6 +516,33 @@ private:
         if (n.type() == NodeType::List && depth > 0) {
             w.key("items");
             renderSchema(w, *static_cast<const ListNode&>(n).prototype(), depth, Filter());
+        }
+        w.endObject();
+    }
+
+    static void renderUi(JsonWriter& w, const UiMeta& m) {
+        if (m.label) {
+            w.key("label");
+            w.string(m.label);
+        }
+        if (m.unit) {
+            w.key("unit");
+            w.string(m.unit);
+        }
+        if (m.step != 0) {
+            w.key("step");
+            w.number(static_cast<double>(m.step), 7);
+        }
+        if (!m.hints) return;
+        w.key("ui");
+        w.beginObject();
+        for (const UiHint* h = m.hints; h; h = h->next) {
+            w.key(h->key);
+            switch (h->kind) {
+                case UiHint::Kind::Flag: w.boolean(true); break;
+                case UiHint::Kind::String: w.string(h->str ? h->str : ""); break;
+                case UiHint::Kind::Number: w.number(static_cast<double>(h->num), 7); break;
+            }
         }
         w.endObject();
     }

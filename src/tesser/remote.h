@@ -19,7 +19,7 @@ namespace tesser {
 // Created with Object::remote(); lives as long as the tree. Either may be
 // destroyed first: a destroyed endpoint detaches its remote nodes, which then
 // answer "no endpoint".
-class RemoteNode : public Node {
+class RemoteNode : public Annotated<RemoteNode> {
 public:
     RemoteNode(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath);
     ~RemoteNode() override;
@@ -34,10 +34,6 @@ public:
     // events. `intervalMs` is the subscription's interval; the subscription
     // is renewed every `refreshMs` in case the remote node restarted.
     RemoteNode& mirror(uint32_t intervalMs = 500, uint32_t refreshMs = 30000);
-    RemoteNode& doc(const char* text) {
-        setDoc(text);
-        return *this;
-    }
 
     DatagramEndpoint* endpoint() const { return endpoint_; }
     const PeerAddress& peer() const { return peer_; }

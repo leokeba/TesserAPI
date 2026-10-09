@@ -27,7 +27,7 @@ void merge(JsonVariant dst, JsonVariantConst patch) {
 }  // namespace
 
 RemoteNode::RemoteNode(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath)
-    : Node(name, NodeType::Remote), endpoint_(&endpoint), peer_(peer), remotePath_(std::move(remotePath)) {
+    : Annotated(name, NodeType::Remote), endpoint_(&endpoint), peer_(peer), remotePath_(std::move(remotePath)) {
     if (remotePath_.empty() || remotePath_.front() != '/') remotePath_.insert(0, "/");
     while (remotePath_.size() > 1 && remotePath_.back() == '/') remotePath_.pop_back();
     endpoint_->addRemote(this);

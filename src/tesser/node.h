@@ -31,6 +31,28 @@ struct PeerAddress;
 
 enum class NodeType : uint8_t { Object, Value, Action, Event, Custom, List, Remote };
 
+// A presentation hint (docs/DESIGN.md section 7.1): a key and a string,
+// number or `true`, emitted in the schema under "ui" and never interpreted.
+struct UiHint {
+    enum class Kind : uint8_t { Flag, String, Number };
+    const char* key;
+    union {
+        const char* str;
+        float num;
+    };
+    Kind kind;
+    UiHint* next = nullptr;
+};
+
+// Presentation metadata, allocated only when a node has some.
+struct UiMeta {
+    const char* label = nullptr;
+    const char* unit = nullptr;
+    float step = 0;  // 0: none
+    UiHint* hints = nullptr;
+    ~UiMeta();
+};
+
 // Optional per-node metadata, allocated only when a modifier needs it.
 struct NodeMeta {
     double min = 0;
@@ -39,6 +61,8 @@ struct NodeMeta {
     bool hashed = false;  // watch(): `hash` holds the last sample
     const char* doc = nullptr;
     uint32_t hash = 0;
+    UiMeta* ui = nullptr;
+    ~NodeMeta() { delete ui; }
 };
 
 // Change tracking: a global generation counter, stamped on nodes as they
@@ -80,7 +104,12 @@ protected:
     enum Flags : uint8_t { kReadOnly = 1, kPersist = 2, kDeferring = 4, kLinked = 8, kWatch = 16 };
 
     NodeMeta& editMeta();
+    UiMeta* editUi();  // null when compiled out (TESSER_NO_UI)
     void setDoc(const char* text);
+    void setRange(double min, double max);
+    void addHint(const char* key, UiHint::Kind kind, const char* str, float num);
+    // Range check for values and numeric action arguments.
+    Check checkRange(double v) const;
 
     const char* name_;
     Node* next_ = nullptr;
@@ -90,16 +119,64 @@ protected:
     std::atomic<uint16_t> generation_{0};
 };
 
-// A typed scalar. Concrete classes bind it to a variable or to functions.
-class ValueNode : public Node {
+// The modifiers every node type has, returning the node's own type so they
+// chain with its specific ones. Description, label, unit, step and hints are
+// schema metadata only (docs/DESIGN.md section 7.1).
+template <class Self>
+class Annotated : public Node {
 public:
-    explicit ValueNode(const char* name) : Node(name, NodeType::Value) {}
+    using Node::Node;
+
+    // Schema description. Compiled out with TESSER_NO_DESCRIPTIONS.
+    Self& doc(const char* text) {
+        setDoc(text);
+        return self();
+    }
+    // Human-readable name, for user interfaces. The rest of this group is
+    // compiled out with TESSER_NO_UI.
+    Self& label(const char* text) {
+        if (UiMeta* m = editUi()) m->label = text;
+        return self();
+    }
+    // Unit of a value or of an action's argument: "%", "°C", "ms".
+    Self& unit(const char* text) {
+        if (UiMeta* m = editUi()) m->unit = text;
+        return self();
+    }
+    // Input granularity. A hint: writes are not rounded or checked against it.
+    Self& step(double s) {
+        if (UiMeta* m = editUi()) m->step = static_cast<float>(s);
+        return self();
+    }
+    // Presentation hints for renderers: ui("advanced") is a flag,
+    // ui("widget", "knob") a string, ui("precision", 1) a number.
+    Self& ui(const char* key) {
+        addHint(key, UiHint::Kind::Flag, nullptr, 0);
+        return self();
+    }
+    Self& ui(const char* key, const char* value) {
+        addHint(key, UiHint::Kind::String, value, 0);
+        return self();
+    }
+    template <class T, std::enable_if_t<std::is_arithmetic<T>::value && !std::is_same<T, bool>::value, int> = 0>
+    Self& ui(const char* key, T value) {
+        addHint(key, UiHint::Kind::Number, nullptr, static_cast<float>(value));
+        return self();
+    }
+
+private:
+    Self& self() { return static_cast<Self&>(*this); }
+};
+
+// A typed scalar. Concrete classes bind it to a variable or to functions.
+class ValueNode : public Annotated<ValueNode> {
+public:
+    explicit ValueNode(const char* name) : Annotated(name, NodeType::Value) {}
 
     // Numeric bounds, checked on write and reported in the schema.
     ValueNode& range(double min, double max);
     ValueNode& readOnly();
     ValueNode& persist();
-    ValueNode& doc(const char* text);
     // Samples the value periodically (Config::watchIntervalMs, while anyone
     // is subscribed) and marks it changed when it differs. For bound state
     // the application doesn't report with changed().
@@ -119,7 +196,6 @@ public:
 
 protected:
     virtual bool canWrite() const = 0;
-    Check checkRange(double v) const;
 };
 
 namespace detail {
@@ -293,9 +369,9 @@ private:
 
 // Something that happens: emit() pushes it to subscribers right away, never
 // coalesced. Events have no value; they appear only in the schema.
-class EventNode : public Node {
+class EventNode : public Annotated<EventNode> {
 public:
-    explicit EventNode(const char* name) : Node(name, NodeType::Event) {}
+    explicit EventNode(const char* name) : Annotated(name, NodeType::Event) {}
 
     void emit();  // null payload
     void emit(JsonVariantConst payload);
@@ -306,17 +382,12 @@ public:
     // Arbitrary JSON payload. Thread-safe; takes the API lock.
     void emitWith(const std::function<void(JsonWriter&)>& write);
 
-    EventNode& doc(const char* text) {
-        setDoc(text);
-        return *this;
-    }
-
 private:
     Api* api_ = nullptr;  // found on the first emit()
     std::string path_;
 };
 
-class ActionNode : public Node {
+class ActionNode : public Annotated<ActionNode> {
 public:
     // Converts the argument and runs the action; the result goes through
     // call.reply() / call.fail() / call.defer().
@@ -325,7 +396,7 @@ public:
 
     ActionNode(const char* name, Invoker invoker, ArgCheck argCheck, const char* argKindName,
                const char* returnKindName, bool defers)
-        : Node(name, NodeType::Action),
+        : Annotated(name, NodeType::Action),
           invoke_(std::move(invoker)),
           check_(argCheck),
           argKind_(argKindName),
@@ -333,12 +404,18 @@ public:
         if (defers) flags_ |= kDeferring;
     }
 
-    ActionNode& doc(const char* text) {
-        setDoc(text);
+    // Bounds for a numeric argument, checked before the action runs and
+    // reported in the schema.
+    ActionNode& range(double min, double max) {
+        setRange(min, max);
         return *this;
     }
 
-    Check check(JsonVariantConst arg) const { return check_ ? check_(arg) : Check::ok(); }
+    Check check(JsonVariantConst arg) const {
+        Check c = check_ ? check_(arg) : Check::ok();
+        if (c.isOk() && arg.is<double>()) c = checkRange(arg.as<double>());
+        return c;
+    }
     void invoke(JsonVariantConst arg, Call& call) { invoke_(arg, call); }
     bool deferring() const { return flags_ & kDeferring; }
     const char* argKind() const { return argKind_; }        // null: no argument
@@ -352,14 +429,14 @@ private:
 };
 
 // Escape hatch: user code writes the JSON and applies incoming values.
-class CustomNode : public Node {
+class CustomNode : public Annotated<CustomNode> {
 public:
     using Writer = std::function<void(JsonWriter&)>;
     using Applier = std::function<Status(JsonVariantConst)>;
     using Validator = std::function<Check(JsonVariantConst)>;
 
     CustomNode(const char* name, Writer writer, Applier applier)
-        : Node(name, NodeType::Custom), writer_(std::move(writer)), applier_(std::move(applier)) {}
+        : Annotated(name, NodeType::Custom), writer_(std::move(writer)), applier_(std::move(applier)) {}
 
     CustomNode& validate(Validator v) {
         validator_ = std::move(v);
@@ -367,10 +444,6 @@ public:
     }
     CustomNode& persist() {
         flags_ |= kPersist;
-        return *this;
-    }
-    CustomNode& doc(const char* text) {
-        setDoc(text);
         return *this;
     }
 
@@ -394,9 +467,9 @@ private:
 // A std::vector of described objects (docs/DESIGN.md section 4.4). Elements
 // are described on demand into temporary objects, so a list costs one node
 // however long it is.
-class ListNode : public Node {
+class ListNode : public Annotated<ListNode> {
 public:
-    explicit ListNode(const char* name) : Node(name, NodeType::List) {}
+    explicit ListNode(const char* name) : Annotated(name, NodeType::List) {}
 
     virtual size_t size() const = 0;
     // A temporary object describing element `i` (< size()).
@@ -413,10 +486,6 @@ public:
     size_t maxSize() const { return maxSize_; }
     ListNode& persist() {
         flags_ |= kPersist;
-        return *this;
-    }
-    ListNode& doc(const char* text) {
-        setDoc(text);
         return *this;
     }
 
@@ -504,9 +573,9 @@ struct HasDescribeMember<T, std::void_t<decltype(std::declval<T&>().describe(std
 
 }  // namespace detail
 
-class Object : public Node {
+class Object : public Annotated<Object> {
 public:
-    explicit Object(const char* name) : Node(name, NodeType::Object) {}
+    explicit Object(const char* name) : Annotated(name, NodeType::Object) {}
     ~Object() override;
 
     // Child object; returns the existing one when the name is already an object.
@@ -619,10 +688,6 @@ public:
     template <class T>
     Object& mount(const char* name, T& thing);
 
-    Object& doc(const char* text) {
-        setDoc(text);
-        return *this;
-    }
     // Persists every value below this object (see Api::persistence()).
     Object& persist() {
         flags_ |= kPersist;

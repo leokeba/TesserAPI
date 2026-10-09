@@ -87,11 +87,55 @@ void Node::setDoc(const char* text) {
 #endif
 }
 
-ValueNode& ValueNode::range(double min, double max) {
+UiMeta::~UiMeta() {
+    while (hints) {
+        UiHint* next = hints->next;
+        delete hints;
+        hints = next;
+    }
+}
+
+UiMeta* Node::editUi() {
+#if !defined(TESSER_NO_UI)
+    NodeMeta& m = editMeta();
+    if (!m.ui) m.ui = new UiMeta();
+    return m.ui;
+#else
+    return nullptr;
+#endif
+}
+
+void Node::addHint(const char* key, UiHint::Kind kind, const char* str, float num) {
+    UiMeta* m = editUi();
+    if (!m || !key) return;
+    // Setting a key again replaces it; otherwise hints keep declaration order.
+    UiHint** at = &m->hints;
+    for (; *at; at = &(*at)->next) {
+        if (strcmp((*at)->key, key) == 0) break;
+    }
+    UiHint* h = *at;
+    if (!h) {
+        h = new UiHint();
+        h->key = key;
+        *at = h;
+    }
+    h->kind = kind;
+    if (kind == UiHint::Kind::Number) {
+        h->num = num;
+    } else {
+        h->str = str;
+    }
+}
+
+void Node::setRange(double min, double max) {
     NodeMeta& m = editMeta();
     m.min = min;
     m.max = max;
     m.hasRange = true;
+}
+
+ValueNode& ValueNode::range(double min, double max) {
+    setRange(min, max);
     return *this;
 }
 
@@ -111,12 +155,7 @@ ValueNode& ValueNode::watch() {
     return *this;
 }
 
-ValueNode& ValueNode::doc(const char* text) {
-    setDoc(text);
-    return *this;
-}
-
-Check ValueNode::checkRange(double v) const {
+Check Node::checkRange(double v) const {
     if (meta_ && meta_->hasRange && (v < meta_->min || v > meta_->max)) {
         return Check::fail(Status::InvalidValue, "out of range");
     }
