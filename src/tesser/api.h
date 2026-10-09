@@ -43,6 +43,11 @@ struct Subscription {
     bool remotes = true;
     uint16_t since = 0;  // generation of the last flush
     uint32_t lastFlushMs = 0;
+    // Forwarded below a remote node (docs/DESIGN.md section 14): the remote
+    // node relays its changes; poll() leaves it alone.
+    bool forwarded = false;
+    bool snapshot = true;
+    Reply* waiting = nullptr;  // detached reply awaiting the remote's snapshot
 };
 
 class Storage;
@@ -125,6 +130,9 @@ public:
     void addSubscription(Subscription&& sub);
     size_t removeSubscriptions(Subscriber* subscriber, std::string_view path);
     void emitEvent(const std::string& path, const std::function<void(JsonWriter&)>& write);
+    // Calls fn for each forwarded subscription to `node`, under the API lock;
+    // fn returns false to remove the subscription. Used by RemoteNode.
+    void forwardedSubscriptions(const Node* node, const std::function<bool(Subscription&)>& fn);
     // Finds the API whose tree holds `node`, and the node's path.
     static Api* owner(const Node& node, std::string& path);
 
@@ -151,6 +159,9 @@ private:
     void runQueued();
     void handleNow(const Request& request, Reply& reply);
     void flush(Subscription& sub, uint32_t nowMs);
+    // After subscriptions were removed: answers the waiting ones, and lets
+    // remote nodes drop upstream subscriptions nobody uses any more.
+    void subscriptionsRemoved(std::vector<Subscription>& gone, bool clientGone);
     void sampleWatched(Node& node);
     void checkPersistence(uint32_t nowMs);
 

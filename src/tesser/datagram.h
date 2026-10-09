@@ -115,6 +115,7 @@ public:
 
     Stats stats() const;
     size_t pendingCalls() const;
+    uint32_t now() const { return clock_ ? clock_() : 0; }
     Api* api() const { return api_; }
 
 private:

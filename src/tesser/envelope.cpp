@@ -141,6 +141,14 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
         }
         request.query.events = events.as<bool>();
     }
+    JsonVariantConst snapshot = env["snapshot"];
+    if (!snapshot.isNull()) {
+        if (!snapshot.is<bool>()) {
+            message = "snapshot must be a boolean";
+            return Status::BadRequest;
+        }
+        request.query.snapshot = snapshot.as<bool>();
+    }
     request.body = env["body"];
     return Status::Ok;
 }

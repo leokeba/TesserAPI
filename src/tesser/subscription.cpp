@@ -2,7 +2,9 @@
 #include <string.h>
 
 #include "tesser/api.h"
+#include "tesser/call.h"
 #include "tesser/detail/lazy_patch.h"
+#include "tesser/remote.h"
 
 namespace tesser {
 
@@ -87,6 +89,13 @@ Api::Api() : Object("") {
 
 Api::~Api() {
     {
+        MutexGuard guard(mutex_);
+        for (Subscription& s : subs_) {
+            if (s.waiting) s.waiting->release();
+        }
+        subs_.clear();
+    }
+    {
         MutexGuard guard(queueMutex_);
         for (QueuedRequest* q : queue_) {
             q->reply->release();
@@ -158,16 +167,45 @@ void Api::addSubscription(Subscription&& sub) {
 
 size_t Api::removeSubscriptions(Subscriber* subscriber, std::string_view path) {
     MutexGuard guard(mutex_);
-    size_t removed = 0;
+    std::vector<Subscription> gone;
     for (size_t i = 0; i < subs_.size();) {
         if (subs_[i].subscriber == subscriber && subs_[i].path == path) {
+            gone.push_back(std::move(subs_[i]));
             subs_.erase(subs_.begin() + static_cast<std::ptrdiff_t>(i));
-            removed++;
         } else {
             i++;
         }
     }
-    return removed;
+    subscriptionsRemoved(gone, false);
+    return gone.size();
+}
+
+void Api::subscriptionsRemoved(std::vector<Subscription>& gone, bool clientGone) {
+    for (Subscription& g : gone) {
+        if (g.waiting) {
+            if (!clientGone) writeError(*g.waiting, Status::NotFound, g.path, "unsubscribed before the remote answered");
+            g.waiting->release();
+            g.waiting = nullptr;
+            pendingDone();
+        }
+    }
+    for (const Subscription& g : gone) {
+        if (!g.forwarded) continue;
+        bool used = false;
+        for (const Subscription& s : subs_) used = used || (s.node == g.node && s.path == g.path);
+        if (!used) static_cast<RemoteNode*>(g.node)->released(g.path);
+    }
+}
+
+void Api::forwardedSubscriptions(const Node* node, const std::function<bool(Subscription&)>& fn) {
+    MutexGuard guard(mutex_);
+    for (size_t i = 0; i < subs_.size();) {
+        if (subs_[i].forwarded && subs_[i].node == node && !fn(subs_[i])) {
+            subs_.erase(subs_.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            i++;
+        }
+    }
 }
 
 void Api::dropSubscriber(Subscriber* subscriber) {
@@ -185,13 +223,16 @@ void Api::dropSubscriber(Subscriber* subscriber) {
         }
     }
     MutexGuard guard(mutex_);
+    std::vector<Subscription> gone;
     for (size_t i = 0; i < subs_.size();) {
         if (subs_[i].subscriber == subscriber) {
+            gone.push_back(std::move(subs_[i]));
             subs_.erase(subs_.begin() + static_cast<std::ptrdiff_t>(i));
         } else {
             i++;
         }
     }
+    subscriptionsRemoved(gone, true);
 }
 
 size_t Api::subscriptionCount() const {
@@ -210,7 +251,9 @@ void Api::poll(uint32_t nowMs) {
         lastWatchMs_ = nowMs;
         sampleWatched(*this);
     }
-    for (Subscription& sub : subs_) flush(sub, nowMs);
+    for (Subscription& sub : subs_) {
+        if (!sub.forwarded) flush(sub, nowMs);
+    }
 }
 
 void Api::sampleWatched(Node& node) {
@@ -297,7 +340,7 @@ void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter
 
     std::vector<Subscriber*> notified;
     for (const Subscription& sub : subs_) {
-        if (!sub.events) continue;
+        if (!sub.events || sub.waiting) continue;
         // The subscription's path must be a prefix of the event's, at a
         // segment boundary, within its depth and key filter.
         std::string_view ev(path);

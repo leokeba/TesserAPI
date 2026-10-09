@@ -44,6 +44,22 @@ inline Resp subscribe(Api& api, tesser::Subscriber* sub, const char* path, Query
     return request(api, sub, Op::Subscribe, path, q);
 }
 
+TEST(sub_without_snapshot) {
+    cases::Device d;
+    FakeSubscriber s;
+    Query q;
+    q.snapshot = false;
+    Resp r = subscribe(d.api, &s, "/lamp", q);
+    CHECK_EQ(r.status, Status::Ok);
+    CHECK_EQ(r.body, "null");
+    cases::set(d.api, "/lamp/on", "true");
+    d.api.poll(1000);
+    CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"on\":true}}");
+    q.interval = 5;
+    CHECK_EQ(tesser::buildRequestEnvelope(3, Op::Subscribe, "/lamp", q, std::string_view()),
+             "{\"id\":3,\"op\":\"sub\",\"path\":\"/lamp\",\"interval\":5,\"snapshot\":false}");
+}
+
 TEST(sub_snapshot_and_changes) {
     cases::Device d;
     FakeSubscriber s;

@@ -159,9 +159,10 @@ public:
             auto& remote = static_cast<RemoteNode&>(*target);
             bool itself = remoteRest_.empty();
             if (req_.op == Op::Get || req_.op == Op::Set) return forward(remote);
-            // Subscriptions: to a mirrored remote node itself, locally.
-            if (!itself || !remote.mirrored()) {
-                return replyError(Status::NotAllowed, "subscribe to a mirrored remote node itself", base_);
+            // A mirrored remote node itself is subscribed to locally, like a
+            // value; anything else is forwarded. Unsubscribing is local.
+            if (req_.op == Op::Subscribe && (!itself || !remote.mirrored())) {
+                return remote.subscribe(api_, req_, remoteRest_, base_, reply_);
             }
         }
         switch (req_.op) {
@@ -571,8 +572,8 @@ private:
         }
         Status allowed = api_.subscriptionAllowed(req_.subscriber);
         if (allowed != Status::Ok) return replyError(allowed, "too many subscriptions", base_);
-        if (target.type() == NodeType::Event) {
-            // Nothing to snapshot.
+        if (target.type() == NodeType::Event || !req_.query.snapshot) {
+            // Nothing to snapshot, or the client doesn't want one.
             JsonWriter w(reply_.begin(Status::Ok));
             w.null();
             detail::finishBody(reply_, w, base_);

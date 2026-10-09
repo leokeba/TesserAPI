@@ -375,7 +375,7 @@ These transports are message-based and two-way, so they share one JSON envelope.
 ```
 
 - **`id`:** any JSON scalar, echoed verbatim. It may be omitted, in which case the response also has no `id`.
-- **`op`:** `get`, `set`, `sub` or `unsub`. The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `events` and `body` map one-to-one onto `Request`.
+- **`op`:** `get`, `set`, `sub` or `unsub`. The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `events`, `snapshot` and `body` map one-to-one onto `Request`.
 - **Unknown envelope keys** are ignored, for forward compatibility.
 - **Response:** the response is written as a stream: `{"id":…,"status":"…","body":` followed by the body and then `}`. Buffered transports can still replace it with an error if the body overflows the limit.
 - **Framing** is the transport's job:
@@ -469,6 +469,7 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 | `keys`, `exclude`, `depth` | Same as for get, applied to both the snapshot and the notifications. Shapes are not supported. |
 | `interval` | At most one change notification per `interval` ms (default 0: every `poll()`). Intermediate states are coalesced. |
 | `events` | Also deliver events under the path (default `true`). |
+| `snapshot` | Reply with the current state (default `true`). With `false` the reply body is `null`, for clients that read large subtrees in pieces with gets. |
 
 **Notifications:**
 - A change notification is a **sparse merge patch** rooted at the subscription path, holding only the values changed since the last notification. Clients apply it exactly like a `set` body, so one format serves writes, notifications and persistence. For a subscription to a single value, the body is the value.
@@ -544,11 +545,18 @@ nowApi.remote(api, "light", kitchenMac, "/lamp").mirror(200);
 
 - **Forwarding:** get and set on `/kitchen/...` are forwarded with the path rewritten, and complete through a deferred reply (`maxPending` applies). Error paths in the remote's reply are mapped back under the local path (`/kitchen/nope`). A silent node answers `timeout` after the node's `timeout()` (default: the endpoint's 3 s). Transports that can't wait get `not_allowed`.
 - **Writes** must target the remote subtree: a patch of the parent can't include a remote node.
-- **Without a mirror**, a remote node renders as `null` in a parent read, and as `{"type": "remote"}` in the schema; reads below it are always forwarded live.
+- **Without a mirror**, a remote node renders as `null` in a parent read, and as `{"type": "remote"}` in the schema; reads below it are always forwarded live, and subscriptions are forwarded (below).
 - **`.mirror(intervalMs, refreshMs)`** keeps a local copy through a subscription. The copy is renewed every `refreshMs`, in case the remote node restarted.
   - Parent reads include the copy, respecting `depth`.
   - Local subscribers get the remote's changes as changes of the remote node, and its events under the local path (`/kitchen/button/pressed`).
-  - Subscribing to a mirrored remote node itself is allowed; subscribing below a remote node is not.
+  - Subscribing to a mirrored remote node itself is a local subscription to the copy.
+- **Forwarded subscriptions:** a subscription below a remote node, or to an unmirrored remote node itself, is forwarded. This is how a browser on the gateway follows a NowTP node's state without a mirror.
+  - **Shared upstream:** local subscribers of the same path share one upstream subscription to that path, which holds the whole subtree (no keys, unlimited depth). The gateway keeps its state as a copy, merged with each notification.
+  - **Snapshots:** the first subscriber's reply waits for the upstream snapshot (a deferred reply, so `maxPending` applies; transports that can't wait get `not_allowed`). Later ones are answered from the copy at once.
+  - **Filtering:** each local subscription's `keys`, `exclude` and `depth` are applied by the gateway, to its snapshot and to every relayed change. Unknown keys are not reported, since the gateway doesn't know the remote's tree. `interval` and `remotes` are taken from the first subscriber; changes are relayed as they arrive.
+  - **Events** under an upstream subscription's path come out under the local path, like a mirror's, to every local subscriber they concern.
+  - **Lifetime:** the upstream subscription ends with its last local subscriber (unsubscribe, or the client going away). It is renewed every `refreshMs` (default 30 s; every 2 s after a failed renewal) in case the remote restarted. If the renewed state differs from the copy, every subscriber gets the whole state as one change.
+  - **Limit:** two remote nodes of one gateway that reach the same remote path through the same endpoint share that path's subscription on the remote, so unsubscribing one ends both. Mount a peer once.
 - **No loops:** the `remotes: false` request option leaves mirrored remote nodes out of a read or subscription. Mirrors always subscribe with it, so a mirrored copy never contains copies of copies, and two gateways mounting each other stay flat. Requests below a remote node are forwarded live and may cross several hops.
 - **Lifetime:** the API must outlive its transports. A remote node and its endpoint may be destroyed in either order: a destroyed endpoint detaches its remote nodes.
 - **Channel:** on a gateway, Wi-Fi station mode and ESP-NOW share one channel, so every node must be on the router's channel.

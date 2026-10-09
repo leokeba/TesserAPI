@@ -106,7 +106,8 @@ TEST(remote_mirror) {
     Rig r;
     r.kitchen.mirror(0, 30000);
     subscription_cases::FakeSubscriber local;
-    // Subscribing below a remote node isn't possible; to the node itself is.
+    // Below a remote node, subscriptions are forwarded, which needs a
+    // transport that can wait; the mirrored node itself is subscribed locally.
     CHECK_EQ(subscription_cases::subscribe(r.gateway, &local, "/kitchen/lamp").status, Status::NotAllowed);
     r.net.run();  // the gateway's endpoint subscribes to the device
     CHECK(r.kitchen.hasCopy());
@@ -135,6 +136,115 @@ TEST(remote_mirror) {
     r.net.run();
     CHECK_EQ(r.device.api.subscriptionCount(), 1u);
     CHECK_EQ(r.gatewayEnd.stats().timeouts, 0u);
+}
+
+TEST(remote_forwarded_subscriptions) {
+    Rig r;
+    // The first subscriber waits for the upstream subscription's snapshot.
+    CHECK_EQ(r.ask("{\"id\":1,\"op\":\"sub\",\"path\":\"/kitchen/lamp\",\"keys\":\"on\"}"),
+             "{\"id\":1,\"status\":\"ok\",\"body\":{\"on\":false}}");
+    CHECK_EQ(r.device.api.subscriptionCount(), 1u);
+    CHECK_EQ(r.kitchen.upstreamCount(), 1u);
+    // Later ones share it, and get their snapshot from its copy at once.
+    subscription_cases::FakeSubscriber local;
+    CHECK_EQ(subscription_cases::subscribe(r.gateway, &local, "/kitchen/lamp").body,
+             "{\"on\":false,\"brightness\":128,\"label\":\"desk\"}");
+    CHECK_EQ(r.device.api.subscriptionCount(), 1u);
+    CHECK_EQ(r.gateway.subscriptionCount(), 2u);
+
+    // Changes are relayed through each subscriber's own filter.
+    r.lines.out.clear();
+    cases::set(r.device.api, "/lamp/brightness", "42");
+    r.device.api.poll(1000);
+    r.net.run();
+    CHECK_EQ(local.last(), "{\"op\":\"change\",\"path\":\"/kitchen/lamp\",\"body\":{\"brightness\":42}}");
+    CHECK_EQ(r.lines.out.size(), 0u);  // keys=on: nothing for the serial client
+    cases::set(r.device.api, "/lamp/on", "true");
+    r.device.api.poll(1010);
+    r.net.run();
+    CHECK_EQ(r.lines.out.size(), 1u);
+    if (!r.lines.out.empty()) {
+        CHECK_EQ(r.lines.out[0], "{\"op\":\"change\",\"path\":\"/kitchen/lamp\",\"body\":{\"on\":true}}");
+    }
+
+    // The remote node itself, unmirrored: depth applies, events come through.
+    CHECK_EQ(r.ask("{\"id\":2,\"op\":\"sub\",\"path\":\"/kitchen\",\"depth\":1,\"snapshot\":false}"),
+             "{\"id\":2,\"status\":\"ok\",\"body\":null}");
+    CHECK_EQ(r.kitchen.upstreamCount(), 2u);
+    r.lines.out.clear();
+    cases::set(r.device.api, "/lamp/brightness", "43");  // two levels down: not for depth 1
+    r.device.api.poll(1020);
+    r.net.run();
+    CHECK_EQ(r.lines.out.size(), 0u);
+    r.pressed.emit(4);  // two levels down too
+    r.net.run();
+    CHECK_EQ(r.lines.out.size(), 0u);
+    CHECK_EQ(r.ask("{\"id\":4,\"op\":\"sub\",\"path\":\"/kitchen/button\"}"), "{\"id\":4,\"status\":\"ok\",\"body\":{}}");
+    r.lines.out.clear();
+    r.pressed.emit(5);
+    r.net.run();
+    CHECK_EQ(r.lines.out.size(), 1u);
+    if (!r.lines.out.empty()) CHECK_EQ(r.lines.out[0], "{\"op\":\"event\",\"path\":\"/kitchen/button/pressed\",\"body\":5}");
+
+    // Renewal replaces the upstream subscriptions; a change the remote never
+    // announced comes out as the whole state.
+    r.device.lamp.brightness = 77;  // no changed(): nobody is told
+    r.net.clock += 31000;
+    r.net.run();
+    CHECK_EQ(r.device.api.subscriptionCount(), 3u);
+    CHECK_EQ(local.last(),
+             "{\"op\":\"change\",\"path\":\"/kitchen/lamp\",\"body\":{\"on\":true,\"brightness\":77,\"label\":\"desk\"}}");
+
+    // The upstream subscription ends with its last local subscriber.
+    CHECK_EQ(r.ask("{\"id\":3,\"op\":\"unsub\",\"path\":\"/kitchen/lamp\"}"), "{\"id\":3,\"status\":\"ok\",\"body\":1}");
+    CHECK_EQ(r.kitchen.upstreamCount(), 3u);
+    r.gateway.dropSubscriber(&local);
+    r.net.run();
+    CHECK_EQ(r.kitchen.upstreamCount(), 2u);
+    CHECK_EQ(r.device.api.subscriptionCount(), 2u);
+    CHECK_EQ(r.gateway.pending(), 0);
+}
+
+TEST(remote_forwarded_subscription_failures) {
+    Rig r;
+    r.gateway.remote("ghost", r.gatewayEnd, addr(9)).timeout(500);
+    CHECK_EQ(r.ask("{\"id\":1,\"op\":\"sub\",\"path\":\"/ghost/a\"}"), "<0 lines>");
+    CHECK_EQ(r.gateway.subscriptionCount(), 1u);  // waiting
+    r.net.clock += 600;
+    r.gatewayEnd.process();
+    CHECK_EQ(r.lines.out.size(), 1u);
+    if (!r.lines.out.empty()) {
+        CHECK_EQ(r.lines.out[0],
+                 "{\"id\":1,\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"path\":\"/ghost\","
+                 "\"message\":\"remote node didn't answer\"}}");
+    }
+    CHECK_EQ(r.gateway.subscriptionCount(), 0u);
+    CHECK_EQ(r.gateway.pending(), 0);
+    // A remote error comes back under the local path, and nothing is kept.
+    CHECK_EQ(r.ask("{\"id\":2,\"op\":\"sub\",\"path\":\"/kitchen/nope\"}"),
+             "{\"id\":2,\"status\":\"not_found\",\"body\":{\"error\":\"not_found\",\"path\":\"/kitchen/nope\","
+             "\"message\":\"no such node\"}}");
+    CHECK_EQ(r.gateway.subscriptionCount(), 0u);
+    CHECK_EQ(r.kitchen.upstreamCount(), 0u);
+    // A client that leaves while waiting is forgotten; the late upstream
+    // subscription is undone.
+    subscription_cases::FakeSubscriber gone;
+    {
+        // A detachable reply, as message transports have.
+        struct Detachable : tesser::StringReply {
+            Reply* detach() override { return new tesser::StringReply(); }
+        } reply;
+        tesser::Request req;
+        req.op = tesser::Op::Subscribe;
+        req.path = "/kitchen/sensors";
+        req.subscriber = &gone;
+        r.gateway.handle(req, reply);
+    }
+    r.gateway.dropSubscriber(&gone);
+    CHECK_EQ(r.gateway.pending(), 0);
+    r.net.run();
+    CHECK_EQ(r.device.api.subscriptionCount(), 0u);
+    CHECK_EQ(r.kitchen.upstreamCount(), 0u);
 }
 
 TEST(remote_mutual_mirrors_dont_loop) {

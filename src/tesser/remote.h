@@ -1,6 +1,8 @@
 #pragma once
 
+#include <memory>
 #include <string>
+#include <vector>
 
 #include <ArduinoJson.h>
 
@@ -10,6 +12,8 @@
 #include "tesser/request.h"
 
 namespace tesser {
+
+struct Subscription;
 
 // Another node's tree grafted into this one (docs/DESIGN.md section 14):
 // requests below it are forwarded over a DatagramEndpoint (NowTP, ...), and
@@ -53,13 +57,41 @@ public:
     virtual void forward(Api& api, const Request& request, std::string_view rest, std::string_view base,
                          Reply& reply);
 
+    // Subscribes a local client below this node (`rest`, "" for the node
+    // itself when it isn't mirrored). Clients of the same path share one
+    // upstream subscription; see docs/DESIGN.md section 14. Called by the
+    // request handler, under the API lock.
+    virtual void subscribe(Api& api, const Request& request, std::string_view rest, std::string_view base,
+                           Reply& reply);
+    // The last local subscription to `localPath` is gone. Called by the API,
+    // under its lock.
+    virtual void released(std::string_view localPath);
+    // Upstream subscriptions currently held (tests, diagnostics).
+    size_t upstreamCount() const;
+
     // Called by the endpoint, from process(), and when it is destroyed.
     void tick(uint32_t nowMs);
     void detach() { endpoint_ = nullptr; }
     bool handleNotification(const PeerAddress& from, JsonObjectConst envelope);
 
 private:
+    // One subscription to the remote node, shared by local subscribers.
+    struct Upstream {
+        std::string rest;  // below this node; "" for the node itself
+        JsonDocument copy;  // the remote's state, kept with its notifications
+        bool ready = false;
+        bool subscribing = false;
+        bool stale = false;  // a renewal failed: retry soon
+        uint32_t interval = 0;
+        uint32_t lastSubscribeMs = 0;
+    };
+
     bool localPath(std::string& out);
+    Upstream* findUpstream(std::string_view rest);
+    std::string remotePathOf(std::string_view rest) const;
+    bool sendUpstream(const std::string& rest, uint32_t interval, bool renew);
+    void upstreamReply(const std::string& rest, Status status, JsonVariantConst body);
+    bool relayChange(std::string_view rest, JsonVariantConst patch);
 
     DatagramEndpoint* endpoint_;
     PeerAddress peer_;
@@ -77,6 +109,7 @@ private:
     bool hasCopy_ = false;
     Api* api_ = nullptr;
     std::string localPath_;
+    std::vector<std::unique_ptr<Upstream>> upstreams_;  // guarded by mutex_
 };
 
 }  // namespace tesser

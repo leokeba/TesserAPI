@@ -49,6 +49,10 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
             w.key("events");
             w.boolean(false);
         }
+        if (!query.snapshot) {
+            w.key("snapshot");
+            w.boolean(false);
+        }
     }
     if (!bodyJson.empty()) {
         w.key("body");

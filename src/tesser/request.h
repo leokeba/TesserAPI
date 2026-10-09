@@ -35,6 +35,7 @@ struct Query {
     // Subscribe only.
     uint32_t interval = 0;  // minimum ms between change notifications
     bool events = true;     // also deliver events under the path
+    bool snapshot = true;   // reply with the current state (false: with null)
 };
 
 enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket };
