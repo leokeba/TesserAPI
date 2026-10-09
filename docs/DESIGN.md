@@ -87,6 +87,8 @@ The getter has the form `T()`. The setter has the form `void(T)`, or `bool(T)` /
 
 **Supported `T`:** `bool`, all integer types up to 64 bits, `float`, `double`, `std::string`, `char[N]` (a fixed buffer, NUL-terminated), Arduino `String` (when `ARDUINO` is defined), and `const char*` (read-only).
 
+**Enums** are exposed as strings: `o.value("mode", mode, {"off", "auto", "manual"})` names the enumerators in order of their underlying values. Writes accept only those names, and the schema lists them under `"enum"`. An enumerator without a name reads as its number.
+
 **Modifiers** (chainable on the returned node):
 
 | Modifier | Effect |
@@ -368,7 +370,7 @@ http.attach(handle, "/api");     // registers a wildcard URI on an existing http
 - Request bodies are capped by `maxRequestBody`.
 - The status is mapped as in §8.
 - The handler runs in the httpd task (inline mode).
-- `begin()` starts a dedicated server with wildcard URI matching and a 6 KB stack. `attach()` uses 4 handler slots (5 with CORS) on an existing server, which must use `httpd_uri_match_wildcard`.
+- `begin()` starts a dedicated server with wildcard URI matching and an 8 KB stack. `attach()` uses 4 handler slots (5 with CORS, 6 with WebSocket) on an existing server, which must use `httpd_uri_match_wildcard` and should have at least 8 KB of stack. Measured peak use is about 4.9 KB: recursive rendering, newlib's float formatting and lwIP all run on it.
 - `enableCors(origin)` adds `Access-Control-Allow-*` headers and answers `OPTIONS` preflights with 204.
 - The client's IP address is passed to the core in `Client`.
 
@@ -386,6 +388,7 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 - **Security:** ESP-NOW frames aren't authenticated. Writes over NowTP should be restricted with an allowlist of MACs or encrypted peers (§13).
 - **Threading:** NowTP runs its receive callbacks while holding its own lock, so the adapter never handles a request there. It copies each message into a bounded queue (default 8, then `busy`), and a worker task (or `poll()`) handles it under the API lock. The lock order is therefore always API, then NowTP, and replies sent from any API context can't deadlock.
 - **Client:** the same endpoint sends requests to other nodes (`get`, `set`, or `endpoint().request()`) and matches responses by `id`, with a timeout per call (default 3 s) and at most 8 calls in flight. Handlers run in the worker task. `peerLost(mac)` fails a lost peer's calls at once.
+- **Discovery:** `advertise()` puts `{"tesser": <port>, "schema": "<schemaHash>"}` into NowTP discovery metadata, and `parseAdvertisement()` reads it, so clients can tell TesserAPI nodes apart and keep a cached schema while its hash (`Api::schemaHash()`, FNV-1a of the full schema) is unchanged.
 - **Generic core:** all of this lives in `tesser::DatagramEndpoint`, which is platform-independent and host-tested with an in-memory link. Another datagram transport (UDP, LoRa, ...) only needs a send function and a call to `receive()`.
 - **Optional:** the adapter is compiled only when NowTP is available. The core never includes NowTP.
 
@@ -523,7 +526,7 @@ Targets to be measured on a classic ESP32 and a C3, and enforced in CI:
 
 | Item | Target |
 |---|---|
-| Flash, core + HTTP transport | ≤ 40 KB above the application's baseline, ArduinoJson included (measured: 34.6 KB, `examples/idf/http_api` against its `FOOTPRINT_BASELINE` build) |
+| Flash, core + HTTP transport | ≤ 40 KB above the application's baseline, ArduinoJson included (measured below: 45.5 KB) |
 | RAM per value leaf | ≤ 32 B with a bound variable, ≤ 56 B with a getter and setter, + 28 B with a range or description |
 | RAM per object node | ≤ 32 B |
 | Request handling | Request body document (bounded by `maxRequestBody`) + 512 B streaming buffer (HTTP), or the response buffer (NowTP, bounded by `maxResponse`) |
@@ -533,16 +536,27 @@ Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware
 
 | Item | Measured |
 |---|---|
-| `Api` object | 148 B |
+| `Api` object | 324 B (two statically allocated FreeRTOS mutexes make most of it) |
 | Value bound to a variable | 28 B |
 | Value with getter and setter (small captures) | 56 B |
 | Object | 32 B |
-| Value with a range | 56 B (28 B node + 28 B metadata) |
-| Full GET of a 13-leaf tree (227 B response) | 0.4 ms |
-| Envelope parse + keyed GET + reply | 0.6 ms |
+| Value with a range | 64 B (28 B node + 36 B metadata) |
+| List of any length | one node; elements are built per request |
+| Full GET of a 13-leaf tree (227 B response) | 0.43 ms |
+| Envelope parse + keyed GET + reply | 0.9 ms |
+| Peak stack of an HTTP request (schema, patch, shape) | about 4.9 KB |
+| Peak stack of a serial (UART task) request | about 3.5 KB |
 | Serial round trip at 115200 baud | 13 ms (mostly wire time) |
-| HTTP GET over Wi-Fi, new TCP connection each time | 55 ms median |
-| NowTP request and response between two boards | 14 ms median, fragmented 1.5 KB responses included |
+| HTTP GET over Wi-Fi, new TCP connection each time | 55–85 ms median |
+| NowTP request and response between two boards | 13–14 ms median, fragmented 1.5 KB responses included |
+| GET through a gateway (HTTP, then NowTP to the remote node) | 85 ms median |
+
+**Flash:** `examples/idf/http_api` against its `FOOTPRINT_BASELINE` build (the same app on bare `esp_http_server`):
+- **Total:** 45.5 KB for the core, the HTTP transport and ArduinoJson. With `TESSER_NO_SCHEMA`, `TESSER_NO_MESSAGES` and `TESSER_NO_DESCRIPTIONS` it is 43.8 KB.
+- **Against the target:** the 40 KB target was set before subscriptions, events, lists and authorization joined the core. 34.6 KB was measured for core + HTTP at phase 2.
+- **Linked only when used:** remote nodes (and the datagram client), persistence, WebSocket and NowTP. Remote forwarding is virtual and persistence is a hook installed by `persistence()`, so applications that don't use them don't link them.
+
+**No leaks:** running the whole host test suite a second time on the chip moves the heap by exactly the two nodes the duplicate-name test deliberately leaves unlinked.
 
 Configuration (`tesser::Config`, at runtime):
 
@@ -586,8 +600,9 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | done |
 
-## 19. Open questions
+## 19. Decisions on former open questions
 
-- **Enum values:** expose them as strings, with the allowed values in the schema.
-- **Binary envelope for NowTP:** only if measurements show the JSON overhead matters at 250-byte frames.
-- **Schema hash in NowTP discovery metadata,** so clients can cache schemas.
+- **Lists of described objects:** implemented (§4.4).
+- **Enum values:** strings, with the allowed values in the schema (§4.1).
+- **Binary envelope for NowTP:** not needed. JSON requests fit in one 250-byte frame, and round trips measure 13–14 ms, dominated by the radio rather than by parsing. Revisit only if a measured workload says otherwise.
+- **Schema hash in NowTP discovery metadata:** implemented (`advertise()`, §10.3).
