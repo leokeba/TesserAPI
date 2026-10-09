@@ -247,6 +247,78 @@ TEST(remote_forwarded_subscription_failures) {
     CHECK_EQ(r.kitchen.upstreamCount(), 0u);
 }
 
+TEST(remote_discovered_peers) {
+    Rig r;
+    cases::Device other;
+    tesser::DatagramEndpoint otherEnd(&other.api, tesser::TransportKind::NowTP, r.net.sender(addr(5)), r.net.clockFn());
+    r.net.nodes.push_back({addr(5), &otherEnd});
+    auto& peers = r.gateway.object("peers");
+    r.gatewayEnd.mountPeers(peers);
+    // A remote node's own reads are forwarded; its stub is in its parent's schema.
+    auto stub = [&](const char* parent, const char* name) {
+        tesser::Query q = cases::schema(1);
+        q.keys = name;
+        return cases::get(r.gateway, parent, q).body;
+    };
+    subscription_cases::FakeSubscriber watcher;
+    CHECK_EQ(subscription_cases::subscribe(r.gateway, &watcher, "/peers", cases::depth(1)).body, "{}");
+
+    // A peer mounted already (as /kitchen) isn't mounted again, but shows
+    // the schema hash it advertises.
+    r.gatewayEnd.peerSeen(addr(2), "kitchen", 0xabc);
+    r.gatewayEnd.process();
+    CHECK_EQ(stub("/", "kitchen"),
+             "{\"type\":\"object\",\"children\":{\"kitchen\":{\"type\":\"remote\",\"schema\":\"00000abc\"}}}");
+
+    // An announcement mounts the peer under its name; repeats don't.
+    r.gatewayEnd.peerSeen(addr(5), "kitchen lamp!", 0x1234abcd);
+    r.gatewayEnd.process();
+    r.gatewayEnd.peerSeen(addr(5), "kitchen lamp!", 0x1234abcd);
+    r.gatewayEnd.process();
+    CHECK_EQ(cases::get(r.gateway, "/peers", cases::schema()).body,
+             "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":{\"type\":\"remote\",\"schema\":\"1234abcd\"}}}");
+    r.gateway.poll(1000);
+    CHECK_EQ(watcher.last(), "{\"op\":\"change\",\"path\":\"/peers\",\"body\":{\"kitchen-lamp\":null}}");
+    CHECK_EQ(r.ask("{\"id\":1,\"op\":\"get\",\"path\":\"/peers/kitchen-lamp/lamp/on\"}"),
+             "{\"id\":1,\"status\":\"ok\",\"body\":false}");
+
+    // A name already taken gets the address's last bytes; an empty one is
+    // only those.
+    r.gatewayEnd.peerSeen(addr(3), "kitchen-lamp", 1);
+    r.gatewayEnd.peerSeen(addr(4), "", 0);
+    r.gatewayEnd.process();
+    CHECK_EQ(cases::get(r.gateway, "/peers", cases::depth(1)).body,
+             "{\"kitchen-lamp\":null,\"kitchen-lamp-75f303\":null,\"75f304\":null}");
+
+    // Lost peers show offline until they are heard from again.
+    r.gateway.poll(1050);
+    watcher.messages.clear();
+    r.gatewayEnd.forgetPeer(addr(5));
+    r.gatewayEnd.process();
+    CHECK_EQ(stub("/peers", "kitchen-lamp"), "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":"
+                                             "{\"type\":\"remote\",\"online\":false,\"schema\":\"1234abcd\"}}}");
+    r.gateway.poll(1100);
+    CHECK_EQ(watcher.last(), "{\"op\":\"change\",\"path\":\"/peers\",\"body\":{\"kitchen-lamp\":null}}");
+    r.ask("{\"id\":2,\"op\":\"get\",\"path\":\"/peers/kitchen-lamp/lamp/on\"}");  // the device answers
+    CHECK_EQ(stub("/peers", "kitchen-lamp"),
+             "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":{\"type\":\"remote\",\"schema\":\"1234abcd\"}}}");
+    // A new schema hash is shown as soon as it is announced.
+    r.gatewayEnd.peerSeen(addr(5), "kitchen lamp!", 0xfeed);
+    r.gatewayEnd.process();
+    CHECK_EQ(stub("/peers", "kitchen-lamp"),
+             "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":{\"type\":\"remote\",\"schema\":\"0000feed\"}}}");
+
+    // Advertisements.
+    std::string ad = tesser::buildAdvertisement(84, 0xfeed);
+    CHECK_EQ(ad, "{\"tesser\":84,\"schema\":\"0000feed\"}");
+    uint8_t port = 0;
+    uint32_t hash = 0;
+    CHECK(tesser::parseAdvertisement(ad, port, hash));
+    CHECK_EQ(port, 84);
+    CHECK_EQ(hash, 0xfeedu);
+    CHECK(!tesser::parseAdvertisement("{\"name\":\"x\"}", port, hash));
+}
+
 TEST(remote_mutual_mirrors_dont_loop) {
     // Two gateways mounting each other: each mirror leaves out the other
     // side's mirrors, so copies never nest.

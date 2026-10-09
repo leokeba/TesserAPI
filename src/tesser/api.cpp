@@ -493,10 +493,21 @@ private:
                 break;
             }
             case NodeType::Remote: {
+                const auto& r = static_cast<const RemoteNode&>(n);
                 w.string("remote");
-                if (static_cast<const RemoteNode&>(n).mirrored()) {
+                if (r.mirrored()) {
                     w.key("mirror");
                     w.boolean(true);
+                }
+                if (!r.online()) {
+                    w.key("online");
+                    w.boolean(false);
+                }
+                if (uint32_t hash = r.advertisedSchema()) {
+                    char hex[9];
+                    snprintf(hex, sizeof(hex), "%08lx", static_cast<unsigned long>(hash));
+                    w.key("schema");
+                    w.string(hex);
                 }
                 break;
             }

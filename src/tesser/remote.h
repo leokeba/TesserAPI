@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -26,6 +27,8 @@ struct Subscription;
 class RemoteNode : public Annotated<RemoteNode> {
 public:
     RemoteNode(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath);
+    // Same, owning a copy of its name (nodes mounted at run time).
+    RemoteNode(std::string name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath);
     ~RemoteNode() override;
 
     // Timeout for forwarded requests (default: the endpoint's).
@@ -45,6 +48,17 @@ public:
     uint32_t timeoutMs() const { return timeoutMs_; }
     bool mirrored() const { return mirror_; }
     bool hasCopy() const;
+
+    // Whether the peer is reachable, as far as the endpoint knows: false
+    // once it is lost (DatagramEndpoint::forgetPeer()), true again when it
+    // is heard from. Shown in the schema; a change marks the node changed,
+    // so subscribers of its parent hear about it.
+    bool online() const { return online_.load(); }
+    void setOnline(bool online);
+    // The schema hash the peer advertises (0: unknown), shown in the schema
+    // so clients can cache the remote's schema under it.
+    uint32_t advertisedSchema() const { return advertisedSchema_.load(); }
+    void setAdvertisedSchema(uint32_t hash);
 
     // The mirrored copy (objects below `depth` levels as {}), or null.
     // Virtual like forward(): keeps the remote code out of applications
@@ -110,6 +124,9 @@ private:
     Api* api_ = nullptr;
     std::string localPath_;
     std::vector<std::unique_ptr<Upstream>> upstreams_;  // guarded by mutex_
+    std::atomic<bool> online_{true};
+    std::atomic<uint32_t> advertisedSchema_{0};
+    std::string ownedName_;
 };
 
 }  // namespace tesser

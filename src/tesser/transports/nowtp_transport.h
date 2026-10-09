@@ -50,6 +50,15 @@ public:
     // Call from your NowTP peer-event handler when a peer is lost: fails its
     // pending calls and drops its subscriptions.
     void peerLost(const nowtp::Mac& mac) { endpoint_.forgetPeer(address(mac)); }
+    // Or hand it every peer event: TesserAPI peers on this port are marked
+    // online (and mounted, with mountPeers()), lost ones offline.
+    //   radio.onPeerEvent([](nowtp::PeerEvent e, const nowtp::PeerInfo& p) { nowApi.peerEvent(e, p); });
+    void peerEvent(nowtp::PeerEvent event, const nowtp::PeerInfo& peer);
+
+    // Mounts every TesserAPI peer on this port under `parent`, named after
+    // its NowTP discovery name (docs/DESIGN.md section 14.1), including the
+    // peers already discovered. Needs peerEvent() for the ones found later.
+    void mountPeers(Object& parent, uint32_t mirrorIntervalMs = 0);
 
     // Requests from these peers count as authenticated (Api::authorize()).
     // ESP-NOW frames carry no proof of origin, so this trusts MAC addresses:

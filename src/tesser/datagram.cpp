@@ -1,5 +1,8 @@
 #include "tesser/datagram.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 #include "tesser/api.h"
 #include "tesser/call.h"
 #include "tesser/envelope.h"
@@ -62,6 +65,22 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
     return out;
 }
 
+std::string buildAdvertisement(uint8_t port, uint32_t schemaHash) {
+    char meta[48];
+    int n = snprintf(meta, sizeof(meta), "{\"tesser\":%u,\"schema\":\"%08lx\"}", unsigned(port),
+                     static_cast<unsigned long>(schemaHash));
+    return std::string(meta, n > 0 ? static_cast<size_t>(n) : 0);
+}
+
+bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash) {
+    JsonDocument doc;
+    if (deserializeJson(doc, metadata.data(), metadata.size())) return false;
+    if (!doc["tesser"].is<uint8_t>() || !doc["schema"].is<const char*>()) return false;
+    port = doc["tesser"].as<uint8_t>();
+    schemaHash = static_cast<uint32_t>(strtoul(doc["schema"].as<const char*>(), nullptr, 16));
+    return true;
+}
+
 DatagramEndpoint::DatagramEndpoint(Api* api, TransportKind kind, SendFn send, ClockFn clock, Options options)
     : api_(api), kind_(kind), send_(std::move(send)), clock_(std::move(clock)), options_(options) {}
 
@@ -95,6 +114,7 @@ Subscriber* DatagramEndpoint::subscriberFor(const PeerAddress& peer, bool create
 
 void DatagramEndpoint::dropPeer(const PeerAddress& peer) {
     expire(0, true, &peer);
+    markOnline(peer, false);
     MutexGuard guard(subscribersMutex_);
     for (size_t i = 0; i < subscribers_.size(); i++) {
         if (subscribers_[i]->peer != peer) continue;
@@ -128,12 +148,18 @@ void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t
 bool DatagramEndpoint::process() {
     bool worked = false;
     std::vector<PeerAddress> lost;
+    std::vector<Seen> seen;
     {
         MutexGuard guard(mutex_);
         lost.swap(lostPeers_);
+        seen.swap(seenPeers_);
     }
     for (const PeerAddress& p : lost) {
         dropPeer(p);
+        worked = true;
+    }
+    for (const Seen& s : seen) {
+        applySeen(s);
         worked = true;
     }
     for (;;) {
@@ -144,6 +170,7 @@ bool DatagramEndpoint::process() {
             msg = std::move(queue_.front());
             queue_.erase(queue_.begin());
         }
+        markOnline(msg.from, true);
         handle(msg);
         worked = true;
     }
@@ -346,6 +373,87 @@ void DatagramEndpoint::forgetPeer(const PeerAddress& peer) {
         lostPeers_.push_back(peer);
     }
     if (onQueued_) onQueued_();
+}
+
+void DatagramEndpoint::mountPeers(Object& parent, uint32_t mirrorIntervalMs) {
+    MutexGuard guard(mutex_);
+    mountParent_ = &parent;
+    mountMirrorMs_ = mirrorIntervalMs;
+}
+
+void DatagramEndpoint::peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash) {
+    {
+        MutexGuard guard(mutex_);
+        for (Seen& s : seenPeers_) {
+            if (s.peer == peer) {  // coalesce repeated announcements
+                s.name.assign(name.data(), name.size());
+                s.schemaHash = schemaHash;
+                return;
+            }
+        }
+        seenPeers_.push_back(Seen{peer, std::string(name), schemaHash});
+    }
+    if (onQueued_) onQueued_();
+}
+
+void DatagramEndpoint::markOnline(const PeerAddress& peer, bool online) {
+    MutexGuard guard(mutex_);
+    for (RemoteNode* r : remotes_) {
+        if (r->peer() == peer) r->setOnline(online);
+    }
+}
+
+namespace {
+
+// A node name from an advertised name: characters names can't hold become
+// '-', and leading or trailing dashes go.
+std::string nodeName(std::string_view advertised) {
+    std::string n;
+    for (char c : advertised) {
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+                  c == '-' || c == '.';
+        n += ok ? c : '-';
+    }
+    while (!n.empty() && n.front() == '-') n.erase(n.begin());
+    while (!n.empty() && n.back() == '-') n.pop_back();
+    return n;
+}
+
+}  // namespace
+
+void DatagramEndpoint::applySeen(const Seen& seen) {
+    bool known = false;
+    Object* parent;
+    uint32_t mirrorMs;
+    {
+        MutexGuard guard(mutex_);
+        for (RemoteNode* r : remotes_) {
+            if (r->peer() != seen.peer) continue;
+            known = true;
+            r->setOnline(true);
+            r->setAdvertisedSchema(seen.schemaHash);
+        }
+        parent = mountParent_;
+        mirrorMs = mountMirrorMs_;
+    }
+    if (known || !parent || !api_) return;
+
+    // Named after the peer; when that is taken or empty, the last three bytes
+    // of its address are added.
+    MutexGuard apiGuard(api_->mutex());
+    std::string name = nodeName(seen.name);
+    if (name.empty() || parent->child(name)) {
+        char suffix[8] = "";
+        const uint8_t* b = seen.peer.bytes;
+        uint8_t n = seen.peer.length;
+        if (n >= 3) snprintf(suffix, sizeof(suffix), "%02x%02x%02x", b[n - 3], b[n - 2], b[n - 1]);
+        name = name.empty() ? std::string(suffix) : name + "-" + suffix;
+    }
+    if (name.empty() || parent->child(name)) return;
+    RemoteNode& node = parent->add(new RemoteNode(std::move(name), *this, seen.peer, "/"));
+    node.setAdvertisedSchema(seen.schemaHash);
+    if (mirrorMs) node.mirror(mirrorMs);
+    node.changed();  // subscribers of the parent see the new key
 }
 
 void DatagramEndpoint::expire(uint32_t now, bool all, const PeerAddress* peer) {

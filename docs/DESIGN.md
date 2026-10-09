@@ -421,7 +421,7 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 - **Security:** ESP-NOW frames aren't authenticated. Writes over NowTP should be restricted with an allowlist of MACs or encrypted peers (§13).
 - **Threading:** NowTP runs its receive callbacks while holding its own lock, so the adapter never handles a request there. It copies each message into a bounded queue (default 8, then `busy`), and a worker task (or `poll()`) handles it under the API lock. The lock order is therefore always API, then NowTP, and replies sent from any API context can't deadlock.
 - **Client:** the same endpoint sends requests to other nodes (`get`, `set`, or `endpoint().request()`) and matches responses by `id`, with a timeout per call (default 3 s) and at most 8 calls in flight. Handlers run in the worker task. `peerLost(mac)` fails a lost peer's calls at once.
-- **Discovery:** `advertise()` puts `{"tesser": <port>, "schema": "<schemaHash>"}` into NowTP discovery metadata, and `parseAdvertisement()` reads it, so clients can tell TesserAPI nodes apart and keep a cached schema while its hash (`Api::schemaHash()`, FNV-1a of the full schema) is unchanged.
+- **Discovery:** `advertise()` puts `{"tesser": <port>, "schema": "<schemaHash>"}` into NowTP discovery metadata, and `parseAdvertisement()` reads it, so clients can tell TesserAPI nodes apart and keep a cached schema while its hash (`Api::schemaHash()`, FNV-1a of the full schema) is unchanged. `peerEvent()` takes NowTP's peer events, and `mountPeers()` mounts the TesserAPI peers it reports (§14.1).
 - **Generic core:** all of this lives in `tesser::DatagramEndpoint`, which is platform-independent and host-tested with an in-memory link. Another datagram transport (UDP, LoRa, ...) only needs a send function and a call to `receive()`.
 - **Optional:** the adapter is compiled only when NowTP is available. The core never includes NowTP.
 
@@ -560,6 +560,30 @@ nowApi.remote(api, "light", kitchenMac, "/lamp").mirror(200);
 - **No loops:** the `remotes: false` request option leaves mirrored remote nodes out of a read or subscription. Mirrors always subscribe with it, so a mirrored copy never contains copies of copies, and two gateways mounting each other stay flat. Requests below a remote node are forwarded live and may cross several hops.
 - **Lifetime:** the API must outlive its transports. A remote node and its endpoint may be destroyed in either order: a destroyed endpoint detaches its remote nodes.
 - **Channel:** on a gateway, Wi-Fi station mode and ESP-NOW share one channel, so every node must be on the router's channel.
+
+### 14.1 Discovered peers
+
+A gateway can mount the nodes it discovers instead of declaring them:
+
+```cpp
+radio.onPeerEvent([](nowtp::PeerEvent e, const nowtp::PeerInfo& p) { nowApi.peerEvent(e, p); });
+nowApi.mountPeers(api.object("peers"));   // also mounts the peers already discovered
+nowApi.advertise();                       // on every node, once its tree is complete
+```
+
+- **Mounting:** each peer that advertises TesserAPI on the transport's port becomes a remote node under the parent, named after its NowTP discovery name. Characters a name can't hold become `-`. If the name is empty or taken, the last three address bytes are appended (`tesser-lamp-75f303`). `mountPeers(parent, intervalMs)` also mirrors them. A peer that already has a remote node, declared or mounted, isn't mounted again.
+- **Nodes are never removed.** A lost peer stays mounted and shows offline; it comes back online as soon as it is heard from or announces itself again.
+- **Remote node stub:** the parent's schema shows each remote node's state. `"online": false` appears while the peer is lost, and `"schema"` is the hash the peer advertises, so a client can cache the peer's own schema under it:
+
+  ```json
+  GET /peers?view=schema&depth=1
+  {"type": "object", "children": {
+     "tesser-lamp": {"type": "remote", "schema": "1a2b3c4d"},
+     "heliostat-3": {"type": "remote", "online": false, "schema": "99f0e1aa"}}}
+  ```
+
+- **Watching the list:** mounting a peer, a change of its online state and a new advertised hash all mark the remote node changed. A subscriber of the parent (depth 1) gets `{"heliostat-3": null}` for an unmirrored node, which is its cue to re-read the parent's schema.
+- **Generic core:** `DatagramEndpoint::mountPeers()` and `peerSeen(address, name, schemaHash)` do the work, host-tested with the in-memory link. The NowTP adapter only parses advertisements and forwards peer events. Online state comes from the endpoint: `forgetPeer()` marks a peer's remote nodes offline, and any message from the peer marks them online.
 
 ## 15. Memory budget
 

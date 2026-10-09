@@ -18,6 +18,7 @@
 namespace tesser {
 
 class Api;
+class Object;
 class RemoteNode;
 
 // Address of a peer on a datagram link: a MAC for NowTP, IP and port for UDP.
@@ -109,9 +110,21 @@ public:
     void onNotification(NotificationHandler fn) { onNotification_ = std::move(fn); }
 
     // The peer is gone (e.g. NowTP reported it lost): its pending calls get
-    // Status::Timeout and its subscriptions are dropped. Safe from any task,
-    // including link callbacks: the work happens in the next process().
+    // Status::Timeout, its subscriptions are dropped and its remote nodes
+    // show it offline. Safe from any task, including link callbacks: the
+    // work happens in the next process().
     void forgetPeer(const PeerAddress& peer);
+
+    // ---- discovery ------------------------------------------------------
+    // Mounts every TesserAPI peer reported by peerSeen() under `parent`, an
+    // object of this endpoint's API, as a remote node named after the peer
+    // (docs/DESIGN.md section 14.1). `mirrorIntervalMs` > 0 also mirrors it.
+    void mountPeers(Object& parent, uint32_t mirrorIntervalMs = 0);
+    // A peer announced itself as a TesserAPI node (from NowTP discovery
+    // metadata, ...): `name` is its advertised name, `schemaHash` the hash
+    // it advertises. Marks its remote nodes online and mounts it if needed.
+    // Safe from any task; takes effect in the next process().
+    void peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash);
 
     Stats stats() const;
     size_t pendingCalls() const;
@@ -138,6 +151,12 @@ private:
         PeerAddress peer;
     };
 
+    struct Seen {
+        PeerAddress peer;
+        std::string name;
+        uint32_t schemaHash;
+    };
+
     struct CallSlot {
         uint32_t id;
         PeerAddress to;
@@ -153,6 +172,8 @@ private:
     void expire(uint32_t now, bool all, const PeerAddress* peer);
     Subscriber* subscriberFor(const PeerAddress& peer, bool create);
     void dropPeer(const PeerAddress& peer);
+    void applySeen(const Seen& seen);
+    void markOnline(const PeerAddress& peer, bool online);
 
     Api* api_;
     TransportKind kind_;
@@ -167,6 +188,9 @@ private:
     std::vector<Incoming> queue_;  // a vector: an empty deque allocates
     std::vector<CallSlot> calls_;
     std::vector<PeerAddress> lostPeers_;  // forgetPeer() → process()
+    std::vector<Seen> seenPeers_;         // peerSeen() → process()
+    Object* mountParent_ = nullptr;
+    uint32_t mountMirrorMs_ = 0;
     Mutex subscribersMutex_;              // taken before the API lock, never after
     std::vector<PeerSubscriber*> subscribers_;
     std::vector<RemoteNode*> remotes_;  // guarded by mutex_
@@ -177,5 +201,11 @@ private:
 // Builds a request envelope. `bodyJson` is inserted verbatim when not empty.
 std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, const Query& query,
                                  std::string_view bodyJson);
+
+// Discovery metadata announcing a TesserAPI node:
+// {"tesser":<port>,"schema":"<schemaHash, 8 hex digits>"}.
+std::string buildAdvertisement(uint8_t port, uint32_t schemaHash);
+// Reads it; false if the metadata isn't a TesserAPI advertisement.
+bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash);
 
 }  // namespace tesser

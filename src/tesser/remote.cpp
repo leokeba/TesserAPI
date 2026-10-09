@@ -185,6 +185,20 @@ RemoteNode::RemoteNode(const char* name, DatagramEndpoint& endpoint, const PeerA
     endpoint_->addRemote(this);
 }
 
+RemoteNode::RemoteNode(std::string name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath)
+    : RemoteNode(static_cast<const char*>(nullptr), endpoint, peer, std::move(remotePath)) {
+    ownedName_ = std::move(name);
+    name_ = ownedName_.c_str();
+}
+
+void RemoteNode::setOnline(bool online) {
+    if (online_.exchange(online) != online) changed();
+}
+
+void RemoteNode::setAdvertisedSchema(uint32_t hash) {
+    if (advertisedSchema_.exchange(hash) != hash) changed();
+}
+
 RemoteNode::~RemoteNode() {
     if (!endpoint_) return;
     endpoint_->removeRemote(this);

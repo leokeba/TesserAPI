@@ -699,6 +699,8 @@ public:
     size_t childCount() const;
 
 protected:
+    friend class DatagramEndpoint;  // mounts discovered peers
+
     template <class N>
     N& add(N* node) {
         link(node);

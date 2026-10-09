@@ -85,19 +85,27 @@ bool NowTpTransport::set(const nowtp::Mac& to, std::string_view path, std::strin
 bool NowTpTransport::advertise() {
     Api* api = endpoint_.api();
     if (!api) return false;
-    char meta[48];
-    int n = snprintf(meta, sizeof(meta), "{\"tesser\":%u,\"schema\":\"%08lx\"}", unsigned(port_),
-                     static_cast<unsigned long>(api->schemaHash()));
-    return n > 0 && now_.setDiscoveryMetadata(meta, static_cast<size_t>(n)) == nowtp::Status::Ok;
+    std::string meta = buildAdvertisement(port_, api->schemaHash());
+    return now_.setDiscoveryMetadata(meta.data(), meta.size()) == nowtp::Status::Ok;
 }
 
 bool NowTpTransport::parseAdvertisement(const std::vector<uint8_t>& metadata, uint8_t& port, uint32_t& schemaHash) {
-    JsonDocument doc;
-    if (deserializeJson(doc, reinterpret_cast<const char*>(metadata.data()), metadata.size())) return false;
-    if (!doc["tesser"].is<uint8_t>() || !doc["schema"].is<const char*>()) return false;
-    port = doc["tesser"].as<uint8_t>();
-    schemaHash = static_cast<uint32_t>(strtoul(doc["schema"].as<const char*>(), nullptr, 16));
-    return true;
+    return tesser::parseAdvertisement(
+        std::string_view(reinterpret_cast<const char*>(metadata.data()), metadata.size()), port, schemaHash);
+}
+
+void NowTpTransport::peerEvent(nowtp::PeerEvent event, const nowtp::PeerInfo& peer) {
+    if (event == nowtp::PeerEvent::Lost) return peerLost(peer.mac);
+    uint8_t port;
+    uint32_t hash;
+    if (parseAdvertisement(peer.metadata, port, hash) && port == port_) {
+        endpoint_.peerSeen(address(peer.mac), peer.name, hash);
+    }
+}
+
+void NowTpTransport::mountPeers(Object& parent, uint32_t mirrorIntervalMs) {
+    endpoint_.mountPeers(parent, mirrorIntervalMs);
+    for (const nowtp::PeerInfo& p : now_.peers()) peerEvent(nowtp::PeerEvent::Found, p);
 }
 
 }  // namespace tesser
