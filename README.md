@@ -114,6 +114,13 @@ api.mount("right", rightMotor);
 - [examples/arduino/HttpAndNowTP](examples/arduino/HttpAndNowTP): the same API over HTTP, WebSocket and ESP-NOW; each board mounts the boards it discovers (a gateway).
 - [examples/idf/http_api](examples/idf/http_api): ESP-IDF, HTTP.
 
+## Testing
+
+- **Host:** 65 test cases under ASan and UBSan (`cmake -S . -B build && cmake --build build && ./build/tesser_tests`).
+- **On the chip:** the same cases run on target (`test/hardware`).
+- **End to end:** scripts drive two boards over serial, HTTP, WebSocket and ESP-NOW. The same conformance vectors must give the same results on every transport and through a gateway. Persistence is checked across a real reboot. See [docs/DESIGN.md §17](docs/DESIGN.md#17-testing).
+- **CI** builds ESP-IDF 5.1 to latest and Arduino-ESP32 3.x for the ESP32 and the ESP32-C3. Hardware testing so far used classic ESP32 boards; the C3 is built but not yet run.
+
 ## Requirements
 
 - ESP-IDF ≥ 5.1 or Arduino-ESP32 ≥ 3.0, C++17
