@@ -4,6 +4,7 @@
 // See docs/DESIGN.md.
 
 #include "tesser/api.h"
+#include "tesser/client.h"
 #include "tesser/datagram.h"
 #include "tesser/envelope.h"
 #include "tesser/line_transport.h"

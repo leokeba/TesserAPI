@@ -5,6 +5,7 @@
 
 #include "tesser/api.h"
 #include "tesser/call.h"
+#include "tesser/client.h"
 #include "tesser/envelope.h"
 #include "tesser/json_writer.h"
 #include "tesser/remote.h"
@@ -257,10 +258,18 @@ void DatagramEndpoint::handle(Incoming& msg) {
             remotes = remotes_;
         }
         // Remote nodes take what concerns their mirror; the application's
-        // handler still sees everything.
+        // handler and clients of the peer still see everything.
         for (RemoteNode* r : remotes) {
             if (r->handleNotification(msg.from, env)) break;
         }
+        std::vector<std::shared_ptr<ClientInbox>> inboxes;
+        {
+            MutexGuard guard(mutex_);
+            for (auto& c : clients_) {
+                if (c.first == msg.from) inboxes.push_back(c.second);
+            }
+        }
+        for (auto& inbox : inboxes) inbox->notification(msg.text);
         if (onNotification_) onNotification_(msg.from, env);
         return;
     }
@@ -362,6 +371,21 @@ void DatagramEndpoint::removeRemote(RemoteNode* remote) {
     for (size_t i = 0; i < remotes_.size(); i++) {
         if (remotes_[i] == remote) {
             remotes_.erase(remotes_.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
+}
+
+void DatagramEndpoint::addClient(const PeerAddress& peer, std::shared_ptr<ClientInbox> inbox) {
+    MutexGuard guard(mutex_);
+    clients_.emplace_back(peer, std::move(inbox));
+}
+
+void DatagramEndpoint::removeClient(const ClientInbox* inbox) {
+    MutexGuard guard(mutex_);
+    for (size_t i = 0; i < clients_.size(); i++) {
+        if (clients_[i].second.get() == inbox) {
+            clients_.erase(clients_.begin() + static_cast<std::ptrdiff_t>(i));
             break;
         }
     }

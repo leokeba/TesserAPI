@@ -20,6 +20,7 @@ namespace tesser {
 class Api;
 class Object;
 class RemoteNode;
+struct ClientInbox;
 
 // Address of a peer on a datagram link: a MAC for NowTP, IP and port for UDP.
 struct PeerAddress {
@@ -98,6 +99,9 @@ public:
     // Used by RemoteNode.
     void addRemote(RemoteNode* remote);
     void removeRemote(RemoteNode* remote);
+    // Used by PeerClient: notifications from `peer` are queued in `inbox`.
+    void addClient(const PeerAddress& peer, std::shared_ptr<ClientInbox> inbox);
+    void removeClient(const ClientInbox* inbox);
 
     // Requests from peers for which `fn` returns true count as authenticated
     // (see Api::authorize()). Without it, none do.
@@ -194,6 +198,7 @@ private:
     Mutex subscribersMutex_;              // taken before the API lock, never after
     std::vector<PeerSubscriber*> subscribers_;
     std::vector<RemoteNode*> remotes_;  // guarded by mutex_
+    std::vector<std::pair<PeerAddress, std::shared_ptr<ClientInbox>>> clients_;  // guarded by mutex_
     uint32_t nextId_ = 1;
     Stats stats_;
 };

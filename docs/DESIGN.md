@@ -585,6 +585,27 @@ nowApi.advertise();                       // on every node, once its tree is com
 - **Watching the list:** mounting a peer, a change of its online state and a new advertised hash all mark the remote node changed. A subscriber of the parent (depth 1) gets `{"heliostat-3": null}` for an unmirrored node, which is its cue to re-read the parent's schema.
 - **Generic core:** `DatagramEndpoint::mountPeers()` and `peerSeen(address, name, schemaHash)` do the work, host-tested with the in-memory link. The NowTP adapter only parses advertisements and forwards peer events. Online state comes from the endpoint: `forgetPeer()` marks a peer's remote nodes offline, and any message from the peer marks them online.
 
+### 14.2 ApiClient
+
+`tesser::ApiClient` is one interface for talking to an API, wherever it is. A user interface, or any other client, is written once against it:
+
+```cpp
+tesser::LocalClient local(api);                     // the API on this chip
+tesser::PeerClient remote(nowApi.endpoint(), mac);  // another node, over NowTP
+
+client.get("/lamp", [](tesser::Status s, JsonVariantConst body) { ... });
+client.set("/lamp/brightness", "200");
+client.subscribe("/sensors", onSnapshot, query);
+client.onNotification([](JsonObjectConst envelope) { ... });   // "change" and "event"
+client.process();                                   // from the UI loop: runs the callbacks
+```
+
+- **Callbacks run in `process()`,** in the caller's task, in arrival order. Responses and notifications are queued until then, so a single-threaded UI loop (LVGL) needs no locking. Handlers may send new requests.
+- **Bounded:** at most `maxQueued` notifications (default 16) wait between two `process()` calls. Further ones are dropped, and the server marks the next one `"overflow": true`, which tells the client to re-read. Responses are always queued.
+- **`LocalClient`** goes through `Api::handle()` like a transport, as a `Subscriber`, so subscriptions, deferred actions, queued mode and remote nodes behave as they do for remote clients. Its requests count as authenticated unless `setAuthenticated(false)`. Destroying it drops its subscriptions.
+- **`PeerClient`** sends through a `DatagramEndpoint` and gets the notifications its peer sends to that endpoint. These are per peer, not per client: two clients of the same peer on one endpoint both see both clients' notifications. Destroying it unsubscribes what it subscribed to.
+- **Bodies** are JSON text in, `JsonVariantConst` out. A response that arrives after its client is gone is dropped.
+
 ## 15. Memory budget
 
 Targets to be measured on a classic ESP32 and a C3, and enforced in CI:
@@ -664,6 +685,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 3 | Change tracking, subscriptions, events, WebSocket | done |
 | 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | done |
+| 6 | Groundwork for TesserUI: presentation metadata, forwarded subscriptions, discovered peers, `ApiClient` | done |
 
 ## 19. Decisions on former open questions
 
