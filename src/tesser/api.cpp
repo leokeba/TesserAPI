@@ -1,6 +1,7 @@
 #include "tesser/api.h"
 
-#include <deque>
+#include <stdio.h>
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -189,7 +190,13 @@ private:
         std::string p(base_.data(), base_.size());
         for (int i = 0; i < trailLen_; i++) {
             p += '/';
-            p.append(trail_[i].data(), trail_[i].size());
+            if (indexMask_ & (uint32_t(1) << i)) {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%u", unsigned(indexes_[i]));
+                p += buf;
+            } else {
+                p.append(trail_[i].data(), trail_[i].size());
+            }
         }
         if (p.empty()) p = "/";
         return p;
@@ -197,10 +204,19 @@ private:
 
     bool push(std::string_view name) {
         if (trailLen_ >= kMaxTrail) return false;
+        indexMask_ &= ~(uint32_t(1) << trailLen_);
         trail_[trailLen_++] = name;
         return true;
     }
     void pop() { trailLen_--; }
+
+    // A list index in the trail: stored as a number, formatted on error only.
+    bool pushIndex(size_t i) {
+        if (trailLen_ >= kMaxTrail) return false;
+        indexMask_ |= uint32_t(1) << trailLen_;
+        indexes_[trailLen_++] = static_cast<uint16_t>(i);
+        return true;
+    }
 
     // Records the first error; the reply is written once the walk unwinds.
     bool error(Status s, const char* message) {
@@ -272,6 +288,12 @@ private:
         const Query& q = req_.query;
         bool hasShape = !req_.body.isNull();
         View view = q.view;
+#if defined(TESSER_NO_SCHEMA)
+        if (view == View::Schema) {
+            replyError(Status::NotAllowed, "schemas are compiled out (TESSER_NO_SCHEMA)", base_);
+            return false;
+        }
+#endif
 
         if (target.type() != NodeType::Object) {
             if (!q.keys.empty() || !q.exclude.empty() || hasShape) {
@@ -395,6 +417,13 @@ private:
     }
 
     void renderSchema(JsonWriter& w, const Node& n, int depth, const Filter& f) {
+#if defined(TESSER_NO_SCHEMA)
+        (void)n;
+        (void)depth;
+        (void)f;
+        w.null();
+        return;
+#endif
         w.beginObject();
         w.key("type");
         switch (n.type()) {
@@ -415,6 +444,12 @@ private:
                 if (v.maxLength()) {
                     w.key("maxLength");
                     w.uinteger(v.maxLength());
+                }
+                if (const std::vector<const char*>* opts = v.options()) {
+                    w.key("enum");
+                    w.beginArray();
+                    for (const char* o : *opts) w.string(o);
+                    w.endArray();
                 }
                 break;
             }
@@ -480,62 +515,9 @@ private:
 
     // ---- remote nodes -------------------------------------------------
 
-    void forward(RemoteNode& remote) {
-        if (!remote.endpoint()) return replyError(Status::Internal, "no endpoint", base_);
-        if (!api_.pendingBegin()) return replyError(Status::Busy, "too many pending calls", base_);
-        Reply* detached = reply_.detach();
-        if (!detached) {
-            api_.pendingDone();
-            return replyError(Status::NotAllowed, "this transport can't wait for remote nodes", base_);
-        }
-        std::string remoteBase = remote.remotePath() == "/" ? std::string() : remote.remotePath();
-        std::string remotePath = remoteBase + std::string(remoteRest_);
-        if (remotePath.empty()) remotePath = "/";
-        // The local path of the remote node: error paths in its replies are
-        // mapped back under it.
-        std::string localBase(base_.substr(0, base_.size() - remoteRest_.size()));
-        Api* api = &api_;
-        auto done = [detached, api, localBase, remoteBase](Status s, JsonVariantConst body) {
-            JsonWriter w(detached->begin(s));
-            if (s == Status::Timeout && body.isNull()) {
-                w.beginObject();
-                w.key("error");
-                w.string("timeout");
-                w.key("path");
-                w.string(localBase.empty() ? std::string_view("/") : std::string_view(localBase));
-                w.key("message");
-                w.string("remote node didn't answer");
-                w.endObject();
-            } else if (s != Status::Ok && body.is<JsonObjectConst>()) {
-                w.beginObject();
-                for (JsonPairConst kv : body.as<JsonObjectConst>()) {
-                    w.key(std::string_view(kv.key().c_str(), kv.key().size()));
-                    if (kv.key() == "path" && kv.value().is<const char*>()) {
-                        std::string_view p(kv.value().as<const char*>());
-                        if (p.compare(0, remoteBase.size(), remoteBase) == 0) p.remove_prefix(remoteBase.size());
-                        if (p == "/") p = std::string_view();
-                        std::string local = localBase + std::string(p);
-                        w.string(local.empty() ? std::string_view("/") : std::string_view(local));
-                    } else {
-                        w.variant(kv.value());
-                    }
-                }
-                w.endObject();
-            } else {
-                w.variant(body);
-            }
-            detail::finishBody(*detached, w, localBase);
-            detached->release();
-            api->pendingDone();
-        };
-        if (!remote.endpoint()->request(remote.peer(), req_.op, remotePath, req_.body, done, req_.query,
-                                        remote.timeoutMs(), &remote)) {
-            writeError(*detached, Status::Busy, base_.empty() ? std::string_view("/") : base_,
-                       "couldn't send to the remote node");
-            detached->release();
-            api_.pendingDone();
-        }
-    }
+    // Virtual, so the datagram and forwarding code is only linked into
+    // applications that create remote nodes.
+    void forward(RemoteNode& remote) { remote.forward(api_, req_, remoteRest_, base_, reply_); }
 
     // ---- subscriptions ------------------------------------------------
 
@@ -716,8 +698,7 @@ private:
                 if (items.size() > list.maxSize()) return error(Status::InvalidValue, "too many elements");
                 size_t i = 0;
                 for (JsonVariantConst item : items) {
-                    names_.push_back(std::to_string(i));
-                    if (!push(names_.back())) return error(Status::BadRequest, "patch too deep");
+                    if (!pushIndex(i)) return error(Status::BadRequest, "patch too deep");
                     if (!item.is<JsonObjectConst>()) return error(Status::InvalidValue, "expected object");
                     std::unique_ptr<Object> element = i < list.size() ? list.element(i) : list.prototype();
                     if (!validatePatch(*element, item)) return false;
@@ -778,8 +759,7 @@ private:
                 if (!actions) list.resize(items.size());
                 size_t i = 0;
                 for (JsonVariantConst item : items) {
-                    names_.push_back(std::to_string(i));
-                    push(names_.back());
+                    pushIndex(i);
                     if (!applyPatch(*list.element(i), item, actions)) return false;
                     pop();
                     i++;
@@ -810,7 +790,8 @@ private:
     bool partial_ = false;
     std::vector<std::unique_ptr<Object>> temps_;  // list elements on the request path
     std::vector<ListNode*> lists_;                // lists the path went through
-    std::deque<std::string> names_;               // list indexes in the error trail
+    uint16_t indexes_[kMaxTrail];                 // list indexes in the trail...
+    uint32_t indexMask_ = 0;                      // ...at the levels whose bit is set
     std::string_view remoteRest_;                 // path below a remote node, forwarded as is
 };
 
@@ -886,7 +867,7 @@ void Api::runQueued() {
             MutexGuard guard(queueMutex_);
             if (queue_.empty()) return;
             q = queue_.front();
-            queue_.pop_front();
+            queue_.erase(queue_.begin());
         }
         JsonDocument doc;
         if (!q->body.empty()) {
@@ -898,6 +879,21 @@ void Api::runQueued() {
         if (!reply.transferred) q->reply->release();
         delete q;
     }
+}
+
+uint32_t Api::schemaHash() {
+    class HashReply : public Reply {
+    public:
+        Sink& begin(Status) override { return sink; }
+        void end() override {}
+        HashSink sink;
+    } reply;
+    Request req;
+    req.path = "/";
+    req.query.view = View::Schema;
+    req.client.authenticated = true;  // internal
+    handleNow(req, reply);
+    return reply.sink.hash;
 }
 
 size_t Api::queuedRequests() const {

@@ -483,6 +483,38 @@ TEST(custom_nodes) {
              "\"fixed\":{\"type\":\"custom\"}}}");
 }
 
+// ---- enums -------------------------------------------------------------
+
+enum class Mode { Off, Auto, Manual, Unnamed };
+
+TEST(enums) {
+    Api api;
+    Mode mode = Mode::Auto;
+    api.value("mode", mode, {"off", "auto", "manual"});
+    CHECK_EQ(get(api, "/mode").body, "\"auto\"");
+    CHECK_EQ(set(api, "/mode", "\"manual\"").body, "\"manual\"");
+    CHECK(mode == Mode::Manual);
+    Resp r = set(api, "/mode", "\"turbo\"");
+    CHECK_EQ(r.status, Status::InvalidValue);
+    CHECK(r.body.find("not one of the options") != std::string::npos);
+    CHECK_EQ(set(api, "/mode", "1").status, Status::InvalidValue);
+    CHECK_EQ(get(api, "/mode", schema()).body,
+             "{\"type\":\"string\",\"writable\":true,\"enum\":[\"off\",\"auto\",\"manual\"]}");
+    mode = Mode::Unnamed;
+    CHECK_EQ(get(api, "/mode").body, "3");
+}
+
+TEST(schema_hash) {
+    Device a, b;
+    CHECK_EQ(a.api.schemaHash(), b.api.schemaHash());  // same shape, different instances
+    uint32_t before = a.api.schemaHash();
+    a.lamp.brightness = 3;
+    CHECK_EQ(a.api.schemaHash(), before);  // values don't count
+    int extra = 0;
+    a.api.value("extra", extra);
+    CHECK(a.api.schemaHash() != before);
+}
+
 // ---- composition -------------------------------------------------------
 
 struct Motor {

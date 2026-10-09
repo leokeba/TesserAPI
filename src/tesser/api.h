@@ -4,7 +4,6 @@
 #include <stdint.h>
 
 #include <atomic>
-#include <deque>
 #include <functional>
 #include <string>
 #include <vector>
@@ -136,6 +135,10 @@ public:
     // Requests waiting for poll() in queued mode.
     size_t queuedRequests() const;
 
+    // FNV-1a hash of the full schema: changes whenever the tree's shape,
+    // types or constraints do. Clients can cache a schema under it.
+    uint32_t schemaHash();
+
     // A request copied out of the transport's buffers, with its detached reply.
     struct QueuedRequest {
         Request request;
@@ -163,8 +166,11 @@ private:
     uint16_t seenGen_ = 0;   // newest persisted change seen by poll()
     uint32_t changedAtMs_ = 0;
     uint32_t lastPersistCheckMs_ = 0;
+    // Set by persistence(): poll() reaches the persistence code through it,
+    // so applications that don't persist don't link it.
+    void (*persistHook_)(Api& api, uint32_t nowMs) = nullptr;
     mutable Mutex queueMutex_;  // never held with the API lock
-    std::deque<QueuedRequest*> queue_;
+    std::vector<QueuedRequest*> queue_;  // a vector: an empty deque allocates
     Api* nextApi_ = nullptr;  // registry used by EventNode
 };
 

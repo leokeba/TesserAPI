@@ -30,19 +30,6 @@ bool findPath(const Object& o, const Node* target, std::string& path) {
     return false;
 }
 
-// FNV-1a over everything written to it.
-class HashSink : public Sink {
-public:
-    bool write(const char* data, size_t len) override {
-        for (size_t i = 0; i < len; i++) {
-            hash ^= static_cast<uint8_t>(data[i]);
-            hash *= 16777619u;
-        }
-        return true;
-    }
-    uint32_t hash = 2166136261u;
-};
-
 bool inList(std::string_view list, std::string_view name) {
     size_t pos = 0;
     while (pos <= list.size()) {
@@ -217,7 +204,7 @@ void Api::poll() { poll(millis32()); }
 void Api::poll(uint32_t nowMs) {
     runQueued();
     MutexGuard guard(mutex_);
-    if (storage_) checkPersistence(nowMs);
+    if (persistHook_) persistHook_(*this, nowMs);
     if (subs_.empty()) return;
     if (nowMs - lastWatchMs_ >= config_.watchIntervalMs) {
         lastWatchMs_ = nowMs;

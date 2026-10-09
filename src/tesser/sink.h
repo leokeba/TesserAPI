@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include <string>
 
@@ -39,6 +40,19 @@ public:
         return true;
     }
     size_t count = 0;
+};
+
+// FNV-1a hash of everything written.
+class HashSink : public Sink {
+public:
+    bool write(const char* data, size_t len) override {
+        for (size_t i = 0; i < len; i++) {
+            hash ^= static_cast<unsigned char>(data[i]);
+            hash *= 16777619u;
+        }
+        return true;
+    }
+    uint32_t hash = 2166136261u;
 };
 
 }  // namespace tesser

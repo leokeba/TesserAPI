@@ -7,6 +7,7 @@
 #include "tesser/datagram.h"
 #include "tesser/node.h"
 #include "tesser/platform.h"
+#include "tesser/request.h"
 
 namespace tesser {
 
@@ -46,7 +47,15 @@ public:
     bool hasCopy() const;
 
     // The mirrored copy (objects below `depth` levels as {}), or null.
-    void writeCopy(JsonWriter& w, int depth = 255) const;
+    // Virtual like forward(): keeps the remote code out of applications
+    // without remote nodes.
+    virtual void writeCopy(JsonWriter& w, int depth = 255) const;
+
+    // Forwards a request whose path continues below this node (`rest`,
+    // "" for the node itself); `base` is the full local path. Called by the
+    // request handler, under the API lock.
+    virtual void forward(Api& api, const Request& request, std::string_view rest, std::string_view base,
+                         Reply& reply);
 
     // Called by the endpoint, from process(), and when it is destroyed.
     void tick(uint32_t nowMs);

@@ -138,7 +138,7 @@ bool DatagramEndpoint::process() {
             MutexGuard guard(mutex_);
             if (queue_.empty()) break;
             msg = std::move(queue_.front());
-            queue_.pop_front();
+            queue_.erase(queue_.begin());
         }
         handle(msg);
         worked = true;

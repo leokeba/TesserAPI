@@ -210,7 +210,13 @@ extern "C" void app_main() {
 
     size_t heap0 = freeHeap();
     check::run(nullptr);
-    printf("MEM heap_drift_after_cases=%d bytes\n", int(heap0) - int(freeHeap()));
+    size_t heap1 = freeHeap();
+    printf("MEM heap_drift_after_cases=%d bytes\n", int(heap0) - int(heap1));
+    // A second run tells one-time initialization (newlib buffers, the orphans
+    // of the duplicate-name test) apart from leaks.
+    printf("SECOND RUN\n");
+    check::run(nullptr);
+    printf("MEM heap_drift_second_run=%d bytes\n", int(heap1) - int(freeHeap()));
     measureNodes();
     measureLatency();
     printf("MEM main_stack_free=%u bytes\n", unsigned(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include <atomic>
+#include <memory>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -18,7 +19,6 @@ namespace tesser {
 namespace {
 
 constexpr size_t kChunk = 512;
-constexpr size_t kQueryValue = 160;
 
 const char* statusLine(Status s) {
     switch (httpCode(s)) {
@@ -118,7 +118,8 @@ private:
 // with a Content-Length; larger ones switch to chunked encoding.
 class HttpReply : public Reply {
 public:
-    HttpReply(HttpServer& server, httpd_req_t* req) : server_(server), req_(req) {}
+    // The chunk buffer lives on the heap: the httpd task's stack is precious.
+    HttpReply(HttpServer& server, httpd_req_t* req) : server_(server), req_(req), buf_(new char[kChunk]) {}
 
     Sink& begin(Status s) override {
         status_ = s;
@@ -131,7 +132,7 @@ public:
         if (failed_) return;
         if (!chunked_) {
             sendHeaders();
-            httpd_resp_send(req_, buf_, static_cast<ssize_t>(used_));
+            httpd_resp_send(req_, buf_.get(), static_cast<ssize_t>(used_));
         } else {
             flush();
             httpd_resp_send_chunk(req_, nullptr, 0);
@@ -182,7 +183,7 @@ private:
 
     bool flush() {
         if (used_ == 0) return true;
-        if (httpd_resp_send_chunk(req_, buf_, static_cast<ssize_t>(used_)) != ESP_OK) {
+        if (httpd_resp_send_chunk(req_, buf_.get(), static_cast<ssize_t>(used_)) != ESP_OK) {
             failed_ = true;
             return false;
         }
@@ -201,7 +202,7 @@ private:
                 if (!flush()) return false;
             }
             size_t n = len < kChunk - used_ ? len : kChunk - used_;
-            memcpy(buf_ + used_, data, n);
+            memcpy(buf_.get() + used_, data, n);
             used_ += n;
             data += n;
             len -= n;
@@ -212,7 +213,7 @@ private:
     HttpServer& server_;
     httpd_req_t* req_;
     ChunkSink sink_{*this};
-    char buf_[kChunk];
+    std::unique_ptr<char[]> buf_;
     size_t used_ = 0;
     Status status_ = Status::Ok;
     bool chunked_ = false;
@@ -398,7 +399,9 @@ esp_err_t HttpServer::begin(uint16_t port, const char* basePath) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.ctrl_port = static_cast<uint16_t>(config.ctrl_port + port % 1000);
-    config.stack_size = 6144;
+    // Handlers render recursively and lwIP sends from this stack: 8 KB keeps
+    // a comfortable margin (measured in test/hardware).
+    config.stack_size = 8192;
     config.lru_purge_enable = true;
     config.max_uri_handlers = 10;
     return begin(config, basePath);
@@ -551,8 +554,8 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
     // Query options.
     char* query = nullptr;
     size_t queryLen = httpd_req_get_url_query_len(req);
-    char keys[kQueryValue], exclude[kQueryValue], value[16];
-    std::string shapeText;
+    char value[16];
+    std::string keys, exclude, shapeText;
     bool bad = false;
     if (queryLen) {
         query = static_cast<char*>(malloc(queryLen + 1));
@@ -568,9 +571,15 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
             if (len == 0 || *end || d < 0 || d > 255) bad = true;
             request.query.depth = static_cast<int>(d);
         }
-        if (queryParam(query, "keys", keys, sizeof(keys), len, bad)) request.query.keys = std::string_view(keys, len);
-        if (queryParam(query, "exclude", exclude, sizeof(exclude), len, bad)) {
-            request.query.exclude = std::string_view(exclude, len);
+        keys.resize(queryLen + 1);
+        if (queryParam(query, "keys", &keys[0], keys.size(), len, bad)) {
+            keys.resize(len);
+            request.query.keys = keys;
+        }
+        exclude.resize(queryLen + 1);
+        if (queryParam(query, "exclude", &exclude[0], exclude.size(), len, bad)) {
+            exclude.resize(len);
+            request.query.exclude = exclude;
         }
         if (queryParam(query, "view", value, sizeof(value), len, bad) &&
             !parseView(std::string_view(value, len), request.query.view)) {

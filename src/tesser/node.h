@@ -2,9 +2,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include <atomic>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -107,6 +109,8 @@ public:
 
     virtual ValueKind kind() const = 0;
     virtual size_t maxLength() const { return 0; }
+    // Allowed string values (enums), or null.
+    virtual const std::vector<const char*>* options() const { return nullptr; }
     virtual void write(JsonWriter& w) const = 0;
     // Type and range check. Doesn't consider writability.
     virtual Check check(JsonVariantConst v) const = 0;
@@ -184,6 +188,49 @@ protected:
 
 private:
     const char* value_;
+};
+
+// A C++ enum exposed as strings: names[i] is the name of the enumerator
+// whose underlying value is i.
+template <class E>
+class EnumValue : public ValueNode {
+public:
+    EnumValue(const char* name, E& ref, std::vector<const char*> names)
+        : ValueNode(name), ref_(ref), names_(std::move(names)) {}
+    ValueKind kind() const override { return ValueKind::String; }
+    const std::vector<const char*>* options() const override { return &names_; }
+    void write(JsonWriter& w) const override {
+        size_t i = static_cast<size_t>(ref_);
+        if (i < names_.size()) {
+            w.string(names_[i]);
+        } else {
+            w.integer(static_cast<int64_t>(ref_));  // an enumerator without a name
+        }
+    }
+    Check check(JsonVariantConst v) const override {
+        if (!v.is<const char*>()) return Check::fail(Status::InvalidValue, "expected string");
+        return index(v.as<const char*>()) < names_.size() ? Check::ok()
+                                                          : Check::fail(Status::InvalidValue, "not one of the options");
+    }
+    Check apply(JsonVariantConst v) override {
+        size_t i = index(v.as<const char*>());
+        if (i >= names_.size()) return Check::fail(Status::InvalidValue, "not one of the options");
+        ref_ = static_cast<E>(i);
+        return Check::ok();
+    }
+
+protected:
+    bool canWrite() const override { return true; }
+
+private:
+    size_t index(const char* s) const {
+        for (size_t i = 0; i < names_.size(); i++) {
+            if (s && strcmp(s, names_[i]) == 0) return i;
+        }
+        return names_.size();
+    }
+    E& ref_;
+    std::vector<const char*> names_;
 };
 
 // Getter, and optionally a setter. R is the getter's type, P the setter's
@@ -474,6 +521,13 @@ public:
 
     // A constant string.
     ValueNode& value(const char* name, const char* constant) { return add(new ConstStringValue(name, constant)); }
+
+    // An enum, as strings: `names` lists the enumerators in order of their
+    // underlying values (0, 1, 2, ...). The names must outlive the API.
+    template <class E, std::enable_if_t<std::is_enum<E>::value, int> = 0>
+    ValueNode& value(const char* name, E& var, std::initializer_list<const char*> names) {
+        return add(new EnumValue<E>(name, var, std::vector<const char*>(names)));
+    }
 
     // A getter: read-only.
     template <class G, std::enable_if_t<detail::IsCallable<std::decay_t<G>>::value, int> = 0>

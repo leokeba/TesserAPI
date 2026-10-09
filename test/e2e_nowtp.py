@@ -31,6 +31,18 @@ def main():
     peers = a.call('get', '/net/peers', {}, conformance.ABSENT)[1]
     check('A discovered B', any(p['mac'] == mac_b for p in peers), peers)
 
+    # B advertises its port and schema hash in discovery metadata.
+    hash_b = b.call('get', '/system/schemaHash', {}, conformance.ABSENT)[1]
+    entry = None
+    for _ in range(30):  # announcements repeat; give a fresh one time to arrive
+        peers = a.call('get', '/net/peers', {}, conformance.ABSENT)[1]
+        entry = next((p for p in peers if p['mac'] == mac_b), None)
+        if entry and entry.get('tesser', {}).get('schema') == hash_b:
+            break
+        time.sleep(0.5)
+    check('B advertises its schema hash', entry and entry.get('tesser') == {'port': 84, 'schema': hash_b},
+          (entry, hash_b))
+
     a_to_b = NowtpRelay(a, mac_b)
     b_to_a = NowtpRelay(b, mac_a)
     conformance.run(a_to_b, 'nowtp A->B', check)

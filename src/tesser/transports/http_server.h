@@ -21,7 +21,7 @@ public:
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
 
-    // Starts a dedicated server (wildcard URI matching, 6 KB stack) and
+    // Starts a dedicated server (wildcard URI matching, 8 KB stack) and
     // serves the API under basePath ("/api" → GET /api/lamp/on).
     esp_err_t begin(uint16_t port = 80, const char* basePath = "/api");
     // Same, with a custom configuration. uri_match_fn is forced to
@@ -29,7 +29,7 @@ public:
     esp_err_t begin(httpd_config_t config, const char* basePath = "/api");
     // Registers on an existing server, e.g. one shared with a web UI or
     // PsychicHttp. That server must use httpd_uri_match_wildcard and should
-    // have a stack of at least 6 KB. Uses 4 URI handler slots (5 with CORS).
+    // have a stack of at least 8 KB. Uses 4 URI handler slots (5 with CORS).
     esp_err_t attach(httpd_handle_t server, const char* basePath = "/api");
     // Unregisters the handlers, and stops the server if begin() started it.
     void end();

@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#include <deque>
 #include <memory>
 #include <functional>
 #include <string>
@@ -116,6 +115,7 @@ public:
 
     Stats stats() const;
     size_t pendingCalls() const;
+    Api* api() const { return api_; }
 
 private:
     struct Incoming {
@@ -163,7 +163,7 @@ private:
     std::function<bool(const PeerAddress&)> trust_;
 
     mutable Mutex mutex_;
-    std::deque<Incoming> queue_;
+    std::vector<Incoming> queue_;  // a vector: an empty deque allocates
     std::vector<CallSlot> calls_;
     std::vector<PeerAddress> lostPeers_;  // forgetPeer() → process()
     Mutex subscribersMutex_;              // taken before the API lock, never after

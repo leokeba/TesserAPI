@@ -102,6 +102,7 @@ void Api::persistence(Storage& storage, uint32_t debounceMs) {
     MutexGuard guard(mutex_);
     storage_ = &storage;
     debounceMs_ = debounceMs;
+    persistHook_ = [](Api& api, uint32_t nowMs) { api.checkPersistence(nowMs); };
     savedGen_ = seenGen_ = currentGeneration();
 }
 

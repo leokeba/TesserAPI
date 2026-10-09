@@ -1,6 +1,7 @@
 #include "tesser/remote.h"
 
 #include "tesser/api.h"
+#include "tesser/call.h"
 
 namespace tesser {
 
@@ -156,6 +157,63 @@ bool RemoteNode::handleNotification(const PeerAddress& from, JsonObjectConst env
         return true;
     }
     return false;
+}
+
+void RemoteNode::forward(Api& api, const Request& request, std::string_view rest, std::string_view base,
+                         Reply& reply) {
+    std::string_view basePath = base.empty() ? std::string_view("/") : base;
+    if (!endpoint_) return writeError(reply, Status::Internal, basePath, "no endpoint");
+    if (!api.pendingBegin()) return writeError(reply, Status::Busy, basePath, "too many pending calls");
+    Reply* detached = reply.detach();
+    if (!detached) {
+        api.pendingDone();
+        return writeError(reply, Status::NotAllowed, basePath, "this transport can't wait for remote nodes");
+    }
+    std::string remoteBase = remotePath_ == "/" ? std::string() : remotePath_;
+    std::string remotePath = remoteBase + std::string(rest);
+    if (remotePath.empty()) remotePath = "/";
+    // The local path of this node: error paths in the remote's replies are
+    // mapped back under it.
+    std::string localBase(base.substr(0, base.size() - rest.size()));
+    Api* a = &api;
+    auto done = [detached, a, localBase, remoteBase](Status s, JsonVariantConst body) {
+        JsonWriter w(detached->begin(s));
+        if (s == Status::Timeout && body.isNull()) {
+            w.beginObject();
+            w.key("error");
+            w.string("timeout");
+            w.key("path");
+            w.string(localBase.empty() ? std::string_view("/") : std::string_view(localBase));
+            w.key("message");
+            w.string("remote node didn't answer");
+            w.endObject();
+        } else if (s != Status::Ok && body.is<JsonObjectConst>()) {
+            w.beginObject();
+            for (JsonPairConst kv : body.as<JsonObjectConst>()) {
+                w.key(std::string_view(kv.key().c_str(), kv.key().size()));
+                if (kv.key() == "path" && kv.value().is<const char*>()) {
+                    std::string_view p(kv.value().as<const char*>());
+                    if (p.compare(0, remoteBase.size(), remoteBase) == 0) p.remove_prefix(remoteBase.size());
+                    if (p == "/") p = std::string_view();
+                    std::string local = localBase + std::string(p);
+                    w.string(local.empty() ? std::string_view("/") : std::string_view(local));
+                } else {
+                    w.variant(kv.value());
+                }
+            }
+            w.endObject();
+        } else {
+            w.variant(body);
+        }
+        detail::finishBody(*detached, w, localBase);
+        detached->release();
+        a->pendingDone();
+    };
+    if (!endpoint_->request(peer_, request.op, remotePath, request.body, done, request.query, timeoutMs_, this)) {
+        writeError(*detached, Status::Busy, basePath, "couldn't send to the remote node");
+        detached->release();
+        api.pendingDone();
+    }
 }
 
 RemoteNode& Object::remote(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer,

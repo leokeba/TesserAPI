@@ -70,6 +70,14 @@ public:
         return parent.remote(name, endpoint_, address(mac), remotePath);
     }
 
+    // Announces this node in NowTP discovery metadata as
+    // {"tesser":<port>,"schema":"<schemaHash, 8 hex digits>"}, so peers can
+    // tell TesserAPI nodes apart and keep cached schemas while the hash
+    // holds. Call once the tree is complete (and again if it changes).
+    bool advertise();
+    // Reads such metadata; false if it isn't a TesserAPI advertisement.
+    static bool parseAdvertisement(const std::vector<uint8_t>& metadata, uint8_t& port, uint32_t& schemaHash);
+
     DatagramEndpoint& endpoint() { return endpoint_; }
     uint8_t port() const { return port_; }
 
