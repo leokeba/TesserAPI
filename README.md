@@ -55,12 +55,26 @@ pressed.emit(3);                                   // → {"op":"event","path":"
 ← {"op":"change","path":"/","body":{"temperature":22.0}}
 ```
 
-## Lists
+## Lists, arrays and object arguments
 
 ```cpp
 std::vector<Remote> remotes;
-api.list("remotes", remotes);    // GET /remotes, /remotes/1/host; PUT /remotes [...] replaces the list
+api.list("remotes", remotes);                   // GET /remotes, /remotes/1/host; PUT /remotes [...] replaces the list
+api.list("sources", sources).key("name");       // keyed: /sources/Sun/az; replacing matches elements by key
+api.array("offsets", offsets).range(-5, 5);     // float offsets[128]: GET /offsets, PUT /offsets/3 0.25
+
+struct Target { std::string name; float az = 180, el = 30; };   // with a describe(), like mount()
+api.action("add", [](const Target& t) { ... });  // POST /add {"name": "Sun", "az": 120}, each field validated
 ```
+
+## Files
+
+```cpp
+api.file("firmware").maxSize(0x1E0000).accept(".bin").upload([](tesser::FileRequest& r) { return otaSink(r.size); });
+api.file("backup").text([] { return api.persistedState(); }, restoreBackup);   // GET downloads, PUT uploads
+```
+
+Over HTTP, a file node streams raw bytes both ways, outside the request body limit.
 
 ## Gateway
 
@@ -82,6 +96,8 @@ api.load();                                       // unknown or invalid stored k
 
 http.setToken("s3cret");                          // Authorization: Bearer s3cret
 api.authorize(tesser::authorizers::readOnlyUnlessAuthenticated());
+auto& wifi = api.object("wifi").writeAccess(tesser::Access::Admin);   // access levels, in the schema
+wifi.value("password", password).secret().persist();     // writable and persisted, never read back
 ```
 
 ## Composition
@@ -116,7 +132,7 @@ api.mount("right", rightMotor);
 
 ## Testing
 
-- **Host:** 65 test cases under ASan and UBSan (`cmake -S . -B build && cmake --build build && ./build/tesser_tests`).
+- **Host:** 114 test cases under ASan and UBSan (`cmake -S . -B build && cmake --build build && ./build/tesser_tests`).
 - **On the chip:** the same cases run on target (`test/hardware`).
 - **End to end:** scripts drive two boards over serial, HTTP, WebSocket and ESP-NOW. The same conformance vectors must give the same results on every transport and through a gateway. Persistence is checked across a real reboot. See [docs/DESIGN.md §17](docs/DESIGN.md#17-testing).
 - **CI** builds ESP-IDF 5.1 to latest and Arduino-ESP32 3.x for the ESP32 and the ESP32-C3. Hardware testing so far used classic ESP32 boards; the C3 is built but not yet run.
