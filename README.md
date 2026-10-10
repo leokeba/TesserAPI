@@ -76,7 +76,7 @@ With a mirror, the remote's state also appears in local reads and subscriptions,
 
 ```cpp
 tesser::NvsStorage storage;
-api.object("config").persist();                 // saved to NVS 2 s after a change
+api.object("config").persist();                 // saved to NVS 2 s after a change, one record per top-level node
 api.persistence(storage);
 api.load();                                       // unknown or invalid stored keys are skipped
 

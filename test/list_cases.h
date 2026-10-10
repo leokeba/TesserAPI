@@ -107,13 +107,13 @@ TEST(list_subscriptions_and_persistence) {
     f.list->persist();
     f.api.persistence(storage);
     CHECK(f.api.save());
-    CHECK_EQ(storage.data,
-             "{\"remotes\":[{\"host\":\"a\",\"port\":80,\"enabled\":true},{\"host\":\"b\",\"port\":99,\"enabled\":false}]}");
+    CHECK_EQ(storage.records["remotes"],
+             "[{\"host\":\"a\",\"port\":80,\"enabled\":true},{\"host\":\"b\",\"port\":99,\"enabled\":false}]");
 
     Fixture g;
     g.remotes.clear();
     g.list->persist();
-    storage.data = "{\"remotes\":[{\"host\":\"x\",\"port\":0},{\"host\":\"y\"},{},{},{}]}";
+    storage.records["remotes"] = "[{\"host\":\"x\",\"port\":0},{\"host\":\"y\"},{},{},{}]";
     g.api.persistence(storage);
     CHECK(g.api.load());
     CHECK_EQ(g.remotes.size(), 3u);  // capped at maxSize

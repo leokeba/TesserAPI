@@ -122,15 +122,23 @@ public:
 
     // Persistence (docs/DESIGN.md section 12): values and objects marked
     // persist() are saved to `storage` by poll(), debounceMs after the last
-    // change to one of them. Call load() once the tree is declared.
+    // change to one of them, one record per top-level node; a change
+    // rewrites only the records it touched. Call load() once the tree is
+    // declared.
     void persistence(Storage& storage, uint32_t debounceMs = 2000);
-    // Applies the stored state. Unknown keys and invalid values are skipped
-    // with a warning. Returns false if nothing was stored or it didn't parse.
+    // Applies the stored records. Unknown keys and invalid values are skipped
+    // with a warning. Returns false if nothing was stored.
     bool load();
-    // Saves now. Returns false on a storage error.
+    // Saves every record now. Returns false on a storage error.
     bool save();
-    // The JSON that save() would store.
+    // The whole persisted state as one JSON document (the records under
+    // their names), secrets included: a backup.
     std::string persistedState();
+    // Applies a document like persistedState()'s (a backup), leniently like
+    // load(): what doesn't fit the tree is skipped and its path added to
+    // `skipped`. What is applied is marked changed, then everything is
+    // saved. BadRequest if it doesn't parse, Internal if saving failed.
+    Status restore(std::string_view json, std::vector<std::string>* skipped = nullptr);
 
     // Removes every subscription of a client. Transports call it when a
     // connection closes and before destroying a Subscriber.
@@ -180,6 +188,9 @@ private:
     // remote nodes drop upstream subscriptions nobody uses any more.
     void subscriptionsRemoved(std::vector<Subscription>& gone, bool clientGone);
     void checkPersistence(uint32_t nowMs);
+    // Writes the records of top-level nodes (all, or those changed since
+    // the last save).
+    bool saveRecords(bool all);
 
     Config config_;
     mutable Mutex mutex_;

@@ -11,6 +11,7 @@
 
 #include "core_cases.h"
 #include "datagram_cases.h"
+#include "subscription_cases.h"
 
 namespace persistence_cases {
 
@@ -49,8 +50,10 @@ TEST(persist_state_and_roundtrip) {
         cases::set(s.api, "/on", "true");
         s.calibration = 42;  // read-only through the API, but persisted
         CHECK(s.api.save());
-        CHECK_EQ(storage.data,
-                 "{\"config\":{\"brightness\":7,\"name\":\"desk\",\"tuning\":{\"gain\":2}},\"calibration\":42}");
+        // One record per top-level node holding persisted state.
+        CHECK_EQ(storage.records.size(), 2u);
+        CHECK_EQ(storage.records["config"], "{\"brightness\":7,\"name\":\"desk\",\"tuning\":{\"gain\":2}}");
+        CHECK_EQ(storage.records["calibration"], "42");
     }
     Settings fresh(&storage);
     CHECK(fresh.api.load());
@@ -63,21 +66,24 @@ TEST(persist_state_and_roundtrip) {
 
 TEST(persist_lenient_load) {
     MemoryStorage storage;
-    storage.data =
-        "{\"config\":{\"brightness\":999,\"name\":\"kitchen\",\"removed\":1,\"tuning\":5},"
-        "\"on\":true,\"calibration\":3,\"ghost\":{\"x\":1}}";
+    storage.records["config"] = "{\"brightness\":999,\"name\":\"kitchen\",\"removed\":1,\"tuning\":5}";
+    storage.records["on"] = "true";
+    storage.records["calibration"] = "3";
+    storage.records["ghost"] = "{\"x\":1}";
     Settings s(&storage);
     CHECK(s.api.load());
     CHECK_EQ(s.brightness, 128);  // out of range: default kept
     CHECK_EQ(std::string(s.name), "kitchen");
     CHECK_EQ(s.gain, 0.5);  // "tuning" is now an object
-    CHECK(!s.on);           // not persisted
+    CHECK(!s.on);           // not persisted: its record isn't even read
     CHECK_EQ(s.calibration, 3);
 
-    storage.data = "{not json";
+    // A record that doesn't parse keeps its node's defaults; the others load.
+    storage.records["config"] = "{not json";
     Settings broken(&storage);
-    CHECK(!broken.api.load());
+    CHECK(broken.api.load());
     CHECK_EQ(broken.brightness, 128);
+    CHECK_EQ(broken.calibration, 3);
 }
 
 TEST(persist_autosave_debounce) {
@@ -95,8 +101,10 @@ TEST(persist_autosave_debounce) {
     s.api.poll(11600);
     CHECK_EQ(storage.saves, 0);
     s.api.poll(11800);
+    // Only the record that changed is written.
     CHECK_EQ(storage.saves, 1);
-    CHECK(storage.data.find("\"brightness\":2") != std::string::npos);
+    CHECK_EQ(storage.records.count("calibration"), 0u);
+    CHECK(storage.records["config"].find("\"brightness\":2") != std::string::npos);
     s.api.poll(13000);
     CHECK_EQ(storage.saves, 1);  // nothing new
 
@@ -105,23 +113,78 @@ TEST(persist_autosave_debounce) {
     s.api.poll(14000);
     s.api.poll(16000);
     CHECK_EQ(storage.saves, 1);
+
+    // A change elsewhere writes its own record only.
+    s.calibration = 5;
+    s.api.changed("/calibration");
+    s.api.poll(17000);
+    s.api.poll(18100);
+    CHECK_EQ(storage.saves, 2);
+    CHECK_EQ(storage.records["calibration"], "5");
+}
+
+TEST(persist_restore) {
+    MemoryStorage storage;
+    Settings s(&storage);
+    subscription_cases::FakeSubscriber watcher;
+    subscription_cases::subscribe(s.api, &watcher, "/config");
+    std::vector<std::string> skipped;
+    Status st = s.api.restore(
+        "{\"config\":{\"brightness\":9,\"name\":\"attic\",\"old\":1,\"tuning\":{\"gain\":\"x\"}},\"on\":true,"
+        "\"calibration\":12}",
+        &skipped);
+    CHECK_EQ(st, Status::Ok);
+    CHECK_EQ(s.brightness, 9);
+    CHECK_EQ(std::string(s.name), "attic");
+    CHECK_EQ(s.gain, 0.5);
+    CHECK(!s.on);
+    CHECK_EQ(s.calibration, 12);
+    CHECK_EQ(skipped.size(), 3u);
+    if (skipped.size() == 3) {
+        CHECK_EQ(skipped[0], "/config/old");
+        CHECK_EQ(skipped[1], "/config/tuning/gain");
+        CHECK_EQ(skipped[2], "/on");
+    }
+    // Saved at once, and subscribers hear about it.
+    CHECK_EQ(storage.records["config"], "{\"brightness\":9,\"name\":\"attic\",\"tuning\":{\"gain\":0.5}}");
+    s.api.poll(100);
+    CHECK_EQ(watcher.last(), "{\"op\":\"change\",\"path\":\"/config\",\"body\":{\"brightness\":9,\"name\":\"attic\"}}");
+
+    CHECK_EQ(s.api.restore("{nope"), Status::BadRequest);
+    CHECK_EQ(s.api.restore("[1]"), Status::BadRequest);
+}
+
+TEST(persist_erase) {
+    MemoryStorage storage;
+    Settings s(&storage);
+    CHECK(s.api.save());
+    CHECK(!storage.records.empty());
+    CHECK(storage.erase());
+    Settings fresh(&storage);
+    CHECK(!fresh.api.load());
 }
 
 #if !defined(ESP_PLATFORM)
 TEST(persist_file_storage) {
-    char path[] = "/tmp/tesser_state_XXXXXX";
-    int fd = mkstemp(path);
-    CHECK(fd >= 0);
-    close(fd);
-    remove(path);
+    char dir[] = "/tmp/tesser_state_XXXXXX";
+    CHECK(mkdtemp(dir) != nullptr);
+    std::string path = std::string(dir) + "/state";
     tesser::FileStorage file(path);
     std::string out;
-    CHECK(!file.load(out));
-    CHECK(file.save("{\"a\":1}"));
-    CHECK(file.save("{\"a\":2}"));  // replaces
-    CHECK(file.load(out));
+    CHECK(!file.load("config", out));
+    CHECK(file.erase());  // nothing yet: fine
+    CHECK(file.save("config", "{\"a\":1}"));  // creates the directory
+    CHECK(file.save("config", "{\"a\":2}"));  // replaces
+    CHECK(file.save("other", "3"));
+    CHECK(file.load("config", out));
     CHECK_EQ(out, "{\"a\":2}");
-    remove(path);
+    CHECK(file.load("other", out));
+    CHECK_EQ(out, "3");
+    CHECK(file.erase());
+    CHECK(!file.load("config", out));
+    CHECK(!file.load("other", out));
+    rmdir(path.c_str());
+    rmdir(dir);
 }
 #endif
 

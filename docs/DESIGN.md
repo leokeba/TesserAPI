@@ -507,21 +507,23 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 ## 12. Persistence
 
 ```cpp
-tesser::NvsStorage storage;               // or FileStorage("/littlefs/state.json")
+tesser::NvsStorage storage;               // or FileStorage("/littlefs/state")
 api.object("config").persist();           // everything below it
 api.value("calibration", cal).readOnly().persist();
 api.persistence(storage, 2000);           // debounce: save 2 s after the last change
 api.load();                               // once the tree is declared
 ```
 
-- **What is saved:** values and custom nodes marked `.persist()`, or below an object marked `.persist()`. They are stored as a single JSON document: the value view filtered to persisted nodes, the same sparse format as patches and change notifications. `api.persistedState()` returns it.
-- **Storage backends:** `tesser::Storage` has two methods, `load(std::string&)` and `save(const std::string&)`.
-  - `NvsStorage`: one NVS blob; the application initializes NVS.
-  - `FileStorage`: stdio, so any VFS mount on ESP and the host. It writes to a temporary file and renames it, so a power cut leaves either the old or the new state.
+- **What is saved:** values, custom nodes and lists marked `.persist()`, or below an object marked `.persist()`, in the same sparse format as patches and change notifications: the value view filtered to persisted nodes, secrets included.
+- **Records:** the state is stored as one record per top-level node that holds persisted state, under the node's name: `config` holds `{"brightness": 7, "tuning": {"gain": 2}}`, and a persisted value at the root (`calibration`) holds just its value. A change rewrites only the records it touched, so a setting changed often doesn't rewrite the rest of the state. `api.persistedState()` returns the whole state as one document, the records under their names.
+- **Storage backends:** `tesser::Storage` has three methods: `load(key, out)`, `save(key, data)` and `erase()`, which removes every record (a factory reset; the running state keeps its values until the next boot).
+  - `NvsStorage(namespace)`: one NVS blob per record, in its own namespace (default `tesser`). NVS keys hold 15 characters, so longer names keep their first 7 and get a hash. The application initializes NVS.
+  - `FileStorage(dir)`: one file per record, `<dir>/<key>.json`, through stdio, so any VFS mount on ESP and the host. The directory is created on the first save. It writes to a temporary file and renames it, so a power cut leaves either the old or the new record.
   - `MemoryStorage`: tests.
-- **Saving:** `Api::poll()` notices changes to persisted values through their generations, at most every 50 ms. It saves once `debounceMs` has passed without a new change. Changes to values that aren't persisted never cause a save. `api.save()` saves immediately.
+- **Saving:** `Api::poll()` notices changes to persisted values through their generations, at most every 50 ms. Once `debounceMs` has passed without a new change, it writes the records whose values changed since the last save. Changes to values that aren't persisted never cause a save. `api.save()` writes every record immediately.
 - **Loading** is lenient: the stored state goes through each value's normal validation, but whatever no longer fits is skipped with a warning and the value keeps its default. That covers renamed or removed keys, values now out of range, a key that became an object, and a value no longer persisted. So schema changes never break a boot.
 - **Read-only values:** values marked `readOnly()` for the API (calibration data written by an action, a boot counter) are restored too. Getter-only values can't be.
+- **Restoring** a backup: `api.restore(json, &skipped)` applies a document like `persistedState()`'s, leniently like a boot load, so a backup from an older firmware restores whatever still fits. The paths it skipped are listed in `skipped`. Unlike a boot load, what it applies is marked changed, so subscribers hear about it, and every record is saved at once. It returns `bad_request` if the document doesn't parse, and `internal` if saving failed.
 
 ## 13. Security
 
@@ -727,7 +729,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | done |
 | 6 | Groundwork for TesserUI: presentation metadata, forwarded subscriptions, discovered peers, `ApiClient` | done |
-| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels, secrets, streamed replies, `view=hash` and re-advertisement done |
+| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels, secrets, streamed replies, `view=hash`, re-advertisement, per-record persistence, `Storage::erase()` and `Api::restore()` done |
 
 ## 19. Decisions on former open questions
 

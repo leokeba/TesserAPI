@@ -11,17 +11,32 @@ bool isLeaf(const Node& n) {
     return n.type() == NodeType::Value || n.type() == NodeType::Custom || n.type() == NodeType::List;
 }
 
-// Newest change among persisted values (0: none ever changed).
-void newestPersisted(const Object& o, bool inherited, uint16_t& newest) {
-    for (const Node* c = o.first(); c; c = c->next()) {
-        bool p = inherited || c->persisted();
-        if (c->type() == NodeType::Object) {
-            newestPersisted(static_cast<const Object&>(*c), p, newest);
-        } else if (p && isLeaf(*c)) {
-            uint16_t g = c->generation();
-            if (g && (newest == 0 || newerGeneration(g, newest))) newest = g;
-        }
+// Whether `n` holds persisted state: a persisted leaf, or an object with one
+// below it.
+bool holdsPersisted(const Node& n, bool inherited) {
+    bool p = inherited || n.persisted();
+    if (n.type() != NodeType::Object) return p && isLeaf(n);
+    for (const Node* c = static_cast<const Object&>(n).first(); c; c = c->next()) {
+        if (holdsPersisted(*c, p)) return true;
     }
+    return false;
+}
+
+// Newest change among persisted values at or below `n` (0: none ever changed).
+void newestPersisted(const Node& n, bool inherited, uint16_t& newest) {
+    bool p = inherited || n.persisted();
+    if (n.type() == NodeType::Object) {
+        for (const Node* c = static_cast<const Object&>(n).first(); c; c = c->next()) newestPersisted(*c, p, newest);
+    } else if (p && isLeaf(n)) {
+        uint16_t g = n.generation();
+        if (g && (newest == 0 || newerGeneration(g, newest))) newest = g;
+    }
+}
+
+void writeLeaf(const Node& n, JsonWriter& w) {
+    detail::RenderOptions options;
+    options.secrets = true;
+    detail::writeLeaf(w, n, options);
 }
 
 void writePersisted(const Object& o, bool inherited, detail::LazyPatch& lp, JsonWriter& w) {
@@ -33,70 +48,92 @@ void writePersisted(const Object& o, bool inherited, detail::LazyPatch& lp, Json
             lp.leave();
         } else if (p && isLeaf(*c)) {
             lp.key(c->name());
-            detail::RenderOptions options;
-            options.secrets = true;
-            detail::writeLeaf(w, *c, options);
+            writeLeaf(*c, w);
         }
     }
 }
 
-// Applies a stored state leniently: whatever doesn't fit the current tree is
-// skipped, so renamed or removed fields never break a boot.
-void applyStored(Object& o, JsonObjectConst stored, bool inherited, std::string& path) {
-    for (JsonPairConst kv : stored) {
-        std::string_view key(kv.key().c_str(), kv.key().size());
-        size_t len = path.size();
-        path += '/';
-        path.append(key.data(), key.size());
-        Node* c = o.child(key);
+// A top-level node's record: its value, or for an object the sparse object
+// of its persisted values.
+std::string record(const Node& top, bool inherited) {
+    std::string out;
+    StringSink sink(out);
+    JsonWriter w(sink);
+    if (top.type() == NodeType::Object) {
+        detail::LazyPatch lp(w);
+        writePersisted(static_cast<const Object&>(top), inherited || top.persisted(), lp, w);
+        if (!lp.finish()) out = "{}";
+    } else {
+        writeLeaf(top, w);
+    }
+    return out;
+}
+
+// Applies stored state leniently: whatever doesn't fit the current tree is
+// skipped, so renamed or removed fields never break a boot. `notify` marks
+// what it applies changed (a restore at run time; a boot load needn't).
+struct Applier {
+    bool notify = false;
+    std::vector<std::string>* skipped = nullptr;
+    std::string path;
+
+    void skip(const char* problem) {
+        logWarning("stored state: %s %s, skipped", path.c_str(), problem);
+        if (skipped) skipped->push_back(path);
+    }
+
+    // `c` is the node at `path` (null if there is none).
+    void apply(Node* c, JsonVariantConst value, bool inherited) {
         bool p = c && (inherited || c->persisted());
-        const char* problem = nullptr;
-        if (!c) {
-            problem = "no longer exists";
-        } else if (c->type() == NodeType::Object) {
-            if (kv.value().is<JsonObjectConst>()) {
-                applyStored(static_cast<Object&>(*c), kv.value().as<JsonObjectConst>(), p, path);
-            } else {
-                problem = "is now an object";
+        if (!c) return skip("no longer exists");
+        if (c->type() == NodeType::Object) {
+            if (!value.is<JsonObjectConst>()) return skip("is now an object");
+            for (JsonPairConst kv : value.as<JsonObjectConst>()) {
+                std::string_view key(kv.key().c_str(), kv.key().size());
+                size_t len = path.size();
+                path += '/';
+                path.append(key.data(), key.size());
+                apply(static_cast<Object*>(c)->child(key), kv.value(), p);
+                path.resize(len);
             }
-        } else if (!p) {
-            problem = "is not persisted";
-        } else if (c->type() == NodeType::Value) {
+            return;
+        }
+        if (!p) return skip("is not persisted");
+        if (c->type() == NodeType::Value) {
             auto& v = static_cast<ValueNode&>(*c);
-            Check chk = v.check(kv.value());
-            if (chk.isOk()) chk = v.apply(kv.value());  // readOnly() values are restored too
-            if (!chk.isOk()) problem = chk.message ? chk.message : "rejected";
+            Check chk = v.check(value);
+            if (chk.isOk()) chk = v.apply(value);  // readOnly() values are restored too
+            if (!chk.isOk()) return skip(chk.message ? chk.message : "rejected");
         } else if (c->type() == NodeType::List) {
             auto& list = static_cast<ListNode&>(*c);
-            if (!kv.value().is<JsonArrayConst>()) {
-                problem = "is now a list";
-            } else {
-                JsonArrayConst items = kv.value().as<JsonArrayConst>();
-                list.resize(items.size() < list.maxSize() ? items.size() : list.maxSize());
-                size_t i = 0;
-                for (JsonVariantConst item : items) {
-                    if (i >= list.size()) break;
-                    size_t at = path.size();
-                    path += '/';
-                    path += std::to_string(i);
-                    if (item.is<JsonObjectConst>()) {
-                        applyStored(*list.element(i), item.as<JsonObjectConst>(), true, path);
-                    }
-                    path.resize(at);
-                    i++;
+            if (!value.is<JsonArrayConst>()) return skip("is now a list");
+            JsonArrayConst items = value.as<JsonArrayConst>();
+            list.resize(items.size() < list.maxSize() ? items.size() : list.maxSize());
+            size_t i = 0;
+            for (JsonVariantConst item : items) {
+                if (i >= list.size()) break;
+                size_t at = path.size();
+                path += '/';
+                path += std::to_string(i);
+                if (item.is<JsonObjectConst>()) {
+                    bool was = notify;
+                    notify = false;  // the list is marked as a whole
+                    apply(list.element(i).get(), item, true);
+                    notify = was;
                 }
+                path.resize(at);
+                i++;
             }
         } else if (c->type() == NodeType::Custom) {
             auto& cu = static_cast<CustomNode&>(*c);
-            Check chk = cu.check(kv.value());
-            if (!chk.isOk() || cu.apply(kv.value()) != Status::Ok) problem = "rejected";
+            Check chk = cu.check(value);
+            if (!chk.isOk() || cu.apply(value) != Status::Ok) return skip("rejected");
         } else {
-            problem = "can't be restored";
+            return skip("can't be restored");
         }
-        if (problem) logWarning("stored state: %s %s, skipped", path.c_str(), problem);
-        path.resize(len);
+        if (notify) c->changed();
     }
-}
+};
 
 }  // namespace
 
@@ -119,31 +156,68 @@ std::string Api::persistedState() {
     return out;
 }
 
-bool Api::save() {
-    MutexGuard guard(mutex_);
+bool Api::saveRecords(bool all) {
     if (!storage_) return false;
     uint16_t gen = currentGeneration();
-    if (!storage_->save(persistedState())) {
-        logError("saving state failed");
-        return false;
+    bool ok = true;
+    for (const Node* c = first(); c; c = c->next()) {
+        if (!holdsPersisted(*c, persisted())) continue;
+        if (!all) {
+            uint16_t newest = 0;
+            newestPersisted(*c, persisted(), newest);
+            if (!newerGeneration(newest, savedGen_)) continue;  // its record is current
+        }
+        if (!storage_->save(c->name(), record(*c, persisted()))) {
+            logError("saving state %s failed", c->name());
+            ok = false;
+        }
     }
-    savedGen_ = seenGen_ = gen;
-    return true;
+    // After a failure the dirty records stay dirty and are written again.
+    if (ok) savedGen_ = seenGen_ = gen;
+    return ok;
+}
+
+bool Api::save() {
+    MutexGuard guard(mutex_);
+    return saveRecords(true);
 }
 
 bool Api::load() {
     MutexGuard guard(mutex_);
-    std::string data;
-    if (!storage_ || !storage_->load(data)) return false;
-    JsonDocument doc;
-    if (deserializeJson(doc, data) || !doc.is<JsonObjectConst>()) {
-        logWarning("stored state doesn't parse; keeping defaults");
-        return false;
+    if (!storage_) return false;
+    bool any = false;
+    Applier a;
+    for (Node* c = first(); c; c = c->next()) {
+        if (!holdsPersisted(*c, persisted())) continue;
+        std::string data;
+        if (!storage_->load(c->name(), data)) continue;
+        JsonDocument doc;
+        a.path = "/";
+        a.path += c->name();
+        if (deserializeJson(doc, data)) {
+            logWarning("stored state %s doesn't parse; keeping defaults", a.path.c_str());
+            continue;
+        }
+        a.apply(c, doc.as<JsonVariantConst>(), persisted());
+        any = true;
     }
-    std::string path;
-    applyStored(*this, doc.as<JsonObjectConst>(), persisted(), path);
     savedGen_ = seenGen_ = currentGeneration();
-    return true;
+    return any;
+}
+
+Status Api::restore(std::string_view json, std::vector<std::string>* skipped) {
+    MutexGuard guard(mutex_);
+    JsonDocument doc;
+    if (deserializeJson(doc, json.data(), json.size(), DeserializationOption::NestingLimit(config_.maxDepth + 1)) ||
+        !doc.is<JsonObjectConst>()) {
+        return Status::BadRequest;
+    }
+    Applier a;
+    a.notify = true;
+    a.skipped = skipped;
+    a.apply(this, doc.as<JsonVariantConst>(), persisted());
+    if (storage_ && !saveRecords(true)) return Status::Internal;
+    return Status::Ok;
 }
 
 void Api::checkPersistence(uint32_t nowMs) {
@@ -158,7 +232,7 @@ void Api::checkPersistence(uint32_t nowMs) {
         changedAtMs_ = nowMs;
         return;
     }
-    if (nowMs - changedAtMs_ >= debounceMs_) save();
+    if (nowMs - changedAtMs_ >= debounceMs_) saveRecords(false);
 }
 
 }  // namespace tesser
