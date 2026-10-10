@@ -381,7 +381,9 @@ These transports are message-based and two-way, so they share one JSON envelope.
 - **`id`:** any JSON scalar, echoed verbatim. It may be omitted, in which case the response also has no `id`.
 - **`op`:** `get`, `set`, `sub` or `unsub`. The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `events`, `snapshot` and `body` map one-to-one onto `Request`.
 - **Unknown envelope keys** are ignored, for forward compatibility.
-- **Response:** the response is written as a stream: `{"id":…,"status":"…","body":` followed by the body and then `}`. Buffered transports can still replace it with an error if the body overflows the limit.
+- **Response:** the response is written as a stream: `{"id":…,"status":"…","body":` followed by the body and then `}`.
+  - **Buffered** (NowTP, and every deferred or queued reply): the envelope is sent whole, up to `maxResponse`. A larger body is replaced with a `too_large` error.
+  - **Streamed** (serial and WebSocket, for replies sent while the request is handled): `EnvelopeReply::stream()` sends the envelope in 1 KB pieces as it is rendered, so its size isn't limited and memory stays bounded. An error found before the first piece is out still replaces the reply. After that, a failed piece stops the rendering, and the transport ends the message as it can.
 - **Framing** is the transport's job:
   - Serial: one envelope per line (`\n`). Non-JSON lines from the log are ignored by clients.
   - NowTP: one envelope per message.
@@ -435,13 +437,15 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 
 - Leading control and non-ASCII bytes are skipped, since a UART picks them up while the peer resets.
 - When the UART is also the console, log output from other tasks can interleave with a reply on the same line. Use a dedicated UART, or lower the log level once the transport is serving.
+- Responses stream (§10.1): one line however long. The output lock is held from the first piece to the end of the line, so notifications and deferred replies from other tasks wait for it.
 
 ### 10.5 WebSocket
 
 `http.enableWebSocket("/ws")` serves the §10.1 envelope over WebSocket on the HTTP transport's server. This is where browser subscriptions live.
 - Needs `CONFIG_HTTPD_WS_SUPPORT`, which is enabled in Arduino-ESP32 3.x and must be turned on in menuconfig on ESP-IDF.
-- One text frame per envelope. Each connection is a client (`Subscriber`).
-- **Ordering:** every frame (responses, deferred replies, notifications) is written from the httpd task through `httpd_queue_work`, so writes from other tasks never interleave.
+- One text message per envelope. Each connection is a client (`Subscriber`).
+- **Large replies** stream (§10.1) as a fragmented message: a text frame, then continuation frames, the last one final. Browsers reassemble it into one message.
+- **Ordering:** notifications, deferred replies and replies that fit in one piece are written from the httpd task through `httpd_queue_work`, so writes from other tasks never interleave. A fragmented reply is written directly while the httpd task handles its request, so no queued frame can come in between, but it can overtake notifications queued just before the request.
 - **Cleanup:** when `begin()` owns the server, `close_fn` drops a closed connection's subscriptions at once. With `attach()`, a closed connection is noticed on the next send to it.
 - **Handshake:** a connection's authentication (§13) is decided from its handshake. ESP-IDF 6.1 stopped calling a WebSocket handler with the handshake's GET, so `HttpServer` reads the handshake in the pre-handshake callback, which needs `CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT`. The component's Kconfig selects it; older ESP-IDF versions and Arduino-ESP32 3.x still call the handler. When neither path saw the handshake, the server logs a warning once and the connection is unauthenticated.
 
@@ -645,7 +649,7 @@ Targets to be measured on a classic ESP32 and a C3, and enforced in CI:
 | Flash, core + HTTP transport | ≤ 40 KB above the application's baseline, ArduinoJson included (measured below: 45.5 KB) |
 | RAM per value leaf | ≤ 32 B with a bound variable, ≤ 56 B with a getter and setter, + 28 B with a range or description |
 | RAM per object node | ≤ 32 B |
-| Request handling | Request body document (bounded by `maxRequestBody`) + 512 B streaming buffer (HTTP), or the response buffer (NowTP, bounded by `maxResponse`) |
+| Request handling | Request body document (bounded by `maxRequestBody`) + 512 B streaming buffer (HTTP) or 1 KB (serial, WebSocket), or the response buffer (NowTP and deferred replies, bounded by `maxResponse`) |
 | Stack | Rendering depth bounded by `maxDepth` (default 16) |
 
 Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware`):
@@ -679,7 +683,7 @@ Configuration (`tesser::Config`, at runtime):
 | Option | Default |
 |---|---|
 | `maxRequestBody` | 4096 |
-| `maxResponse` (buffered transports) | 8192 |
+| `maxResponse` (buffered replies: NowTP, deferred and queued replies) | 8192 |
 | `maxDepth` | 16 |
 | `deferTimeoutMs` | 10000 |
 | `maxPending` | 4 |
@@ -717,7 +721,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | done |
 | 6 | Groundwork for TesserUI: presentation metadata, forwarded subscriptions, discovered peers, `ApiClient` | done |
-| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels and secrets done |
+| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels, secrets and streamed replies done |
 
 ## 19. Decisions on former open questions
 

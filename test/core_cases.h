@@ -641,14 +641,23 @@ TEST(envelope_errors) {
     CHECK(roundTrip(d.api, "{\"op\":\"get\",\"keys\":[\"a\"]}").find("keys must be") != std::string::npos);
 }
 
+// Buffered envelope replies (NowTP, deferred replies) are limited by
+// maxResponse; streamed ones (serial, WebSocket) aren't: see stream_cases.h.
+inline std::string bufferedRoundTrip(Api& api, const char* text) {
+    std::string out;
+    tesser::handleEnvelope(api, text, tesser::Client(), [&](const std::string& m) { out = m; });
+    return out;
+}
+
 TEST(envelope_response_limit) {
     Device d;
     d.api.config().maxResponse = 64;
-    std::string r = roundTrip(d.api, "{\"id\":1,\"op\":\"get\",\"path\":\"/\"}");
+    std::string r = bufferedRoundTrip(d.api, "{\"id\":1,\"op\":\"get\",\"path\":\"/\"}");
     CHECK(r.find("\"status\":\"too_large\"") != std::string::npos);
     CHECK(r.size() <= 120);
     d.api.config().maxResponse = 0;  // unlimited
-    CHECK(roundTrip(d.api, "{\"id\":1,\"op\":\"get\",\"path\":\"/\"}").find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(bufferedRoundTrip(d.api, "{\"id\":1,\"op\":\"get\",\"path\":\"/\"}").find("\"status\":\"ok\"") !=
+          std::string::npos);
 }
 
 TEST(line_transport_framing) {

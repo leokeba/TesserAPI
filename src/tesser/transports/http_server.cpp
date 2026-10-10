@@ -417,7 +417,22 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
     }
     client.access = ws->access;
     client.authenticated = ws->access != Access::Public;
-    handleEnvelope(api_, text, client, [this, fd](const std::string& m) { wsSend(fd, m); }, ws);
+    // The reply streams: a large one goes out as a fragmented message, sent
+    // from this (the httpd) task, so no queued frame can come in between. A
+    // reply that fits in one piece is queued like any frame, which keeps it
+    // in order with the notifications queued before it.
+    handleEnvelope(
+        api_, text, client, [this, fd](const std::string& m) { wsSend(fd, m); }, ws,
+        [this, req, fd](const char* data, size_t len, bool first, bool final) {
+            if (first && final) return wsSend(fd, std::string(data, len));
+            httpd_ws_frame_t out = {};
+            out.type = first ? HTTPD_WS_TYPE_TEXT : HTTPD_WS_TYPE_CONTINUE;
+            out.fragmented = true;
+            out.final = final;
+            out.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(data));
+            out.len = len;
+            return httpd_ws_send_frame(req, &out) == ESP_OK;
+        });
     return ESP_OK;
 #else
     (void)req;

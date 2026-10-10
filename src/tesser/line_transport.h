@@ -20,7 +20,9 @@ class Api;
 // deferred replies from other tasks never interleave.
 //
 // The line is one client: it can subscribe, and notifications are written to
-// the output like responses.
+// the output like responses. Responses are streamed to the output as they
+// are rendered, so Config::maxResponse doesn't limit them; deferred replies
+// are buffered and limited by it.
 class LineTransport : public Subscriber {
 public:
     using Output = std::function<void(const char* data, size_t len)>;
@@ -43,6 +45,7 @@ public:
 private:
     void handleLine();
     void send(const std::string& message);
+    bool sendPiece(const char* data, size_t len, bool first, bool final);
 
     Api& api_;
     Output output_;

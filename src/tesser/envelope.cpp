@@ -154,6 +154,11 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
 }
 
 bool EnvelopeReply::LimitedSink::write(const char* data, size_t len) {
+    if (r_.fragment_) {
+        if (r_.failed_) return false;
+        r_.buf_.append(data, len);
+        return r_.buf_.size() < r_.chunk_ || r_.flush();
+    }
     if (r_.limit_ && r_.buf_.size() + len + 1 > r_.limit_) return false;  // keep room for '}'
     r_.buf_.append(data, len);
     return true;
@@ -161,6 +166,25 @@ bool EnvelopeReply::LimitedSink::write(const char* data, size_t len) {
 
 EnvelopeReply::EnvelopeReply(const EnvelopeId& id, size_t limit, Send send)
     : id_(id), limit_(limit), send_(std::move(send)) {}
+
+EnvelopeReply::~EnvelopeReply() {
+    // A streamed envelope cut short still ends, so the transport can release
+    // what it holds for it (a line's output lock, a WebSocket message).
+    if (flushed_) fragment_(nullptr, 0, false, true);
+}
+
+void EnvelopeReply::stream(Fragment fragment, size_t chunk) {
+    fragment_ = std::move(fragment);
+    chunk_ = chunk ? chunk : 1;
+}
+
+bool EnvelopeReply::flush() {
+    bool first = !flushed_;
+    flushed_ = true;
+    if (!fragment_(buf_.data(), buf_.size(), first, false)) failed_ = true;
+    buf_.clear();
+    return !failed_;
+}
 
 Sink& EnvelopeReply::begin(Status status) {
     buf_.clear();
@@ -178,13 +202,25 @@ Sink& EnvelopeReply::begin(Status status) {
 
 void EnvelopeReply::end() {
     buf_ += '}';
-    if (send_) send_(buf_);
+    if (fragment_) {
+        bool first = !flushed_;
+        flushed_ = false;  // the final piece goes out here
+        if (failed_) {
+            if (!first) fragment_(nullptr, 0, false, true);
+        } else {
+            fragment_(buf_.data(), buf_.size(), first, true);
+        }
+    } else if (send_) {
+        send_(buf_);
+    }
     buf_.clear();
     buf_.shrink_to_fit();
 }
 
 bool EnvelopeReply::rollback() {
+    if (flushed_) return false;
     buf_.clear();
+    failed_ = false;
     return true;
 }
 
@@ -199,7 +235,7 @@ void EnvelopeReply::release() {
 }
 
 void handleEnvelope(Api& api, std::string_view text, const Client& client, const EnvelopeReply::Send& send,
-                    Subscriber* subscriber) {
+                    Subscriber* subscriber, const EnvelopeReply::Fragment& stream) {
     JsonDocument doc;
     Request req;
     req.client = client;
@@ -208,6 +244,7 @@ void handleEnvelope(Api& api, std::string_view text, const Client& client, const
     const char* message = nullptr;
     Status s = parseEnvelope(text, doc, api.config().maxDepth, req, id, message);
     EnvelopeReply reply(id, api.config().maxResponse, send);
+    if (stream) reply.stream(stream);
     if (s != Status::Ok) {
         writeError(reply, s, std::string_view(), message);
         return;

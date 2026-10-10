@@ -19,6 +19,7 @@
 #include "remote_cases.h"
 #include "client_cases.h"
 #include "access_cases.h"
+#include "stream_cases.h"
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
@@ -126,6 +127,16 @@ tesser::Node* g_secretNode;
 tesser::NvsStorage* g_storage;
 tesser::UartTransport* g_uart;
 
+// Rows of a table whose full read (about 11 KB at 300 rows) exceeds
+// Config::maxResponse:
+// streamed over serial and WebSocket, chunked over HTTP.
+struct Row {
+    int id;
+    char name[16];
+    float gain;
+};
+std::vector<Row> g_table;
+
 void delayedReply(void* arg) {
     auto* pending = static_cast<tesser::Pending*>(arg);
     vTaskDelay(pdMS_TO_TICKS(200));
@@ -158,6 +169,24 @@ void serveDemo() {
     g_ticksNode = &demo.value("ticks", g_ticks);
     g_fired = &demo.event("fired");
     demo.action("fire", [](JsonVariantConst payload) { g_fired->emit(payload); });
+    // Empty until a test sets tableRows, so whole-tree reads (the gateway's
+    // mirror over NowTP) stay small.
+    demo.list("table", g_table, [](tesser::Object& o, Row& r) {
+            o.value("id", r.id);
+            o.value("name", r.name);
+            o.value("gain", r.gain);
+        }).maxSize(300);
+    demo.value(
+            "tableRows", [] { return uint32_t(g_table.size()); },
+            [](uint32_t n) {
+                g_table.resize(n);
+                for (size_t i = 0; i < g_table.size(); i++) {
+                    g_table[i].id = int(i);
+                    snprintf(g_table[i].name, sizeof(g_table[i].name), "row%u", unsigned(i % 1000));
+                    g_table[i].gain = 0.5f;
+                }
+            })
+        .range(0, 300);
     esp_timer_create_args_t timer = {};
     timer.callback = [](void*) {
         if (!g_running) return;

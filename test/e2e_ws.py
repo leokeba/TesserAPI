@@ -73,14 +73,24 @@ class WebSocket:
         elif n == 127:
             n = struct.unpack('>Q', self._read(8))[0]
         payload = self._read(n)
-        return b0 & 0x0f, payload
+        return b0 & 0x0f, bool(b0 & 0x80), payload
 
     def message(self, timeout=3):
+        """The next text message, reassembled from its fragments; the number
+        of frames it took is left in self.frames."""
         end = time.time() + timeout
+        parts = None
         while time.time() < end:
-            op, payload = self.recv(max(0.05, end - time.time()))
+            op, fin, payload = self.recv(max(0.05, end - time.time()))
             if op == 1:
-                return json.loads(payload)
+                parts = [payload]
+            elif op == 0 and parts is not None:
+                parts.append(payload)
+            else:
+                continue
+            if fin:
+                self.frames = len(parts)
+                return json.loads(b''.join(parts))
         raise TimeoutError
 
     def request(self, op, path, timeout=3, **kw):
@@ -222,6 +232,18 @@ def main():
     check('ws bearer token -> ok', r.get('status') == 'ok' and r.get('body') == 4, r)
     check('ws reads stay open', http.call('get', '/secure/secret', {}, ABSENT) == ('ok', 4))
     time.sleep(0.5)
+
+    # A reply larger than maxResponse (8 KB) streams as a fragmented message.
+    http.call('set', '/demo/tableRows', {}, 300)
+    c = WebSocket(host)
+    r = c.request('get', '/demo/table', timeout=10)
+    rows = r.get('body') or []
+    check(f'large reply streamed ({c.frames} frames)', r.get('status') == 'ok' and len(rows) == 300 and
+          rows[299] == {'id': 299, 'name': 'row299', 'gain': 0.5} and c.frames > 1, (r.get('status'), c.frames))
+    r = c.request('get', '/lamp/on')
+    check('next reply after a streamed one', r.get('status') == 'ok' and c.frames == 1, r)
+    c.close()
+    http.call('set', '/demo/tableRows', {}, 0)
 
     # Plain HTTP can't subscribe.
     code, data, _, _ = http.raw('GET', '/lamp')

@@ -56,7 +56,20 @@ void LineTransport::handleLine() {
     Client client;
     client.transport = TransportKind::Serial;
     client.authenticated = authenticated_;
-    handleEnvelope(api_, text, client, [this](const std::string& m) { send(m); }, this);
+    handleEnvelope(api_, text, client, [this](const std::string& m) { send(m); }, this,
+                   [this](const char* data, size_t len, bool first, bool final) { return sendPiece(data, len, first, final); });
+}
+
+// A streamed response line. The output lock is held from the first piece to
+// the last, so nothing else lands in the middle of the line.
+bool LineTransport::sendPiece(const char* data, size_t len, bool first, bool final) {
+    if (first) outputMutex_.lock();
+    if (output_ && len) output_(data, len);
+    if (final) {
+        if (output_) output_("\n", 1);
+        outputMutex_.unlock();
+    }
+    return true;
 }
 
 void LineTransport::send(const std::string& message) {

@@ -154,6 +154,14 @@ def main():
 
     conformance.run(b, 'serial', check)
 
+    # A reply larger than maxResponse (8 KB) streams as one long line.
+    b.request('set', '/demo/tableRows', body=300)
+    r = b.request('get', '/demo/table', timeout=5)
+    rows = r.get('body') or []
+    check('large reply streamed', r['status'] == 'ok' and len(rows) == 300 and
+          rows[299] == {'id': 299, 'name': 'row299', 'gain': 0.5}, r.get('status'))
+    b.request('set', '/demo/tableRows', body=0)
+
     # Subscriptions: the serial line is one client.
     r = b.request('sub', '/lamp', keys='brightness')
     check('sub snapshot', r['status'] == 'ok' and r['body'] == {'brightness': 128}, r)
