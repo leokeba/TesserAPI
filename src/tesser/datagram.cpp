@@ -36,9 +36,9 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
         w.key("exclude");
         w.string(query.exclude);
     }
-    if (query.view == View::Schema) {
+    if (query.view != View::Value) {
         w.key("view");
-        w.string("schema");
+        w.string(query.view == View::Schema ? "schema" : "hash");
     }
     if (!query.remotes) {
         w.key("remotes");
@@ -184,7 +184,34 @@ bool DatagramEndpoint::process() {
         remotes = remotes_;
     }
     for (RemoteNode* r : remotes) r->tick(now);
+    checkAdvertisement(now);
     return worked || pendingCalls() != before;
+}
+
+void DatagramEndpoint::autoAdvertise(std::function<void(uint32_t)> publish, uint32_t current, uint32_t debounceMs) {
+    publish_ = std::move(publish);
+    publishedHash_ = current;
+    seenRevision_ = schemaRevision();
+    advertiseDebounceMs_ = debounceMs;
+    revisionPending_ = false;
+}
+
+void DatagramEndpoint::checkAdvertisement(uint32_t now) {
+    if (!publish_ || !api_) return;
+    uint32_t rev = schemaRevision();
+    if (rev != seenRevision_) {
+        // Changes come in bursts (several peers mounted at once): wait for quiet.
+        seenRevision_ = rev;
+        revisionAtMs_ = now;
+        revisionPending_ = true;
+        return;
+    }
+    if (!revisionPending_ || now - revisionAtMs_ < advertiseDebounceMs_) return;
+    revisionPending_ = false;
+    uint32_t hash = api_->schemaHash();
+    if (hash == publishedHash_) return;
+    publishedHash_ = hash;
+    publish_(hash);
 }
 
 void DatagramEndpoint::reject(const Incoming& msg, Status status, const char* message) {

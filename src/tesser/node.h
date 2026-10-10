@@ -75,6 +75,12 @@ uint16_t currentGeneration();
 // True if generation `a` is newer than `b`.
 inline bool newerGeneration(uint16_t a, uint16_t b) { return a != 0 && static_cast<int16_t>(a - b) > 0; }
 
+// Bumped whenever the shape of a tree changes: a node is added, a modifier
+// changes a node's schema, a remote node's state changes. Temporary objects
+// (list elements) don't count. Lets transports re-advertise a changed schema
+// (docs/DESIGN.md section 10.3) without rendering it to find out.
+uint32_t schemaRevision();
+
 // Number of declaration mistakes (duplicate or invalid names) since boot.
 // Each one is also logged.
 int declarationErrors();
@@ -108,7 +114,22 @@ protected:
     friend class Object;
     friend class Api;
 
-    enum Flags : uint8_t { kReadOnly = 1, kPersist = 2, kDeferring = 4, kLinked = 8, kWatch = 16, kSecret = 32 };
+    enum Flags : uint8_t {
+        kReadOnly = 1,
+        kPersist = 2,
+        kDeferring = 4,
+        kLinked = 8,
+        kWatch = 16,
+        kSecret = 32,
+        kTemporary = 64,  // part of a temporary object (list element, prototype)
+    };
+
+    // Records a schema change (see schemaRevision()).
+    void touch();
+    void setFlag(uint8_t flag) {
+        flags_ |= flag;
+        touch();
+    }
 
     NodeMeta& editMeta();
     UiMeta* editUi();  // null when compiled out (TESSER_NO_UI)
@@ -469,7 +490,7 @@ public:
         return *this;
     }
     CustomNode& persist() {
-        flags_ |= kPersist;
+        setFlag(kPersist);
         return *this;
     }
 
@@ -507,11 +528,12 @@ public:
     // Longest list a write may create (default 32).
     ListNode& maxSize(size_t n) {
         maxSize_ = n;
+        touch();
         return *this;
     }
     size_t maxSize() const { return maxSize_; }
     ListNode& persist() {
-        flags_ |= kPersist;
+        setFlag(kPersist);
         return *this;
     }
 
@@ -601,7 +623,11 @@ struct HasDescribeMember<T, std::void_t<decltype(std::declval<T&>().describe(std
 
 class Object : public Annotated<Object> {
 public:
-    explicit Object(const char* name) : Annotated(name, NodeType::Object) {}
+    // An object without a name is temporary: a list element or prototype,
+    // described for one request.
+    explicit Object(const char* name) : Annotated(name, NodeType::Object) {
+        if (!name) flags_ |= kTemporary;
+    }
     ~Object() override;
 
     // Child object; returns the existing one when the name is already an object.
@@ -716,7 +742,7 @@ public:
 
     // Persists every value below this object (see Api::persistence()).
     Object& persist() {
-        flags_ |= kPersist;
+        setFlag(kPersist);
         return *this;
     }
 

@@ -85,8 +85,17 @@ bool NowTpTransport::set(const nowtp::Mac& to, std::string_view path, std::strin
 bool NowTpTransport::advertise() {
     Api* api = endpoint_.api();
     if (!api) return false;
-    std::string meta = buildAdvertisement(port_, api->schemaHash());
-    return now_.setDiscoveryMetadata(meta.data(), meta.size()) == nowtp::Status::Ok;
+    uint32_t hash = api->schemaHash();
+    std::string meta = buildAdvertisement(port_, hash);
+    bool ok = now_.setDiscoveryMetadata(meta.data(), meta.size()) == nowtp::Status::Ok;
+    // From now on the worker (or poll()) re-advertises when the tree changes.
+    endpoint_.autoAdvertise(
+        [this](uint32_t h) {
+            std::string m = buildAdvertisement(port_, h);
+            now_.setDiscoveryMetadata(m.data(), m.size());
+        },
+        hash);
+    return ok;
 }
 
 bool NowTpTransport::parseAdvertisement(const std::vector<uint8_t>& metadata, uint8_t& port, uint32_t& schemaHash) {

@@ -20,6 +20,7 @@
 #include "client_cases.h"
 #include "access_cases.h"
 #include "stream_cases.h"
+#include "housekeeping_cases.h"
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"

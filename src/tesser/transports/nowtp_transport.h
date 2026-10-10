@@ -82,7 +82,9 @@ public:
     // Announces this node in NowTP discovery metadata as
     // {"tesser":<port>,"schema":"<schemaHash, 8 hex digits>"}, so peers can
     // tell TesserAPI nodes apart and keep cached schemas while the hash
-    // holds. Call once the tree is complete (and again if it changes).
+    // holds. Call once the tree is complete: after that, the advertisement
+    // follows the tree, 1 s after its last change (peers mounted, nodes
+    // added, a mounted peer going offline).
     bool advertise();
     // Reads such metadata; false if it isn't a TesserAPI advertisement.
     static bool parseAdvertisement(const std::vector<uint8_t>& metadata, uint8_t& port, uint32_t& schemaHash);

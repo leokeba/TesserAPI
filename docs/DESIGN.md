@@ -197,7 +197,7 @@ struct Request {
 | `depth` | `0`–`255`, default unlimited | Levels of objects to expand below the target. An object beyond the limit renders as `{}`. `depth=0` on an object gives `{}`. Values are always rendered. |
 | `keys` | comma-separated names | Only these direct children of the target. An unknown name is `not_found`. |
 | `exclude` | comma-separated names | All direct children except these. |
-| `view` | `value` (default), `schema` | The representation to return (§7). |
+| `view` | `value` (default), `schema`, `hash` | The representation to return (§7). |
 | `remotes` | `true` (default), `false` | Include mirrored remote nodes' copies (§14). |
 
 `keys` and `exclude` apply only at the target level. Nested selection uses a shape (§5.3). `keys` together with `exclude` is `bad_request`. With `depth`, the target itself is level 0.
@@ -287,6 +287,11 @@ GET /lamp?view=schema
 - `depth`, `keys` and the shape apply to `children` the same way.
 - A schema leaf is always an object containing `"type"`. Children are always under `"children"`, so a child named `type` can't be confused with a descriptor.
 - Schema output is compiled out with `TESSER_NO_SCHEMA` when flash is tight.
+
+**Hash view:** `GET /lamp?view=hash` → `"1a2b3c4d"`, the FNV-1a hash of the target's schema as 8 hex digits, so a client can keep a cached schema while the hash holds.
+- It covers the whole schema the client may read (§13.1): `depth` doesn't apply, and `keys`, `exclude` or a shape are `bad_request`.
+- The root's hash for a client with full access is `Api::schemaHash()`, the one advertised in discovery metadata (§10.3).
+- Below a remote node, the request is forwarded like any read, so the remote computes its own hash.
 
 ### 7.1 Presentation metadata
 
@@ -428,6 +433,7 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 - **Threading:** NowTP runs its receive callbacks while holding its own lock, so the adapter never handles a request there. It copies each message into a bounded queue (default 8, then `busy`), and a worker task (or `poll()`) handles it under the API lock. The lock order is therefore always API, then NowTP, and replies sent from any API context can't deadlock.
 - **Client:** the same endpoint sends requests to other nodes (`get`, `set`, or `endpoint().request()`) and matches responses by `id`, with a timeout per call (default 3 s) and at most 8 calls in flight. Handlers run in the worker task. `peerLost(mac)` fails a lost peer's calls at once.
 - **Discovery:** `advertise()` puts `{"tesser": <port>, "schema": "<schemaHash>"}` into NowTP discovery metadata, and `parseAdvertisement()` reads it, so clients can tell TesserAPI nodes apart and keep a cached schema while its hash (`Api::schemaHash()`, FNV-1a of the full schema) is unchanged. `peerEvent()` takes NowTP's peer events, and `mountPeers()` mounts the TesserAPI peers it reports (§14.1).
+- **Re-advertising:** after the first `advertise()`, the advertisement follows the tree. A global schema revision (`schemaRevision()`) counts the changes that can alter a schema: a node added, a modifier, a remote node's online state or advertised hash. Temporary objects (list elements and prototypes) and value changes don't count. Once the revision has stayed unchanged for 1 s, the worker recomputes `schemaHash()` and updates the metadata if the hash differs, so a gateway that mounts a burst of peers re-advertises once. The logic is `DatagramEndpoint::autoAdvertise()`, host-tested with the in-memory link.
 - **Generic core:** all of this lives in `tesser::DatagramEndpoint`, which is platform-independent and host-tested with an in-memory link. Another datagram transport (UDP, LoRa, ...) only needs a send function and a call to `receive()`.
 - **Optional:** the adapter is compiled only when NowTP is available. The core never includes NowTP.
 
@@ -602,7 +608,7 @@ A gateway can mount the nodes it discovers instead of declaring them:
 ```cpp
 radio.onPeerEvent([](nowtp::PeerEvent e, const nowtp::PeerInfo& p) { nowApi.peerEvent(e, p); });
 nowApi.mountPeers(api.object("peers"));   // also mounts the peers already discovered
-nowApi.advertise();                       // on every node, once its tree is complete
+nowApi.advertise();                       // on every node, once its tree is complete; kept current after that
 ```
 
 - **Mounting:** each peer that advertises TesserAPI on the transport's port becomes a remote node under the parent, named after its NowTP discovery name. Characters a name can't hold become `-`. If the name is empty or taken, the last three address bytes are appended (`tesser-lamp-75f303`). `mountPeers(parent, intervalMs)` also mirrors them. A peer already mounted under the parent isn't mounted again. Remote nodes of the peer elsewhere in the tree (declared ones) don't prevent it, but they share its online state and schema hash, including remote nodes declared after the announcement.
@@ -721,7 +727,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | done |
 | 6 | Groundwork for TesserUI: presentation metadata, forwarded subscriptions, discovered peers, `ApiClient` | done |
-| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels, secrets and streamed replies done |
+| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels, secrets, streamed replies, `view=hash` and re-advertisement done |
 
 ## 19. Decisions on former open questions
 

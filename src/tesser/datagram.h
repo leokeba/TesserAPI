@@ -130,6 +130,15 @@ public:
     // Safe from any task; takes effect in the next process().
     void peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash);
 
+    // Keeps an advertisement current: once the API's tree has changed (a
+    // peer mounted, a node added, a remote node's state, see
+    // schemaRevision()) and then stayed unchanged for `debounceMs`,
+    // process() recomputes Api::schemaHash() and calls `publish` with it if
+    // it differs from the last one. `current` is the hash already published.
+    // An empty `publish` stops it.
+    void autoAdvertise(std::function<void(uint32_t schemaHash)> publish, uint32_t current,
+                       uint32_t debounceMs = 1000);
+
     Stats stats() const;
     size_t pendingCalls() const;
     uint32_t now() const { return clock_ ? clock_() : 0; }
@@ -178,6 +187,7 @@ private:
     void dropPeer(const PeerAddress& peer);
     void applySeen(const Seen& seen);
     void markOnline(const PeerAddress& peer, bool online);
+    void checkAdvertisement(uint32_t now);
 
     Api* api_;
     TransportKind kind_;
@@ -203,6 +213,13 @@ private:
     std::vector<std::pair<PeerAddress, std::shared_ptr<ClientInbox>>> clients_;  // guarded by mutex_
     uint32_t nextId_ = 1;
     Stats stats_;
+    // autoAdvertise()
+    std::function<void(uint32_t)> publish_;
+    uint32_t publishedHash_ = 0;
+    uint32_t seenRevision_ = 0;
+    uint32_t revisionAtMs_ = 0;
+    uint32_t advertiseDebounceMs_ = 1000;
+    bool revisionPending_ = false;
 };
 
 // Builds a request envelope. `bodyJson` is inserted verbatim when not empty.

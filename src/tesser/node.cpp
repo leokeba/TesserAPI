@@ -56,6 +56,16 @@ uint16_t nextGeneration() {
 
 uint16_t currentGeneration() { return g_generation.load(); }
 
+namespace {
+std::atomic<uint32_t> g_schemaRevision{0};
+}  // namespace
+
+uint32_t schemaRevision() { return g_schemaRevision.load(); }
+
+void Node::touch() {
+    if (!(flags_ & kTemporary)) g_schemaRevision.fetch_add(1);
+}
+
 void Node::changed() {
     uint16_t g = nextGeneration();
     if (type_ != NodeType::Object) {
@@ -75,6 +85,7 @@ void Node::changed() {
 Node::~Node() { delete meta_; }
 
 NodeMeta& Node::editMeta() {
+    touch();  // a modifier is changing the node's schema
     if (!meta_) meta_ = new NodeMeta();
     return *meta_;
 }
@@ -146,22 +157,22 @@ ValueNode& ValueNode::range(double min, double max) {
 }
 
 ValueNode& ValueNode::readOnly() {
-    flags_ |= kReadOnly;
+    setFlag(kReadOnly);
     return *this;
 }
 
 ValueNode& ValueNode::persist() {
-    flags_ |= kPersist;
+    setFlag(kPersist);
     return *this;
 }
 
 ValueNode& ValueNode::secret() {
-    flags_ |= kSecret;
+    setFlag(kSecret);
     return *this;
 }
 
 ValueNode& ValueNode::watch() {
-    flags_ |= kWatch;
+    setFlag(kWatch);
     editMeta();
     return *this;
 }
@@ -211,7 +222,9 @@ void Object::link(Node* node) {
         g_orphans = node;
         return;
     }
-    node->flags_ |= kLinked;
+    // Children of a temporary object are temporary too.
+    node->flags_ |= kLinked | (flags_ & kTemporary);
+    node->touch();
     if (last_) {
         last_->next_ = node;
     } else {

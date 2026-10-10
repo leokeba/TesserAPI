@@ -114,7 +114,7 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
     }
     JsonVariantConst v = env["view"];
     if (!v.isNull() && (!v.is<const char*>() || !parseView(view(v), request.query.view))) {
-        message = "view must be \"value\" or \"schema\"";
+        message = "view must be \"value\", \"schema\" or \"hash\"";
         return Status::BadRequest;
     }
     JsonVariantConst interval = env["interval"];

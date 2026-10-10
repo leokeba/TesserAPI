@@ -31,6 +31,8 @@ bool parseView(std::string_view s, View& out) {
         out = View::Value;
     } else if (s == "schema") {
         out = View::Schema;
+    } else if (s == "hash") {
+        out = View::Hash;
     } else {
         return false;
     }
@@ -338,11 +340,27 @@ private:
         bool hasShape = !req_.body.isNull();
         View view = q.view;
 #if defined(TESSER_NO_SCHEMA)
-        if (view == View::Schema) {
+        if (view != View::Value) {
             replyError(Status::NotAllowed, "schemas are compiled out (TESSER_NO_SCHEMA)", base_);
             return false;
         }
 #endif
+        if (view == View::Hash) {
+            if (!q.keys.empty() || !q.exclude.empty() || hasShape) {
+                replyError(Status::BadRequest, "a hash covers the whole schema: no keys, exclude or shape", base_);
+                return false;
+            }
+            // The schema this client would read, whole.
+            HashSink sink;
+            JsonWriter hw(sink);
+            renderSchema(hw, target, api_.config().maxDepth, Filter());
+            char hex[9];
+            snprintf(hex, sizeof(hex), "%08lx", static_cast<unsigned long>(sink.hash));
+            JsonWriter w(reply_.begin(Status::Ok));
+            w.string(hex);
+            detail::finishBody(reply_, w, base_);
+            return true;
+        }
 
         if (target.type() != NodeType::Object) {
             if (!q.keys.empty() || !q.exclude.empty() || hasShape) {

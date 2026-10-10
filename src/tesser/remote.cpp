@@ -192,11 +192,17 @@ RemoteNode::RemoteNode(std::string name, DatagramEndpoint& endpoint, const PeerA
 }
 
 void RemoteNode::setOnline(bool online) {
-    if (online_.exchange(online) != online) changed();
+    if (online_.exchange(online) != online) {
+        touch();  // the schema shows it
+        changed();
+    }
 }
 
 void RemoteNode::setAdvertisedSchema(uint32_t hash) {
-    if (advertisedSchema_.exchange(hash) != hash) changed();
+    if (advertisedSchema_.exchange(hash) != hash) {
+        touch();
+        changed();
+    }
 }
 
 RemoteNode::~RemoteNode() {
@@ -207,6 +213,7 @@ RemoteNode::~RemoteNode() {
 
 RemoteNode& RemoteNode::mirror(uint32_t intervalMs, uint32_t refreshMs) {
     mirror_ = true;
+    touch();
     mirrorIntervalMs_ = intervalMs;
     refreshMs_ = refreshMs;
     return *this;
