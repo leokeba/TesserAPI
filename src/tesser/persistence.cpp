@@ -8,7 +8,8 @@ namespace tesser {
 namespace {
 
 bool isLeaf(const Node& n) {
-    return n.type() == NodeType::Value || n.type() == NodeType::Custom || n.type() == NodeType::List;
+    return n.type() == NodeType::Value || n.type() == NodeType::Custom || n.type() == NodeType::List ||
+           n.type() == NodeType::Array;
 }
 
 // Whether `n` holds persisted state: a persisted leaf, or an object with one
@@ -108,13 +109,48 @@ struct Applier {
             auto& list = static_cast<ListNode&>(*c);
             if (!value.is<JsonArrayConst>()) return skip("is now a list");
             JsonArrayConst items = value.as<JsonArrayConst>();
-            list.resize(items.size() < list.maxSize() ? items.size() : list.maxSize());
+            const char* field = list.keyField();
+            std::vector<JsonVariantConst> kept;  // items that make it into the list
+            if (field) {
+                // Matched by key, like a write: elements keep what the stored
+                // state doesn't say.
+                std::vector<std::string> keys;
+                list.keys(keys);
+                std::vector<int> from;
+                std::vector<std::string> seen;
+                size_t n = 0;
+                for (JsonVariantConst item : items) {
+                    size_t at = path.size();
+                    path += '/';
+                    path += std::to_string(n++);
+                    const char* key = item[field].as<const char*>();
+                    bool dup = false;
+                    for (const std::string& k : seen) dup = dup || (key && k == key);
+                    if (!ListNode::checkKey(item[field]).isOk() || dup) {
+                        skip("has no valid key");
+                    } else if (kept.size() < list.maxSize()) {
+                        int index = -1;
+                        for (size_t k = 0; k < keys.size(); k++) {
+                            if (keys[k] == key) index = static_cast<int>(k);
+                        }
+                        from.push_back(index);
+                        seen.push_back(key);
+                        kept.push_back(item);
+                    }
+                    path.resize(at);
+                }
+                list.reorder(from);
+            } else {
+                for (JsonVariantConst item : items) {
+                    if (kept.size() < list.maxSize()) kept.push_back(item);
+                }
+                list.resize(kept.size());
+            }
             size_t i = 0;
-            for (JsonVariantConst item : items) {
-                if (i >= list.size()) break;
+            for (JsonVariantConst item : kept) {
                 size_t at = path.size();
                 path += '/';
-                path += std::to_string(i);
+                path += field ? std::string(item[field].as<const char*>()) : std::to_string(i);
                 if (item.is<JsonObjectConst>()) {
                     bool was = notify;
                     notify = false;  // the list is marked as a whole
@@ -124,6 +160,11 @@ struct Applier {
                 path.resize(at);
                 i++;
             }
+        } else if (c->type() == NodeType::Array) {
+            auto& arr = static_cast<ArrayNode&>(*c);
+            Check chk = arr.check(value);  // readOnly() arrays are restored too
+            if (!chk.isOk()) return skip(chk.message ? chk.message : "rejected");
+            arr.apply(value);
         } else if (c->type() == NodeType::Custom) {
             auto& cu = static_cast<CustomNode&>(*c);
             Check chk = cu.check(value);

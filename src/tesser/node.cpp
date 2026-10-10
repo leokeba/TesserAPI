@@ -184,6 +184,76 @@ Check Node::checkRange(double v) const {
     return Check::ok();
 }
 
+ListNode& ListNode::key(const char* field) {
+    key_ = field;
+    touch();
+    // The key must be a string value of the element.
+    std::unique_ptr<Object> proto = prototype();
+    Node* k = field ? proto->child(field) : nullptr;
+    if (!k || k->type() != NodeType::Value || static_cast<ValueNode*>(k)->kind() != ValueKind::String) {
+        g_declarationErrors++;
+        logError("key \"%s\" of list \"%s\" isn't a string value of its elements", field ? field : "(null)",
+                 name_ ? name_ : "");
+        key_ = nullptr;
+    }
+    return *this;
+}
+
+void ListNode::keys(std::vector<std::string>& out) const {
+    out.clear();
+    if (!key_) return;
+    for (size_t i = 0; i < size(); i++) {
+        std::string json;
+        StringSink sink(json);
+        JsonWriter w(sink);
+        std::unique_ptr<Object> e = element(i);
+        Node* k = e->child(key_);
+        if (k) static_cast<ValueNode*>(k)->write(w);
+        JsonDocument doc;
+        deserializeJson(doc, json);
+        out.push_back(doc.is<const char*>() ? doc.as<const char*>() : "");
+    }
+}
+
+Check ListNode::checkKey(JsonVariantConst v) {
+    if (!v.is<const char*>()) return Check::fail(Status::InvalidValue, "key must be a string");
+    JsonString s = v.as<JsonString>();
+    if (s.size() == 0) return Check::fail(Status::InvalidValue, "key must not be empty");
+    if (memchr(s.c_str(), '/', s.size())) return Check::fail(Status::InvalidValue, "key must not contain '/'");
+    return Check::ok();
+}
+
+void ArrayNode::write(JsonWriter& w) const {
+    w.beginArray();
+    for (size_t i = 0; i < size(); i++) writeItem(w, i);
+    w.endArray();
+}
+
+Check ArrayNode::checkLength(JsonVariantConst v) const {
+    if (!v.is<JsonArrayConst>()) return Check::fail(Status::InvalidValue, "expected array");
+    size_t n = v.as<JsonArrayConst>().size();
+    if (fixedSize() && n != size()) return Check::fail(Status::InvalidValue, "wrong number of elements");
+    if (n > maxSize()) return Check::fail(Status::InvalidValue, "too many elements");
+    return Check::ok();
+}
+
+Check ArrayNode::check(JsonVariantConst v) const {
+    Check length = checkLength(v);
+    if (!length.isOk()) return length;
+    for (JsonVariantConst item : v.as<JsonArrayConst>()) {
+        Check c = checkElement(item);
+        if (!c.isOk()) return c;
+    }
+    return Check::ok();
+}
+
+void ArrayNode::apply(JsonVariantConst v) {
+    JsonArrayConst items = v.as<JsonArrayConst>();
+    resize(items.size());
+    size_t i = 0;
+    for (JsonVariantConst item : items) applyItem(i++, item);
+}
+
 Object::~Object() {
     Node* n = first_;
     while (n) {

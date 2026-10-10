@@ -193,7 +193,39 @@ api.list("levels", levels, [](tesser::Object& o, int& v) { o.value("v", v); }); 
 - **Schema:** `{"type": "list", "maxSize": n, "items": <element schema>}`.
 - **Subscriptions and persistence** treat the list as one value: a write anywhere in it marks the list changed, change notifications carry the whole list, and `.persist()` saves it whole. Subscribing below a list is `not_allowed`, since its elements are temporary.
 
-### 4.5 Names and the tree's lifetime
+**Keyed lists.** `.key("name")` names each element by one of its fields, a string value, so elements are addressed by key instead of by index:
+
+```cpp
+api.list("sources", sources).key("name");       // GET /sources/Sun/az, PUT /sources/Sun/az 120
+api.list("networks", networks).key("ssid");     // whose passwords are secret()
+```
+
+- **The key** must be a non-empty string without `/`, unique in the list. A key field that isn't a string value of the element is a declaration error (`api.errors()`), and the list stays indexed.
+- **Reading** is unchanged: the list renders as an array, in its order. `/sources/0` is `not_found` unless an element's key is `0`.
+- **Renaming** is a write to the key field through the element, `PUT /sources/Sun/name "Sol"` or an element patch: the element keeps its other fields. The new key must be valid and not used by another element.
+- **Replacing** matches items to elements by key, not by index: each item patches the element with its key (keeping the fields it omits), elements whose key no item has are removed, and items with new keys start from defaults. The array's order becomes the list's. Every item needs a valid key, once. So a client can rewrite the whole list without reading back fields it can't see, like secrets: an edited network keeps its password. A rename through the array isn't one: the new key is a new element.
+- **Errors** name elements by key (`/sources/Sun/az`), or by index when the item has no valid key (`/sources/1/name`).
+- **Loading** matches stored items by key too; items without a valid key are skipped.
+- **Schema:** `"key": "name"` in the list's schema.
+- **Cost:** a lookup by key describes each element once to read its key, so keyed lists suit tens of elements, like indexed ones.
+
+### 4.5 Arrays
+
+```cpp
+float offsets[128];
+std::vector<uint8_t> days;
+api.array("offsets", offsets).range(-5, 5).persist();   // fixed size: C array or std::array
+api.array("days", days).range(0, 6).maxSize(7);         // resizable: std::vector
+```
+
+- **Elements** are any value type except `bool` in a `std::vector` (which has no element references). A const container is read-only, and so is `.readOnly()`.
+- **Reading:** `GET /offsets` renders a JSON array, and `/offsets/3` one element (by index, as for lists).
+- **Writing:** `PUT /offsets/3 0.25` writes one element; setting the array (or including it in a patch) replaces its contents. A fixed-size array takes exactly its length; a `std::vector` any length up to `maxSize` (default 64). Every element is checked against the element type and `.range()` before anything changes, and an error names it (`/offsets/7`).
+- **Schema:** `{"type": "array", "writable": true, "maxSize": 128, "fixed": true, "items": {"type": "number", "min": -5, "max": 5}}`. `fixed` appears for fixed-size arrays, whose `maxSize` is their size. An element's schema is a value's.
+- **Subscriptions and persistence** treat the array as one value, like a list.
+- **Cost:** one node; element nodes are built only for requests that address one.
+
+### 4.6 Names and the tree's lifetime
 
 - Names are `const char*` and are never copied. Use string literals or strings that outlive the `Api`.
 - A name contains only `[A-Za-z0-9_.-]`. Names are unique among siblings, and adding a duplicate fails, which is reported by `api.errors()` and on the log.
@@ -310,7 +342,7 @@ GET /lamp?view=schema
 }
 ```
 
-- **Types:** `object`, `boolean`, `integer`, `number`, `string`, `action`, `event`, `custom`.
+- **Types:** `object`, `boolean`, `integer`, `number`, `string`, `action`, `event`, `custom`, `list` (§4.4), `array` (§4.5), `remote` (§14).
 - **Optional keys:** `writable` (only when true), `min`, `max` (values and action arguments), `persist`, `description`, `arg`, `params` (an object argument's schema, §4.2), `returns` and `deferred` (actions), `maxLength` (`char[N]`), `enum`, `secret` (§4.1), `access` (the node's own write level when it isn't `public`, §13), and the presentation keys of §7.1.
 - `depth`, `keys` and the shape apply to `children` the same way.
 - A schema leaf is always an object containing `"type"`. Children are always under `"children"`, so a child named `type` can't be confused with a descriptor.
@@ -757,7 +789,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | done |
 | 6 | Groundwork for TesserUI: presentation metadata, forwarded subscriptions, discovered peers, `ApiClient` | done |
-| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels, secrets, streamed replies, `view=hash`, re-advertisement, per-record persistence, `Storage::erase()`, `Api::restore()`, object arguments and typed deferred actions done |
+| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels, secrets, streamed replies, `view=hash`, re-advertisement, per-record persistence, `Storage::erase()`, `Api::restore()`, object arguments, typed deferred actions, keyed lists and scalar arrays done |
 
 ## 19. Decisions on former open questions
 

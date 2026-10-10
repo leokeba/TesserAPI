@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <initializer_list>
@@ -30,7 +31,7 @@ class Object;
 class RemoteNode;
 struct PeerAddress;
 
-enum class NodeType : uint8_t { Object, Value, Action, Event, Custom, List, Remote };
+enum class NodeType : uint8_t { Object, Value, Action, Event, Custom, List, Remote, Array };
 
 // A presentation hint (docs/DESIGN.md section 7.1): a key and a string,
 // number or `true`, emitted in the schema under "ui" and never interpreted.
@@ -87,7 +88,11 @@ int declarationErrors();
 
 class Node {
 public:
-    Node(const char* name, NodeType type) : name_(name), type_(type) {}
+    // A node without a name is temporary: part of a list element or
+    // prototype, or an array element, built for one request.
+    Node(const char* name, NodeType type) : name_(name), type_(type) {
+        if (!name) flags_ |= kTemporary;
+    }
     virtual ~Node();
     Node(const Node&) = delete;
     Node& operator=(const Node&) = delete;
@@ -533,6 +538,20 @@ public:
     // A temporary object describing a default element (schema, validation).
     virtual std::unique_ptr<Object> prototype() const = 0;
     virtual void resize(size_t n) = 0;
+    // Rebuilds the list: element i becomes the old element from[i], or a
+    // default one where from[i] < 0.
+    virtual void reorder(const std::vector<int>& from) = 0;
+
+    // Makes this a keyed list: elements are named by their `field`, a string
+    // value of the element, and addressed as /list/<key> instead of by
+    // index. Replacing the list matches elements by key (docs/DESIGN.md
+    // section 4.4).
+    ListNode& key(const char* field);
+    const char* keyField() const { return key_; }
+    // Keys of the elements, in order (keyed lists).
+    void keys(std::vector<std::string>& out) const;
+    // A valid key: a non-empty string without '/'.
+    static Check checkKey(JsonVariantConst v);
 
     // Longest list a write may create (default 32).
     ListNode& maxSize(size_t n) {
@@ -548,7 +567,135 @@ public:
 
 private:
     size_t maxSize_ = 32;
+    const char* key_ = nullptr;
 };
+
+// An array of scalars bound to a std::vector (resizable, up to maxSize()),
+// a C array or a std::array (fixed size) (docs/DESIGN.md section 4.5). It is
+// one value: written whole, or element by element as /name/<index>.
+class ArrayNode : public Annotated<ArrayNode> {
+public:
+    explicit ArrayNode(const char* name) : Annotated(name, NodeType::Array) {}
+
+    // Bounds for every element, checked on write and reported in the schema.
+    ArrayNode& range(double min, double max) {
+        setRange(min, max);
+        return *this;
+    }
+    ArrayNode& readOnly() {
+        setFlag(kReadOnly);
+        return *this;
+    }
+    ArrayNode& persist() {
+        setFlag(kPersist);
+        return *this;
+    }
+    // Longest array a write may create (resizable arrays; default 64).
+    ArrayNode& maxSize(size_t n) {
+        maxSize_ = n;
+        touch();
+        return *this;
+    }
+
+    virtual size_t size() const = 0;
+    virtual bool fixedSize() const = 0;
+    virtual ValueKind itemKind() const = 0;
+    size_t maxSize() const { return fixedSize() ? size() : maxSize_; }
+    bool writable() const { return canWrite() && !(flags_ & kReadOnly); }
+    // Element `i` (< size()) as a temporary value node, with the array's
+    // range and writability.
+    virtual std::unique_ptr<ValueNode> element(size_t i) = 0;
+
+    void write(JsonWriter& w) const;
+    // An array of valid elements, of the right length. Doesn't consider
+    // writability.
+    Check check(JsonVariantConst v) const;
+    // An array of the right length (elements unchecked).
+    Check checkLength(JsonVariantConst v) const;
+    // One element: its type and the range.
+    Check checkElement(JsonVariantConst v) const {
+        Check c = checkItem(v);
+        return c.isOk() && v.is<double>() ? checkRange(v.as<double>()) : c;
+    }
+    // Replaces the contents with an array that passed check().
+    void apply(JsonVariantConst v);
+
+protected:
+    virtual void writeItem(JsonWriter& w, size_t i) const = 0;
+    virtual Check checkItem(JsonVariantConst v) const = 0;
+    virtual void applyItem(size_t i, JsonVariantConst v) = 0;
+    virtual void resize(size_t n) = 0;
+    virtual bool canWrite() const = 0;
+
+private:
+    size_t maxSize_ = 64;
+};
+
+namespace detail {
+
+// How an array binding reaches its elements.
+template <class C>
+struct ArrayAccess;
+template <class T>
+struct ArrayAccess<std::vector<T>> {
+    using Item = T;
+    static constexpr bool fixed = false;
+    static size_t size(const std::vector<T>& c) { return c.size(); }
+    static void resize(std::vector<T>& c, size_t n) { c.resize(n); }
+};
+template <class T, size_t N>
+struct ArrayAccess<T[N]> {
+    using Item = T;
+    static constexpr bool fixed = true;
+    static size_t size(const T (&)[N]) { return N; }
+    static void resize(T (&)[N], size_t) {}
+};
+template <class T, size_t N>
+struct ArrayAccess<std::array<T, N>> {
+    using Item = T;
+    static constexpr bool fixed = true;
+    static size_t size(const std::array<T, N>&) { return N; }
+    static void resize(std::array<T, N>&, size_t) {}
+};
+
+template <class C>
+class BoundArray final : public ArrayNode {
+    using Bare = std::remove_const_t<C>;
+    using Access = ArrayAccess<Bare>;
+    using T = typename Access::Item;
+
+public:
+    BoundArray(const char* name, C& items) : ArrayNode(name), items_(items) {
+        static_assert(ValueTraits<T>::supported, "array elements must be a value type");
+        static_assert(!std::is_same<Bare, std::vector<bool>>::value,
+                      "std::vector<bool> has no element references: use std::vector<uint8_t>");
+    }
+    size_t size() const override { return Access::size(items_); }
+    bool fixedSize() const override { return Access::fixed; }
+    ValueKind itemKind() const override { return ValueTraits<T>::kind; }
+    std::unique_ptr<ValueNode> element(size_t i) override {
+        std::unique_ptr<ValueNode> e(new RefValue<std::conditional_t<std::is_const<C>::value, const T, T>>(nullptr, items_[i]));
+        if (const NodeMeta* m = meta(); m && m->hasRange) e->range(m->min, m->max);
+        if (!writable()) e->readOnly();
+        return e;
+    }
+
+protected:
+    void writeItem(JsonWriter& w, size_t i) const override { ValueTraits<T>::write(w, items_[i]); }
+    Check checkItem(JsonVariantConst v) const override { return ValueTraits<T>::check(v); }
+    void applyItem(size_t i, JsonVariantConst v) override {
+        if constexpr (!std::is_const<C>::value) ValueTraits<T>::read(v, items_[i]);
+    }
+    void resize(size_t n) override {
+        if constexpr (!std::is_const<C>::value) Access::resize(items_, n);
+    }
+    bool canWrite() const override { return !std::is_const<C>::value; }
+
+private:
+    C& items_;
+};
+
+}  // namespace detail
 
 namespace detail {
 
@@ -696,11 +843,7 @@ struct ArgReader {
 
 class Object : public Annotated<Object> {
 public:
-    // An object without a name is temporary: a list element or prototype,
-    // described for one request.
-    explicit Object(const char* name) : Annotated(name, NodeType::Object) {
-        if (!name) flags_ |= kTemporary;
-    }
+    explicit Object(const char* name) : Annotated(name, NodeType::Object) {}
     ~Object() override;
 
     // Child object; returns the existing one when the name is already an object.
@@ -820,6 +963,29 @@ public:
     template <class T>
     ListNode& list(const char* name, std::vector<T>& items);
 
+    // An array of scalars: a std::vector (resizable, up to maxSize()), a C
+    // array or a std::array (fixed size). Const makes it read-only.
+    template <class T>
+    ArrayNode& array(const char* name, std::vector<T>& items) {
+        return add(new detail::BoundArray<std::vector<T>>(name, items));
+    }
+    template <class T>
+    ArrayNode& array(const char* name, const std::vector<T>& items) {
+        return add(new detail::BoundArray<const std::vector<T>>(name, items));
+    }
+    template <class T, size_t N>
+    ArrayNode& array(const char* name, T (&items)[N]) {
+        return add(new detail::BoundArray<T[N]>(name, items));
+    }
+    template <class T, size_t N>
+    ArrayNode& array(const char* name, const T (&items)[N]) {
+        return add(new detail::BoundArray<const T[N]>(name, items));
+    }
+    template <class T, size_t N>
+    ArrayNode& array(const char* name, std::array<T, N>& items) {
+        return add(new detail::BoundArray<std::array<T, N>>(name, items));
+    }
+
     // Another node's tree, reached through a datagram endpoint (NowTP, ...),
     // grafted here: requests below it are forwarded. See tesser/remote.h.
     RemoteNode& remote(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer,
@@ -921,6 +1087,18 @@ public:
         return std::unique_ptr<Object>(p.release());
     }
     void resize(size_t n) override { items_.resize(n); }
+    void reorder(const std::vector<int>& from) override {
+        std::vector<T> next;
+        next.reserve(from.size());
+        for (int i : from) {
+            if (i >= 0 && static_cast<size_t>(i) < items_.size()) {
+                next.push_back(std::move(items_[static_cast<size_t>(i)]));
+            } else {
+                next.emplace_back();
+            }
+        }
+        items_ = std::move(next);
+    }
 
 private:
     // An object that owns the default element it describes.

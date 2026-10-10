@@ -160,6 +160,7 @@ void renderValue(JsonWriter& w, const Node& n, int depth, const RenderOptions& o
             break;
         }
         case NodeType::Custom: static_cast<const CustomNode&>(n).write(w); break;
+        case NodeType::Array: static_cast<const ArrayNode&>(n).write(w); break;
         case NodeType::Remote: static_cast<const RemoteNode&>(n).writeCopy(w, depth); break;
         case NodeType::Action:
         case NodeType::Event: w.null(); break;
@@ -216,7 +217,7 @@ private:
     // A write below a list element marks the list itself changed: element
     // nodes are temporary, the list is what subscribers and persistence see.
     void markLists() {
-        for (ListNode* l : lists_) l->changed();
+        for (Node* l : containers_) l->changed();
     }
 
     bool allowed(const Node& n) const {
@@ -314,10 +315,29 @@ private:
                 next = static_cast<Object*>(node)->child(seg);
             } else if (node->type() == NodeType::List) {
                 auto* list = static_cast<ListNode*>(node);
+                size_t index = list->size();
+                if (list->keyField()) {
+                    std::vector<std::string> keys;
+                    list->keys(keys);
+                    for (size_t i = 0; i < keys.size(); i++) {
+                        if (keys[i] == seg) index = i;
+                    }
+                } else if (!parseIndex(seg, index)) {
+                    index = list->size();
+                }
+                if (index < list->size()) {
+                    std::unique_ptr<Object> element = list->element(index);
+                    if (list->keyField()) keyRefs_.push_back({element->child(list->keyField()), list, index});
+                    temps_.push_back(std::move(element));
+                    containers_.push_back(list);
+                    next = temps_.back().get();
+                }
+            } else if (node->type() == NodeType::Array) {
+                auto* array = static_cast<ArrayNode*>(node);
                 size_t index;
-                if (parseIndex(seg, index) && index < list->size()) {
-                    temps_.push_back(list->element(index));
-                    lists_.push_back(list);
+                if (parseIndex(seg, index) && index < array->size()) {
+                    temps_.push_back(array->element(index));
+                    containers_.push_back(array);
                     next = temps_.back().get();
                 }
             }
@@ -567,10 +587,40 @@ private:
                 break;
             }
             case NodeType::Event: w.string("event"); break;
+            case NodeType::Array: {
+                const auto& a = static_cast<const ArrayNode&>(n);
+                w.string("array");
+                if (a.writable()) {
+                    w.key("writable");
+                    w.boolean(true);
+                }
+                w.key("maxSize");
+                w.uinteger(a.maxSize());
+                if (a.fixedSize()) {
+                    w.key("fixed");
+                    w.boolean(true);
+                }
+                w.key("items");
+                w.beginObject();
+                w.key("type");
+                w.string(kindName(a.itemKind()));
+                if (const NodeMeta* m = a.meta(); m && m->hasRange) {
+                    w.key("min");
+                    w.number(m->min);
+                    w.key("max");
+                    w.number(m->max);
+                }
+                w.endObject();
+                break;
+            }
             case NodeType::List: {
                 w.string("list");
                 w.key("maxSize");
                 w.uinteger(static_cast<const ListNode&>(n).maxSize());
+                if (const char* k = static_cast<const ListNode&>(n).keyField()) {
+                    w.key("key");
+                    w.string(k);
+                }
                 break;
             }
             case NodeType::Remote: {
@@ -664,7 +714,7 @@ private:
             return replyError(Status::NotAllowed, "actions can't be subscribed to", base_);
         }
         if (!temps_.empty()) {
-            return replyError(Status::NotAllowed, "subscribe to the list itself, not to its elements", base_);
+            return replyError(Status::NotAllowed, "subscribe to the list or array itself, not to its elements", base_);
         }
         Status allowed = api_.subscriptionAllowed(req_.subscriber);
         if (allowed != Status::Ok) return replyError(allowed, "too many subscriptions", base_);
@@ -713,6 +763,7 @@ private:
             case NodeType::Value: {
                 auto& v = static_cast<ValueNode&>(target);
                 if (!v.writable()) return replyError(Status::ReadOnly, "read-only", base_);
+                if (!keyWriteOk(v, body)) return replyError();
                 Check c = v.check(body);
                 if (c.isOk()) c = v.apply(body);
                 if (!c.isOk()) return replyError(c.status, c.message, base_);
@@ -754,6 +805,17 @@ private:
                 return;
             }
             case NodeType::Event: replyError(Status::NotAllowed, "events can't be set", base_); return;
+            case NodeType::Array: {
+                auto& a = static_cast<ArrayNode&>(target);
+                if (!validatePatch(a, body, writeNeed_)) return replyError();
+                a.apply(body);
+                a.changed();
+                markLists();
+                JsonWriter w(reply_.begin(Status::Ok));
+                a.write(w);
+                detail::finishBody(reply_, w, base_);
+                return;
+            }
             case NodeType::List: {
                 auto& list = static_cast<ListNode&>(target);
                 if (!validatePatch(list, body, writeNeed_)) return replyError();
@@ -792,6 +854,60 @@ private:
         detail::finishBody(reply_, w, base_);
     }
 
+    // A keyed list replaced by an array: every item names its element by a
+    // valid key, once; it patches that element, or a default one.
+    bool validateKeyed(ListNode& list, JsonArrayConst items, Access need) {
+        const char* field = list.keyField();
+        std::vector<std::string> keys;
+        list.keys(keys);
+        std::vector<std::string_view> seen;
+        size_t i = 0;
+        for (JsonVariantConst item : items) {
+            if (!item.is<JsonObjectConst>()) {
+                pushIndex(i);
+                return error(Status::InvalidValue, "expected object");
+            }
+            Check c = ListNode::checkKey(item[field]);
+            if (!c.isOk()) {
+                pushIndex(i);
+                push(field);
+                return error(c.status, c.message);
+            }
+            JsonString k = item[field].as<JsonString>();
+            std::string_view key(k.c_str(), k.size());
+            if (!push(key)) return error(Status::BadRequest, "patch too deep");
+            for (std::string_view s : seen) {
+                if (s == key) return error(Status::InvalidValue, "duplicate key");
+            }
+            seen.push_back(key);
+            size_t at = keys.size();
+            for (size_t j = 0; j < keys.size(); j++) {
+                if (keys[j] == key) at = j;
+            }
+            std::unique_ptr<Object> element = at < keys.size() ? list.element(at) : list.prototype();
+            if (!validatePatch(*element, item, higher(need, element->writeAccess()))) return false;
+            pop();
+            i++;
+        }
+        return true;
+    }
+
+    // A write to the key of a keyed list's element (renaming it, reached
+    // through /list/<key>) must give a valid key no other element has.
+    bool keyWriteOk(const Node& n, JsonVariantConst v) {
+        for (const KeyRef& ref : keyRefs_) {
+            if (ref.node != &n) continue;
+            Check c = ListNode::checkKey(v);
+            if (!c.isOk()) return error(c.status, c.message);
+            std::vector<std::string> keys;
+            ref.list->keys(keys);
+            for (size_t j = 0; j < keys.size(); j++) {
+                if (j != ref.index && keys[j] == v.as<const char*>()) return error(Status::InvalidValue, "key already used");
+            }
+        }
+        return true;
+    }
+
     // An action's object argument: a default one, validated and filled from
     // `arg` like a patch, so errors name the field (/add/az). Null (with the
     // error recorded) if `arg` doesn't fit.
@@ -827,6 +943,7 @@ private:
             case NodeType::Value: {
                 auto& val = static_cast<ValueNode&>(n);
                 if (!val.writable()) return error(Status::ReadOnly, "read-only");
+                if (!keyWriteOk(val, v)) return false;
                 Check c = val.check(v);
                 return c.isOk() || error(c.status, c.message);
             }
@@ -845,11 +962,28 @@ private:
             }
             case NodeType::Event: return error(Status::NotAllowed, "events can't be set");
             case NodeType::Remote: return error(Status::NotAllowed, "write remote nodes directly");
+            case NodeType::Array: {
+                auto& a = static_cast<ArrayNode&>(n);
+                if (!a.writable()) return error(Status::ReadOnly, "read-only");
+                Check c = a.checkLength(v);
+                if (!c.isOk()) return error(c.status, c.message);
+                size_t i = 0;
+                for (JsonVariantConst item : v.as<JsonArrayConst>()) {
+                    c = a.checkElement(item);
+                    if (!c.isOk()) {
+                        pushIndex(i);  // names the element; the walk stops here
+                        return error(c.status, c.message);
+                    }
+                    i++;
+                }
+                return true;
+            }
             case NodeType::List: {
                 auto& list = static_cast<ListNode&>(n);
                 if (!v.is<JsonArrayConst>()) return error(Status::InvalidValue, "expected array");
                 JsonArrayConst items = v.as<JsonArrayConst>();
                 if (items.size() > list.maxSize()) return error(Status::InvalidValue, "too many elements");
+                if (list.keyField()) return validateKeyed(list, items, need);
                 size_t i = 0;
                 for (JsonVariantConst item : items) {
                     if (!pushIndex(i)) return error(Status::BadRequest, "patch too deep");
@@ -909,15 +1043,45 @@ private:
             }
             case NodeType::Event:
             case NodeType::Remote: return true;
+            case NodeType::Array: {
+                if (actions) return true;
+                static_cast<ArrayNode&>(n).apply(v);
+                if (filling_) return true;
+                n.changed();
+                applied_++;
+                return true;
+            }
             case NodeType::List: {
                 // The array replaces the list: its length is the new size, and
                 // each element is patched (new ones start from defaults).
                 auto& list = static_cast<ListNode&>(n);
                 JsonArrayConst items = v.as<JsonArrayConst>();
-                if (!actions) list.resize(items.size());
+                const char* keyField = list.keyField();
+                if (!actions && keyField) {
+                    // Elements follow their keys: kept ones move, missing
+                    // ones go, new ones start from defaults.
+                    std::vector<std::string> keys;
+                    list.keys(keys);
+                    std::vector<int> from;
+                    for (JsonVariantConst item : items) {
+                        int at = -1;
+                        for (size_t k = 0; k < keys.size(); k++) {
+                            if (keys[k] == item[keyField].as<const char*>()) at = static_cast<int>(k);
+                        }
+                        from.push_back(at);
+                    }
+                    list.reorder(from);
+                } else if (!actions) {
+                    list.resize(items.size());
+                }
                 size_t i = 0;
                 for (JsonVariantConst item : items) {
-                    pushIndex(i);
+                    if (keyField) {
+                        JsonString k = item[keyField].as<JsonString>();
+                        push(std::string_view(k.c_str(), k.size()));
+                    } else {
+                        pushIndex(i);
+                    }
                     if (!applyPatch(*list.element(i), item, actions)) return false;
                     pop();
                     i++;
@@ -951,8 +1115,14 @@ private:
     int applied_ = 0;
     bool partial_ = false;
     bool filling_ = false;  // validating or filling an action's object argument
-    std::vector<std::unique_ptr<Object>> temps_;  // list elements on the request path
-    std::vector<ListNode*> lists_;                // lists the path went through
+    std::vector<std::unique_ptr<Node>> temps_;  // list and array elements on the request path
+    std::vector<Node*> containers_;             // lists and arrays the path went through
+    struct KeyRef {
+        const Node* node;  // the key value of an element on the path
+        ListNode* list;
+        size_t index;
+    };
+    std::vector<KeyRef> keyRefs_;
     uint16_t indexes_[kMaxTrail];                 // list indexes in the trail...
     uint32_t indexMask_ = 0;                      // ...at the levels whose bit is set
     std::string_view remoteRest_;                 // path below a remote node, forwarded as is

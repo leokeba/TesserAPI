@@ -70,6 +70,7 @@ void renderValue(JsonWriter& w, const Node& n, int depth, const RenderOptions& o
 // A node subscriptions and persistence treat as one value.
 inline bool isLeaf(const Node& n) {
     return n.type() == NodeType::Value || n.type() == NodeType::Custom || n.type() == NodeType::List ||
+           n.type() == NodeType::Array ||
            n.type() == NodeType::Remote;
 }
 

@@ -189,6 +189,7 @@ RemoteNode::RemoteNode(std::string name, DatagramEndpoint& endpoint, const PeerA
     : RemoteNode(static_cast<const char*>(nullptr), endpoint, peer, std::move(remotePath)) {
     ownedName_ = std::move(name);
     name_ = ownedName_.c_str();
+    flags_ &= static_cast<uint8_t>(~kTemporary);  // named after all
 }
 
 void RemoteNode::setOnline(bool online) {
