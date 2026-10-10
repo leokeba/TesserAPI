@@ -101,6 +101,12 @@ struct Applier {
             return;
         }
         if (!p) return skip("is not persisted");
+        applyOther(c, value);
+    }
+
+    // Everything but objects, out of line: the recursion through objects
+    // then keeps small frames (with -Og, the ESP-IDF default).
+    __attribute__((noinline)) void applyOther(Node* c, JsonVariantConst value) {
         if (c->type() == NodeType::Value) {
             auto& v = static_cast<ValueNode&>(*c);
             Check chk = v.check(value);

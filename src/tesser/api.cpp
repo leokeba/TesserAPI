@@ -516,17 +516,7 @@ private:
         w.beginObject();
         if (depth > 0) {
             if (f.hasShape) {
-                for (JsonPairConst kv : f.shape) {
-                    const Node* c = o.child(std::string_view(kv.key().c_str(), kv.key().size()));
-                    if (!c || !readable(*c)) continue;  // validated already; patches can't get here either
-                    w.key(c->name());
-                    Filter sub;
-                    if (kv.value().is<JsonObjectConst>() && c->type() == NodeType::Object) {
-                        sub.shape = kv.value().as<JsonObjectConst>();
-                        sub.hasShape = true;
-                    }
-                    renderAny(w, *c, depth - 1, sub, view);
-                }
+                renderShaped(w, o, depth, f, view);
             } else {
                 for (const Node* c = o.first(); c; c = c->next()) {
                     if (view == View::Value && !detail::hasValue(*c)) {
@@ -544,6 +534,22 @@ private:
         w.endObject();
     }
 
+    // Out of line, like schemaAttributes, so renders without a shape don't
+    // carry its frame.
+    __attribute__((noinline)) void renderShaped(JsonWriter& w, const Object& o, int depth, const Filter& f, View view) {
+        for (JsonPairConst kv : f.shape) {
+            const Node* c = o.child(std::string_view(kv.key().c_str(), kv.key().size()));
+            if (!c || !readable(*c)) continue;  // validated already; patches can't get here either
+            w.key(c->name());
+            Filter sub;
+            if (kv.value().is<JsonObjectConst>() && c->type() == NodeType::Object) {
+                sub.shape = kv.value().as<JsonObjectConst>();
+                sub.hasShape = true;
+            }
+            renderAny(w, *c, depth - 1, sub, view);
+        }
+    }
+
     void renderSchema(JsonWriter& w, const Node& n, int depth, const Filter& f) {
 #if defined(TESSER_NO_SCHEMA)
         (void)n;
@@ -553,6 +559,22 @@ private:
         return;
 #endif
         w.beginObject();
+        schemaAttributes(w, n);
+        if (n.type() == NodeType::Object && depth > 0) {
+            w.key("children");
+            renderChildren(w, static_cast<const Object&>(n), depth, f, View::Schema);
+        }
+        if (n.type() == NodeType::List && depth > 0) {
+            w.key("items");
+            renderSchema(w, *static_cast<const ListNode&>(n).prototype(), depth, Filter());
+        }
+        w.endObject();
+    }
+
+    // Everything but the children, out of line: the recursion through
+    // renderSchema and renderChildren then keeps small frames (with -Og, the
+    // ESP-IDF default, this one alone takes over 500 bytes).
+    __attribute__((noinline)) void schemaAttributes(JsonWriter& w, const Node& n) {
         w.key("type");
         switch (n.type()) {
             case NodeType::Object: w.string("object"); break;
@@ -709,15 +731,6 @@ private:
             w.string(m->doc);
         }
         if (const NodeMeta* m = n.meta(); m && m->ui) renderUi(w, *m->ui);
-        if (n.type() == NodeType::Object && depth > 0) {
-            w.key("children");
-            renderChildren(w, static_cast<const Object&>(n), depth, f, View::Schema);
-        }
-        if (n.type() == NodeType::List && depth > 0) {
-            w.key("items");
-            renderSchema(w, *static_cast<const ListNode&>(n).prototype(), depth, Filter());
-        }
-        w.endObject();
     }
 
     static void renderUi(JsonWriter& w, const UiMeta& m) {
@@ -994,6 +1007,15 @@ private:
                 }
                 return true;
             }
+            case NodeType::List: return validateList(static_cast<ListNode&>(n), v, need);
+            default: return validateLeaf(n, v);
+        }
+    }
+
+    // The cases that don't recurse, and lists, out of line: walking a deep
+    // object then keeps small frames (with -Og, the ESP-IDF default).
+    __attribute__((noinline)) bool validateLeaf(Node& n, JsonVariantConst v) {
+        switch (n.type()) {
             case NodeType::Value: {
                 auto& val = static_cast<ValueNode&>(n);
                 if (!val.writable()) return error(Status::ReadOnly, "read-only");
@@ -1033,25 +1055,27 @@ private:
                 }
                 return true;
             }
-            case NodeType::List: {
-                auto& list = static_cast<ListNode&>(n);
-                if (!v.is<JsonArrayConst>()) return error(Status::InvalidValue, "expected array");
-                JsonArrayConst items = v.as<JsonArrayConst>();
-                if (items.size() > list.maxSize()) return error(Status::InvalidValue, "too many elements");
-                if (list.keyField()) return validateKeyed(list, items, need);
-                size_t i = 0;
-                for (JsonVariantConst item : items) {
-                    if (!pushIndex(i)) return error(Status::BadRequest, "patch too deep");
-                    if (!item.is<JsonObjectConst>()) return error(Status::InvalidValue, "expected object");
-                    std::unique_ptr<Object> element = i < list.size() ? list.element(i) : list.prototype();
-                    if (!validatePatch(*element, item, higher(need, element->writeAccess()))) return false;
-                    pop();
-                    i++;
-                }
-                return true;
-            }
+            case NodeType::Object:
+            case NodeType::List: break;
         }
         return false;
+    }
+
+    __attribute__((noinline)) bool validateList(ListNode& list, JsonVariantConst v, Access need) {
+        if (!v.is<JsonArrayConst>()) return error(Status::InvalidValue, "expected array");
+        JsonArrayConst items = v.as<JsonArrayConst>();
+        if (items.size() > list.maxSize()) return error(Status::InvalidValue, "too many elements");
+        if (list.keyField()) return validateKeyed(list, items, need);
+        size_t i = 0;
+        for (JsonVariantConst item : items) {
+            if (!pushIndex(i)) return error(Status::BadRequest, "patch too deep");
+            if (!item.is<JsonObjectConst>()) return error(Status::InvalidValue, "expected object");
+            std::unique_ptr<Object> element = i < list.size() ? list.element(i) : list.prototype();
+            if (!validatePatch(*element, item, higher(need, element->writeAccess()))) return false;
+            pop();
+            i++;
+        }
+        return true;
     }
 
     // actions == false: apply values and custom nodes; true: run actions.
@@ -1067,6 +1091,13 @@ private:
                 }
                 return true;
             }
+            case NodeType::List: return applyList(static_cast<ListNode&>(n), v, actions);
+            default: return applyLeaf(n, v, actions);
+        }
+    }
+
+    __attribute__((noinline)) bool applyLeaf(Node& n, JsonVariantConst v, bool actions) {
+        switch (n.type()) {
             case NodeType::Value: {
                 if (actions) return true;
                 Check c = static_cast<ValueNode&>(n).apply(v);
@@ -1107,47 +1138,49 @@ private:
                 applied_++;
                 return true;
             }
-            case NodeType::List: {
-                // The array replaces the list: its length is the new size, and
-                // each element is patched (new ones start from defaults).
-                auto& list = static_cast<ListNode&>(n);
-                JsonArrayConst items = v.as<JsonArrayConst>();
-                const char* keyField = list.keyField();
-                if (!actions && keyField) {
-                    // Elements follow their keys: kept ones move, missing
-                    // ones go, new ones start from defaults.
-                    std::vector<std::string> keys;
-                    list.keys(keys);
-                    std::vector<int> from;
-                    for (JsonVariantConst item : items) {
-                        int at = -1;
-                        for (size_t k = 0; k < keys.size(); k++) {
-                            if (keys[k] == item[keyField].as<const char*>()) at = static_cast<int>(k);
-                        }
-                        from.push_back(at);
-                    }
-                    list.reorder(from);
-                } else if (!actions) {
-                    list.resize(items.size());
+            case NodeType::Object:
+            case NodeType::List: break;
+        }
+        return true;
+    }
+
+    __attribute__((noinline)) bool applyList(ListNode& list, JsonVariantConst v, bool actions) {
+        // The array replaces the list: its length is the new size, and
+        // each element is patched (new ones start from defaults).
+        JsonArrayConst items = v.as<JsonArrayConst>();
+        const char* keyField = list.keyField();
+        if (!actions && keyField) {
+            // Elements follow their keys: kept ones move, missing
+            // ones go, new ones start from defaults.
+            std::vector<std::string> keys;
+            list.keys(keys);
+            std::vector<int> from;
+            for (JsonVariantConst item : items) {
+                int at = -1;
+                for (size_t k = 0; k < keys.size(); k++) {
+                    if (keys[k] == item[keyField].as<const char*>()) at = static_cast<int>(k);
                 }
-                size_t i = 0;
-                for (JsonVariantConst item : items) {
-                    if (keyField) {
-                        JsonString k = item[keyField].as<JsonString>();
-                        push(std::string_view(k.c_str(), k.size()));
-                    } else {
-                        pushIndex(i);
-                    }
-                    if (!applyPatch(*list.element(i), item, actions)) return false;
-                    pop();
-                    i++;
-                }
-                if (!actions) {
-                    list.changed();
-                    applied_++;
-                }
-                return true;
+                from.push_back(at);
             }
+            list.reorder(from);
+        } else if (!actions) {
+            list.resize(items.size());
+        }
+        size_t i = 0;
+        for (JsonVariantConst item : items) {
+            if (keyField) {
+                JsonString k = item[keyField].as<JsonString>();
+                push(std::string_view(k.c_str(), k.size()));
+            } else {
+                pushIndex(i);
+            }
+            if (!applyPatch(*list.element(i), item, actions)) return false;
+            pop();
+            i++;
+        }
+        if (!actions) {
+            list.changed();
+            applied_++;
         }
         return true;
     }

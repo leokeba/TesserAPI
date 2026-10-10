@@ -29,7 +29,7 @@ struct EnvelopeId {
 // stored records) is bounded by its JsonWriter instead, not by maxDepth:
 // schemas nest two or three levels per tree level, and the peer that wrote
 // a reply may have a deeper maxDepth than ours. On Xtensa each level costs
-// 80 bytes of stack while parsing.
+// 80 to 96 bytes of stack while parsing (-Os, -Og).
 inline uint8_t requestNesting(uint8_t maxDepth) { return maxDepth < 254 ? uint8_t(maxDepth + 1) : uint8_t(255); }
 inline uint8_t envelopeNesting(uint8_t maxDepth) { return maxDepth < 253 ? uint8_t(maxDepth + 2) : uint8_t(255); }
 constexpr uint8_t kWrittenNesting = JsonWriter::kMaxNesting + 1;
