@@ -165,6 +165,12 @@ public:
     bool pendingBegin();
     void pendingDone() { pending_.fetch_sub(1); }
 
+    // Used by FileTransfer: the file node at request.path that the client
+    // may transfer (op Get: download, Set: upload), or null with the error
+    // written to `reply`. `notFile` is set, with nothing written, when the
+    // path resolves to another kind of node.
+    FileNode* fileNode(const Request& request, Reply& reply, bool& notFile);
+
     // Requests waiting for poll() in queued mode.
     size_t queuedRequests() const;
 

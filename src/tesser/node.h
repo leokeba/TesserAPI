@@ -31,7 +31,7 @@ class Object;
 class RemoteNode;
 struct PeerAddress;
 
-enum class NodeType : uint8_t { Object, Value, Action, Event, Custom, List, Remote, Array };
+enum class NodeType : uint8_t { Object, Value, Action, Event, Custom, List, Remote, Array, File };
 
 // A presentation hint (docs/DESIGN.md section 7.1): a key and a string,
 // number or `true`, emitted in the schema under "ui" and never interpreted.
@@ -570,6 +570,117 @@ private:
     const char* key_ = nullptr;
 };
 
+// What a file node's handlers get when a transfer starts (docs/DESIGN.md
+// section 4.6).
+struct FileRequest {
+    explicit FileRequest(const Client& c) : client(c) {}
+    const Client& client;
+    uint64_t size = 0;     // upload: the bytes announced (Content-Length)
+    std::string filename;  // download: the name to suggest (default: the node's)
+    Status status = Status::Ok;
+    const char* message = nullptr;
+    // Refuses the transfer (the handler then returns null).
+    void refuse(Status s, const char* why = nullptr) {
+        status = s;
+        message = why;
+    }
+};
+
+// Receives an upload. Destroyed without finish() when the upload is cut
+// short (the client went away, a write failed): roll back there.
+class FileSink {
+public:
+    virtual ~FileSink() = default;
+    // The next bytes, in order. A failure ends the upload.
+    virtual Check write(const uint8_t* data, size_t len) = 0;
+    // Every byte arrived. Writes the reply body (one JSON value, or nothing
+    // for null) or fails.
+    virtual Check finish(JsonWriter& reply) {
+        (void)reply;
+        return Check::ok();
+    }
+};
+
+// Produces a download.
+class FileSource {
+public:
+    virtual ~FileSource() = default;
+    // Total bytes, or -1 if unknown (the transfer is then chunked).
+    virtual int64_t size() const { return -1; }
+    // Up to `cap` bytes into `buf`: the count, 0 at the end, -1 on error.
+    virtual int read(uint8_t* buf, size_t cap) = 0;
+};
+
+// Binary content streamed to and from the device: firmware images, backups,
+// core dumps (docs/DESIGN.md section 4.6). Transferred by HTTP only; the
+// handlers' transfers run outside the API lock.
+class FileNode : public Annotated<FileNode> {
+public:
+    using Upload = std::function<std::unique_ptr<FileSink>(FileRequest& request)>;
+    using Download = std::function<std::unique_ptr<FileSource>(FileRequest& request)>;
+    using TextGetter = std::function<std::string()>;
+    using TextSetter = std::function<Check(std::string_view text, JsonWriter& reply)>;
+
+    explicit FileNode(const char* name) : Annotated(name, NodeType::File) {}
+
+    // Accepts uploads: `open` returns the sink of each, or null after
+    // request.refuse(). It runs under the API lock; the sink doesn't.
+    FileNode& upload(Upload open) {
+        upload_ = std::move(open);
+        touch();
+        return *this;
+    }
+    // Serves downloads, likewise.
+    FileNode& download(Download open) {
+        download_ = std::move(open);
+        touch();
+        return *this;
+    }
+    // Small text files kept in memory: a download is `get()`, an upload is
+    // collected (up to maxSize(), default 16 KB) and handed to `set`, which
+    // may write the reply body. Either may be empty.
+    FileNode& text(TextGetter get, TextSetter set);
+    // Largest upload, in bytes (0: no limit).
+    FileNode& maxSize(uint64_t bytes) {
+        maxSize_ = bytes;
+        touch();
+        return *this;
+    }
+    // MIME type of downloads (default application/octet-stream).
+    FileNode& contentType(const char* type) {
+        contentType_ = type;
+        touch();
+        return *this;
+    }
+    // File types an upload form should offer, as in HTML's accept: ".bin".
+    FileNode& accept(const char* types) {
+        accept_ = types;
+        touch();
+        return *this;
+    }
+
+    bool writable() const { return static_cast<bool>(upload_); }
+    bool readable() const { return static_cast<bool>(download_); }
+    uint64_t maxSize() const { return maxSize_; }
+    const char* contentType() const { return contentType_; }
+    const char* acceptTypes() const { return accept_; }
+
+    // Used by FileTransfer.
+    std::unique_ptr<FileSink> openUpload(FileRequest& r) { return upload_ ? upload_(r) : nullptr; }
+    std::unique_ptr<FileSource> openDownload(FileRequest& r) { return download_ ? download_(r) : nullptr; }
+    // One transfer at a time.
+    bool claim() { return !busy_.exchange(true); }
+    void release() { busy_.store(false); }
+
+private:
+    Upload upload_;
+    Download download_;
+    uint64_t maxSize_ = 0;
+    const char* contentType_ = "application/octet-stream";
+    const char* accept_ = nullptr;
+    std::atomic<bool> busy_{false};
+};
+
 // An array of scalars bound to a std::vector (resizable, up to maxSize()),
 // a C array or a std::array (fixed size) (docs/DESIGN.md section 4.5). It is
 // one value: written whole, or element by element as /name/<index>.
@@ -954,6 +1065,9 @@ public:
     }
 
     EventNode& event(const char* name) { return add(new EventNode(name)); }
+
+    // Binary content transferred over HTTP: see FileNode.
+    FileNode& file(const char* name) { return add(new FileNode(name)); }
 
     // A std::vector<T>, each element described by `describe(Object&, T&)`.
     template <class T, class F>

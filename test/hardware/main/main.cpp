@@ -24,6 +24,7 @@
 #include "action_cases.h"
 #include "array_cases.h"
 #include "keyed_cases.h"
+#include "file_cases.h"
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
@@ -140,6 +141,7 @@ struct Row {
     float gain;
 };
 std::vector<Row> g_table;
+std::string g_blob;  // /files/blob
 
 void delayedReply(void* arg) {
     auto* pending = static_cast<tesser::Pending*>(arg);
@@ -219,6 +221,61 @@ void serveDemo() {
         if (op == tesser::Op::Get || op == tesser::Op::Subscribe || c.authenticated) return true;
         return &n != g_secureNode && &n != g_secretNode;
     });
+
+    // File nodes (HTTP only): a blob kept in RAM, and a backup of the
+    // persisted state (Admin-only to read, since it holds secrets).
+    auto& files = g_demo->api.object("files");
+    files.file("blob")
+        .upload([](tesser::FileRequest&) -> std::unique_ptr<tesser::FileSink> {
+            struct Sink : tesser::FileSink {
+                std::string data;
+                tesser::Check write(const uint8_t* d, size_t n) override {
+                    data.append(reinterpret_cast<const char*>(d), n);
+                    return tesser::Check::ok();
+                }
+                tesser::Check finish(tesser::JsonWriter& reply) override {
+                    g_blob = std::move(data);
+                    reply.beginObject();
+                    reply.key("bytes");
+                    reply.uinteger(g_blob.size());
+                    reply.endObject();
+                    return tesser::Check::ok();
+                }
+            };
+            return std::unique_ptr<tesser::FileSink>(new Sink());
+        })
+        .download([](tesser::FileRequest& r) -> std::unique_ptr<tesser::FileSource> {
+            r.filename = "blob.bin";
+            struct Source : tesser::FileSource {
+                size_t at = 0;
+                int64_t size() const override { return int64_t(g_blob.size()); }
+                int read(uint8_t* buf, size_t cap) override {
+                    size_t n = g_blob.size() - at < cap ? g_blob.size() - at : cap;
+                    memcpy(buf, g_blob.data() + at, n);
+                    at += n;
+                    return int(n);
+                }
+            };
+            return std::unique_ptr<tesser::FileSource>(new Source());
+        })
+        .maxSize(32768)
+        .accept(".bin");
+    files.file("backup")
+        .text([] { return g_demo->api.persistedState(); },
+              [](std::string_view text, tesser::JsonWriter& reply) {
+                  std::vector<std::string> skipped;
+                  tesser::Status st = g_demo->api.restore(text, &skipped);
+                  if (st != tesser::Status::Ok) return tesser::Check::fail(st, "not a backup");
+                  reply.beginObject();
+                  reply.key("skipped");
+                  reply.beginArray();
+                  for (const std::string& p : skipped) reply.string(p);
+                  reply.endArray();
+                  reply.endObject();
+                  return tesser::Check::ok();
+              })
+        .contentType("application/json")
+        .readAccess(tesser::Access::Admin);
 
     startNetwork(g_demo->api);  // NVS is initialized there
     g_storage = new tesser::NvsStorage("tesser_test");

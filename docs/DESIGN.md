@@ -225,7 +225,37 @@ api.array("days", days).range(0, 6).maxSize(7);         // resizable: std::vecto
 - **Subscriptions and persistence** treat the array as one value, like a list.
 - **Cost:** one node; element nodes are built only for requests that address one.
 
-### 4.6 Names and the tree's lifetime
+### 4.6 Files
+
+A file node streams binary content to and from the device: firmware images, backups, core dumps, calibration exports. Its bytes never go through JSON or the request body limit.
+
+```cpp
+auto& fw = api.object("sys").file("firmware").maxSize(0x1E0000).accept(".bin").writeAccess(tesser::Access::Admin);
+fw.upload([](tesser::FileRequest& r) -> std::unique_ptr<tesser::FileSink> {
+    if (!ota.begin(r.size)) { r.refuse(tesser::Status::Busy, "update in progress"); return nullptr; }
+    return std::unique_ptr<tesser::FileSink>(new OtaSink());      // write() each chunk, finish() at the end
+});
+api.object("sys").file("coredump").download([](tesser::FileRequest& r) {   // a FileSource: size(), read()
+    r.filename = "core.elf";
+    return std::unique_ptr<tesser::FileSource>(new CoreDumpSource());
+});
+api.object("sys").file("backup").contentType("application/json").readAccess(tesser::Access::Admin).text(
+    [] { return api.persistedState(); },                                      // download
+    [](std::string_view text, tesser::JsonWriter& reply) { ... api.restore(text, &skipped) ... });  // upload
+```
+
+- **Handlers:** `upload(open)` and `download(open)` take a function called when a transfer starts, under the API lock, with a `FileRequest`: the client, the announced size (uploads), and a `filename` a download may set (default: the node's name). It returns the transfer's `FileSink` or `FileSource`, or null after `request.refuse(status, message)`.
+- **Uploads:** the sink's `write(data, len)` gets the bytes in order, then `finish(reply)` once all of them arrived; it may write the reply body (by default `null`). A failing write ends the upload with its error. A sink destroyed without `finish()` was cut short (a failed write, the client gone, fewer bytes than announced): roll back in its destructor.
+- **Downloads:** the source's `size()` (or -1 if unknown) and `read(buf, cap)`, which returns the bytes read, 0 at the end, or -1 on error.
+- **Outside the lock:** writes, reads and `finish()` run without the API lock, in the transport's task, so a long upload doesn't hold up other requests. Only one transfer per node runs at a time; another one is `busy`.
+- **`text(get, set)`** covers small text files: a download is `get()`, and an upload is collected in memory (up to `maxSize`, 16 KB unless set) and handed to `set`, which may write the reply.
+- **Limits:** `maxSize(bytes)` caps uploads (0, the default, means no limit), checked against the announced size before the upload starts. `contentType()` is the downloads' MIME type (default `application/octet-stream`), and `accept()` the file types an upload form should offer, as in HTML (`.bin`).
+- **Access:** access levels (§13.1) and the authorizer apply: a download is a read, an upload a write.
+- **In the tree:** a file node has no value, so it is left out of value reads and patches, like an action. A JSON request on it is `not_allowed`: get, set, a patch that names it, a subscription. Its schema is `{"type": "file", "readable": true, "writable": true, "maxSize": 1966080, "contentType": "application/octet-stream", "accept": ".bin"}`. A file node inside a list element can't be transferred, since the element is temporary.
+- **Transports:** HTTP only for now (§10.2). The message transports *(planned)* would need a chunked envelope; NowTP also needs streaming of large messages.
+- **Generic core:** `tesser::FileTransfer` does the work (resolution, access, size, one transfer at a time, the reply), host-tested; the HTTP transport only moves bytes.
+
+### 4.7 Names and the tree's lifetime
 
 - Names are `const char*` and are never copied. Use string literals or strings that outlive the `Api`.
 - A name contains only `[A-Za-z0-9_.-]`. Names are unique among siblings, and adding a duplicate fails, which is reported by `api.errors()` and on the log.
@@ -468,10 +498,13 @@ http.attach(handle, "/api");     // registers a wildcard URI on an existing http
 |---|---|
 | `GET /api/<path>?depth=&keys=&exclude=&view=&shape=` | get. A shape comes either in the body or URL-encoded in `shape` (browsers can't send a GET body); both at once is `bad_request`. |
 | `PUT`, `PATCH` or `POST /api/<path>` | set. The body is JSON. |
+| `GET /api/<file>` (no `view`, or `view=value`) | download a file node (§4.6): the raw bytes. |
+| `PUT` or `POST /api/<file>` | upload to a file node: the body is the raw bytes, with any `Content-Type`. The reply is JSON. |
 | `OPTIONS` | CORS preflight, when CORS is enabled |
 
 - Responses up to 512 bytes go out with a `Content-Length`. Larger ones are streamed with chunked encoding through the same 512-byte buffer, so there is no limit on response size.
-- Request bodies are capped by `maxRequestBody`.
+- Request bodies are capped by `maxRequestBody`, except uploads to file nodes, which are capped by the node's `maxSize`.
+- **File transfers** stream in 2 KB pieces from the heap. A download of known size goes out with a `Content-Length` (so clients can show progress) and a `Content-Disposition: attachment; filename="..."`; one of unknown size is chunked. An upload refused before its body is read closes the connection rather than read a large body. With CORS, file responses carry the headers too.
 - The status is mapped as in §8.
 - The handler runs in the httpd task (inline mode).
 - `begin()` starts a dedicated server with wildcard URI matching and an 8 KB stack. `attach()` uses 4 handler slots (5 with CORS, 6 with WebSocket) on an existing server, which must use `httpd_uri_match_wildcard` and should have at least 8 KB of stack. Measured peak use is about 4.9 KB: recursive rendering, newlib's float formatting and lwIP all run on it.
@@ -789,7 +822,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | done |
 | 6 | Groundwork for TesserUI: presentation metadata, forwarded subscriptions, discovered peers, `ApiClient` | done |
-| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels, secrets, streamed replies, `view=hash`, re-advertisement, per-record persistence, `Storage::erase()`, `Api::restore()`, object arguments, typed deferred actions, keyed lists and scalar arrays done |
+| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels, secrets, streamed replies, `view=hash`, re-advertisement, per-record persistence, `Storage::erase()`, `Api::restore()`, object arguments, typed deferred actions, keyed lists, scalar arrays and file nodes done |
 
 ## 19. Decisions on former open questions
 

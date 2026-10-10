@@ -13,7 +13,8 @@ set(TESSER_CORE_SRCS
     src/tesser/persistence.cpp
     src/tesser/storage.cpp
     src/tesser/remote.cpp
-    src/tesser/client.cpp)
+    src/tesser/client.cpp
+    src/tesser/file.cpp)
 
 if(ESP_PLATFORM)
     # The UART driver moved out of "driver" in ESP-IDF 5.3.

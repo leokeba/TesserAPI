@@ -56,7 +56,7 @@ void changesIn(const Object& o, uint16_t since, int depth, const Subscription* t
                detail::LazyPatch& lp, JsonWriter& w) {
     if (depth <= 0) return;
     for (const Node* c = o.first(); c; c = c->next()) {
-        if (c->type() == NodeType::Action || c->type() == NodeType::Event) continue;
+        if (!detail::hasValue(*c)) continue;
         if (c->type() == NodeType::Remote && !options.remotes) continue;
         if (c->readAccess() > options.access) continue;
         if (top && !passesFilter(*top, c->name())) continue;

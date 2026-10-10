@@ -67,6 +67,11 @@ struct RenderOptions {
 // Value view of any node, without filters (defined in api.cpp).
 void renderValue(JsonWriter& w, const Node& n, int depth, const RenderOptions& options = RenderOptions());
 
+// Whether a node appears in the value view (actions, events and files don't).
+inline bool hasValue(const Node& n) {
+    return n.type() != NodeType::Action && n.type() != NodeType::Event && n.type() != NodeType::File;
+}
+
 // A node subscriptions and persistence treat as one value.
 inline bool isLeaf(const Node& n) {
     return n.type() == NodeType::Value || n.type() == NodeType::Custom || n.type() == NodeType::List ||

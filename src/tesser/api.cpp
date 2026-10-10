@@ -132,7 +132,7 @@ void renderValue(JsonWriter& w, const Node& n, int depth, const RenderOptions& o
             w.beginObject();
             if (depth > 0) {
                 for (const Node* c = static_cast<const Object&>(n).first(); c; c = c->next()) {
-                    if (c->type() == NodeType::Action || c->type() == NodeType::Event) continue;
+                    if (!detail::hasValue(*c)) continue;
                     if (!options.remotes && c->type() == NodeType::Remote) continue;
                     if (c->readAccess() > options.access) continue;
                     w.key(c->name());
@@ -163,7 +163,8 @@ void renderValue(JsonWriter& w, const Node& n, int depth, const RenderOptions& o
         case NodeType::Array: static_cast<const ArrayNode&>(n).write(w); break;
         case NodeType::Remote: static_cast<const RemoteNode&>(n).writeCopy(w, depth); break;
         case NodeType::Action:
-        case NodeType::Event: w.null(); break;
+        case NodeType::Event:
+        case NodeType::File: w.null(); break;
     }
 }
 
@@ -211,6 +212,27 @@ public:
             case Op::Subscribe: subscribe(*target); break;
             case Op::Unsubscribe: unsubscribe(); break;
         }
+    }
+
+    // The file node a transfer targets (FileTransfer), or null with the error
+    // written; `notFile` (no error) when the path resolves to something else.
+    FileNode* file(bool& notFile) {
+        Node* target = resolve();
+        if (!target) return nullptr;
+        if (target->type() != NodeType::File) {
+            notFile = true;
+            return nullptr;
+        }
+        if (!temps_.empty()) {
+            replyError(Status::NotAllowed, "files in list elements can't be transferred", base_);
+            return nullptr;
+        }
+        Access need = req_.op == Op::Set ? writeNeed_ : readNeed_;
+        if (level_ < need || !allowed(*target)) {
+            replyError(Status::Unauthorized, "not authorized", base_);
+            return nullptr;
+        }
+        return static_cast<FileNode*>(target);
     }
 
 private:
@@ -387,7 +409,11 @@ private:
                 replyError(Status::BadRequest, "keys, exclude and shapes apply to objects", base_);
                 return false;
             }
-            if (view == View::Value && (target.type() == NodeType::Action || target.type() == NodeType::Event)) {
+            if (view == View::Value && target.type() == NodeType::File) {
+                replyError(Status::NotAllowed, "download files over HTTP; use view=schema", base_);
+                return false;
+            }
+            if (view == View::Value && !detail::hasValue(target)) {
                 replyError(Status::NotAllowed, "no value to read; use view=schema", base_);
                 return false;
             }
@@ -495,7 +521,7 @@ private:
                 }
             } else {
                 for (const Node* c = o.first(); c; c = c->next()) {
-                    if (view == View::Value && (c->type() == NodeType::Action || c->type() == NodeType::Event)) {
+                    if (view == View::Value && !detail::hasValue(*c)) {
                         continue;
                     }
                     if (view == View::Value && c->type() == NodeType::Remote && !req_.query.remotes) continue;
@@ -587,6 +613,25 @@ private:
                 break;
             }
             case NodeType::Event: w.string("event"); break;
+            case NodeType::File: {
+                const auto& file = static_cast<const FileNode&>(n);
+                w.string("file");
+                w.key("readable");
+                w.boolean(file.readable());
+                w.key("writable");
+                w.boolean(file.writable());
+                if (file.maxSize()) {
+                    w.key("maxSize");
+                    w.uinteger(file.maxSize());
+                }
+                w.key("contentType");
+                w.string(file.contentType());
+                if (file.acceptTypes()) {
+                    w.key("accept");
+                    w.string(file.acceptTypes());
+                }
+                break;
+            }
             case NodeType::Array: {
                 const auto& a = static_cast<const ArrayNode&>(n);
                 w.string("array");
@@ -710,8 +755,8 @@ private:
             return replyError(Status::BadRequest, "subscriptions take keys, exclude and depth, not shapes", base_);
         }
         if (req_.query.view != View::Value) return replyError(Status::BadRequest, "subscriptions are on values", base_);
-        if (target.type() == NodeType::Action) {
-            return replyError(Status::NotAllowed, "actions can't be subscribed to", base_);
+        if (target.type() == NodeType::Action || target.type() == NodeType::File) {
+            return replyError(Status::NotAllowed, "actions and files can't be subscribed to", base_);
         }
         if (!temps_.empty()) {
             return replyError(Status::NotAllowed, "subscribe to the list or array itself, not to its elements", base_);
@@ -805,6 +850,7 @@ private:
                 return;
             }
             case NodeType::Event: replyError(Status::NotAllowed, "events can't be set", base_); return;
+            case NodeType::File: replyError(Status::NotAllowed, "upload files over HTTP", base_); return;
             case NodeType::Array: {
                 auto& a = static_cast<ArrayNode&>(target);
                 if (!validatePatch(a, body, writeNeed_)) return replyError();
@@ -961,6 +1007,7 @@ private:
                 return c.isOk() || error(c.status, c.message);
             }
             case NodeType::Event: return error(Status::NotAllowed, "events can't be set");
+            case NodeType::File: return error(Status::NotAllowed, "upload files over HTTP");
             case NodeType::Remote: return error(Status::NotAllowed, "write remote nodes directly");
             case NodeType::Array: {
                 auto& a = static_cast<ArrayNode&>(n);
@@ -1042,6 +1089,7 @@ private:
                 return true;
             }
             case NodeType::Event:
+            case NodeType::File:
             case NodeType::Remote: return true;
             case NodeType::Array: {
                 if (actions) return true;
@@ -1149,6 +1197,12 @@ Access Api::tokenAccess(std::string_view token) const {
 void Api::handle(const Request& request, Reply& reply) {
     if (config_.queued && enqueue(request, reply)) return;
     handleNow(request, reply);
+}
+
+FileNode* Api::fileNode(const Request& request, Reply& reply, bool& notFile) {
+    MutexGuard guard(mutex_);
+    notFile = false;
+    return Handler(*this, request, reply).file(notFile);
 }
 
 void Api::handleNow(const Request& request, Reply& reply) {

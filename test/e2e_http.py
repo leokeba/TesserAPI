@@ -7,6 +7,7 @@ Runs the conformance vectors, then HTTP-specific checks. Standard library
 only. Prints "E2E pass=<n> fail=<n>".
 """
 import json
+import os
 import statistics
 import sys
 import threading
@@ -90,6 +91,36 @@ def main():
     check('patch touching /secure -> 403, nothing applied', got == 403 and
           h.call('get', '/lamp/on', {}, ABSENT) == ('ok', False), (got, data))
     check('reads stay open', h.call('get', '/secure/secret', {}, ABSENT) == ('ok', 6))
+
+    # File nodes: raw bytes both ways, past maxRequestBody.
+    blob = os.urandom(20000)
+    got, data, _, ms = h.raw('PUT', '/files/blob', None, blob, {'Content-Type': 'application/octet-stream'})
+    check(f'file upload ({ms:.0f} ms)', got == 200 and json.loads(data) == {'bytes': 20000}, (got, data[:80]))
+    got, data, headers, ms = h.raw('GET', '/files/blob')
+    check(f'file download ({ms:.0f} ms)', got == 200 and data == blob and headers.get('Content-Length') == '20000' and
+          headers.get('Content-Type') == 'application/octet-stream' and
+          'filename="blob.bin"' in headers.get('Content-Disposition', ''), (got, len(data), headers))
+    got, data, _, _ = h.raw('PUT', '/files/blob', None, os.urandom(40000))
+    check('file too large -> 413', got == 413, (got, data[:80]))
+    got, data, _, _ = h.raw('GET', '/files/blob', {'view': 'schema'})
+    check('file schema', got == 200 and json.loads(data) == {
+        'type': 'file', 'readable': True, 'writable': True, 'maxSize': 32768,
+        'contentType': 'application/octet-stream', 'accept': '.bin'}, data)
+    check('file left out of values', 'blob' not in (h.call('get', '/files', {}, ABSENT)[1] or {'blob': 1}))
+    # The backup: the persisted state, Admin-only, restored leniently.
+    auth = {'Authorization': 'Bearer test-token'}
+    got, data, _, _ = h.raw('GET', '/files/backup')
+    check('backup needs the token', got == 403, got)
+    got, data, headers, _ = h.raw('GET', '/files/backup', None, ABSENT, auth)
+    backup = json.loads(data) if got == 200 else {}
+    check('backup download', got == 200 and 'settings' in backup and
+          headers.get('Content-Type') == 'application/json', (got, data[:120]))
+    name = h.call('get', '/settings/name', {}, ABSENT)[1]
+    got, data, _, _ = h.raw('PUT', '/files/backup', None,
+                            json.dumps({'settings': {'name': 'restored', 'gone': 1}}).encode(), auth)
+    check('backup restore', got == 200 and json.loads(data) == {'skipped': ['/settings/gone']} and
+          h.call('get', '/settings/name', {}, ABSENT)[1] == 'restored', (got, data))
+    h.call('set', '/settings/name', {}, name)
 
     # Deferred action: the handler parks until the reply arrives.
     got, data, _, ms = h.raw('POST', '/system/later')

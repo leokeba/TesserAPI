@@ -7,6 +7,7 @@
 #include "tesser/client.h"
 #include "tesser/datagram.h"
 #include "tesser/envelope.h"
+#include "tesser/file.h"
 #include "tesser/line_transport.h"
 #include "tesser/remote.h"
 #include "tesser/storage.h"

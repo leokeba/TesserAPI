@@ -14,6 +14,8 @@
 
 namespace tesser {
 
+class FileTransfer;
+
 class HttpServer {
 public:
     explicit HttpServer(Api& api);
@@ -67,6 +69,8 @@ private:
     static esp_err_t onWebSocketHandshake(httpd_req_t* req);
     static void onClose(httpd_handle_t server, int fd);
     esp_err_t serve(httpd_req_t* req);
+    esp_err_t receiveFile(httpd_req_t* req, FileTransfer& file, Reply& reply);
+    esp_err_t sendFile(httpd_req_t* req, FileTransfer& file);
     esp_err_t serveWebSocket(httpd_req_t* req);
     void addCorsHeaders(httpd_req_t* req);
     WsClient* wsClient(int fd, bool create);

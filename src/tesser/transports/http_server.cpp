@@ -2,6 +2,7 @@
 
 #if defined(ESP_PLATFORM)
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,12 +14,14 @@
 #include "lwip/sockets.h"
 #include "sdkconfig.h"
 #include "tesser/envelope.h"
+#include "tesser/file.h"
 
 namespace tesser {
 
 namespace {
 
 constexpr size_t kChunk = 512;
+constexpr size_t kFileChunk = 2048;  // file transfers, on the heap
 
 const char* statusLine(Status s) {
     switch (httpCode(s)) {
@@ -648,6 +651,20 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
         }
     }
 
+    // File nodes (docs/DESIGN.md section 4.6): raw bytes both ways, before
+    // the body is read, so maxRequestBody doesn't apply to uploads.
+    if (request.op == Op::Set || request.query.view == View::Value) {
+        FileTransfer file(api_);
+        FileTransfer::Open o = request.op == Op::Set
+                                   ? file.openUpload(path, request.client, req->content_len, reply)
+                                   : file.openDownload(path, request.client, reply);
+        if (o == FileTransfer::Open::Ok) return request.op == Op::Set ? receiveFile(req, file, reply) : sendFile(req, file);
+        if (o == FileTransfer::Open::Failed) {
+            // A refused upload's body is unread: close rather than read it.
+            return request.op == Op::Set && req->content_len > kFileChunk ? ESP_FAIL : ESP_OK;
+        }
+    }
+
     // Body.
     if (req->content_len > cfg.maxRequestBody) {
         writeError(reply, Status::TooLarge, path, "request body too large");
@@ -689,6 +706,79 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
             writeError(reply, Status::Timeout, path, "deferred call timed out");
         }
         st->unref();
+    }
+    return ESP_OK;
+}
+
+esp_err_t HttpServer::receiveFile(httpd_req_t* req, FileTransfer& file, Reply& reply) {
+    std::unique_ptr<uint8_t[]> buf(new uint8_t[kFileChunk]);
+    size_t left = req->content_len;
+    int timeouts = 0;
+    while (left) {
+        int n = httpd_req_recv(req, reinterpret_cast<char*>(buf.get()), left < kFileChunk ? left : kFileChunk);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 4) continue;
+        if (n <= 0) return ESP_FAIL;  // the client went away: the transfer is aborted
+        timeouts = 0;
+        left -= static_cast<size_t>(n);
+        if (!file.write(buf.get(), static_cast<size_t>(n), reply)) return left ? ESP_FAIL : ESP_OK;
+    }
+    file.finish(reply);
+    return ESP_OK;
+}
+
+namespace {
+bool sendAll(httpd_req_t* req, const char* data, size_t len) {
+    while (len) {
+        int n = httpd_send(req, data, len);
+        if (n <= 0) return false;
+        data += n;
+        len -= static_cast<size_t>(n);
+    }
+    return true;
+}
+}  // namespace
+
+esp_err_t HttpServer::sendFile(httpd_req_t* req, FileTransfer& file) {
+    std::unique_ptr<uint8_t[]> buf(new uint8_t[kFileChunk]);
+    std::string disposition = "attachment; filename=\"" + file.filename() + "\"";
+    int64_t size = file.size();
+    if (size < 0) {
+        // Unknown size: chunked.
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_set_type(req, file.contentType());
+        httpd_resp_set_hdr(req, "Content-Disposition", disposition.c_str());
+        addCorsHeaders(req);
+        int n;
+        while ((n = file.read(buf.get(), kFileChunk)) > 0) {
+            if (httpd_resp_send_chunk(req, reinterpret_cast<char*>(buf.get()), n) != ESP_OK) return ESP_FAIL;
+        }
+        if (n < 0) return ESP_FAIL;  // cut short: the client sees no final chunk
+        return httpd_resp_send_chunk(req, nullptr, 0);
+    }
+    // Known size: a Content-Length, so clients can show progress.
+    // esp_http_server can't stream with one, so the head is written here.
+    char length[24];
+    snprintf(length, sizeof(length), "%llu", static_cast<unsigned long long>(size));
+    std::string head = "HTTP/1.1 200 OK\r\nContent-Type: ";
+    head += file.contentType();
+    head += "\r\nContent-Length: ";
+    head += length;
+    head += "\r\nContent-Disposition: ";
+    head += disposition;
+    head += "\r\n";
+    if (corsOrigin_) {
+        head += "Access-Control-Allow-Origin: ";
+        head += corsOrigin_;
+        head += "\r\nAccess-Control-Expose-Headers: Content-Disposition, Content-Length\r\n";
+    }
+    head += "\r\n";
+    if (!sendAll(req, head.data(), head.size())) return ESP_FAIL;
+    uint64_t left = static_cast<uint64_t>(size);
+    while (left) {
+        int n = file.read(buf.get(), kFileChunk);
+        if (n <= 0 || static_cast<uint64_t>(n) > left) return ESP_FAIL;  // the client sees it short
+        if (!sendAll(req, reinterpret_cast<char*>(buf.get()), static_cast<size_t>(n))) return ESP_FAIL;
+        left -= static_cast<uint64_t>(n);
     }
     return ESP_OK;
 }
