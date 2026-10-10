@@ -354,13 +354,19 @@ esp_err_t HttpServer::onWebSocket(httpd_req_t* req) {
     return static_cast<HttpServer*>(req->user_ctx)->serveWebSocket(req);
 }
 
+// The handshake's headers and query are only readable here. ESP-IDF calls
+// this before switching protocols (pre-handshake callback); before 6.1 it
+// also called the WebSocket handler with the handshake's GET.
+esp_err_t HttpServer::onWebSocketHandshake(httpd_req_t* req) {
+    auto* self = static_cast<HttpServer*>(req->user_ctx);
+    self->wsClient(httpd_req_to_sockfd(req), true)->authenticated = self->authenticated(req);
+    return ESP_OK;
+}
+
 esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
 #if CONFIG_HTTPD_WS_SUPPORT
     int fd = httpd_req_to_sockfd(req);
-    if (req->method == HTTP_GET) {  // handshake
-        wsClient(fd, true)->authenticated = authenticated(req);
-        return ESP_OK;
-    }
+    if (req->method == HTTP_GET) return onWebSocketHandshake(req);  // ESP-IDF before 6.1
     httpd_ws_frame_t frame = {};
     if (httpd_ws_recv_frame(req, &frame, 0) != ESP_OK) return ESP_FAIL;
     if (frame.len > api_.config().maxRequestBody) {
@@ -385,7 +391,16 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
         memcpy(client.address, &reinterpret_cast<struct sockaddr_in*>(&addr)->sin_addr.s_addr, 4);
         client.addressLength = 4;
     }
-    WsClient* ws = wsClient(fd, true);
+    WsClient* ws = wsClient(fd, false);
+    if (!ws) {
+        // The handshake went unseen, so its token can't count.
+        if (token_ && *token_ && !wsAuthWarned_) {
+            wsAuthWarned_ = true;
+            logWarning("WebSocket handshakes aren't visible: enable CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT "
+                       "for token authentication");
+        }
+        ws = wsClient(fd, true);
+    }
     client.authenticated = ws->authenticated;
     handleEnvelope(api_, text, client, [this, fd](const std::string& m) { wsSend(fd, m); }, ws);
     return ESP_OK;
@@ -443,6 +458,9 @@ esp_err_t HttpServer::attach(httpd_handle_t server, const char* basePath) {
         uri.handler = &HttpServer::onWebSocket;
         uri.user_ctx = this;
         uri.is_websocket = true;
+#if CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+        uri.ws_pre_handshake_cb = &HttpServer::onWebSocketHandshake;
+#endif
         esp_err_t err = httpd_register_uri_handler(server, &uri);
         if (err != ESP_OK) return err;
     }

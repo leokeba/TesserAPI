@@ -23,12 +23,13 @@ from conformance import ABSENT, Http
 class WebSocket:
     """Just enough RFC 6455 for text frames."""
 
-    def __init__(self, host, path='/ws', port=80, timeout=5):
+    def __init__(self, host, path='/ws', port=80, timeout=5, headers=None):
         self.sock = socket.create_connection((host, port), timeout=timeout)
         key = base64.b64encode(os.urandom(16)).decode()
+        extra = ''.join(f'{k}: {v}\r\n' for k, v in (headers or {}).items())
         self.sock.sendall((f'GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n'
                            f'Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n'
-                           'Sec-WebSocket-Version: 13\r\n\r\n').encode())
+                           f'Sec-WebSocket-Version: 13\r\n{extra}\r\n').encode())
         head = b''
         while b'\r\n\r\n' not in head:
             chunk = self.sock.recv(1024)
@@ -205,6 +206,22 @@ def main():
         c.close()
     time.sleep(0.5)
     check('all dropped', subs() == base_subs, subs())
+
+    # Access control: the handshake's token authenticates the connection.
+    def secure_write(c, v):
+        r = c.request('set', '/secure/secret', body=v)
+        c.close()
+        return r
+    r = secure_write(WebSocket(host), 1)
+    check('ws write without token -> unauthorized', r.get('status') == 'unauthorized', r)
+    r = secure_write(WebSocket(host, '/ws?token=wrong'), 2)
+    check('ws wrong token -> unauthorized', r.get('status') == 'unauthorized', r)
+    r = secure_write(WebSocket(host, '/ws?token=test-token'), 3)
+    check('ws ?token= -> ok', r.get('status') == 'ok' and r.get('body') == 3, r)
+    r = secure_write(WebSocket(host, headers={'Authorization': 'Bearer test-token'}), 4)
+    check('ws bearer token -> ok', r.get('status') == 'ok' and r.get('body') == 4, r)
+    check('ws reads stay open', http.call('get', '/secure/secret', {}, ABSENT) == ('ok', 4))
+    time.sleep(0.5)
 
     # Plain HTTP can't subscribe.
     code, data, _, _ = http.raw('GET', '/lamp')

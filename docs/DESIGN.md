@@ -439,6 +439,7 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 - One text frame per envelope. Each connection is a client (`Subscriber`).
 - **Ordering:** every frame (responses, deferred replies, notifications) is written from the httpd task through `httpd_queue_work`, so writes from other tasks never interleave.
 - **Cleanup:** when `begin()` owns the server, `close_fn` drops a closed connection's subscriptions at once. With `attach()`, a closed connection is noticed on the next send to it.
+- **Handshake:** a connection's authentication (§13) is decided from its handshake. ESP-IDF 6.1 stopped calling a WebSocket handler with the handshake's GET, so `HttpServer` reads the handshake in the pre-handshake callback, which needs `CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT`. The component's Kconfig selects it; older ESP-IDF versions and Arduino-ESP32 3.x still call the handler. When neither path saw the handshake, the server logs a warning once and the connection is unauthenticated.
 
 ## 11. Change tracking and subscriptions
 
@@ -661,6 +662,7 @@ Compile-time switches: `TESSER_NO_SCHEMA`, `TESSER_NO_DESCRIPTIONS`, `TESSER_NO_
 The layout follows NowTP:
 - `CMakeLists.txt` is an ESP-IDF component under `idf.py`, and a host library plus tests otherwise.
 - `idf_component.yml` depends on `bblanchon/arduinojson` as a public requirement (`require: public`), since TesserAPI's headers include ArduinoJson's: any component that requires TesserAPI can include `TesserAPI.h`.
+- The component's `Kconfig` selects `CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT` when WebSocket support is on (§10.5).
 - `library.properties` and `library.json` for Arduino and PlatformIO.
 
 Optional transports (NowTP) compile only when their dependency is present: `__has_include(<NowTP.h>)` on Arduino and PlatformIO. On ESP-IDF, the component looks for a `nowtp` component among the build components and links it, since requirements are resolved before that list is known.

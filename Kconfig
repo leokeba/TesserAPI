@@ -1,0 +1,9 @@
+# Since ESP-IDF 6.1, esp_http_server no longer calls a WebSocket handler with
+# the handshake's GET; HttpServer reads the handshake's token from the
+# pre-handshake callback instead. Older versions don't define the symbol, and
+# the select is ignored.
+config TESSER_WS_HANDSHAKE_AUTH
+    bool
+    default y
+    depends on HTTPD_WS_SUPPORT
+    select HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
