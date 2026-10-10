@@ -174,8 +174,10 @@ public:
     // Requests waiting for poll() in queued mode.
     size_t queuedRequests() const;
 
-    // FNV-1a hash of the full schema: changes whenever the tree's shape,
-    // types or constraints do. Clients can cache a schema under it.
+    // FNV-1a hash of the full schema (view=hash at the root, full access):
+    // changes whenever the tree's shape, types or constraints do, but not
+    // with remote nodes' online state or advertised hashes. Clients can cache
+    // a schema under it.
     uint32_t schemaHash();
 
     // A request copied out of the transport's buffers, with its detached reply.

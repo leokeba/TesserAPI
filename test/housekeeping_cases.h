@@ -134,19 +134,28 @@ TEST(auto_advertise) {
     r.gatewayEnd.process();
     CHECK_EQ(published.size(), 1u);
 
-    // A mounted peer going offline shows in the schema: re-advertised.
+    // A peer's state (online, its own advertised hash) shows in the schema
+    // but not in its hash: no re-advertisement. Otherwise two gateways
+    // mounting each other would re-advertise forever.
+    uint32_t before = r.gateway.schemaHash();
     r.gatewayEnd.forgetPeer(datagram_cases::addr(5));
     r.gatewayEnd.process();
+    r.gatewayEnd.peerSeen(datagram_cases::addr(6), "fan", 0x33);
+    r.gatewayEnd.process();
+    CHECK(cases::get(r.gateway, "/peers", cases::schema()).body.find("\"online\":false") != std::string::npos);
     r.net.clock = 12500;
     r.gatewayEnd.process();
-    CHECK_EQ(published.size(), 2u);
-
-    // A change that comes back to the advertised hash publishes nothing.
-    r.gatewayEnd.peerSeen(datagram_cases::addr(5), "lamp", 0x11);
-    r.gatewayEnd.process();
-    r.gatewayEnd.forgetPeer(datagram_cases::addr(5));
-    r.gatewayEnd.process();
     r.net.clock = 14000;
+    r.gatewayEnd.process();
+    CHECK_EQ(published.size(), 1u);
+    CHECK_EQ(r.gateway.schemaHash(), before);
+    CHECK_EQ(cases::get(r.gateway, "/", hash()).body, hex(before));
+
+    // A new node is a change.
+    int extra = 0;
+    r.gateway.value("extra", extra);
+    r.gatewayEnd.process();
+    r.net.clock = 15500;
     r.gatewayEnd.process();
     CHECK_EQ(published.size(), 2u);
 }

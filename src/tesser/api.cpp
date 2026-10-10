@@ -1,6 +1,7 @@
 #include "tesser/api.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <memory>
 #include <string>
@@ -392,10 +393,16 @@ private:
                 replyError(Status::BadRequest, "a hash covers the whole schema: no keys, exclude or shape", base_);
                 return false;
             }
-            // The schema this client would read, whole.
+            // The schema this client would read, whole, without the state of
+            // remote nodes (online, advertised hash), which changes with
+            // peers and reaches subscribers as changes. Otherwise two gateways
+            // mounting each other would re-advertise each other's hashes
+            // forever.
             HashSink sink;
             JsonWriter hw(sink);
+            hashing_ = true;
             renderSchema(hw, target, api_.config().maxDepth, Filter());
+            hashing_ = false;
             char hex[9];
             snprintf(hex, sizeof(hex), "%08lx", static_cast<unsigned long>(sink.hash));
             JsonWriter w(reply_.begin(Status::Ok));
@@ -675,11 +682,11 @@ private:
                     w.key("mirror");
                     w.boolean(true);
                 }
-                if (!r.online()) {
+                if (!r.online() && !hashing_) {
                     w.key("online");
                     w.boolean(false);
                 }
-                if (uint32_t hash = r.advertisedSchema()) {
+                if (uint32_t hash = hashing_ ? 0 : r.advertisedSchema()) {
                     char hex[9];
                     snprintf(hex, sizeof(hex), "%08lx", static_cast<unsigned long>(hash));
                     w.key("schema");
@@ -1163,6 +1170,7 @@ private:
     int applied_ = 0;
     bool partial_ = false;
     bool filling_ = false;  // validating or filling an action's object argument
+    bool hashing_ = false;  // rendering a schema for view=hash
     std::vector<std::unique_ptr<Node>> temps_;  // list and array elements on the request path
     std::vector<Node*> containers_;             // lists and arrays the path went through
     struct KeyRef {
@@ -1280,18 +1288,14 @@ void Api::runQueued() {
 }
 
 uint32_t Api::schemaHash() {
-    class HashReply : public Reply {
-    public:
-        Sink& begin(Status) override { return sink; }
-        void end() override {}
-        HashSink sink;
-    } reply;
+    StringReply reply;
     Request req;
     req.path = "/";
-    req.query.view = View::Schema;
+    req.query.view = View::Hash;
     req.client.authenticated = true;  // internal
     handleNow(req, reply);
-    return reply.sink.hash;
+    // "1a2b3c4d", quoted
+    return reply.body.size() == 10 ? static_cast<uint32_t>(strtoul(reply.body.c_str() + 1, nullptr, 16)) : 0;
 }
 
 size_t Api::queuedRequests() const {

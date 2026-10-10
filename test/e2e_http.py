@@ -100,13 +100,15 @@ def main():
     check(f'file download ({ms:.0f} ms)', got == 200 and data == blob and headers.get('Content-Length') == '20000' and
           headers.get('Content-Type') == 'application/octet-stream' and
           'filename="blob.bin"' in headers.get('Content-Disposition', ''), (got, len(data), headers))
-    got, data, _, _ = h.raw('PUT', '/files/blob', None, os.urandom(40000))
-    check('file too large -> 413', got == 413, (got, data[:80]))
+    for i in range(3):  # the body is drained, so the client always reads the 413
+        got, data, _, _ = h.raw('PUT', '/files/blob', None, os.urandom(40000))
+        check(f'file too large -> 413 ({i + 1}/3)', got == 413, (got, data[:80]))
     got, data, _, _ = h.raw('GET', '/files/blob', {'view': 'schema'})
     check('file schema', got == 200 and json.loads(data) == {
         'type': 'file', 'readable': True, 'writable': True, 'maxSize': 32768,
         'contentType': 'application/octet-stream', 'accept': '.bin'}, data)
-    check('file left out of values', 'blob' not in (h.call('get', '/files', {}, ABSENT)[1] or {'blob': 1}))
+    r = h.call('get', '/files', {}, ABSENT)
+    check('file left out of values', r == ('ok', {}), r)
     # The backup: the persisted state, Admin-only, restored leniently.
     auth = {'Authorization': 'Bearer test-token'}
     got, data, _, _ = h.raw('GET', '/files/backup')

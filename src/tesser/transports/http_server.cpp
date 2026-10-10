@@ -22,6 +22,24 @@ namespace {
 
 constexpr size_t kChunk = 512;
 constexpr size_t kFileChunk = 2048;  // file transfers, on the heap
+// A refused upload's body is read and dropped up to this size, so the client
+// (which sends it all before reading) gets the error; beyond it, the
+// connection is closed.
+constexpr size_t kDrainLimit = 256 * 1024;
+
+// Reads and drops `left` bytes of request body. False if the client went away.
+bool drain(httpd_req_t* req, size_t left) {
+    char buf[256];
+    int timeouts = 0;
+    while (left) {
+        int n = httpd_req_recv(req, buf, left < sizeof(buf) ? left : sizeof(buf));
+        if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 4) continue;
+        if (n <= 0) return false;
+        timeouts = 0;
+        left -= static_cast<size_t>(n);
+    }
+    return true;
+}
 
 const char* statusLine(Status s) {
     switch (httpCode(s)) {
@@ -660,8 +678,8 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
                                    : file.openDownload(path, request.client, reply);
         if (o == FileTransfer::Open::Ok) return request.op == Op::Set ? receiveFile(req, file, reply) : sendFile(req, file);
         if (o == FileTransfer::Open::Failed) {
-            // A refused upload's body is unread: close rather than read it.
-            return request.op == Op::Set && req->content_len > kFileChunk ? ESP_FAIL : ESP_OK;
+            if (request.op != Op::Set || req->content_len == 0) return ESP_OK;
+            return req->content_len <= kDrainLimit && drain(req, req->content_len) ? ESP_OK : ESP_FAIL;
         }
     }
 
@@ -720,7 +738,9 @@ esp_err_t HttpServer::receiveFile(httpd_req_t* req, FileTransfer& file, Reply& r
         if (n <= 0) return ESP_FAIL;  // the client went away: the transfer is aborted
         timeouts = 0;
         left -= static_cast<size_t>(n);
-        if (!file.write(buf.get(), static_cast<size_t>(n), reply)) return left ? ESP_FAIL : ESP_OK;
+        if (!file.write(buf.get(), static_cast<size_t>(n), reply)) {
+            return left <= kDrainLimit && drain(req, left) ? ESP_OK : ESP_FAIL;
+        }
     }
     file.finish(reply);
     return ESP_OK;

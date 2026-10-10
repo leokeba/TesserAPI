@@ -193,17 +193,13 @@ RemoteNode::RemoteNode(std::string name, DatagramEndpoint& endpoint, const PeerA
 }
 
 void RemoteNode::setOnline(bool online) {
-    if (online_.exchange(online) != online) {
-        touch();  // the schema shows it
-        changed();
-    }
+    // Shown in the schema, but not part of its hash (docs/DESIGN.md section
+    // 7): subscribers of the parent hear about it as a change.
+    if (online_.exchange(online) != online) changed();
 }
 
 void RemoteNode::setAdvertisedSchema(uint32_t hash) {
-    if (advertisedSchema_.exchange(hash) != hash) {
-        touch();
-        changed();
-    }
+    if (advertisedSchema_.exchange(hash) != hash) changed();
 }
 
 RemoteNode::~RemoteNode() {

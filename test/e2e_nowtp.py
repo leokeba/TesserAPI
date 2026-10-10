@@ -32,7 +32,10 @@ def main():
     check('A discovered B', any(p['mac'] == mac_b for p in peers), peers)
 
     # B advertises its port and schema hash in discovery metadata.
-    hash_b = b.call('get', '/system/schemaHash', {}, conformance.ABSENT)[1]
+    # view=hash is the schema hash the node advertises, for a client with full
+    # access (the test firmware has Admin-only nodes, which others don't see).
+    hash_b = json.loads(b.raw('GET', '/', {'view': 'hash'}, conformance.ABSENT,
+                              {'Authorization': 'Bearer test-token'})[1])
     entry = None
     for _ in range(30):  # announcements repeat; give a fresh one time to arrive
         peers = a.call('get', '/net/peers', {}, conformance.ABSENT)[1]

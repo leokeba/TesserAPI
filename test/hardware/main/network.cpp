@@ -74,12 +74,6 @@ uint32_t g_notifications = 0;
 std::string g_lastNotification = "null";
 tesser::Mutex g_notifMutex;
 
-char g_schemaHash[9] = "";
-
-void updateSchemaHash() {
-    snprintf(g_schemaHash, sizeof(g_schemaHash), "%08lx", static_cast<unsigned long>(g_api->schemaHash()));
-}
-
 bool parseMac(const char* s, nowtp::Mac& out) {
     unsigned b[6];
     if (!s || sscanf(s, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return false;
@@ -152,9 +146,7 @@ void describeNet(tesser::Object& net) {
         // Runs under the API lock, so growing the tree here is safe.
         tesser::RemoteNode& peer = g_nowApi->remote(*g_api, "peer", mac);
         if (a["mirror"] | false) peer.mirror(a["interval"] | 200u, 30000);
-        updateSchemaHash();
-        g_nowApi->advertise();  // the schema changed
-        call.reply(true);
+        call.reply(true);  // the advertisement follows the schema on its own
     });
 
     net.action("remote", [](tesser::Call& call) {
@@ -240,10 +232,8 @@ void startNetwork(tesser::Api& api) {
 
     describeNet(api.object("net"));
     g_nowApi->mountPeers(api.object("peers").doc("TesserAPI boards around, mounted as they are discovered"));
-    // Computed when the tree changes, not inside a request: rendering the
-    // whole schema nested in a handler is heavy on the handler's stack.
-    api.object("system").value("schemaHash", g_schemaHash);
-    updateSchemaHash();
+    // Kept current from now on (re-advertised 1 s after the tree changes);
+    // clients read the hash with view=hash.
     printf("ADVERTISE %d\n", int(g_nowApi->advertise()));
 
     if (wifi) {

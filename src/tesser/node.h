@@ -77,8 +77,8 @@ uint16_t currentGeneration();
 inline bool newerGeneration(uint16_t a, uint16_t b) { return a != 0 && static_cast<int16_t>(a - b) > 0; }
 
 // Bumped whenever the shape of a tree changes: a node is added, a modifier
-// changes a node's schema, a remote node's state changes. Temporary objects
-// (list elements) don't count. Lets transports re-advertise a changed schema
+// changes a node's schema. Temporary objects (list elements) and remote
+// nodes' state (online, advertised hash) don't count. Lets transports re-advertise a changed schema
 // (docs/DESIGN.md section 10.3) without rendering it to find out.
 uint32_t schemaRevision();
 

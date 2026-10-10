@@ -44,6 +44,19 @@ def main():
     status, body = a.call('set', '/net/mount', {}, {'mac': mac_b, 'mirror': True, 'interval': 100})
     check('mount B as /peer', status == 'ok' or (body or {}).get('message') == 'already mounted', (status, body))
 
+    # Mounting changed A's schema: A re-advertises its new hash on its own,
+    # and B sees it in A's discovery metadata.
+    mac_a = a.call('get', '/net/mac', {}, ABSENT)[1]
+    hash_a = json.loads(a.raw('GET', '/', {'view': 'hash'}, ABSENT, {'Authorization': 'Bearer test-token'})[1])
+    seen = None
+    for _ in range(30):  # 1 s debounce, then the next announcement
+        peers = b.call('get', '/net/peers', {}, ABSENT)[1] or []
+        seen = next((p.get('tesser', {}).get('schema') for p in peers if p['mac'] == mac_a), None)
+        if seen == hash_a:
+            break
+        time.sleep(0.5)
+    check('A re-advertised after the mount', seen == hash_a, (seen, hash_a))
+
     conformance.run(Prefixed(a, '/peer'), 'gateway', check)
 
     # Error paths come back under the gateway's path.
