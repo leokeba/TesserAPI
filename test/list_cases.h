@@ -55,6 +55,13 @@ TEST(list_get) {
     CHECK_EQ(get(t.api, "/a/b/c/d/e/f/g/h", cases::depth(1)).body, whole);
     subscription_cases::FakeSubscriber s;
     CHECK_EQ(subscription_cases::subscribe(t.api, &s, "/a/b/c/d/e/f/g/h", cases::depth(1)).body, whole);
+    // TesserUI reads a list's schema on its own path: the element schema
+    // comes in full, nested objects included.
+    CHECK_EQ(get(t.api, "/a/b/c/d/e/f/g/h/networks", cases::schema(16)).body,
+             "{\"type\":\"list\",\"maxSize\":32,\"key\":\"ssid\",\"items\":{\"type\":\"object\",\"children\":{"
+             "\"ssid\":{\"type\":\"string\",\"writable\":true},\"static\":{\"type\":\"object\",\"children\":{"
+             "\"dhcp\":{\"type\":\"boolean\",\"writable\":true},\"addr\":{\"type\":\"object\",\"children\":{"
+             "\"ip\":{\"type\":\"integer\",\"writable\":true}}}}}}}}");
     CHECK_EQ(get(f.api, "/remotes", cases::keys("host")).status, Status::BadRequest);
     CHECK_EQ(get(f.api, "/remotes", cases::schema()).body,
              "{\"type\":\"list\",\"maxSize\":3,\"items\":{\"type\":\"object\",\"children\":{"
