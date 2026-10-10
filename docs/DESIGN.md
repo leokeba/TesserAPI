@@ -660,7 +660,7 @@ Compile-time switches: `TESSER_NO_SCHEMA`, `TESSER_NO_DESCRIPTIONS`, `TESSER_NO_
 
 The layout follows NowTP:
 - `CMakeLists.txt` is an ESP-IDF component under `idf.py`, and a host library plus tests otherwise.
-- `idf_component.yml` depends on `bblanchon/arduinojson`.
+- `idf_component.yml` depends on `bblanchon/arduinojson` as a public requirement (`require: public`), since TesserAPI's headers include ArduinoJson's: any component that requires TesserAPI can include `TesserAPI.h`.
 - `library.properties` and `library.json` for Arduino and PlatformIO.
 
 Optional transports (NowTP) compile only when their dependency is present: `__has_include(<NowTP.h>)` on Arduino and PlatformIO. On ESP-IDF, the component looks for a `nowtp` component among the build components and links it, since requirements are resolved before that list is known.
