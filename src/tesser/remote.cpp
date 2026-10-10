@@ -2,6 +2,7 @@
 
 #include "tesser/api.h"
 #include "tesser/call.h"
+#include "tesser/detail/lazy_patch.h"
 
 namespace tesser {
 
@@ -36,10 +37,10 @@ void writeLimited(JsonWriter& w, JsonVariantConst v, int depth) {
         }
         w.endObject();
     } else if (v.is<JsonArrayConst>()) {
+        // A remote list or array: one value, whole at any depth.
+        int d = depth > detail::kWholeDepth ? depth : detail::kWholeDepth;
         w.beginArray();
-        if (depth > 0) {
-            for (JsonVariantConst e : v.as<JsonArrayConst>()) writeLimited(w, e, depth);
-        }
+        for (JsonVariantConst e : v.as<JsonArrayConst>()) writeLimited(w, e, d);
         w.endArray();
     } else {
         w.variant(v);

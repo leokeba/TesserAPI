@@ -138,6 +138,19 @@ TEST(remote_mirror) {
     CHECK_EQ(r.gatewayEnd.stats().timeouts, 0u);
 }
 
+// Arrays in a mirrored copy are values: whole at any depth, like local ones.
+TEST(remote_mirror_arrays_whole) {
+    Rig r;
+    std::vector<int> nums = {1, 2};
+    r.device.api.array("nums", nums);
+    r.kitchen.mirror(0, 30000);
+    r.net.run();
+    CHECK(r.kitchen.hasCopy());
+    std::string body = cases::get(r.gateway, "/", cases::depth(2)).body;
+    CHECK(body.find("\"nums\":[1,2]") != std::string::npos);
+    CHECK(body.find("\"lamp\":{}") != std::string::npos);
+}
+
 TEST(remote_forwarded_subscriptions) {
     Rig r;
     // The first subscriber waits for the upstream subscription's snapshot.

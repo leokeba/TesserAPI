@@ -44,7 +44,17 @@ TEST(list_get) {
     CHECK_EQ(get(f.api, "/remotes/2").status, Status::NotFound);
     CHECK_EQ(get(f.api, "/remotes/01").status, Status::NotFound);
     CHECK_EQ(get(f.api, "/remotes/x").status, Status::NotFound);
-    CHECK_EQ(get(f.api, "/", cases::depth(1)).body, "{\"remotes\":[]}");
+    // A list is one value: whole at any depth, its elements' objects included.
+    CHECK_EQ(get(f.api, "/", cases::depth(1)).body,
+             "{\"remotes\":[{\"host\":\"a\",\"port\":80,\"enabled\":true},{\"host\":\"b\",\"port\":81,\"enabled\":false}]}");
+    CHECK_EQ(get(f.api, "/", cases::depth(0)).body, "{}");
+    // Elements' nested objects too, and in a subscription's snapshot, as in
+    // its change notifications.
+    cases::DeepTree t;
+    const char* whole = "{\"networks\":[{\"ssid\":\"home\",\"static\":{\"dhcp\":true,\"addr\":{\"ip\":0}}}]}";
+    CHECK_EQ(get(t.api, "/a/b/c/d/e/f/g/h", cases::depth(1)).body, whole);
+    subscription_cases::FakeSubscriber s;
+    CHECK_EQ(subscription_cases::subscribe(t.api, &s, "/a/b/c/d/e/f/g/h", cases::depth(1)).body, whole);
     CHECK_EQ(get(f.api, "/remotes", cases::keys("host")).status, Status::BadRequest);
     CHECK_EQ(get(f.api, "/remotes", cases::schema()).body,
              "{\"type\":\"list\",\"maxSize\":3,\"items\":{\"type\":\"object\",\"children\":{"

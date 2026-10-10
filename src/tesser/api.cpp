@@ -144,11 +144,11 @@ void renderValue(JsonWriter& w, const Node& n, int depth, const RenderOptions& o
             w.endObject();
             break;
         case NodeType::List: {
+            // One value: whole at any depth, so [] always means empty.
             const auto& l = static_cast<const ListNode&>(n);
+            int d = depth > kWholeDepth ? depth : kWholeDepth;
             w.beginArray();
-            if (depth > 0) {
-                for (size_t i = 0; i < l.size(); i++) renderValue(w, *l.element(i), depth, options);
-            }
+            for (size_t i = 0; i < l.size(); i++) renderValue(w, *l.element(i), d, options);
             w.endArray();
             break;
         }

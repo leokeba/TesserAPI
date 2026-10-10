@@ -299,7 +299,7 @@ struct Request {
 
 | Option | Values | Meaning |
 |---|---|---|
-| `depth` | `0`–`255`, default unlimited | Levels of objects to expand below the target. An object beyond the limit renders as `{}`. `depth=0` on an object gives `{}`. Values are always rendered. |
+| `depth` | `0`–`255`, default unlimited | Levels of objects to expand below the target. An object beyond the limit renders as `{}`. `depth=0` on an object gives `{}`. Values are always rendered, lists and arrays (§4.4, §4.5) included: each is one value and renders whole, its elements' objects too, so `[]` always means empty. |
 | `keys` | comma-separated names | Only these direct children of the target. An unknown name is `not_found`. |
 | `exclude` | comma-separated names | All direct children except these. |
 | `view` | `value` (default), `schema`, `hash` | The representation to return (§7). |

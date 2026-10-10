@@ -79,8 +79,13 @@ inline bool isLeaf(const Node& n) {
            n.type() == NodeType::Remote;
 }
 
+// Lists, arrays and remote copies are one value each (docs/DESIGN.md
+// section 4.4): they render whole whatever depth a read asks for, their
+// elements' objects to this depth.
+constexpr int kWholeDepth = 16;
+
 inline void writeLeaf(JsonWriter& w, const Node& n, const RenderOptions& options = RenderOptions()) {
-    renderValue(w, n, 16, options);
+    renderValue(w, n, kWholeDepth, options);
 }
 
 }  // namespace detail
