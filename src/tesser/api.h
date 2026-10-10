@@ -47,6 +47,7 @@ struct Subscription {
     // node relays its changes; poll() leaves it alone.
     bool forwarded = false;
     bool snapshot = true;
+    Access access = Access::Admin;  // the client's level: what notifications may include
     Reply* waiting = nullptr;  // detached reply awaiting the remote's snapshot
 };
 
@@ -55,6 +56,11 @@ class Storage;
 // Decides whether a client may perform an operation on a node. Consulted for
 // the target of every request, and for every node a patch touches.
 using Authorizer = std::function<bool(const Client& client, Op op, const Node& node)>;
+
+// Gives the access level of a token presented by a client (HTTP and
+// WebSocket: "Authorization: Bearer" or ?token=); empty when it presented
+// none. See Api::authenticate().
+using TokenCheck = std::function<Access(std::string_view token)>;
 
 namespace authorizers {
 // Anyone may read and subscribe; writes and actions need an authenticated
@@ -106,6 +112,13 @@ public:
     // everything is allowed.
     void authorize(Authorizer fn);
     const Authorizer& authorizer() const { return authorizer_; }
+
+    // Token authentication (docs/DESIGN.md section 13): transports that carry
+    // tokens ask `fn` for each client's level. Without it, only a transport's
+    // own token (HttpServer::setToken) authenticates.
+    void authenticate(TokenCheck fn);
+    // The level `fn` gives `token`; Public without a check.
+    Access tokenAccess(std::string_view token) const;
 
     // Persistence (docs/DESIGN.md section 12): values and objects marked
     // persist() are saved to `storage` by poll(), debounceMs after the last
@@ -174,6 +187,7 @@ private:
     std::vector<Subscription> subs_;
     uint32_t lastWatchMs_ = 0;
     Authorizer authorizer_;
+    TokenCheck tokenCheck_;
     Storage* storage_ = nullptr;
     uint32_t debounceMs_ = 2000;
     uint16_t savedGen_ = 0;  // generation when the state was last saved or loaded

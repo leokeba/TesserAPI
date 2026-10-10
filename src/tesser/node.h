@@ -18,6 +18,7 @@
 
 #include "tesser/call.h"
 #include "tesser/json_writer.h"
+#include "tesser/request.h"
 #include "tesser/status.h"
 #include "tesser/value_types.h"
 
@@ -59,6 +60,8 @@ struct NodeMeta {
     double max = 0;
     bool hasRange = false;
     bool hashed = false;  // watch(): `hash` holds the last sample
+    Access readAccess = Access::Public;
+    Access writeAccess = Access::Public;
     const char* doc = nullptr;
     uint32_t hash = 0;
     UiMeta* ui = nullptr;
@@ -89,6 +92,10 @@ public:
     const NodeMeta* meta() const { return meta_; }
     bool persisted() const { return flags_ & kPersist; }
     bool watched() const { return flags_ & kWatch; }
+    // Levels this node itself requires (docs/DESIGN.md section 13); a node
+    // also requires its ancestors'.
+    Access readAccess() const { return meta_ ? meta_->readAccess : Access::Public; }
+    Access writeAccess() const { return meta_ ? meta_->writeAccess : Access::Public; }
 
     // Marks this node (for an object: every value below it) as changed, so
     // subscribers get it on the next Api::poll(). Writes through the API do
@@ -101,13 +108,14 @@ protected:
     friend class Object;
     friend class Api;
 
-    enum Flags : uint8_t { kReadOnly = 1, kPersist = 2, kDeferring = 4, kLinked = 8, kWatch = 16 };
+    enum Flags : uint8_t { kReadOnly = 1, kPersist = 2, kDeferring = 4, kLinked = 8, kWatch = 16, kSecret = 32 };
 
     NodeMeta& editMeta();
     UiMeta* editUi();  // null when compiled out (TESSER_NO_UI)
     void setDoc(const char* text);
     void setRange(double min, double max);
     void addHint(const char* key, UiHint::Kind kind, const char* str, float num);
+    void setAccess(Access read, Access write);
     // Range check for values and numeric action arguments.
     Check checkRange(double v) const;
 
@@ -126,6 +134,8 @@ template <class Self>
 class Annotated : public Node {
 public:
     using Node::Node;
+    using Node::readAccess;
+    using Node::writeAccess;
 
     // Schema description. Compiled out with TESSER_NO_DESCRIPTIONS.
     Self& doc(const char* text) {
@@ -163,6 +173,18 @@ public:
         addHint(key, UiHint::Kind::Number, nullptr, static_cast<float>(value));
         return self();
     }
+    // The level a client needs to read this node and its subtree. Writing
+    // needs at least as much.
+    Self& readAccess(Access a) {
+        setAccess(a, writeAccess() > a ? writeAccess() : a);
+        return self();
+    }
+    // The level a client needs to write this node and its subtree, or to
+    // call actions in it.
+    Self& writeAccess(Access a) {
+        setAccess(readAccess(), a > readAccess() ? a : readAccess());
+        return self();
+    }
 
 private:
     Self& self() { return static_cast<Self&>(*this); }
@@ -181,8 +203,12 @@ public:
     // is subscribed) and marks it changed when it differs. For bound state
     // the application doesn't report with changed().
     ValueNode& watch();
+    // A password or key: writable and persisted like any value, but read as
+    // null by clients (docs/DESIGN.md section 4.1).
+    ValueNode& secret();
 
     bool writable() const { return canWrite() && !(flags_ & kReadOnly); }
+    bool isSecret() const { return flags_ & kSecret; }
 
     virtual ValueKind kind() const = 0;
     virtual size_t maxLength() const { return 0; }

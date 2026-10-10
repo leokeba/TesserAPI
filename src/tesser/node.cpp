@@ -127,6 +127,12 @@ void Node::addHint(const char* key, UiHint::Kind kind, const char* str, float nu
     }
 }
 
+void Node::setAccess(Access read, Access write) {
+    NodeMeta& m = editMeta();
+    m.readAccess = read;
+    m.writeAccess = write;
+}
+
 void Node::setRange(double min, double max) {
     NodeMeta& m = editMeta();
     m.min = min;
@@ -146,6 +152,11 @@ ValueNode& ValueNode::readOnly() {
 
 ValueNode& ValueNode::persist() {
     flags_ |= kPersist;
+    return *this;
+}
+
+ValueNode& ValueNode::secret() {
+    flags_ |= kSecret;
     return *this;
 }
 

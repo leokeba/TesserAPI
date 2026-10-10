@@ -57,9 +57,15 @@ private:
     bool rootOpen_ = false;
 };
 
-// Value view of any node, without filters (defined in api.cpp). `remotes`:
-// include mirrored remote nodes.
-void renderValue(JsonWriter& w, const Node& n, int depth, bool remotes = true);
+// What a value render includes.
+struct RenderOptions {
+    bool remotes = true;            // mirrored remote nodes' copies
+    Access access = Access::Admin;  // children needing more to be read are left out
+    bool secrets = false;           // secret values as themselves (persistence), else null
+};
+
+// Value view of any node, without filters (defined in api.cpp).
+void renderValue(JsonWriter& w, const Node& n, int depth, const RenderOptions& options = RenderOptions());
 
 // A node subscriptions and persistence treat as one value.
 inline bool isLeaf(const Node& n) {
@@ -67,7 +73,9 @@ inline bool isLeaf(const Node& n) {
            n.type() == NodeType::Remote;
 }
 
-inline void writeLeaf(JsonWriter& w, const Node& n, bool remotes = true) { renderValue(w, n, 16, remotes); }
+inline void writeLeaf(JsonWriter& w, const Node& n, const RenderOptions& options = RenderOptions()) {
+    renderValue(w, n, 16, options);
+}
 
 }  // namespace detail
 }  // namespace tesser

@@ -225,7 +225,7 @@ private:
 class HttpServer::WsClient : public Subscriber {
 public:
     WsClient(HttpServer& server, int socket) : server_(server), fd(socket) {}
-    bool authenticated = false;
+    Access access = Access::Public;
     bool notify(const std::string& message, Delivery) override { return server_.wsSend(fd, message); }
 
 private:
@@ -320,28 +320,42 @@ bool HttpServer::wsSend(int fd, const std::string& message) {
 #endif
 }
 
-bool HttpServer::authenticated(httpd_req_t* req) const {
-    if (!token_ || !*token_) return false;
-    size_t tokenLen = strlen(token_);
+namespace {
+constexpr size_t kMaxToken = 256;
+
+// The token a request presents ("Authorization: Bearer <token>" or
+// ?token=<token>), empty if none or too long.
+std::string requestToken(httpd_req_t* req) {
+    std::string token;
     size_t len = httpd_req_get_hdr_value_len(req, "Authorization");
-    if (len == 7 + tokenLen) {
+    if (len > 7 && len <= 7 + kMaxToken) {
         std::string value(len + 1, '\0');
         if (httpd_req_get_hdr_value_str(req, "Authorization", &value[0], value.size()) == ESP_OK &&
-            memcmp(value.data(), "Bearer ", 7) == 0 && memcmp(value.data() + 7, token_, tokenLen) == 0) {
-            return true;
+            memcmp(value.data(), "Bearer ", 7) == 0) {
+            token.assign(value.data() + 7, len - 7);
+            return token;
         }
     }
     size_t qlen = httpd_req_get_url_query_len(req);
     if (qlen) {
         std::string query(qlen + 1, '\0');
-        std::string value(tokenLen + 2, '\0');
+        std::string value(kMaxToken + 2, '\0');
         if (httpd_req_get_url_query_str(req, &query[0], query.size()) == ESP_OK &&
-            httpd_query_key_value(query.c_str(), "token", &value[0], value.size()) == ESP_OK &&
-            strcmp(value.c_str(), token_) == 0) {
-            return true;
+            httpd_query_key_value(query.c_str(), "token", &value[0], value.size()) == ESP_OK) {
+            size_t n = urlDecode(&value[0], strlen(value.c_str()), true);
+            token.assign(value.data(), n);
         }
     }
-    return false;
+    return token;
+}
+}  // namespace
+
+// The transport's own token gives full access; any other goes to the API's
+// token check (Api::authenticate()).
+Access HttpServer::access(httpd_req_t* req) const {
+    std::string token = requestToken(req);
+    if (token_ && *token_ && token == token_) return Access::Admin;
+    return api_.tokenAccess(token);
 }
 
 void HttpServer::onClose(httpd_handle_t server, int fd) {
@@ -359,7 +373,7 @@ esp_err_t HttpServer::onWebSocket(httpd_req_t* req) {
 // also called the WebSocket handler with the handshake's GET.
 esp_err_t HttpServer::onWebSocketHandshake(httpd_req_t* req) {
     auto* self = static_cast<HttpServer*>(req->user_ctx);
-    self->wsClient(httpd_req_to_sockfd(req), true)->authenticated = self->authenticated(req);
+    self->wsClient(httpd_req_to_sockfd(req), true)->access = self->access(req);
     return ESP_OK;
 }
 
@@ -401,7 +415,8 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
         }
         ws = wsClient(fd, true);
     }
-    client.authenticated = ws->authenticated;
+    client.access = ws->access;
+    client.authenticated = ws->access != Access::Public;
     handleEnvelope(api_, text, client, [this, fd](const std::string& m) { wsSend(fd, m); }, ws);
     return ESP_OK;
 #else
@@ -554,7 +569,8 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
     request.op = req->method == HTTP_GET ? Op::Get : Op::Set;
     request.path = path;
     request.client.transport = TransportKind::Http;
-    request.client.authenticated = authenticated(req);
+    request.client.access = access(req);
+    request.client.authenticated = request.client.access != Access::Public;
     int fd = httpd_req_to_sockfd(req);
     struct sockaddr_in6 addr = {};
     socklen_t addrLen = sizeof(addr);

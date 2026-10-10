@@ -52,22 +52,46 @@ bool passesFilter(const Subscription& sub, std::string_view name) {
     return true;
 }
 
-void changesIn(const Object& o, uint16_t since, int depth, const Subscription* top, bool remotes, detail::LazyPatch& lp,
-               JsonWriter& w) {
+void changesIn(const Object& o, uint16_t since, int depth, const Subscription* top, const detail::RenderOptions& options,
+               detail::LazyPatch& lp, JsonWriter& w) {
     if (depth <= 0) return;
     for (const Node* c = o.first(); c; c = c->next()) {
         if (c->type() == NodeType::Action || c->type() == NodeType::Event) continue;
-        if (c->type() == NodeType::Remote && !remotes) continue;
+        if (c->type() == NodeType::Remote && !options.remotes) continue;
+        if (c->readAccess() > options.access) continue;
         if (top && !passesFilter(*top, c->name())) continue;
         if (c->type() == NodeType::Object) {
             if (!lp.enter(c->name())) continue;
-            changesIn(static_cast<const Object&>(*c), since, depth - 1, nullptr, remotes, lp, w);
+            changesIn(static_cast<const Object&>(*c), since, depth - 1, nullptr, options, lp, w);
             lp.leave();
         } else if (detail::isLeaf(*c) && newerGeneration(c->generation(), since)) {
             lp.key(c->name());
-            detail::writeLeaf(w, *c, remotes);
+            detail::writeLeaf(w, *c, options);
         }
     }
+}
+
+// The level needed to read the node at `path`, its ancestors' included. A
+// path leaving the local tree (below a remote node) stops at its last local
+// node.
+Access readNeed(const Object& root, std::string_view path) {
+    Access need = root.readAccess();
+    const Node* node = &root;
+    size_t pos = 0;
+    while (pos < path.size()) {
+        if (path[pos] == '/') {
+            pos++;
+            continue;
+        }
+        size_t slash = path.find('/', pos);
+        if (slash == std::string_view::npos) slash = path.size();
+        if (node->type() != NodeType::Object) return need;
+        node = static_cast<const Object*>(node)->child(path.substr(pos, slash - pos));
+        if (!node) return need;
+        if (node->readAccess() > need) need = node->readAccess();
+        pos = slash;
+    }
+    return need;
 }
 
 // Appends the closing of a notification envelope.
@@ -281,13 +305,16 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
     JsonWriter w(sink);
     bool any = false;
     const Node& n = *sub.node;
+    detail::RenderOptions options;
+    options.remotes = sub.remotes;
+    options.access = sub.access;
     if (n.type() == NodeType::Object) {
         detail::LazyPatch lp(w);
         int depth = sub.depth < 0 || sub.depth > config_.maxDepth ? config_.maxDepth : sub.depth;
-        changesIn(static_cast<const Object&>(n), sub.since, depth, &sub, sub.remotes, lp, w);
+        changesIn(static_cast<const Object&>(n), sub.since, depth, &sub, options, lp, w);
         any = lp.finish();
     } else if (detail::isLeaf(n) && newerGeneration(n.generation(), sub.since)) {
-        detail::writeLeaf(w, n);
+        detail::writeLeaf(w, n, options);
         any = true;
     }
     if (!any) {
@@ -338,9 +365,11 @@ void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter
         w.null();
     }
 
+    Access need = readNeed(*this, path);
+
     std::vector<Subscriber*> notified;
     for (const Subscription& sub : subs_) {
-        if (!sub.events || sub.waiting) continue;
+        if (!sub.events || sub.waiting || sub.access < need) continue;
         // The subscription's path must be a prefix of the event's, at a
         // segment boundary, within its depth and key filter.
         std::string_view ev(path);

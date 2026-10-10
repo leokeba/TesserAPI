@@ -47,9 +47,10 @@ public:
     size_t webSocketClients() const;
 
     // Requests carrying "Authorization: Bearer <token>" (or ?token=<token>,
-    // for WebSocket handshakes from browsers) count as authenticated; see
-    // Api::authorize(). A WebSocket connection is authenticated by its
-    // handshake; since ESP-IDF 6.1 that needs
+    // for WebSocket handshakes from browsers) count as authenticated, with
+    // full access; see Api::authorize(). Other tokens go to the API's token
+    // check (Api::authenticate()). A WebSocket connection is authenticated
+    // by its handshake; since ESP-IDF 6.1 that needs
     // CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT, which TesserAPI's component
     // selects. The string must outlive the server.
     void setToken(const char* token) { token_ = token; }
@@ -71,7 +72,7 @@ private:
     WsClient* wsClient(int fd, bool create);
     void dropWsClient(int fd);
     bool wsSend(int fd, const std::string& message);
-    bool authenticated(httpd_req_t* req) const;
+    Access access(httpd_req_t* req) const;
 
     Api& api_;
     httpd_handle_t server_ = nullptr;

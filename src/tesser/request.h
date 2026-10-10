@@ -40,12 +40,25 @@ struct Query {
 
 enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket };
 
+// Access levels, ordered (docs/DESIGN.md section 13): a client has one, and a
+// node may require one to be read or written.
+enum class Access : uint8_t { Public, User, Admin };
+
+// "public" / "user" / "admin".
+const char* toString(Access a);
+bool parseAccess(std::string_view s, Access& out);
+
 // Who sent a request, as far as the transport knows.
 struct Client {
     TransportKind transport = TransportKind::Local;
     uint8_t address[16] = {};  // IPv4/IPv6 or MAC, transport-defined
     uint8_t addressLength = 0;
     bool authenticated = false;
+    // Set by transports that know the client's level (token checks); an
+    // authenticated client without one has full access.
+    Access access = Access::Public;
+
+    Access level() const { return authenticated && access == Access::Public ? Access::Admin : access; }
 };
 
 // How a message to a client should be delivered, for transports that offer

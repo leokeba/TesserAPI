@@ -37,6 +37,28 @@ bool parseView(std::string_view s, View& out) {
     return true;
 }
 
+const char* toString(Access a) {
+    switch (a) {
+        case Access::Public: return "public";
+        case Access::User: return "user";
+        case Access::Admin: return "admin";
+    }
+    return "public";
+}
+
+bool parseAccess(std::string_view s, Access& out) {
+    if (s == "public") {
+        out = Access::Public;
+    } else if (s == "user") {
+        out = Access::User;
+    } else if (s == "admin") {
+        out = Access::Admin;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 const char* toString(Op op) {
     switch (op) {
         case Op::Get: return "get";
@@ -89,6 +111,8 @@ bool parseIndex(std::string_view s, size_t& out) {
     return true;
 }
 
+Access higher(Access a, Access b) { return a > b ? a : b; }
+
 struct Filter {
     std::string_view keys;
     std::string_view exclude;
@@ -100,16 +124,17 @@ struct Filter {
 
 namespace detail {
 
-void renderValue(JsonWriter& w, const Node& n, int depth, bool remotes) {
+void renderValue(JsonWriter& w, const Node& n, int depth, const RenderOptions& options) {
     switch (n.type()) {
         case NodeType::Object:
             w.beginObject();
             if (depth > 0) {
                 for (const Node* c = static_cast<const Object&>(n).first(); c; c = c->next()) {
                     if (c->type() == NodeType::Action || c->type() == NodeType::Event) continue;
-                    if (!remotes && c->type() == NodeType::Remote) continue;
+                    if (!options.remotes && c->type() == NodeType::Remote) continue;
+                    if (c->readAccess() > options.access) continue;
                     w.key(c->name());
-                    renderValue(w, *c, depth - 1, remotes);
+                    renderValue(w, *c, depth - 1, options);
                 }
             }
             w.endObject();
@@ -118,12 +143,20 @@ void renderValue(JsonWriter& w, const Node& n, int depth, bool remotes) {
             const auto& l = static_cast<const ListNode&>(n);
             w.beginArray();
             if (depth > 0) {
-                for (size_t i = 0; i < l.size(); i++) renderValue(w, *l.element(i), depth, remotes);
+                for (size_t i = 0; i < l.size(); i++) renderValue(w, *l.element(i), depth, options);
             }
             w.endArray();
             break;
         }
-        case NodeType::Value: static_cast<const ValueNode&>(n).write(w); break;
+        case NodeType::Value: {
+            const auto& v = static_cast<const ValueNode&>(n);
+            if (v.isSecret() && !options.secrets) {
+                w.null();
+            } else {
+                v.write(w);
+            }
+            break;
+        }
         case NodeType::Custom: static_cast<const CustomNode&>(n).write(w); break;
         case NodeType::Remote: static_cast<const RemoteNode&>(n).writeCopy(w, depth); break;
         case NodeType::Action:
@@ -142,6 +175,9 @@ public:
     static constexpr int kMaxTrail = 32;
 
     Handler(Api& api, const Request& req, Reply& reply) : api_(api), req_(req), reply_(reply) {
+        level_ = req.client.level();
+        render_.remotes = req.query.remotes;
+        render_.access = level_;
         base_ = req.path;
         if (base_.size() > 1 && base_.back() == '/') base_.remove_suffix(1);
         if (base_ == "/") base_ = std::string_view();
@@ -152,8 +188,9 @@ public:
     void run() {
         Node* target = resolve();
         if (!target) return;
-        if (req_.op != Op::Unsubscribe && !allowed(*target)) {
-            return replyError(Status::Unauthorized, "not authorized", base_);
+        if (req_.op != Op::Unsubscribe) {
+            Access need = req_.op == Op::Set ? writeNeed_ : readNeed_;
+            if (level_ < need || !allowed(*target)) return replyError(Status::Unauthorized, "not authorized", base_);
         }
         if (target->type() == NodeType::Remote) {
             auto& remote = static_cast<RemoteNode&>(*target);
@@ -184,6 +221,9 @@ private:
         const Authorizer& a = api_.authorizer();
         return !a || a(req_.client, req_.op, n);
     }
+
+    // Whether a child of an already readable node may be read.
+    bool readable(const Node& n) const { return n.readAccess() <= level_; }
 
     // ---- errors -------------------------------------------------------
 
@@ -238,8 +278,15 @@ private:
 
     // ---- resolution ---------------------------------------------------
 
+    // The levels needed to read and write `n`, given its parent's.
+    void require(const Node& n) {
+        readNeed_ = higher(readNeed_, n.readAccess());
+        writeNeed_ = higher(writeNeed_, n.writeAccess());
+    }
+
     Node* resolve() {
         std::string_view path = req_.path;
+        require(api_);
         if (path.empty() || path == "/") return &api_;
         if (path.front() != '/') {
             replyError(Status::BadRequest, "path must start with '/'", path);
@@ -276,6 +323,7 @@ private:
                 replyError(Status::NotFound, "no such node", p.substr(0, slash));
                 return nullptr;
             }
+            require(*next);
             node = next;
             pos = slash + 1;
         }
@@ -337,9 +385,14 @@ private:
             f.exclude = q.exclude;
             std::string_view list = f.keys.empty() ? f.exclude : f.keys;
             bool ok = forEachItem(list, [&](std::string_view key) {
-                if (obj.child(key)) return true;
+                const Node* c = obj.child(key);
+                if (c && readable(*c)) return true;
                 push(key);
-                error(Status::NotFound, "no such key");
+                if (c) {
+                    error(Status::Unauthorized, "not authorized");
+                } else {
+                    error(Status::NotFound, "no such key");
+                }
                 pop();
                 return false;
             });
@@ -361,6 +414,7 @@ private:
             if (!push(key)) return error(Status::BadRequest, "shape too deep");
             const Node* c = obj.child(key);
             if (!c) return error(Status::NotFound, "no such key");
+            if (!readable(*c)) return error(Status::Unauthorized, "not authorized");
             JsonVariantConst v = kv.value();
             if (v.is<JsonObjectConst>()) {
                 if (c->type() != NodeType::Object) return error(Status::BadRequest, "not an object");
@@ -382,7 +436,7 @@ private:
         }
         switch (n.type()) {
             case NodeType::Object: renderChildren(w, static_cast<const Object&>(n), depth, f, view); break;
-            default: detail::renderValue(w, n, depth, req_.query.remotes); break;
+            default: detail::renderValue(w, n, depth, render_); break;
         }
     }
 
@@ -392,7 +446,7 @@ private:
             if (f.hasShape) {
                 for (JsonPairConst kv : f.shape) {
                     const Node* c = o.child(std::string_view(kv.key().c_str(), kv.key().size()));
-                    if (!c) continue;  // validated already; patches can't get here either
+                    if (!c || !readable(*c)) continue;  // validated already; patches can't get here either
                     w.key(c->name());
                     Filter sub;
                     if (kv.value().is<JsonObjectConst>() && c->type() == NodeType::Object) {
@@ -407,6 +461,7 @@ private:
                         continue;
                     }
                     if (view == View::Value && c->type() == NodeType::Remote && !req_.query.remotes) continue;
+                    if (!readable(*c)) continue;
                     if (!f.keys.empty() && !listContains(f.keys, c->name())) continue;
                     if (!f.exclude.empty() && listContains(f.exclude, c->name())) continue;
                     w.key(c->name());
@@ -451,6 +506,10 @@ private:
                     w.beginArray();
                     for (const char* o : *opts) w.string(o);
                     w.endArray();
+                }
+                if (v.isSecret()) {
+                    w.key("secret");
+                    w.boolean(true);
                 }
                 break;
             }
@@ -515,6 +574,10 @@ private:
         if (n.persisted()) {
             w.key("persist");
             w.boolean(true);
+        }
+        if (n.writeAccess() != Access::Public) {
+            w.key("access");
+            w.string(toString(n.writeAccess()));
         }
         if (const NodeMeta* m = n.meta(); m && m->doc) {
             w.key("description");
@@ -604,6 +667,7 @@ private:
         sub.interval = req_.query.interval;
         sub.events = req_.query.events;
         sub.remotes = req_.query.remotes;
+        sub.access = level_;
         api_.addSubscription(std::move(sub));
     }
 
@@ -633,7 +697,7 @@ private:
                 v.changed();
                 markLists();
                 JsonWriter w(reply_.begin(Status::Ok));
-                v.write(w);
+                detail::renderValue(w, v, 0, render_);
                 detail::finishBody(reply_, w, base_);
                 return;
             }
@@ -668,14 +732,14 @@ private:
             case NodeType::Event: replyError(Status::NotAllowed, "events can't be set", base_); return;
             case NodeType::List: {
                 auto& list = static_cast<ListNode&>(target);
-                if (!validatePatch(list, body)) return replyError();
+                if (!validatePatch(list, body, writeNeed_)) return replyError();
                 if (!applyPatch(list, body, false) || !applyPatch(list, body, true)) {
                     partial_ = applied_ > 0;
                     return replyError();
                 }
                 markLists();
                 JsonWriter w(reply_.begin(Status::Ok));
-                detail::renderValue(w, list, api_.config().maxDepth, req_.query.remotes);
+                detail::renderValue(w, list, api_.config().maxDepth, render_);
                 detail::finishBody(reply_, w, base_);
                 return;
             }
@@ -689,7 +753,7 @@ private:
             return;
         }
         // Pass 1: validate everything. Nothing is applied on failure.
-        if (!validatePatch(obj, body)) return replyError();
+        if (!validatePatch(obj, body, writeNeed_)) return replyError();
         // Pass 2: values, in document order. Pass 3: actions.
         if (!applyPatch(obj, body, false) || !applyPatch(obj, body, true)) {
             partial_ = applied_ > 0;
@@ -704,8 +768,9 @@ private:
         detail::finishBody(reply_, w, base_);
     }
 
-    bool validatePatch(Node& n, JsonVariantConst v) {
-        if (!allowed(n)) return error(Status::Unauthorized, "not authorized");
+    // `need`: the level writing `n` takes, its ancestors' included.
+    bool validatePatch(Node& n, JsonVariantConst v, Access need) {
+        if (level_ < need || !allowed(n)) return error(Status::Unauthorized, "not authorized");
         switch (n.type()) {
             case NodeType::Object: {
                 if (!v.is<JsonObjectConst>()) return error(Status::InvalidValue, "expected object");
@@ -715,7 +780,7 @@ private:
                     if (!push(key)) return error(Status::BadRequest, "patch too deep");
                     Node* c = o.child(key);
                     if (!c) return error(Status::NotFound, "no such key");
-                    if (!validatePatch(*c, kv.value())) return false;
+                    if (!validatePatch(*c, kv.value(), higher(need, c->writeAccess()))) return false;
                     pop();
                 }
                 return true;
@@ -750,7 +815,7 @@ private:
                     if (!pushIndex(i)) return error(Status::BadRequest, "patch too deep");
                     if (!item.is<JsonObjectConst>()) return error(Status::InvalidValue, "expected object");
                     std::unique_ptr<Object> element = i < list.size() ? list.element(i) : list.prototype();
-                    if (!validatePatch(*element, item)) return false;
+                    if (!validatePatch(*element, item, higher(need, element->writeAccess()))) return false;
                     pop();
                     i++;
                 }
@@ -828,6 +893,10 @@ private:
     Reply& reply_;
     std::string_view base_;  // request path without trailing slash; empty for the root
     int depth_;
+    Access level_;                       // the client's
+    Access readNeed_ = Access::Public;   // what the target needs, its ancestors' included
+    Access writeNeed_ = Access::Public;
+    detail::RenderOptions render_;
 
     std::string_view trail_[kMaxTrail];
     int trailLen_ = 0;
@@ -849,6 +918,17 @@ private:
 void Api::authorize(Authorizer fn) {
     MutexGuard guard(mutex_);
     authorizer_ = std::move(fn);
+}
+
+void Api::authenticate(TokenCheck fn) {
+    MutexGuard guard(mutex_);
+    tokenCheck_ = std::move(fn);
+}
+
+// Under the API lock: checks typically read keys or users from the tree.
+Access Api::tokenAccess(std::string_view token) const {
+    MutexGuard guard(mutex_);
+    return tokenCheck_ ? tokenCheck_(token) : Access::Public;
 }
 
 void Api::handle(const Request& request, Reply& reply) {

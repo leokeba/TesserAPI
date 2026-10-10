@@ -33,7 +33,9 @@ void writePersisted(const Object& o, bool inherited, detail::LazyPatch& lp, Json
             lp.leave();
         } else if (p && isLeaf(*c)) {
             lp.key(c->name());
-            detail::writeLeaf(w, *c);
+            detail::RenderOptions options;
+            options.secrets = true;
+            detail::writeLeaf(w, *c, options);
         }
     }
 }

@@ -97,8 +97,12 @@ The getter has the form `T()`. The setter has the form `void(T)`, or `bool(T)` /
 | `.readOnly()` | Rejects writes. |
 | `.persist()` | Included in the persisted snapshot (§12). |
 | `.watch()` | Sampled for changes while anyone is subscribed (§11). |
+| `.secret()` | A password or a key: written and persisted like any value, but always read as `null` (below). |
 | `.doc("text")` | Schema description. Compiled out with `TESSER_NO_DESCRIPTIONS`. |
 | `.label()`, `.unit()`, `.step()`, `.ui()` | Presentation metadata for user interfaces (§7.1). Every node type has them, like `.doc()`. |
+| `.readAccess(level)`, `.writeAccess(level)` | The access level a client needs to read or write the node and its subtree (§13). Every node type has them. |
+
+**Secrets:** a `.secret()` value renders as `null` in every read, set reply, patch reply and change notification, and the schema marks it `"secret": true`. Only persistence (§12) sees its real value. Clients write it like any value; a user interface shows an empty password field and sends only what the user types.
 
 Integers are range-checked against `T` before any user range: writing `300` to a `uint8_t` is `invalid_value`, never a wrap-around. Integers are accepted for floating-point values. Nothing else is coerced: a string `"12"` is not a number.
 
@@ -279,7 +283,7 @@ GET /lamp?view=schema
 ```
 
 - **Types:** `object`, `boolean`, `integer`, `number`, `string`, `action`, `event`, `custom`.
-- **Optional keys:** `writable` (only when true), `min`, `max` (values and action arguments), `persist`, `description`, `arg` and `returns` (actions), `maxLength` (`char[N]`), `enum`, and the presentation keys of §7.1.
+- **Optional keys:** `writable` (only when true), `min`, `max` (values and action arguments), `persist`, `description`, `arg` and `returns` (actions), `maxLength` (`char[N]`), `enum`, `secret` (§4.1), `access` (the node's own write level when it isn't `public`, §13), and the presentation keys of §7.1.
 - `depth`, `keys` and the shape apply to `children` the same way.
 - A schema leaf is always an object containing `"type"`. Children are always under `"children"`, so a child named `type` can't be confused with a descriptor.
 - Schema output is compiled out with `TESSER_NO_SCHEMA` when flash is tight.
@@ -511,15 +515,40 @@ api.load();                               // once the tree is declared
 
 ## 13. Security
 
+### 13.1 Access levels
+
+Every client has an access level, and every node may require one:
+
+```cpp
+api.object("net").writeAccess(tesser::Access::Admin);      // anyone reads, admins write
+api.object("users").readAccess(tesser::Access::Admin);     // only admins read (and write)
+api.authenticate([](std::string_view token) { return users.check(token); });   // token → level
+```
+
+- **Levels** are ordered: `public` < `user` < `admin` (`tesser::Access`).
+- **A node's requirement** is the highest of its own and its ancestors'. Writing needs at least the read level: `readAccess()` raises the write level with it.
+- **Reads** (get, subscribe) of a node the client can't read are `unauthorized`. Inside a read of a parent, such nodes are **left out**: of values, of schemas, of `keys` and shapes (naming one is `unauthorized`), of change notifications, and of events. A client never learns what it can't read.
+- **Writes** (set, actions, patches) need the write level of every node they touch; a patch touching one node the client can't write is refused whole, before anything is applied, like any validation error.
+- **Schema:** a node whose own write level isn't `public` says so with `"access": "user"` or `"admin"`, so a user interface can disable what its client can't change. Renderers inherit it down the subtree. Schemas differ by level (hidden nodes), so `schemaHash()`, computed with full access, is the admin's.
+- **Cost:** two bytes in the node's optional metadata, only for nodes that declare a level. Without any, everything is `public` and nothing is filtered.
+
+**A client's level** (`Client::level()`) comes from its transport:
+- A transport that knows levels sets `Client::access`.
+- A transport that only knows "authenticated" (`Client::authenticated`, below) gives an authenticated client `admin` and any other `public`. That is the case of serial lines, trusted NowTP peers and `LocalClient`.
+- HTTP and WebSocket clients present a token. The transport's own token (`HttpServer::setToken`) gives `admin`. Any other token, or none (an empty token), goes to the API's token check, `api.authenticate(fn)`, whose answer is the client's level; without a check, `public`. A WebSocket connection's level is decided once, from its handshake.
+- **Gateways:** a gateway checks levels of its own clients before forwarding. The remote node sees the gateway as its client (a trusted peer is `admin`), not the browser behind it.
+
+### 13.2 Authorizer and authentication
+
 - **Authorizer:** `api.authorize(fn)`, where `fn(const Client&, Op, const Node&) -> bool`, is consulted for the target of every get, set and subscribe, and for every node a patch touches (during validation, so a refused patch changes nothing). A refusal is `unauthorized` (HTTP 403).
-- **Default:** without an authorizer, everything is allowed.
+- **Default:** without an authorizer, everything is allowed. Access levels (§13.1) apply independently: a request must pass both.
 - **Ready-made authorizers:** `authorizers::readOnlyUnlessAuthenticated()` (anyone reads and subscribes; writes and actions need authentication) and `authorizers::authenticatedOnly()`.
 - **What makes a client authenticated** (`Client::authenticated`) is the transport's business:
 
 | Transport | Authenticated when |
 |---|---|
-| HTTP | `HttpServer::setToken(token)` is set and the request carries `Authorization: Bearer <token>` or `?token=<token>` |
-| WebSocket | Same check, on the handshake |
+| HTTP | `HttpServer::setToken(token)` is set and the request carries `Authorization: Bearer <token>` or `?token=<token>` (`admin`), or the API's token check gives its token a level above `public` (§13.1) |
+| WebSocket | Same checks, on the handshake |
 | NowTP | The sender is in `NowTpTransport::trustPeers({...})`, or `DatagramEndpoint::trust(fn)` accepts it. ESP-NOW frames carry no proof of origin, so this trusts MAC addresses; combine it with encrypted NowTP peers when that matters. |
 | Serial | Always (physical access), unless `LineTransport::setAuthenticated(false)` |
 
@@ -688,6 +717,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | done |
 | 6 | Groundwork for TesserUI: presentation metadata, forwarded subscriptions, discovered peers, `ApiClient` | done |
+| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels and secrets done |
 
 ## 19. Decisions on former open questions
 
