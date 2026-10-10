@@ -437,15 +437,19 @@ private:
 class ActionNode : public Annotated<ActionNode> {
 public:
     // Converts the argument and runs the action; the result goes through
-    // call.reply() / call.fail() / call.defer().
-    using Invoker = std::function<void(JsonVariantConst arg, Call& call)>;
+    // call.reply() / call.fail() / call.defer(). `params` is the object
+    // argument, filled from `arg`, for actions that take one (else null).
+    using Invoker = std::function<void(JsonVariantConst arg, Object* params, Call& call)>;
     using ArgCheck = Check (*)(JsonVariantConst);
+    // A temporary object describing a default object argument.
+    using ParamsFactory = std::unique_ptr<Object> (*)();
 
     ActionNode(const char* name, Invoker invoker, ArgCheck argCheck, const char* argKindName,
-               const char* returnKindName, bool defers)
+               const char* returnKindName, bool defers, ParamsFactory makeParams = nullptr)
         : Annotated(name, NodeType::Action),
           invoke_(std::move(invoker)),
           check_(argCheck),
+          params_(makeParams),
           argKind_(argKindName),
           returnKind_(returnKindName) {
         if (defers) flags_ |= kDeferring;
@@ -463,14 +467,19 @@ public:
         if (c.isOk() && arg.is<double>()) c = checkRange(arg.as<double>());
         return c;
     }
-    void invoke(JsonVariantConst arg, Call& call) { invoke_(arg, call); }
+    void invoke(JsonVariantConst arg, Object* params, Call& call) { invoke_(arg, params, call); }
     bool deferring() const { return flags_ & kDeferring; }
-    const char* argKind() const { return argKind_; }        // null: no argument
+    const char* argKind() const { return argKind_; }        // null: no argument; "object": see params()
     const char* returnKind() const { return returnKind_; }  // null: no result
+    // For an object argument: a temporary object describing its default,
+    // which the request handler validates and fills like a patch. Else null.
+    std::unique_ptr<Object> params() const;
+    bool takesObject() const { return params_ != nullptr; }
 
 private:
     Invoker invoke_;
     ArgCheck check_;
+    ParamsFactory params_;
     const char* argKind_;
     const char* returnKind_;
 };
@@ -551,6 +560,7 @@ struct Signature<R (*)(A...)> {
     using Return = R;
     static constexpr size_t arity = sizeof...(A);
     using Arg = std::tuple_element_t<0, std::tuple<A..., void>>;
+    using Arg2 = std::tuple_element_t<1, std::tuple<A..., void, void>>;
 };
 template <class R, class... A>
 struct Signature<R(A...)> : Signature<R (*)(A...)> {};
@@ -589,6 +599,12 @@ Check checkArg(JsonVariantConst v) {
 
 inline Check checkNoArg(JsonVariantConst) { return Check::ok(); }
 
+// An object argument: its fields are checked by the request handler.
+inline Check checkObjectArg(JsonVariantConst v) {
+    return v.isNull() || v.is<JsonObjectConst>() ? Check::ok() : Check::fail(Status::InvalidValue, "expected object");
+}
+using ArgCheck_t = Check (*)(JsonVariantConst);
+
 // Converts an action's return value into the call's reply.
 template <class F, class... A>
 void runAndReply(F& f, Call& call, A&&... args) {
@@ -618,6 +634,63 @@ struct HasDescribeMember : std::false_type {};
 template <class T>
 struct HasDescribeMember<T, std::void_t<decltype(std::declval<T&>().describe(std::declval<Object&>()))>>
     : std::true_type {};
+// describe(Object&, T&), found by argument-dependent lookup.
+template <class T, class = void>
+struct HasDescribeFree : std::false_type {};
+template <class T>
+struct HasDescribeFree<T, std::void_t<decltype(describe(std::declval<Object&>(), std::declval<T&>()))>>
+    : std::true_type {};
+// A type that describes itself: usable as an object argument.
+template <class T>
+constexpr bool describable() {
+    return HasDescribeMember<T>::value || HasDescribeFree<T>::value;
+}
+
+template <class T>
+void describeInto(Object& o, T& thing);
+// A temporary object owning a default T it describes (defined below Object).
+template <class T>
+std::unique_ptr<Object> makeParams();
+template <class T>
+T& paramsValue(Object& params);
+
+// The argument of a typed action, converted: a scalar from the JSON, an
+// object argument from its filled params.
+template <class B>
+struct ArgReader {
+    static B read(JsonVariantConst arg, Object* params) {
+        if constexpr (describable<B>() && !ValueTraits<B>::supported) {
+            (void)arg;
+            return params ? paramsValue<B>(*params) : B{};
+        } else {
+            (void)params;
+            B value{};
+            ValueTraits<B>::read(arg, value);
+            return value;
+        }
+    }
+    static constexpr ArgCheck_t check() {
+        if constexpr (describable<B>() && !ValueTraits<B>::supported) {
+            return &checkObjectArg;
+        } else {
+            return &checkArg<B>;
+        }
+    }
+    static const char* kind() {
+        if constexpr (describable<B>() && !ValueTraits<B>::supported) {
+            return "object";
+        } else {
+            return kindName(ValueTraits<B>::kind);
+        }
+    }
+    static ActionNode::ParamsFactory factory() {
+        if constexpr (describable<B>() && !ValueTraits<B>::supported) {
+            return &makeParams<B>;
+        } else {
+            return nullptr;
+        }
+    }
+};
 
 }  // namespace detail
 
@@ -675,40 +748,64 @@ public:
         return add(new FnValue<R, P>(name, std::move(getter), std::move(wrapped)));
     }
 
-    // An action taking nothing, one typed value, a JsonVariantConst, or a
+    // An action taking nothing, one typed value, an object argument (a type
+    // with describe(), as for mount()), a JsonVariantConst, or a
     // tesser::Call& (for deferred replies). It may return void, a value or a
-    // Status.
+    // Status. A typed or object argument followed by a tesser::Call& makes a
+    // typed deferred action.
     template <class F>
     ActionNode& action(const char* name, F fn) {
         using Sig = detail::Signature<std::decay_t<F>>;
         using R = typename Sig::Return;
-        static_assert(Sig::arity <= 1, "actions take at most one argument");
+        static_assert(Sig::arity <= 2, "actions take at most one argument, then optionally a tesser::Call&");
         if constexpr (Sig::arity == 0) {
             return add(new ActionNode(
-                name, [fn = std::move(fn)](JsonVariantConst, Call& call) mutable { detail::runAndReply(fn, call); },
+                name,
+                [fn = std::move(fn)](JsonVariantConst, Object*, Call& call) mutable { detail::runAndReply(fn, call); },
                 &detail::checkNoArg, nullptr, detail::returnKindName<R>(), false));
+        } else if constexpr (Sig::arity == 2) {
+            using B = detail::Bare<typename Sig::Arg>;
+            static_assert(std::is_same<detail::Bare<typename Sig::Arg2>, Call>::value,
+                          "a two-argument action is (argument, tesser::Call&)");
+            static_assert(ValueTraits<B>::supported || detail::describable<B>(),
+                          "the argument of a deferred action must be a value type or have describe()");
+            using Reader = detail::ArgReader<B>;
+            return add(new ActionNode(
+                name,
+                [fn = std::move(fn)](JsonVariantConst arg, Object* params, Call& call) mutable {
+                    B value = Reader::read(arg, params);
+                    fn(value, call);
+                },
+                Reader::check(), Reader::kind(), nullptr, true, Reader::factory()));
         } else {
             using A = typename Sig::Arg;
             using B = detail::Bare<A>;
             if constexpr (std::is_same<B, Call>::value) {
                 return add(new ActionNode(
-                    name, [fn = std::move(fn)](JsonVariantConst, Call& call) mutable { detail::runAndReply(fn, call, call); },
+                    name,
+                    [fn = std::move(fn)](JsonVariantConst, Object*, Call& call) mutable {
+                        detail::runAndReply(fn, call, call);
+                    },
                     &detail::checkNoArg, "any", nullptr, true));
             } else if constexpr (std::is_same<B, JsonVariantConst>::value || std::is_same<B, JsonVariant>::value) {
                 return add(new ActionNode(
                     name,
-                    [fn = std::move(fn)](JsonVariantConst arg, Call& call) mutable { detail::runAndReply(fn, call, arg); },
+                    [fn = std::move(fn)](JsonVariantConst arg, Object*, Call& call) mutable {
+                        detail::runAndReply(fn, call, arg);
+                    },
                     &detail::checkNoArg, "any", detail::returnKindName<R>(), false));
             } else {
-                detail::assertSupported<B>();
+                static_assert(ValueTraits<B>::supported || detail::describable<B>(),
+                              "unsupported argument type: use a value type, a type with describe(), "
+                              "JsonVariantConst or tesser::Call&");
+                using Reader = detail::ArgReader<B>;
                 return add(new ActionNode(
                     name,
-                    [fn = std::move(fn)](JsonVariantConst arg, Call& call) mutable {
-                        B value{};
-                        ValueTraits<B>::read(arg, value);
+                    [fn = std::move(fn)](JsonVariantConst arg, Object* params, Call& call) mutable {
+                        B value = Reader::read(arg, params);
                         detail::runAndReply(fn, call, value);
                     },
-                    &detail::checkArg<B>, kindName(ValueTraits<B>::kind), detail::returnKindName<R>(), false));
+                    Reader::check(), Reader::kind(), detail::returnKindName<R>(), false, Reader::factory()));
             }
         }
     }
@@ -775,6 +872,28 @@ void describeInto(Object& o, T& thing) {
     }
 }
 }  // namespace detail
+
+namespace detail {
+template <class T>
+struct ParamsObject : Object {
+    ParamsObject() : Object(nullptr) {}
+    T value{};
+};
+
+template <class T>
+std::unique_ptr<Object> makeParams() {
+    std::unique_ptr<ParamsObject<T>> p(new ParamsObject<T>());
+    describeInto(*p, p->value);
+    return std::unique_ptr<Object>(p.release());
+}
+
+template <class T>
+T& paramsValue(Object& params) {
+    return static_cast<ParamsObject<T>&>(params).value;
+}
+}  // namespace detail
+
+inline std::unique_ptr<Object> ActionNode::params() const { return params_ ? params_() : nullptr; }
 
 template <class T>
 Object& Object::mount(const char* name, T& thing) {

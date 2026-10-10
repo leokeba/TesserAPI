@@ -122,10 +122,38 @@ o.action("calibrate", [](tesser::Call& call) {                   // deferred com
 - The argument is the request body:
   - no argument: the body is ignored (it should be absent or `null`)
   - one typed argument: the body must convert as described for values
+  - an object argument (below): the body is an object of its fields
   - `JsonVariantConst`: the raw body
 - An action may return `void`, a supported value type, or `tesser::Status`.
 - `.range(min, max)` bounds a numeric argument. It is checked before the action runs, inside patches too, and reported in the schema.
-- More than one argument is not supported. Use an object body with a raw argument, or a nested object of values plus an action (see §6.3).
+
+**Object arguments.** An action whose argument is a type with a `describe()` (member or free function, as for `mount()`, §4.3) takes an object of its fields:
+
+```cpp
+struct Target { std::string name = "New target"; float az = 180, el = 30; };
+void describe(tesser::Object& o, Target& t) {
+    o.value("name", t.name);
+    o.value("az", t.az).range(0, 360);
+    o.value("el", t.el).range(-90, 90);
+}
+o.action("add", [](const Target& t) { targets.add(t); });   // POST /helio/add {"name": "Sun", "az": 120}
+```
+
+- **Filling:** for each call, a default `T` is described into a temporary object, and the body is validated and applied to it like a patch (§6.3), then the action gets the `T`. Fields the body omits keep their defaults; `null` or no body gives the default `T`. So the fields' ranges, lengths, enums and nested objects all apply, and an error names the field: `{"error": "invalid_value", "path": "/helio/add/az"}`.
+- **In a patch,** the argument is validated with the rest in pass 1, so a bad field leaves the whole patch unapplied.
+- **Schema:** `"arg": "object"`, and `"params"` holds the object schema of the fields, for forms.
+- **Cost:** nothing at rest beyond the action node: the object is built per call.
+
+**Typed deferred actions.** An action taking an argument (a value type or an object argument) and then a `tesser::Call&` is deferred like a `Call&`-only one, with its argument converted and validated first:
+
+```cpp
+o.action("moveTo", [](float deg, tesser::Call& call) {
+    auto pending = call.defer();
+    motor.moveTo(deg, [pending](bool ok) mutable { ok ? pending.reply() : pending.fail(tesser::Status::Internal); });
+}).range(0, 360);
+```
+
+The schema reports `arg` (and `params`) with `"deferred": true`. A deferred action that takes only `Call&` reports `"arg": "any"`, since it may read `call.arg()`.
 
 ### 4.3 Composition
 
@@ -283,7 +311,7 @@ GET /lamp?view=schema
 ```
 
 - **Types:** `object`, `boolean`, `integer`, `number`, `string`, `action`, `event`, `custom`.
-- **Optional keys:** `writable` (only when true), `min`, `max` (values and action arguments), `persist`, `description`, `arg` and `returns` (actions), `maxLength` (`char[N]`), `enum`, `secret` (§4.1), `access` (the node's own write level when it isn't `public`, §13), and the presentation keys of §7.1.
+- **Optional keys:** `writable` (only when true), `min`, `max` (values and action arguments), `persist`, `description`, `arg`, `params` (an object argument's schema, §4.2), `returns` and `deferred` (actions), `maxLength` (`char[N]`), `enum`, `secret` (§4.1), `access` (the node's own write level when it isn't `public`, §13), and the presentation keys of §7.1.
 - `depth`, `keys` and the shape apply to `children` the same way.
 - A schema leaf is always an object containing `"type"`. Children are always under `"children"`, so a child named `type` can't be confused with a descriptor.
 - Schema output is compiled out with `TESSER_NO_SCHEMA` when flash is tight.
@@ -729,7 +757,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 4 | Persistence, authorizer, trusted NowTP peers, bearer tokens | done |
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | done |
 | 6 | Groundwork for TesserUI: presentation metadata, forwarded subscriptions, discovered peers, `ApiClient` | done |
-| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels, secrets, streamed replies, `view=hash`, re-advertisement, per-record persistence, `Storage::erase()` and `Api::restore()` done |
+| 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | in progress: access levels, secrets, streamed replies, `view=hash`, re-advertisement, per-record persistence, `Storage::erase()`, `Api::restore()`, object arguments and typed deferred actions done |
 
 ## 19. Decisions on former open questions
 

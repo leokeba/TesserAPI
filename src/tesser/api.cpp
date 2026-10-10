@@ -538,6 +538,10 @@ private:
                     w.key("arg");
                     w.string(a.argKind());
                 }
+                if (std::unique_ptr<Object> params = a.params()) {
+                    w.key("params");
+                    renderSchema(w, *params, api_.config().maxDepth, Filter());
+                }
                 if (const NodeMeta* m = a.meta(); m && m->hasRange) {
                     w.key("min");
                     w.number(m->min);
@@ -737,8 +741,10 @@ private:
                 auto& a = static_cast<ActionNode&>(target);
                 Check chk = a.check(body);
                 if (!chk.isOk()) return replyError(chk.status, chk.message, base_);
+                std::unique_ptr<Object> params;
+                if (a.takesObject() && !(params = fillParams(a, body))) return replyError();
                 Call call(api_, &reply_, body, req_.client, base_.empty() ? std::string_view("/") : base_);
-                a.invoke(body, call);
+                a.invoke(body, params.get(), call);
                 markLists();
                 if (call.deferred() || call.replied()) return;
                 if (call.status() != Status::Ok) return replyError(call.status(), call.message(), base_);
@@ -786,9 +792,24 @@ private:
         detail::finishBody(reply_, w, base_);
     }
 
+    // An action's object argument: a default one, validated and filled from
+    // `arg` like a patch, so errors name the field (/add/az). Null (with the
+    // error recorded) if `arg` doesn't fit.
+    std::unique_ptr<Object> fillParams(const ActionNode& a, JsonVariantConst arg) {
+        std::unique_ptr<Object> params = a.params();
+        if (arg.isNull()) return params;  // every field keeps its default
+        bool was = filling_;
+        filling_ = true;
+        bool ok = validatePatch(*params, arg, Access::Public) && applyPatch(*params, arg, false);
+        filling_ = was;
+        if (!ok) params.reset();
+        return params;
+    }
+
     // `need`: the level writing `n` takes, its ancestors' included.
     bool validatePatch(Node& n, JsonVariantConst v, Access need) {
-        if (level_ < need || !allowed(n)) return error(Status::Unauthorized, "not authorized");
+        // An action's argument isn't the tree: the action itself was checked.
+        if (!filling_ && (level_ < need || !allowed(n))) return error(Status::Unauthorized, "not authorized");
         switch (n.type()) {
             case NodeType::Object: {
                 if (!v.is<JsonObjectConst>()) return error(Status::InvalidValue, "expected object");
@@ -813,7 +834,8 @@ private:
                 auto& a = static_cast<ActionNode&>(n);
                 if (a.deferring()) return error(Status::BadRequest, "call deferred actions directly");
                 Check c = a.check(v);
-                return c.isOk() || error(c.status, c.message);
+                if (!c.isOk()) return error(c.status, c.message);
+                return !a.takesObject() || fillParams(a, v) != nullptr;
             }
             case NodeType::Custom: {
                 auto& cu = static_cast<CustomNode&>(n);
@@ -860,6 +882,7 @@ private:
                 if (actions) return true;
                 Check c = static_cast<ValueNode&>(n).apply(v);
                 if (!c.isOk()) return error(c.status, c.message);
+                if (filling_) return true;  // an action's argument: not state
                 n.changed();
                 applied_++;
                 return true;
@@ -874,9 +897,12 @@ private:
             }
             case NodeType::Action: {
                 if (!actions) return true;
+                auto& a = static_cast<ActionNode&>(n);
+                std::unique_ptr<Object> params;
+                if (a.takesObject() && !(params = fillParams(a, v))) return false;
                 std::string path = trailPath();
                 Call call(api_, nullptr, v, req_.client, path);
-                static_cast<ActionNode&>(n).invoke(v, call);
+                a.invoke(v, params.get(), call);
                 if (call.status() != Status::Ok) return error(call.status(), call.message());
                 applied_++;
                 return true;
@@ -924,6 +950,7 @@ private:
     std::string errPath_;
     int applied_ = 0;
     bool partial_ = false;
+    bool filling_ = false;  // validating or filling an action's object argument
     std::vector<std::unique_ptr<Object>> temps_;  // list elements on the request path
     std::vector<ListNode*> lists_;                // lists the path went through
     uint16_t indexes_[kMaxTrail];                 // list indexes in the trail...
