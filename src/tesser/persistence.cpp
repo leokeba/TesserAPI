@@ -1,6 +1,7 @@
 // Persistence (docs/DESIGN.md section 12).
 #include "tesser/api.h"
 #include "tesser/detail/lazy_patch.h"
+#include "tesser/envelope.h"
 #include "tesser/storage.h"
 
 namespace tesser {
@@ -235,7 +236,7 @@ bool Api::load() {
         JsonDocument doc;
         a.path = "/";
         a.path += c->name();
-        if (deserializeJson(doc, data)) {
+        if (deserializeJson(doc, data, DeserializationOption::NestingLimit(kWrittenNesting))) {
             logWarning("stored state %s doesn't parse; keeping defaults", a.path.c_str());
             continue;
         }
@@ -249,7 +250,7 @@ bool Api::load() {
 Status Api::restore(std::string_view json, std::vector<std::string>* skipped) {
     MutexGuard guard(mutex_);
     JsonDocument doc;
-    if (deserializeJson(doc, json.data(), json.size(), DeserializationOption::NestingLimit(config_.maxDepth + 1)) ||
+    if (deserializeJson(doc, json.data(), json.size(), DeserializationOption::NestingLimit(kWrittenNesting)) ||
         !doc.is<JsonObjectConst>()) {
         return Status::BadRequest;
     }

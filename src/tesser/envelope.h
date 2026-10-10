@@ -8,6 +8,7 @@
 
 #include <ArduinoJson.h>
 
+#include "tesser/json_writer.h"
 #include "tesser/request.h"
 
 namespace tesser {
@@ -21,6 +22,17 @@ struct EnvelopeId {
     char json[kMax + 1] = {};
     size_t length = 0;  // 0: the request had no id
 };
+
+// JSON nesting accepted by the parsers. A request body nests at most one
+// level per key a patch descends (maxDepth) plus the value, and an envelope
+// adds one around it. Whatever a node wrote (responses, notifications,
+// stored records) is bounded by its JsonWriter instead, not by maxDepth:
+// schemas nest two or three levels per tree level, and the peer that wrote
+// a reply may have a deeper maxDepth than ours. On Xtensa each level costs
+// 80 bytes of stack while parsing.
+inline uint8_t requestNesting(uint8_t maxDepth) { return maxDepth < 254 ? uint8_t(maxDepth + 1) : uint8_t(255); }
+inline uint8_t envelopeNesting(uint8_t maxDepth) { return maxDepth < 253 ? uint8_t(maxDepth + 2) : uint8_t(255); }
+constexpr uint8_t kWrittenNesting = JsonWriter::kMaxNesting + 1;
 
 // Parses one envelope (docs/DESIGN.md section 10.1) into `request`. Strings in
 // `request` point into `doc`. On failure returns the status to reply with and

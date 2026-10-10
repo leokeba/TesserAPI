@@ -117,6 +117,31 @@ struct Device {
     }
 };
 
+// A tree whose schema nests deeper than ArduinoJson's default limit (10) and
+// than maxDepth + 1: a keyed list in a chain of objects, elements holding
+// nested objects. The root schema nests 26 levels, the root value 13.
+struct DeepTree {
+    struct Network {
+        std::string ssid;
+        bool dhcp = true;
+        int ip = 0;
+    };
+    std::vector<Network> networks = {{"home", true, 0}};
+    Api api;
+
+    DeepTree() {
+        tesser::Object* o = &api.object("a").persist();
+        for (const char* name : {"b", "c", "d", "e", "f", "g", "h"}) o = &o->object(name);
+        o->list("networks", networks, [](tesser::Object& e, Network& n) {
+             e.value("ssid", n.ssid);
+             auto& st = e.object("static");
+             st.value("dhcp", n.dhcp);
+             st.object("addr").value("ip", n.ip);
+         }).key("ssid");
+    }
+    static constexpr const char* kPath = "/a/b/c/d/e/f/g/h/networks/home/static/addr/ip";
+};
+
 // ---- JSON writer -------------------------------------------------------
 
 TEST(writer_structure) {
@@ -639,6 +664,20 @@ TEST(envelope_errors) {
     CHECK(roundTrip(d.api, "{\"id\":{},\"op\":\"get\"}").find("id must be a scalar") != std::string::npos);
     CHECK(roundTrip(d.api, "{\"op\":\"get\",\"depth\":-1}").find("depth must be") != std::string::npos);
     CHECK(roundTrip(d.api, "{\"op\":\"get\",\"keys\":[\"a\"]}").find("keys must be") != std::string::npos);
+}
+
+// Request bodies nest as deep over an envelope as over HTTP: maxDepth + 1.
+TEST(envelope_nesting) {
+    Api api;
+    int x = 0;
+    api.object("a").object("b").object("c").value("x", x);
+    api.config().maxDepth = 3;
+    CHECK(roundTrip(api, "{\"op\":\"set\",\"path\":\"/\",\"body\":{\"a\":{\"b\":{\"c\":{\"x\":1}}}}}")
+              .find("\"status\":\"ok\"") != std::string::npos);
+    CHECK_EQ(x, 1);
+    CHECK(roundTrip(api, "{\"op\":\"set\",\"path\":\"/\",\"body\":{\"a\":{\"b\":{\"c\":{\"x\":[2]}}}}}")
+              .find("envelope nested too deeply") != std::string::npos);
+    CHECK_EQ(x, 1);
 }
 
 // Buffered envelope replies (NowTP, deferred replies) are limited by

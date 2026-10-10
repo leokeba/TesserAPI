@@ -43,7 +43,7 @@ Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth,
                      const char*& message) {
     id.length = 0;
     DeserializationError err = deserializeJson(doc, text.data(), text.size(),
-                                               DeserializationOption::NestingLimit(static_cast<uint8_t>(maxDepth + 1)));
+                                               DeserializationOption::NestingLimit(envelopeNesting(maxDepth)));
     if (err) {
         message = err == DeserializationError::TooDeep ? "envelope nested too deeply" : "malformed JSON";
         return Status::BadRequest;

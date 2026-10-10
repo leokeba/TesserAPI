@@ -707,7 +707,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
     JsonDocument doc;
     if (!json.empty()) {
         DeserializationError err = deserializeJson(doc, json.data(), json.size(),
-                                                   DeserializationOption::NestingLimit(cfg.maxDepth + 1));
+                                                   DeserializationOption::NestingLimit(requestNesting(cfg.maxDepth)));
         if (err) {
             writeError(reply, Status::BadRequest, path, "malformed JSON body");
             return ESP_OK;

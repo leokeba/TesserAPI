@@ -64,6 +64,26 @@ TEST(persist_state_and_roundtrip) {
     CHECK(!fresh.on);
 }
 
+// Stored records nest as deep as they were written, past maxDepth + 1.
+TEST(persist_deep_records) {
+    MemoryStorage storage;
+    std::string state;
+    {
+        cases::DeepTree t;
+        t.api.persistence(storage);
+        t.networks[0].ip = 7;
+        CHECK(t.api.save());
+        state = t.api.persistedState();
+    }
+    cases::DeepTree fresh;
+    fresh.api.persistence(storage);
+    CHECK(fresh.api.load());
+    CHECK_EQ(fresh.networks[0].ip, 7);
+    fresh.networks[0].ip = 0;
+    CHECK_EQ(fresh.api.restore(state), Status::Ok);
+    CHECK_EQ(fresh.networks[0].ip, 7);
+}
+
 TEST(persist_lenient_load) {
     MemoryStorage storage;
     storage.records["config"] = "{\"brightness\":999,\"name\":\"kitchen\",\"removed\":1,\"tuning\":5}";

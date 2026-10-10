@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "tesser/detail/lazy_patch.h"
+#include "tesser/envelope.h"
 #include "tesser/remote.h"
 
 namespace tesser {
@@ -1275,13 +1276,16 @@ void Api::runQueued() {
             q = queue_.front();
             queue_.erase(queue_.begin());
         }
+        // The body parsed once already, so only memory can run out here.
         JsonDocument doc;
-        if (!q->body.empty()) {
-            deserializeJson(doc, q->body);
-            q->request.body = doc.as<JsonVariantConst>();
-        }
+        bool parsed = q->body.empty() || !deserializeJson(doc, q->body, DeserializationOption::NestingLimit(kWrittenNesting));
+        q->request.body = doc.as<JsonVariantConst>();
         QueuedReply reply(q->reply);
-        handleNow(q->request, reply);
+        if (parsed) {
+            handleNow(q->request, reply);
+        } else {
+            writeError(reply, Status::Internal, q->request.path, "out of memory");
+        }
         if (!reply.transferred) q->reply->release();
         delete q;
     }

@@ -127,6 +127,27 @@ TEST(datagram_unreliable_set_rejected) {
     if (!net.frames.empty()) CHECK_EQ(net.frames[0].text, "{\"id\":5,\"status\":\"ok\",\"body\":false}");
 }
 
+// Request bodies nest no deeper than over HTTP, though the endpoint parses
+// replies of any depth a node writes.
+TEST(datagram_request_nesting) {
+    tesser::Api api;
+    int x = 0;
+    api.object("a").object("b").object("c").value("x", x);
+    api.config().maxDepth = 3;
+    Net net;
+    DatagramEndpoint server(&api, tesser::TransportKind::NowTP, net.sender(addr(2)), net.clockFn());
+    const char* ok = "{\"id\":1,\"op\":\"set\",\"path\":\"/\",\"body\":{\"a\":{\"b\":{\"c\":{\"x\":1}}}}}";
+    server.receive(addr(1), ok, strlen(ok), true);
+    server.process();
+    CHECK_EQ(x, 1);
+    const char* deep = "{\"id\":2,\"op\":\"set\",\"path\":\"/\",\"body\":{\"a\":{\"b\":{\"c\":{\"x\":[2]}}}}}";
+    server.receive(addr(1), deep, strlen(deep), true);
+    server.process();
+    CHECK_EQ(net.frames.size(), 2u);
+    if (net.frames.size() == 2) CHECK(net.frames[1].text.find("envelope nested too deeply") != std::string::npos);
+    CHECK_EQ(x, 1);
+}
+
 TEST(datagram_timeouts_and_forget) {
     Net net;
     net.dropAll = true;

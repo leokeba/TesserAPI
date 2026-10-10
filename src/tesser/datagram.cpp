@@ -220,7 +220,10 @@ void DatagramEndpoint::reject(const Incoming& msg, Status status, const char* me
     filter["id"] = true;
     filter["op"] = true;
     JsonDocument doc;
-    if (deserializeJson(doc, msg.text, DeserializationOption::Filter(filter))) return;
+    if (deserializeJson(doc, msg.text, DeserializationOption::Filter(filter),
+                        DeserializationOption::NestingLimit(kWrittenNesting))) {
+        return;
+    }
     if (!doc["op"].is<const char*>()) return;
     EnvelopeId id;
     JsonVariantConst idv = doc["id"];
@@ -240,11 +243,35 @@ void DatagramEndpoint::reject(const Incoming& msg, Status status, const char* me
     writeError(reply, status, std::string_view(), message);
 }
 
+namespace {
+
+// Levels of nesting in a parsed value; scalars have none.
+int nesting(JsonVariantConst v) {
+    int deepest = 0;
+    if (v.is<JsonObjectConst>()) {
+        for (JsonPairConst kv : v.as<JsonObjectConst>()) {
+            int n = nesting(kv.value());
+            if (n > deepest) deepest = n;
+        }
+    } else if (v.is<JsonArrayConst>()) {
+        for (JsonVariantConst e : v.as<JsonArrayConst>()) {
+            int n = nesting(e);
+            if (n > deepest) deepest = n;
+        }
+    } else {
+        return 0;
+    }
+    return deepest + 1;
+}
+
+}  // namespace
+
 void DatagramEndpoint::handle(Incoming& msg) {
+    // Responses and notifications nest as deep as the peer wrote them;
+    // requests are held to the same limit as on other transports below.
     JsonDocument doc;
-    uint8_t maxDepth = api_ ? api_->config().maxDepth : 16;
     DeserializationError err = deserializeJson(doc, msg.text.data(), msg.text.size(),
-                                               DeserializationOption::NestingLimit(static_cast<uint8_t>(maxDepth + 1)));
+                                               DeserializationOption::NestingLimit(kWrittenNesting));
     if (err || !doc.is<JsonObjectConst>()) {
         MutexGuard guard(mutex_);
         stats_.dropped++;
@@ -319,6 +346,10 @@ void DatagramEndpoint::handle(Incoming& msg) {
     EnvelopeId id;
     const char* message = nullptr;
     Status s = requestFromEnvelope(env, req, id, message);
+    if (s == Status::Ok && nesting(env) > envelopeNesting(api_->config().maxDepth)) {
+        s = Status::BadRequest;
+        message = "envelope nested too deeply";
+    }
     PeerAddress to = msg.from;
     SendFn send = send_;
     EnvelopeReply reply(id, api_->config().maxResponse, [send, to](const std::string& m) {

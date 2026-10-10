@@ -116,6 +116,51 @@ TEST(client_local_deferred_and_auth) {
     held.reply(1);
 }
 
+// Replies nest as deep as the node wrote them, whatever maxDepth says:
+// a schema takes two or three JSON levels per tree level.
+TEST(client_deep_replies) {
+    cases::DeepTree t;
+    std::string schema = cases::get(t.api, "/", cases::schema()).body;
+    std::string value = cases::get(t.api, "/").body;
+    CHECK(schema.find("\"ip\":{\"type\":\"integer\",\"writable\":true}") != std::string::npos);
+
+    tesser::LocalClient c(t.api);
+    Log log;
+    log.watch(c);
+    CHECK(c.get("/", log.handler(), cases::schema()));
+    CHECK(c.get("/", log.handler()));
+    c.process();
+    CHECK_EQ(log.lines.size(), 2u);
+    if (log.lines.size() == 2) {
+        CHECK_EQ(log.lines[0], "ok " + schema);
+        CHECK_EQ(log.lines[1], "ok " + value);
+    }
+
+    // Request bodies as deep as the tree, and notifications that deep.
+    CHECK(c.subscribe("/", log.handler()));
+    CHECK(c.set("/", "{\"a\":{\"b\":{\"c\":{\"d\":{\"e\":{\"f\":{\"g\":{\"h\":{\"networks\":[{\"ssid\":\"home\",\"static\":"
+                     "{\"addr\":{\"ip\":7}}}]}}}}}}}}}",
+                log.handler()));
+    c.process();
+    CHECK_EQ(t.networks[0].ip, 7);
+    t.api.poll(1000);
+    c.process();
+    CHECK(log.last().find("{\"op\":\"change\"") == 0);
+    CHECK(log.last().find("\"ip\":7") != std::string::npos);
+
+    // The same through a peer.
+    datagram_cases::Net net;
+    tesser::DatagramEndpoint server(&t.api, tesser::TransportKind::NowTP, net.sender(addr(2)), net.clockFn());
+    tesser::DatagramEndpoint ep(nullptr, tesser::TransportKind::NowTP, net.sender(addr(1)), net.clockFn());
+    net.nodes = {{addr(1), &ep}, {addr(2), &server}};
+    tesser::PeerClient p(ep, addr(2));
+    Log remote;
+    p.get("/", remote.handler(), cases::schema());
+    net.run();
+    p.process();
+    CHECK_EQ(remote.last(), "ok " + schema);
+}
+
 TEST(client_peer) {
     cases::Device d;
     datagram_cases::Net net;

@@ -752,7 +752,7 @@ Targets to be measured on a classic ESP32 and a C3, and enforced in CI:
 | RAM per value leaf | ≤ 32 B with a bound variable, ≤ 56 B with a getter and setter, + 28 B with a range or description |
 | RAM per object node | ≤ 32 B |
 | Request handling | Request body document (bounded by `maxRequestBody`) + 512 B streaming buffer (HTTP) or 1 KB (serial, WebSocket), or the response buffer (NowTP and deferred replies, bounded by `maxResponse`) |
-| Stack | Rendering depth bounded by `maxDepth` (default 16) |
+| Stack | Rendering depth bounded by `maxDepth` (default 16). JSON parsing: request bodies nest at most `maxDepth` + 1 levels (one more for an envelope); responses, notifications and stored records up to 65, the most a node's JSON writer produces, since a schema nests two or three levels per tree level and the writing peer's `maxDepth` may differ. Parsing costs about 80 B of stack per level on Xtensa (5.2 KB at 65) |
 
 Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware`):
 
@@ -786,7 +786,7 @@ Configuration (`tesser::Config`, at runtime):
 |---|---|
 | `maxRequestBody` | 4096 |
 | `maxResponse` (buffered replies: NowTP, deferred and queued replies) | 8192 |
-| `maxDepth` | 16 |
+| `maxDepth` (levels rendered; request bodies nest at most one more) | 16 |
 | `deferTimeoutMs` | 10000 |
 | `maxPending` | 4 |
 

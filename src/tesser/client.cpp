@@ -1,6 +1,7 @@
 #include "tesser/client.h"
 
 #include "tesser/api.h"
+#include "tesser/envelope.h"
 #include "tesser/sink.h"
 
 namespace tesser {
@@ -41,11 +42,12 @@ size_t ApiClient::process() {
     }
     for (ClientInbox::Item& item : items) {
         JsonDocument doc;
-        if (!item.json.empty()) deserializeJson(doc, item.json);
+        bool parsed = item.json.empty() || !deserializeJson(doc, item.json, DeserializationOption::NestingLimit(kWrittenNesting));
         if (item.notification) {
-            if (onNotification_ && doc.is<JsonObjectConst>()) onNotification_(doc.as<JsonObjectConst>());
+            if (onNotification_ && parsed && doc.is<JsonObjectConst>()) onNotification_(doc.as<JsonObjectConst>());
         } else if (item.done) {
-            item.done(item.status, doc.as<JsonVariantConst>());
+            if (!parsed) doc.clear();  // out of memory: no half a body
+            item.done(parsed ? item.status : Status::Internal, doc.as<JsonVariantConst>());
         }
     }
     return items.size();
@@ -97,7 +99,10 @@ LocalClient::~LocalClient() { api_.dropSubscriber(this); }
 bool LocalClient::request(Op op, std::string_view path, std::string_view bodyJson, ResponseHandler done,
                           const Query& query) {
     JsonDocument doc;
-    if (!bodyJson.empty() && deserializeJson(doc, bodyJson.data(), bodyJson.size())) return false;
+    if (!bodyJson.empty() && deserializeJson(doc, bodyJson.data(), bodyJson.size(),
+                                             DeserializationOption::NestingLimit(requestNesting(api_.config().maxDepth)))) {
+        return false;
+    }
     Request req;
     req.op = op;
     req.path = path;
