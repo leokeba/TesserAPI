@@ -128,6 +128,10 @@ public:
     // Status::Ok, or Busy when a limit is reached.
     Status subscriptionAllowed(Subscriber* subscriber) const;
     void addSubscription(Subscription&& sub);
+    // Samples the watch()ed values at and below `node`, marking those that
+    // changed since the last sample. A subscription samples its subtree
+    // before its snapshot, so the snapshot is the baseline.
+    void sampleWatched(Node& node);
     size_t removeSubscriptions(Subscriber* subscriber, std::string_view path);
     void emitEvent(const std::string& path, const std::function<void(JsonWriter&)>& write);
     // Calls fn for each forwarded subscription to `node`, under the API lock;
@@ -162,7 +166,6 @@ private:
     // After subscriptions were removed: answers the waiting ones, and lets
     // remote nodes drop upstream subscriptions nobody uses any more.
     void subscriptionsRemoved(std::vector<Subscription>& gone, bool clientGone);
-    void sampleWatched(Node& node);
     void checkPersistence(uint32_t nowMs);
 
     Config config_;

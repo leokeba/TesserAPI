@@ -227,6 +227,28 @@ TEST(sub_watch_and_changed) {
     CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/\",\"body\":{\"counter\":5,\"untracked\":5,\"explicit\":9}}");
 }
 
+// The subscription's snapshot is the watch baseline: a change before the
+// first sample is still notified.
+TEST(sub_watch_baseline_at_subscribe) {
+    Api api;
+    int counter = 1;
+    api.value("counter", counter).watch();
+    FakeSubscriber s;
+    CHECK_EQ(subscribe(api, &s, "/").body, "{\"counter\":1}");
+    counter = 2;
+    api.poll(1000);  // first sample
+    CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/\",\"body\":{\"counter\":2}}");
+
+    // A change while nobody was subscribed is in the next snapshot, and not
+    // notified again.
+    api.dropSubscriber(&s);
+    counter = 3;
+    FakeSubscriber t;
+    CHECK_EQ(subscribe(api, &t, "/counter").body, "3");
+    api.poll(2000);
+    CHECK_EQ(t.messages.size(), 0u);
+}
+
 TEST(sub_limits_unsub_and_drop) {
     cases::Device d;
     FakeSubscriber s, t;

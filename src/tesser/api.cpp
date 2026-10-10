@@ -583,6 +583,9 @@ private:
         }
         Status allowed = api_.subscriptionAllowed(req_.subscriber);
         if (allowed != Status::Ok) return replyError(allowed, "too many subscriptions", base_);
+        // Without this, the first sample after subscribing would become the
+        // baseline, and a change made before it would never be notified.
+        api_.sampleWatched(target);
         if (target.type() == NodeType::Event || !req_.query.snapshot) {
             // Nothing to snapshot, or the client doesn't want one.
             JsonWriter w(reply_.begin(Status::Ok));

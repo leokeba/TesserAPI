@@ -447,7 +447,7 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 - A node is marked changed:
   - automatically, when a set or patch goes through the API
   - explicitly, with `node.changed()` or `api.changed("/path")`. On an object, `changed()` marks every value below it. Both are thread-safe and cheap.
-  - by sampling, with `.watch()`: while anyone is subscribed, `Api::poll()` renders each watched value every `Config::watchIntervalMs` (200 ms) and compares a 32-bit hash, kept in the node's metadata.
+  - by sampling, with `.watch()`: while anyone is subscribed, `Api::poll()` renders each watched value every `Config::watchIntervalMs` (200 ms) and compares a 32-bit hash, kept in the node's metadata. A new subscription first samples the watched values below its node, so its snapshot is the baseline: a change right after subscribing is notified on the next sample.
 - Bound plain variables can't announce their own changes, so either `changed()` or `watch()` is needed for push updates.
 
 **Delivering:** `Api::poll()` sends pending change notifications. Call it from `loop()`, or let `api.startTask(periodMs)` (ESP, default 20 ms) do it. It does nothing while nobody is subscribed.
