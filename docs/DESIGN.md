@@ -98,9 +98,24 @@ The getter has the form `T()`. The setter has the form `void(T)`, or `bool(T)` /
 | `.persist()` | Included in the persisted snapshot (§12). |
 | `.watch()` | Sampled for changes while anyone is subscribed (§11). |
 | `.secret()` | A password or a key: written and persisted like any value, but always read as `null` (below). |
+| `.validate(f)` | The application's own check, run with the type and range checks before anything is applied (below). Not reported in the schema. |
 | `.doc("text")` | Schema description. Compiled out with `TESSER_NO_DESCRIPTIONS`. |
 | `.label()`, `.unit()`, `.step()`, `.ui()` | Presentation metadata for user interfaces (§7.1). Every node type has them, like `.doc()`. |
 | `.readAccess(level)`, `.writeAccess(level)` | The access level a client needs to read or write the node and its subtree (§13). Every node type has them. |
+
+**Validators:** `f` takes the value as the node's type (or any type of the same kind: `std::string` or `const char*` for a string) or as a `JsonVariantConst`, and returns a `tesser::Check`, a `bool` (`false` is `invalid_value`, "rejected") or a `tesser::Status`. A validator whose type is of another kind is a declaration error and isn't installed.
+
+```cpp
+o.value("time", alarm.time).validate([](const std::string& t) { return isClockTime(t); });
+o.value("password", [] { return std::string(); }, [&](const std::string& p) { hash(p); })
+    .secret()
+    .validate([](JsonVariantConst v) {
+        size_t n = v.as<JsonString>().size();
+        return n == 0 || (n >= 8 && n <= 63) ? Check::ok() : Check::fail(Status::InvalidValue, "8 to 63 characters");
+    });
+```
+
+It runs wherever values are checked: in pass 1 of a patch (§6.3), so a refused value leaves the whole write unapplied; for every element of a list replacement and every field of an object argument; and in `load()` and `restore()`, which skip a refused value like any invalid one (§12). Prefer it to a setter that returns `false`, which can only refuse at apply time, after earlier writes. On a list element it may capture the element by reference: it runs while the temporary element exists. A setter stays for side effects (hashing, applying to hardware).
 
 **Secrets:** a `.secret()` value renders as `null` in every read, set reply, patch reply and change notification, and the schema marks it `"secret": true`. Only persistence (§12) sees its real value. Clients write it like any value; a user interface shows an empty password field and sends only what the user types.
 
@@ -335,14 +350,14 @@ POST /motor1  {"control": {"speed": 0.8, "direction": true}, "config": {"invert"
 
 The patch is processed in three passes:
 
-1. **Validate everything.** Every key must exist. Values must convert and pass `range`, and must not be read-only. Action arguments must convert. Custom nodes run their optional validator. If any check fails, **nothing is applied**, and the error names the first failing path.
+1. **Validate everything.** Every key must exist. Values must convert and pass `range` and their validator, and must not be read-only. Action arguments must convert. Custom nodes run their optional validator. If any check fails, **nothing is applied**, and the error names the first failing path.
 2. **Apply values** in document order.
 3. **Call actions** in document order, after all values are applied. So `{"position": 10, "go": null}` sets the position first and then starts the move.
 
 The response is the patched keys read back, which is the patch used as a shape. An action's key renders as `null`; call an action directly to get its return value. Actions finish before the response starts, so a failing action can still turn the whole reply into an error.
 
 **Limits:**
-- A setter that returns `false`, an action that returns a failure status, or a custom node that fails at apply time stops the patch. Earlier writes remain applied: only pass 1 is atomic. The error says so with `"partial": true`.
+- A setter that returns `false`, an action that returns a failure status, or a custom node that fails at apply time stops the patch. Earlier writes remain applied: only pass 1 is atomic. The error says so with `"partial": true`. A value's `.validate()` refuses in pass 1 instead.
 - Deferred actions can't be part of a patch (`bad_request`). Call them directly.
 
 This mirrors the predecessor's model, where a POST body mixed values and triggers, but with validation done before anything is applied.

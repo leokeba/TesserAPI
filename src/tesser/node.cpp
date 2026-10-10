@@ -171,6 +171,18 @@ ValueNode& ValueNode::secret() {
     return *this;
 }
 
+void ValueNode::setValidator(std::function<Check(JsonVariantConst)> v, const ValueKind* argKind) {
+    if (argKind && *argKind != kind()) {
+        g_declarationErrors++;
+        logError("validator of \"%s\" reads %s, the value is %s", name_ ? name_ : "(element)", kindName(*argKind),
+                 kindName(kind()));
+        return;
+    }
+    NodeMeta& m = editMeta();
+    delete m.validator;
+    m.validator = new std::function<Check(JsonVariantConst)>(std::move(v));
+}
+
 ValueNode& ValueNode::watch() {
     setFlag(kWatch);
     editMeta();

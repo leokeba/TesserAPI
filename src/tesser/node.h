@@ -66,7 +66,11 @@ struct NodeMeta {
     const char* doc = nullptr;
     uint32_t hash = 0;
     UiMeta* ui = nullptr;
-    ~NodeMeta() { delete ui; }
+    std::function<Check(JsonVariantConst)>* validator = nullptr;  // ValueNode::validate()
+    ~NodeMeta() {
+        delete ui;
+        delete validator;
+    }
 };
 
 // Change tracking: a global generation counter, stamped on nodes as they
@@ -232,6 +236,15 @@ public:
     // A password or key: writable and persisted like any value, but read as
     // null by clients (docs/DESIGN.md section 4.1).
     ValueNode& secret();
+    // A check of the application's own, run with the type and range checks
+    // before anything is applied: a refused value leaves the whole write
+    // unapplied, in patches, list replacements and object arguments, and
+    // load() and restore() skip it. `f` takes the value as the node's type
+    // (int, std::string, ...) or as a JsonVariantConst, and returns a Check,
+    // a bool or a Status. On a list element it may capture the element: it
+    // runs while the element exists.
+    template <class F>
+    ValueNode& validate(F&& f);
 
     bool writable() const { return canWrite() && !(flags_ & kReadOnly); }
     bool isSecret() const { return flags_ & kSecret; }
@@ -248,6 +261,14 @@ public:
 
 protected:
     virtual bool canWrite() const = 0;
+    // The validator, for check() once the type and range passed.
+    Check validated(JsonVariantConst v) const {
+        return meta_ && meta_->validator ? (*meta_->validator)(v) : Check::ok();
+    }
+
+private:
+    // `argKind`: the kind the validator reads the value as (null: JSON).
+    void setValidator(std::function<Check(JsonVariantConst)> v, const ValueKind* argKind);
 };
 
 namespace detail {
@@ -281,9 +302,10 @@ public:
         if constexpr (isNumericKind<U>()) {
             U tmp{};
             Traits::read(v, tmp);
-            return checkRange(Traits::toDouble(tmp));
+            c = checkRange(Traits::toDouble(tmp));
+            if (!c.isOk()) return c;
         }
-        return c;
+        return validated(v);
     }
     Check apply(JsonVariantConst v) override {
         if constexpr (std::is_const<T>::value) {
@@ -337,7 +359,7 @@ public:
     }
     Check check(JsonVariantConst v) const override {
         if (!v.is<const char*>()) return Check::fail(Status::InvalidValue, "expected string");
-        return index(v.as<const char*>()) < names_.size() ? Check::ok()
+        return index(v.as<const char*>()) < names_.size() ? validated(v)
                                                           : Check::fail(Status::InvalidValue, "not one of the options");
     }
     Check apply(JsonVariantConst v) override {
@@ -382,9 +404,10 @@ public:
         if constexpr (isNumericKind<P>()) {
             P tmp{};
             ValueTraits<P>::read(v, tmp);
-            return checkRange(ValueTraits<P>::toDouble(tmp));
+            c = checkRange(ValueTraits<P>::toDouble(tmp));
+            if (!c.isOk()) return c;
         }
-        return c;
+        return validated(v);
     }
     Check apply(JsonVariantConst v) override {
         P tmp{};
@@ -951,6 +974,27 @@ struct ArgReader {
 };
 
 }  // namespace detail
+
+template <class F>
+ValueNode& ValueNode::validate(F&& f) {
+    using Sig = detail::Signature<std::decay_t<F>>;
+    static_assert(Sig::arity == 1, "a validator takes the value");
+    using A = detail::Bare<typename Sig::Arg>;
+    if constexpr (std::is_same<A, JsonVariantConst>::value) {
+        setValidator([f = std::forward<F>(f)](JsonVariantConst v) { return detail::toCheck(f(v)); }, nullptr);
+    } else {
+        detail::assertSupported<A>();
+        ValueKind k = ValueTraits<A>::kind;
+        setValidator(
+            [f = std::forward<F>(f)](JsonVariantConst v) {
+                A tmp{};
+                ValueTraits<A>::read(v, tmp);
+                return detail::toCheck(f(tmp));
+            },
+            &k);
+    }
+    return *this;
+}
 
 class Object : public Annotated<Object> {
 public:

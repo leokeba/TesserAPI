@@ -25,6 +25,7 @@
 #include "array_cases.h"
 #include "keyed_cases.h"
 #include "file_cases.h"
+#include "validate_cases.h"
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"

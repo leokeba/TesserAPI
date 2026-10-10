@@ -98,6 +98,7 @@ http.setToken("s3cret");                          // Authorization: Bearer s3cre
 api.authorize(tesser::authorizers::readOnlyUnlessAuthenticated());
 auto& wifi = api.object("wifi").writeAccess(tesser::Access::Admin);   // access levels, in the schema
 wifi.value("password", password).secret().persist();     // writable and persisted, never read back
+wifi.value("ssid", ssid).validate([](const std::string& s) { return !s.empty(); });  // checked before anything applies
 ```
 
 ## Composition
