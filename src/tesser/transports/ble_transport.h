@@ -32,8 +32,14 @@
 #include <BLE2902.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
+#if defined(CONFIG_NIMBLE_ENABLED)
+#include <services/gap/ble_svc_gap.h>
+#endif
+#include <stdio.h>
+#include <string.h>
 
 #include <atomic>
+#include <functional>
 #include <string>
 
 #include "tesser/api.h"
@@ -59,7 +65,11 @@ public:
     // service, and advertising. One client at a time: advertising stops
     // while one is connected.
     void begin(const char* name) {
-        if (!BLEDevice::getInitialized()) BLEDevice::init(name);
+        if (!BLEDevice::getInitialized()) {
+            BLEDevice::init(name);
+        } else {
+            setDeviceName(name);
+        }
         BLEDevice::setMTU(517);
         server_ = BLEDevice::createServer();
         server_->setCallbacks(this);
@@ -82,8 +92,10 @@ public:
     void poll() {
         if (dropped_.exchange(false)) {
             line_.reset();  // subscriptions, a line cut short, the token
-            BLEDevice::startAdvertising();
+            if (enabled_) BLEDevice::startAdvertising();
+            report(false);
         }
+        if (connected_) report(true);
         std::string in;
         {
             MutexGuard guard(inMutex_);
@@ -92,7 +104,45 @@ public:
         if (!in.empty()) line_.feed(in.data(), in.size());
     }
 
+    // Bluetooth on and off at runtime, after begin(): stop() drops the
+    // client (as a disconnection does, in the next poll()) and stops
+    // advertising; start() advertises again. The stack stays up.
+    void start() {
+        enabled_ = true;
+        if (server_ && !connected_) BLEDevice::startAdvertising();
+    }
+    void stop() {
+        enabled_ = false;
+        if (!server_) return;
+        BLEDevice::stopAdvertising();
+        if (connected_) server_->disconnect(server_->getConnId());
+    }
+    bool enabled() const { return enabled_; }
+
+    // The device name (GAP name, and the scan response that choosers show).
+    // Advertising restarts with it; a connected client sees it after it
+    // leaves. The scan response holds 29 bytes of it.
+    void setName(const char* name) {
+        setDeviceName(name);
+        if (server_ && enabled_ && !connected_) {
+            BLEDevice::stopAdvertising();
+            BLEDevice::startAdvertising();
+        }
+    }
+
     bool connected() const { return connected_; }
+    // The connected client's address ("aa:bb:cc:dd:ee:ff"), empty when none,
+    // and the connection's ATT MTU, 0 when none.
+    std::string peerAddress() const {
+        if (!connected_) return std::string();
+        MutexGuard guard(inMutex_);
+        return peer_;
+    }
+    uint16_t mtu() const { return connected_ ? mtu_.load() : uint16_t(0); }
+    // Called with true when a client connects and false when it leaves, in
+    // poll(), so it may use the API.
+    void onConnection(std::function<void(bool connected)> fn) { onConnection_ = std::move(fn); }
+
     LineTransport& lines() { return line_; }
 
     // Requests count as authenticated (access levels, Api::authorize())
@@ -104,12 +154,53 @@ public:
 private:
     // Called from the BLE stack's task, which must never wait for the API:
     // indications sent under the API lock wait for this task's confirmations.
-    void onConnect(BLEServer*) override { connected_ = true; }
+#if defined(CONFIG_BLUEDROID_ENABLED)
+    void onConnect(BLEServer*, esp_ble_gatts_cb_param_t* param) override {
+        connecting(param->connect.remote_bda, false);
+    }
+    void onMtuChanged(BLEServer*, esp_ble_gatts_cb_param_t* param) override { mtu_ = param->mtu.mtu; }
+#else
+    void onConnect(BLEServer*, ble_gap_conn_desc* desc) override { connecting(desc->peer_id_addr.val, true); }
+    void onMtuChanged(BLEServer*, ble_gap_conn_desc*, uint16_t mtu) override { mtu_ = mtu; }
+#endif
     void onDisconnect(BLEServer*) override {
         connected_ = false;
         dropped_ = true;
         MutexGuard guard(inMutex_);
         inbox_.clear();
+    }
+    // NimBLE stores addresses least significant byte first.
+    void connecting(const uint8_t* a, bool reversed) {
+        char buf[18];
+        if (reversed) {
+            snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", a[5], a[4], a[3], a[2], a[1], a[0]);
+        } else {
+            snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", a[0], a[1], a[2], a[3], a[4], a[5]);
+        }
+        {
+            MutexGuard guard(inMutex_);
+            peer_ = buf;
+        }
+        mtu_ = 23;
+        connected_ = true;
+        // stop() may have missed a client connecting at that moment.
+        if (!enabled_ && server_) server_->disconnect(server_->getConnId());
+    }
+
+    static void setDeviceName(const char* name) {
+#if defined(CONFIG_BLUEDROID_ENABLED)
+        esp_ble_gap_set_device_name(name);  // the scan response includes it
+#else
+        ble_svc_gap_device_name_set(name);
+        BLEDevice::getAdvertising()->setName(name);
+#endif
+    }
+
+    // In poll(): once per change.
+    void report(bool connected) {
+        if (connected == reported_) return;
+        reported_ = connected;
+        if (onConnection_) onConnection_(connected);
     }
     void onWrite(BLECharacteristic* c) override {
         String v = c->getValue();
@@ -138,8 +229,13 @@ private:
     BLECharacteristic* tx_ = nullptr;
     std::atomic<bool> connected_{false};
     std::atomic<bool> dropped_{false};
-    Mutex inMutex_;
+    std::atomic<bool> enabled_{true};
+    std::atomic<uint16_t> mtu_{0};
+    mutable Mutex inMutex_;  // the inbox and peer_
     std::string inbox_;
+    std::string peer_;
+    std::function<void(bool)> onConnection_;
+    bool reported_ = false;
 };
 
 }  // namespace tesser
@@ -153,6 +249,7 @@ private:
 #if defined(CONFIG_BT_NIMBLE_ENABLED)
 
 #include <atomic>
+#include <functional>
 #include <string>
 
 #include "esp_err.h"
@@ -178,7 +275,27 @@ public:
     // under the API lock. One transport per firmware; one client at a time.
     esp_err_t begin(const char* name, uint32_t stackSize = 6144, UBaseType_t priority = 5);
 
+    // Bluetooth on and off at runtime: stop() drops the client (as a
+    // disconnection does) and stops advertising; start() advertises again.
+    // The stack stays up. Either may come before begin().
+    void start();
+    void stop();
+    bool enabled() const { return enabled_; }
+
+    // The device name (GAP name, and the scan response that choosers show).
+    // Advertising restarts with it; a connected client sees it after it
+    // leaves. The scan response holds 29 bytes of it.
+    void setName(const char* name);
+
     bool connected() const { return conn_ >= 0; }
+    // The connected client's address ("aa:bb:cc:dd:ee:ff"), empty when none,
+    // and the connection's ATT MTU, 0 when none.
+    std::string peerAddress() const;
+    uint16_t mtu() const;
+    // Called with true when a client connects and false when it leaves, in
+    // the transport's task, so it may use the API. Set before begin().
+    void onConnection(std::function<void(bool connected)> fn) { onConnection_ = std::move(fn); }
+
     LineTransport& lines() { return line_; }
     // Requests count as authenticated (access levels, Api::authorize())
     // only when set: for a bench, or a link the application secures itself.
@@ -194,6 +311,7 @@ public:
 private:
     static void taskEntry(void* arg);
     void advertise();
+    void report(bool connected);
     void write(const char* data, size_t len);
     bool sendPiece(const char* data, size_t len);
 
@@ -201,7 +319,11 @@ private:
 
     Api& api_;
     LineTransport line_;
+    mutable Mutex stateMutex_;  // name_ and peer_
     std::string name_;
+    char peer_[18] = {};
+    std::atomic<bool> enabled_{true};
+    std::atomic<bool> synced_{false};  // the host is up: advertising works
     std::atomic<int> conn_{-1};
     std::atomic<bool> notify_{false};
     std::atomic<bool> indicate_{false};
@@ -211,6 +333,8 @@ private:
     std::string inbox_;
     TaskHandle_t task_ = nullptr;
     SemaphoreHandle_t confirmed_ = nullptr;  // an indication's confirmation
+    std::function<void(bool)> onConnection_;
+    bool reported_ = false;  // in the task
 };
 
 }  // namespace tesser

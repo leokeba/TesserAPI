@@ -596,7 +596,12 @@ The serial lines of §10.4 over the **Nordic UART Service**, so browsers (Web Bl
 | RX | `6e400002-b5a3-f393-e0a9-e50e24dcca9e` | The client writes request lines, in any pieces; a write longer than the MTU is a long write (up to 512 bytes). |
 | TX | `6e400003-b5a3-f393-e0a9-e50e24dcca9e` | Replies and notifications, in pieces of the MTU (minus 3): notifications or indications, see below. |
 
-- **One `LineTransport`**, so one client at a time: advertising stops while it is connected. On disconnection, its subscriptions are dropped and advertising starts again.
+- **One `LineTransport`**, so one client at a time: advertising stops while it is connected. On disconnection, its subscriptions and token are dropped and advertising starts again.
+- **Runtime control**, for a device's Bluetooth settings:
+  - `stop()` drops the client and stops advertising; `start()` advertises again. The stack stays up. `enabled()` says which.
+  - `setName(name)` changes the GAP name and the scan response. Advertising restarts with it; a connected client sees it after it leaves. The scan response holds 29 bytes of it.
+  - `connected()`, `peerAddress()` (`"aa:bb:cc:dd:ee:ff"`, empty when none) and `mtu()` (the ATT MTU, 0 when none) describe the client.
+  - `onConnection(fn)` is called with `true` when a client connects and `false` when it leaves, in the task that handles requests (`poll()` on Arduino), never in the BLE stack's, so it may use the API.
 - **Threading:** the BLE stack's task only copies what was written into a bounded inbox (8 KB) and sets flags; requests are handled in `poll()`'s task (Arduino) or the transport's own task (ESP-IDF). It must stay so: a send under the API lock may wait for something the BLE task delivers (a confirmation, a free buffer).
 - **Pacing, ESP-IDF:** TX offers notifications and indications, and sends what the client subscribed to (browsers take notifications). NimBLE queues an accepted notification until the link carries it, and refuses one when its buffer pool is full; the transport then waits 10 ms and tries again, which paces a long reply. Indications go one at a time, each confirmed. Measured from an ESP32 to a Mac (MTU 517): about 60 ms per request, 12.8 KB/s for long replies.
 - **Pacing, Arduino:** indications only, since the Arduino library drops the notifications its queue can't take; each confirmation paces the next. About 120 ms per request, 6.3 KB/s.

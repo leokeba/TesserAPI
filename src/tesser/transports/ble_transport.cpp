@@ -4,6 +4,7 @@
 
 #if defined(ESP_PLATFORM) && !defined(ARDUINO) && defined(CONFIG_BT_NIMBLE_ENABLED)
 
+#include <stdio.h>
 #include <string.h>
 
 #include "host/ble_gap.h"
@@ -50,7 +51,10 @@ BleTransport::BleTransport(Api& api)
 esp_err_t BleTransport::begin(const char* name, uint32_t stackSize, UBaseType_t priority) {
     if (instance) return ESP_ERR_INVALID_STATE;
     instance = this;
-    name_ = name;
+    {
+        MutexGuard guard(stateMutex_);
+        name_ = name;
+    }
     confirmed_ = xSemaphoreCreateBinary();
     if (!confirmed_) return ESP_ERR_NO_MEM;
     esp_err_t err = nimble_port_init();
@@ -85,12 +89,58 @@ esp_err_t BleTransport::begin(const char* name, uint32_t stackSize, UBaseType_t 
 
 void BleTransport::onSync() {
     ble_hs_util_ensure_addr(0);
-    if (instance) instance->advertise();
+    if (!instance) return;
+    instance->synced_ = true;
+    instance->advertise();
+}
+
+void BleTransport::start() {
+    enabled_ = true;
+    advertise();
+}
+
+void BleTransport::stop() {
+    enabled_ = false;
+    if (!synced_) return;
+    ble_gap_adv_stop();
+    int conn = conn_;
+    if (conn >= 0) ble_gap_terminate(static_cast<uint16_t>(conn), BLE_ERR_REM_USER_CONN_TERM);
+}
+
+void BleTransport::setName(const char* name) {
+    {
+        MutexGuard guard(stateMutex_);
+        name_ = name;
+    }
+    if (instance != this) return;  // begin() takes it
+    ble_svc_gap_device_name_set(name);
+    if (synced_ && enabled_ && conn_ < 0) {
+        ble_gap_adv_stop();  // reports no ADV_COMPLETE
+        advertise();
+    }
+}
+
+std::string BleTransport::peerAddress() const {
+    if (conn_ < 0) return std::string();
+    MutexGuard guard(stateMutex_);
+    return peer_;
+}
+
+uint16_t BleTransport::mtu() const {
+    int conn = conn_;
+    return conn < 0 ? uint16_t(0) : ble_att_mtu(static_cast<uint16_t>(conn));
 }
 
 // The service's UUID fills the advertisement; the name goes in the scan
-// response, which browsers' choosers show.
+// response, which browsers' choosers show. Called from NimBLE's task and
+// from the application's (start(), setName()).
 void BleTransport::advertise() {
+    if (!enabled_ || !synced_ || conn_ >= 0) return;
+    std::string name;
+    {
+        MutexGuard guard(stateMutex_);
+        name = name_;
+    }
     ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
@@ -100,9 +150,9 @@ void BleTransport::advertise() {
     ble_gap_adv_set_fields(&fields);
     ble_hs_adv_fields rsp;
     memset(&rsp, 0, sizeof(rsp));
-    rsp.name = reinterpret_cast<const uint8_t*>(name_.c_str());
-    rsp.name_len = static_cast<uint8_t>(name_.size() < 29 ? name_.size() : 29);
-    rsp.name_is_complete = name_.size() < 29 ? 1 : 0;
+    rsp.name = reinterpret_cast<const uint8_t*>(name.c_str());
+    rsp.name_len = static_cast<uint8_t>(name.size() < 29 ? name.size() : 29);
+    rsp.name_is_complete = name.size() < 29 ? 1 : 0;
     ble_gap_adv_rsp_set_fields(&rsp);
 
     uint8_t ownAddr = 0;
@@ -122,7 +172,17 @@ int BleTransport::gapEvent(ble_gap_event* event, void* arg) {
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
+                ble_gap_conn_desc desc;
+                if (ble_gap_conn_find(event->connect.conn_handle, &desc) == 0) {
+                    const uint8_t* a = desc.peer_id_addr.val;  // least significant byte first
+                    MutexGuard guard(self->stateMutex_);
+                    snprintf(self->peer_, sizeof(self->peer_), "%02x:%02x:%02x:%02x:%02x:%02x", a[5], a[4], a[3],
+                             a[2], a[1], a[0]);
+                }
                 self->conn_ = event->connect.conn_handle;
+                // stop() may have missed a client connecting at that moment.
+                if (!self->enabled_) ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                xTaskNotifyGive(self->task_);
             } else {
                 self->advertise();
             }
@@ -142,7 +202,7 @@ int BleTransport::gapEvent(ble_gap_event* event, void* arg) {
             break;
         }
         case BLE_GAP_EVENT_ADV_COMPLETE:
-            if (self->conn_ < 0) self->advertise();
+            self->advertise();
             break;
         case BLE_GAP_EVENT_SUBSCRIBE:
             if (event->subscribe.attr_handle == self->txHandle_) {
@@ -185,7 +245,9 @@ void BleTransport::taskEntry(void* arg) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
         if (self->dropped_.exchange(false)) {
             self->line_.reset();  // subscriptions, a line cut short, the token
+            self->report(false);
         }
+        if (self->conn_ >= 0) self->report(true);
         {
             MutexGuard guard(self->inMutex_);
             in.swap(self->inbox_);
@@ -193,6 +255,13 @@ void BleTransport::taskEntry(void* arg) {
         if (!in.empty()) self->line_.feed(in.data(), in.size());
         in.clear();
     }
+}
+
+// In the task: once per change.
+void BleTransport::report(bool connected) {
+    if (connected == reported_) return;
+    reported_ = connected;
+    if (onConnection_) onConnection_(connected);
 }
 
 void BleTransport::write(const char* data, size_t len) {
