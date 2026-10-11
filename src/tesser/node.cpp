@@ -183,6 +183,34 @@ void ValueNode::setValidator(std::function<Check(JsonVariantConst)> v, const Val
     m.validator = new std::function<Check(JsonVariantConst)>(std::move(v));
 }
 
+void EnumNode::write(JsonWriter& w) const {
+    int64_t v = current();
+    if (v >= 0 && static_cast<uint64_t>(v) < names_.size()) {
+        w.string(names_[static_cast<size_t>(v)]);
+    } else {
+        w.integer(v);  // an enumerator without a name
+    }
+}
+
+Check EnumNode::check(JsonVariantConst v) const {
+    if (!v.is<const char*>()) return Check::fail(Status::InvalidValue, "expected string");
+    return index(v.as<const char*>()) < names_.size() ? validated(v)
+                                                      : Check::fail(Status::InvalidValue, "not one of the options");
+}
+
+Check EnumNode::apply(JsonVariantConst v) {
+    size_t i = index(v.as<const char*>());
+    if (i >= names_.size()) return Check::fail(Status::InvalidValue, "not one of the options");
+    return store(i);
+}
+
+size_t EnumNode::index(const char* s) const {
+    for (size_t i = 0; i < names_.size(); i++) {
+        if (s && strcmp(s, names_[i]) == 0) return i;
+    }
+    return names_.size();
+}
+
 ValueNode& ValueNode::watch() {
     setFlag(kWatch);
     editMeta();

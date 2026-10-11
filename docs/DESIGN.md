@@ -87,7 +87,7 @@ The getter has the form `T()`. The setter has the form `void(T)`, or `bool(T)` /
 
 **Supported `T`:** `bool`, all integer types up to 64 bits, `float`, `double`, `std::string`, `char[N]` (a fixed buffer, NUL-terminated), Arduino `String` (when `ARDUINO` is defined), and `const char*` (read-only).
 
-**Enums** are exposed as strings: `o.value("mode", mode, {"off", "auto", "manual"})` names the enumerators in order of their underlying values. Writes accept only those names, and the schema lists them under `"enum"`. An enumerator without a name reads as its number.
+**Enums** are exposed as strings: `o.value("mode", mode, {"off", "auto", "manual"})` names the enumerators in order of their underlying values. Writes accept only those names, and the schema lists them under `"enum"`. An enumerator without a name reads as its number. Through functions, `o.value("state", [&] { return axis.state(); }, {"disabled", "starting", "running"})` is read-only, and `o.value("mode", getter, setter, {...})` writable; the setter takes the enum and returns `void`, `bool`, `Status` or `Check`, like other setters. Use them for state another task owns under its own lock.
 
 **Modifiers** (chainable on the returned node):
 

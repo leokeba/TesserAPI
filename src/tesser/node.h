@@ -341,46 +341,65 @@ private:
 };
 
 // A C++ enum exposed as strings: names[i] is the name of the enumerator
-// whose underlying value is i.
-template <class E>
-class EnumValue : public ValueNode {
+// whose underlying value is i. Subclasses bind it to a variable or to
+// functions.
+class EnumNode : public ValueNode {
 public:
-    EnumValue(const char* name, E& ref, std::vector<const char*> names)
-        : ValueNode(name), ref_(ref), names_(std::move(names)) {}
+    EnumNode(const char* name, std::vector<const char*> names) : ValueNode(name), names_(std::move(names)) {}
     ValueKind kind() const override { return ValueKind::String; }
     const std::vector<const char*>* options() const override { return &names_; }
-    void write(JsonWriter& w) const override {
-        size_t i = static_cast<size_t>(ref_);
-        if (i < names_.size()) {
-            w.string(names_[i]);
-        } else {
-            w.integer(static_cast<int64_t>(ref_));  // an enumerator without a name
-        }
-    }
-    Check check(JsonVariantConst v) const override {
-        if (!v.is<const char*>()) return Check::fail(Status::InvalidValue, "expected string");
-        return index(v.as<const char*>()) < names_.size() ? validated(v)
-                                                          : Check::fail(Status::InvalidValue, "not one of the options");
-    }
-    Check apply(JsonVariantConst v) override {
-        size_t i = index(v.as<const char*>());
-        if (i >= names_.size()) return Check::fail(Status::InvalidValue, "not one of the options");
+    void write(JsonWriter& w) const override;
+    Check check(JsonVariantConst v) const override;
+    Check apply(JsonVariantConst v) override;
+
+protected:
+    // The current enumerator's underlying value.
+    virtual int64_t current() const = 0;
+    // Stores enumerator `i`, a valid index into the names.
+    virtual Check store(size_t i) = 0;
+
+private:
+    size_t index(const char* s) const;
+    std::vector<const char*> names_;
+};
+
+template <class E>
+class EnumValue : public EnumNode {
+public:
+    EnumValue(const char* name, E& ref, std::vector<const char*> names) : EnumNode(name, std::move(names)), ref_(ref) {}
+
+protected:
+    bool canWrite() const override { return true; }
+    int64_t current() const override { return static_cast<int64_t>(ref_); }
+    Check store(size_t i) override {
         ref_ = static_cast<E>(i);
         return Check::ok();
     }
 
+private:
+    E& ref_;
+};
+
+// Getter, and optionally a setter (read-only without).
+template <class E>
+class FnEnumValue : public EnumNode {
+public:
+    using Getter = std::function<E()>;
+    using Setter = std::function<Check(E)>;
+
+    FnEnumValue(const char* name, Getter get, Setter set, std::vector<const char*> names)
+        : EnumNode(name, std::move(names)), get_(std::move(get)), set_(std::move(set)) {}
+
 protected:
-    bool canWrite() const override { return true; }
+    bool canWrite() const override { return static_cast<bool>(set_); }
+    int64_t current() const override { return static_cast<int64_t>(get_()); }
+    Check store(size_t i) override {
+        return set_ ? set_(static_cast<E>(i)) : Check::fail(Status::ReadOnly, "read-only");
+    }
 
 private:
-    size_t index(const char* s) const {
-        for (size_t i = 0; i < names_.size(); i++) {
-            if (s && strcmp(s, names_[i]) == 0) return i;
-        }
-        return names_.size();
-    }
-    E& ref_;
-    std::vector<const char*> names_;
+    Getter get_;
+    Setter set_;
 };
 
 // Getter, and optionally a setter. R is the getter's type, P the setter's
@@ -873,6 +892,21 @@ Check toCheck(S&& setterResult) {
     }
 }
 
+// A setter taking P that returns void, bool, Status or Check, as one
+// returning Check.
+template <class P, class S>
+std::function<Check(const P&)> checkingSetter(S setter) {
+    return [setter = std::move(setter)](const P& v) mutable -> Check {
+        using SR = decltype(setter(v));
+        if constexpr (std::is_void<SR>::value) {
+            setter(v);
+            return Check::ok();
+        } else {
+            return toCheck(setter(v));
+        }
+    };
+}
+
 template <class T>
 Check checkArg(JsonVariantConst v) {
     return ValueTraits<T>::check(v);
@@ -1021,6 +1055,24 @@ public:
         return add(new EnumValue<E>(name, var, std::vector<const char*>(names)));
     }
 
+    // An enum through a getter (read-only), as strings like the above.
+    template <class G, std::enable_if_t<detail::IsCallable<std::decay_t<G>>::value, int> = 0>
+    ValueNode& value(const char* name, G getter, std::initializer_list<const char*> names) {
+        using E = detail::Bare<decltype(getter())>;
+        static_assert(std::is_enum<E>::value, "a getter with enumerator names must return an enum");
+        return add(new FnEnumValue<E>(name, std::move(getter), nullptr, std::vector<const char*>(names)));
+    }
+
+    // An enum through a getter and a setter. The setter may return void,
+    // bool, Status or Check.
+    template <class G, class S>
+    ValueNode& value(const char* name, G getter, S setter, std::initializer_list<const char*> names) {
+        using E = detail::Bare<decltype(getter())>;
+        static_assert(std::is_enum<E>::value, "a getter with enumerator names must return an enum");
+        return add(new FnEnumValue<E>(name, std::move(getter), detail::checkingSetter<E>(std::move(setter)),
+                                      std::vector<const char*>(names)));
+    }
+
     // A getter: read-only.
     template <class G, std::enable_if_t<detail::IsCallable<std::decay_t<G>>::value, int> = 0>
     ValueNode& value(const char* name, G getter) {
@@ -1034,16 +1086,7 @@ public:
         using R = detail::Bare<decltype(getter())>;
         using P = detail::Bare<typename detail::Signature<std::decay_t<S>>::Arg>;
         static_assert(detail::Signature<std::decay_t<S>>::arity == 1, "setter must take exactly one argument");
-        auto wrapped = [setter = std::move(setter)](const P& v) mutable -> Check {
-            using SR = decltype(setter(v));
-            if constexpr (std::is_void<SR>::value) {
-                setter(v);
-                return Check::ok();
-            } else {
-                return detail::toCheck(setter(v));
-            }
-        };
-        return add(new FnValue<R, P>(name, std::move(getter), std::move(wrapped)));
+        return add(new FnValue<R, P>(name, std::move(getter), detail::checkingSetter<P>(std::move(setter))));
     }
 
     // An action taking nothing, one typed value, an object argument (a type

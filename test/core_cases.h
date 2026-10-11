@@ -559,6 +559,39 @@ TEST(enums) {
     CHECK_EQ(get(api, "/mode").body, "3");
 }
 
+// Through a getter, for state another task owns under its own lock.
+TEST(enums_through_functions) {
+    Api api;
+    Mode state = Mode::Off;
+    int reads = 0;
+    api.value("state", [&] { reads++; return state; }, {"off", "auto", "manual"}).watch();
+    CHECK_EQ(get(api, "/state").body, "\"off\"");
+    CHECK_EQ(reads, 1);
+    CHECK_EQ(get(api, "/state", schema()).body, "{\"type\":\"string\",\"enum\":[\"off\",\"auto\",\"manual\"]}");
+    CHECK_EQ(set(api, "/state", "\"auto\"").status, Status::ReadOnly);
+    state = Mode::Unnamed;
+    CHECK_EQ(get(api, "/state").body, "3");
+
+    Mode mode = Mode::Off;
+    api.value(
+           "mode", [&] { return mode; },
+           [&](Mode m) {
+               if (m == Mode::Manual) return false;  // refused at apply time
+               mode = m;
+               return true;
+           },
+           {"off", "auto", "manual"})
+        .validate([](const std::string& m) { return m != "off"; });
+    CHECK_EQ(get(api, "/mode", schema()).body,
+             "{\"type\":\"string\",\"writable\":true,\"enum\":[\"off\",\"auto\",\"manual\"]}");
+    CHECK_EQ(set(api, "/mode", "\"auto\"").body, "\"auto\"");
+    CHECK(mode == Mode::Auto);
+    CHECK_EQ(set(api, "/mode", "\"manual\"").status, Status::InvalidValue);  // the setter's false
+    CHECK_EQ(set(api, "/mode", "\"off\"").status, Status::InvalidValue);     // the validator
+    CHECK_EQ(set(api, "/mode", "\"turbo\"").status, Status::InvalidValue);
+    CHECK(mode == Mode::Auto);
+}
+
 TEST(schema_hash) {
     Device a, b;
     CHECK_EQ(a.api.schemaHash(), b.api.schemaHash());  // same shape, different instances
