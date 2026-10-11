@@ -38,11 +38,15 @@ if(ESP_PLATFORM)
     if(TESSER_NOWTP)
         list(APPEND TESSER_SRCS src/tesser/transports/nowtp_transport.cpp)
     endif()
+    # The Bluetooth transport compiles to nothing unless the application
+    # enables NimBLE. "bt" is always a requirement: requirements are resolved
+    # before the configuration is known, and without BT it builds nothing.
+    list(APPEND TESSER_SRCS src/tesser/transports/ble_transport.cpp)
     idf_component_register(
         SRCS ${TESSER_SRCS}
         INCLUDE_DIRS "src"
         REQUIRES ${TESSER_REQS}
-        PRIV_REQUIRES log esp_timer lwip nvs_flash)
+        PRIV_REQUIRES log esp_timer lwip nvs_flash bt)
     if(TESSER_NOWTP)
         # Requirements are resolved before the component list is known, so
         # NowTP is linked here rather than listed in REQUIRES.

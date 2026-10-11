@@ -572,23 +572,31 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 ```cpp
 #include <tesser/transports/ble_transport.h>   // not in TesserAPI.h: it pulls in a BLE stack
 tesser::BleTransport ble(api);
+
+// Arduino (BLEDevice: Bluedroid on the ESP32, NimBLE on the C3 and S3)
 ble.begin("heliostat-3");    // in setup(): BLE stack (unless started), service, advertising
 ble.poll();                  // in loop(): requests are handled there
+
+// ESP-IDF (NimBLE: CONFIG_BT_NIMBLE_ENABLED)
+nvs_flash_init();            // NimBLE keeps its state there
+ble.begin("heliostat-3");    // controller, host task, service, advertising, and a request task
 ```
 
-Arduino only (`BLEDevice`: Bluedroid on the ESP32, NimBLE on the ESP32-C3 and S3). The serial lines of §10.4 over the **Nordic UART Service**, so browsers (Web Bluetooth) and generic BLE terminals speak it:
+The serial lines of §10.4 over the **Nordic UART Service**, so browsers (Web Bluetooth) and generic BLE terminals speak it:
 
 | Characteristic | UUID | Use |
 |---|---|---|
 | RX | `6e400002-b5a3-f393-e0a9-e50e24dcca9e` | The client writes request lines, in any pieces; a write longer than the MTU is a long write (up to 512 bytes). |
-| TX | `6e400003-b5a3-f393-e0a9-e50e24dcca9e` | Replies and notifications, as **indications** in pieces of the MTU (minus 3), each confirmed before the next. |
+| TX | `6e400003-b5a3-f393-e0a9-e50e24dcca9e` | Replies and notifications, in pieces of the MTU (minus 3): notifications or indications, see below. |
 
-- **One `LineTransport`**, so one client at a time: advertising stops while it is connected. On disconnection, `poll()` drops its subscriptions and advertises again.
-- **Threading:** the BLE stack's task only copies what was written into a bounded inbox (8 KB) and sets flags; requests are handled in `poll()`'s task. It must stay so: an indication sent under the API lock waits for a confirmation that the BLE task delivers.
-- **Pacing:** indications rather than notifications, since the Arduino library drops notifications its queue can't take. Confirmations pace a long reply to what the link carries, as a UART's buffer does: measured 6.3 KB/s from an ESP32 to a Mac (MTU 517). Replies stream (§10.1), so their size isn't limited.
+- **One `LineTransport`**, so one client at a time: advertising stops while it is connected. On disconnection, its subscriptions are dropped and advertising starts again.
+- **Threading:** the BLE stack's task only copies what was written into a bounded inbox (8 KB) and sets flags; requests are handled in `poll()`'s task (Arduino) or the transport's own task (ESP-IDF). It must stay so: a send under the API lock may wait for something the BLE task delivers (a confirmation, a free buffer).
+- **Pacing, ESP-IDF:** TX offers notifications and indications, and sends what the client subscribed to (browsers take notifications). NimBLE queues an accepted notification until the link carries it, and refuses one when its buffer pool is full; the transport then waits 10 ms and tries again, which paces a long reply. Indications go one at a time, each confirmed. Measured from an ESP32 to a Mac (MTU 517): about 60 ms per request, 12.8 KB/s for long replies.
+- **Pacing, Arduino:** indications only, since the Arduino library drops the notifications its queue can't take; each confirmation paces the next. About 120 ms per request, 6.3 KB/s.
+- Replies stream (§10.1), so their size isn't limited.
 - **Authentication:** anyone in range can connect, so the line is not authenticated by default (§13.2); `setAuthenticated(true)` is for a bench or a link the application secures itself (pairing, bonding).
-- **Flash:** Bluedroid on the ESP32 makes a sketch about 1.7 MB: it needs a larger app partition than Arduino's default 1.25 MB (`huge_app`). NimBLE on the ESP32-C3 fits.
-- **ESP-IDF:** not yet *(planned)*: an adapter over the NimBLE host API.
+- **Flash:** NimBLE adds about 400 KB (an ESP-IDF example is 510 KB). Bluedroid on Arduino's ESP32 makes a sketch about 1.7 MB: it needs a larger app partition than the default 1.25 MB (`huge_app`).
+- **ESP-IDF component:** `bt` is a private requirement; the transport compiles to nothing without `CONFIG_BT_NIMBLE_ENABLED`.
 
 ## 11. Change tracking and subscriptions
 
@@ -842,7 +850,7 @@ The layout follows NowTP:
 - The component's `Kconfig` selects `CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT` when WebSocket support is on (§10.5).
 - `library.properties` and `library.json` for Arduino and PlatformIO.
 
-The Bluetooth transport (§10.6) is a header that `TesserAPI.h` doesn't include, so that only the sketches using it compile a BLE stack.
+The Bluetooth transport (§10.6) is a header that `TesserAPI.h` doesn't include, so that only the firmware using it compiles a BLE stack. On ESP-IDF, its source compiles to nothing unless NimBLE is enabled.
 
 Optional transports (NowTP) compile only when their dependency is present: `__has_include(<NowTP.h>)` on Arduino and PlatformIO. On ESP-IDF, the component looks for a `nowtp` component among the build components and links it, since requirements are resolved before that list is known.
 
@@ -868,7 +876,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 5 | Client, remote mount (gateway), queued execution mode, lists of objects | done |
 | 6 | Groundwork for TesserUI: presentation metadata, forwarded subscriptions, discovered peers, `ApiClient` | done |
 | 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | done |
-| 8 | Bluetooth LE transport (Arduino), for TesserUI's launcher | done |
+| 8 | Bluetooth LE transport (Arduino and ESP-IDF), for TesserUI's launcher | done |
 
 ## 19. Decisions on former open questions
 

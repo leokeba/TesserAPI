@@ -124,7 +124,7 @@ api.mount("right", rightMotor);
 | HTTP (`HttpServer`, on `esp_http_server`, also usable under PsychicHttp) | REST mapping, streamed chunked responses, CORS | done |
 | NowTP (`NowTpTransport`, ESP-NOW) | one JSON envelope per message, reliable unicast; also a client for other nodes | done |
 | WebSocket (`HttpServer::enableWebSocket`) | JSON envelope, subscriptions | done |
-| Bluetooth LE (`BleTransport`, Arduino, `<tesser/transports/ble_transport.h>`) | serial lines over the Nordic UART Service, indications | done |
+| Bluetooth LE (`BleTransport`, `<tesser/transports/ble_transport.h>`; Arduino, ESP-IDF with NimBLE) | serial lines over the Nordic UART Service | done |
 
 ## Examples
 

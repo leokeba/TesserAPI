@@ -1,17 +1,27 @@
 #pragma once
 
-// Arduino only: JSON envelopes over Bluetooth LE, one per line, as on a
-// serial port (docs/DESIGN.md section 10.6). The service is the Nordic UART
-// Service: a client writes lines to RX and receives replies and
-// notifications as indications on TX, in pieces of the connection's MTU.
+// JSON envelopes over Bluetooth LE, one per line, as on a serial port
+// (docs/DESIGN.md section 10.6). The service is the Nordic UART Service: a
+// client writes lines to RX and receives replies and notifications on TX,
+// in pieces of the connection's MTU.
 //
-// Not included by TesserAPI.h, so that sketches without it don't pull in a
-// BLE stack:
+// Not included by TesserAPI.h, so that firmware without it doesn't pull in a
+// BLE stack.
+//
+// Arduino (BLEDevice: Bluedroid or NimBLE), TX by confirmed indications:
 //
 //   #include <tesser/transports/ble_transport.h>
 //   tesser::BleTransport ble(api);
 //   ble.begin("heliostat-3");   // in setup(), once the tree is declared
 //   ble.poll();                 // in loop(): requests are handled there
+//
+// ESP-IDF (NimBLE, CONFIG_BT_NIMBLE_ENABLED), TX by notifications paced by
+// the host's buffers (or indications, if the client asks for them); requests
+// are handled in the transport's own task:
+//
+//   nvs_flash_init();           // NimBLE keeps its state there
+//   tesser::BleTransport ble(api);
+//   ble.begin("heliostat-3");
 #if defined(ARDUINO)
 
 #include <Arduino.h>
@@ -132,5 +142,74 @@ private:
 
 }  // namespace tesser
 
-#endif
-#endif
+#endif  // BLE support
+
+#elif defined(ESP_PLATFORM)
+
+#include "sdkconfig.h"
+
+#if defined(CONFIG_BT_NIMBLE_ENABLED)
+
+#include <atomic>
+#include <string>
+
+#include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "tesser/line_transport.h"
+#include "tesser/platform.h"
+
+struct ble_gap_event;
+struct ble_gatt_access_ctxt;
+
+namespace tesser {
+
+class BleTransport {
+public:
+    explicit BleTransport(Api& api);
+    BleTransport(const BleTransport&) = delete;
+    BleTransport& operator=(const BleTransport&) = delete;
+
+    // Starts NimBLE (the controller and the host task), the service under
+    // this device name, advertising, and the task that handles requests,
+    // under the API lock. One transport per firmware; one client at a time.
+    esp_err_t begin(const char* name, uint32_t stackSize = 6144, UBaseType_t priority = 5);
+
+    bool connected() const { return conn_ >= 0; }
+    LineTransport& lines() { return line_; }
+    // Requests count as authenticated (access levels, Api::authorize())
+    // only when set: for a bench, or a link the application secures itself.
+    void setAuthenticated(bool authenticated) { line_.setAuthenticated(authenticated); }
+
+    // NimBLE's callbacks (C function pointers), forwarded to the instance.
+    static int gapEvent(ble_gap_event* event, void* arg);
+    static int access(uint16_t conn, uint16_t attr, ble_gatt_access_ctxt* ctxt, void* arg);
+    static void onSync();
+
+private:
+    static void taskEntry(void* arg);
+    void advertise();
+    void write(const char* data, size_t len);
+    bool sendPiece(const char* data, size_t len);
+
+    static constexpr size_t kMaxInbox = 8192;
+
+    Api& api_;
+    LineTransport line_;
+    std::string name_;
+    std::atomic<int> conn_{-1};
+    std::atomic<bool> notify_{false};
+    std::atomic<bool> indicate_{false};
+    std::atomic<bool> dropped_{false};
+    uint16_t txHandle_ = 0;
+    Mutex inMutex_;
+    std::string inbox_;
+    TaskHandle_t task_ = nullptr;
+    SemaphoreHandle_t confirmed_ = nullptr;  // an indication's confirmation
+};
+
+}  // namespace tesser
+
+#endif  // CONFIG_BT_NIMBLE_ENABLED
+#endif  // platform
