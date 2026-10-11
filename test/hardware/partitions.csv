@@ -1,0 +1,7 @@
+# The default single-app layout with a 3 MB app: the test firmware
+# (Wi-Fi, HTTP, NowTP and every test case) outgrew the 1.5 MB "large" table.
+# NVS keeps its place, so the persisted test state survives reflashing.
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x6000
+phy_init, data, phy,     0xf000,  0x1000
+factory,  app,  factory, 0x10000, 3M
