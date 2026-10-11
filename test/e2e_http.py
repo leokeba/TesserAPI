@@ -11,6 +11,7 @@ import os
 import statistics
 import sys
 import threading
+import urllib.parse
 
 import conformance
 from conformance import ABSENT, Http
@@ -109,6 +110,24 @@ def main():
         'contentType': 'application/octet-stream', 'accept': '.bin'}, data)
     r = h.call('get', '/files', {}, ABSENT)
     check('file left out of values', r == ('ok', {}), r)
+    # A directory listing: file nodes in a read-only keyed list's elements,
+    # uploads named by ?filename=. Idempotent: the directory lives in RAM.
+    got, data, _, _ = h.raw('PUT', '/files/entries/notes.txt/content', None, b'edited')
+    check('element file upload', got == 200 and json.loads(data) == 'notes.txt', (got, data))
+    got, data, headers, _ = h.raw('GET', '/files/entries/notes.txt/content')
+    check('element file download', got == 200 and data == b'edited' and
+          headers.get('Content-Disposition') == 'attachment; filename="notes.txt"', (got, data, headers))
+    name = 'r\u00e9 "x".txt'
+    got, data, _, _ = h.raw('PUT', '/files/upload', {'filename': name}, b'new bytes')
+    check('upload with ?filename=', got == 200 and json.loads(data) == name, (got, data))
+    got, data, headers, _ = h.raw('GET', '/files/entries/' + urllib.parse.quote(name) + '/content')
+    check('download of a non-ASCII name', got == 200 and data == b'new bytes' and
+          headers.get('Content-Disposition') ==
+          'attachment; filename="r__ _x_.txt"; filename*=UTF-8\'\'r%C3%A9%20%22x%22.txt', (got, data, headers))
+    got, data, _, _ = h.raw('PUT', '/files/upload', None, b'x')
+    check('upload without a name -> 422', got == 422 and b'bad file name' in data, (got, data))
+    r = h.call('get', '/files/entries', {}, ABSENT)
+    check('listing updated', r[0] == 'ok' and {'name': name, 'size': 9} in r[1], r)
     # The backup: the persisted state, Admin-only, restored leniently.
     auth = {'Authorization': 'Bearer test-token'}
     got, data, _, _ = h.raw('GET', '/files/backup')

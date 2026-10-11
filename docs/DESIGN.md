@@ -209,7 +209,7 @@ api.list("levels", levels, [](tesser::Object& o, int& v) { o.value("v", v); }); 
 - **Writing:** set a field (`PUT /remotes/1/port 8080`) or patch an element (`{"port": 1}`), and actions inside elements work too.
 - **Replacing:** setting the list itself to an array replaces it. The array's length is the new size (capped by `maxSize`, default 32). Each array item is a patch for the element at that index; existing elements keep the fields the patch omits, new ones start from defaults. Every item is validated before anything changes. The same applies inside a parent patch.
 - **Schema:** `{"type": "list", "writable": true, "maxSize": n, "items": <element schema>}`.
-- **Read-only:** `api.list("nearby", peers).readOnly()` is a list the application fills (scan results, peers nearby). Replacing it, in a parent patch too, and writing its elements or their values are `read_only`; actions in its elements still run. Its schema has no `writable`, nor do its elements' values, so a user interface offers no add or remove controls. It is persisted and restored only with `.persist()`, like any list.
+- **Read-only:** `api.list("nearby", peers).readOnly()` is a list the application fills (scan results, peers nearby). Replacing it, in a parent patch too, and writing its elements or their values are `read_only`; actions in its elements still run, and their file nodes still transfer (§4.6). Its schema has no `writable`, nor do its elements' values, so a user interface offers no add or remove controls. It is persisted and restored only with `.persist()`, like any list.
 - **Subscriptions and persistence** treat the list as one value: a write anywhere in it marks the list changed, change notifications carry the whole list, and `.persist()` saves it whole. Subscribing below a list is `not_allowed`, since its elements are temporary.
 
 **Keyed lists.** `.key("name")` names each element by one of its fields, a string value, so elements are addressed by key instead of by index:
@@ -263,14 +263,27 @@ api.object("sys").file("backup").contentType("application/json").readAccess(tess
     [](std::string_view text, tesser::JsonWriter& reply) { ... api.restore(text, &skipped) ... });  // upload
 ```
 
-- **Handlers:** `upload(open)` and `download(open)` take a function called when a transfer starts, under the API lock, with a `FileRequest`: the client, the announced size (uploads), and a `filename` a download may set (default: the node's name). It returns the transfer's `FileSink` or `FileSource`, or null after `request.refuse(status, message)`.
+- **Handlers:** `upload(open)` and `download(open)` take a function called when a transfer starts, under the API lock, with a `FileRequest`: the client, the announced size (uploads), and a `filename`. A download may set it (default: the node's name). An upload gets the name the client gave (over HTTP, `?filename=`), URL-decoded but otherwise unchecked, or empty if none: the handler validates it. It returns the transfer's `FileSink` or `FileSource`, or null after `request.refuse(status, message)`.
 - **Uploads:** the sink's `write(data, len)` gets the bytes in order, then `finish(reply)` once all of them arrived; it may write the reply body (by default `null`). A failing write ends the upload with its error. A sink destroyed without `finish()` was cut short (a failed write, the client gone, fewer bytes than announced): roll back in its destructor.
 - **Downloads:** the source's `size()` (or -1 if unknown) and `read(buf, cap)`, which returns the bytes read, 0 at the end, or -1 on error.
-- **Outside the lock:** writes, reads and `finish()` run without the API lock, in the transport's task, so a long upload doesn't hold up other requests. Only one transfer per node runs at a time; another one is `busy`.
+- **Outside the lock:** writes, reads and `finish()` run without the API lock, in the transport's task, so a long upload doesn't hold up other requests. A sink that changes bound state takes the lock itself (`tesser::Lock`). Only one transfer per path runs at a time; another one is `busy`.
 - **`text(get, set)`** covers small text files: a download is `get()`, and an upload is collected in memory (up to `maxSize`, 16 KB unless set) and handed to `set`, which may write the reply.
 - **Limits:** `maxSize(bytes)` caps uploads (0, the default, means no limit), checked against the announced size before the upload starts. `contentType()` is the downloads' MIME type (default `application/octet-stream`), and `accept()` the file types an upload form should offer, as in HTML (`.bin`).
 - **Access:** access levels (§13.1) and the authorizer apply: a download is a read, an upload a write.
-- **In the tree:** a file node has no value, so it is left out of value reads and patches, like an action. A JSON request on it is `not_allowed`: get, set, a patch that names it, a subscription. Its schema is `{"type": "file", "readable": true, "writable": true, "maxSize": 1966080, "contentType": "application/octet-stream", "accept": ".bin"}`. A file node inside a list element can't be transferred, since the element is temporary.
+- **In the tree:** a file node has no value, so it is left out of value reads and patches, like an action. A JSON request on it is `not_allowed`: get, set, a patch that names it, a subscription. Its schema is `{"type": "file", "readable": true, "writable": true, "maxSize": 1966080, "contentType": "application/octet-stream", "accept": ".bin"}`.
+- **In list elements:** a file node in a list or array element transfers like any other (`GET /api/files/entries/notes.txt/content`). The transfer resolves the element as a request does, and the handler runs under the lock while the element exists, so it may read it (capture its key by value). The element is freed before the bytes move, so the returned sink or source, and a `text()` setter, must not reference it, as with validators on list elements. Elements of a read-only list keep their transfers: a download is a read, and an upload is the handler's to accept, not a write to the list. A file browser is a read-only keyed list of entries with a `content` file node each, plus a file node elsewhere that takes new files by `filename`:
+
+  ```cpp
+  api.object("files").list("entries", entries, [](tesser::Object& o, Entry& e) {
+      o.value("name", e.name);
+      std::string name = e.name;                           // by value: the element is temporary
+      o.file("content").download([name](tesser::FileRequest& r) { r.filename = name; return openFile(name); });
+  }).key("name").readOnly();
+  api.object("files").file("upload").upload([](tesser::FileRequest& r) -> std::unique_ptr<tesser::FileSink> {   // PUT /api/files/upload?filename=a.txt
+      if (!validName(r.filename)) { r.refuse(tesser::Status::InvalidValue, "bad file name"); return nullptr; }
+      return createFile(r.filename);
+  });
+  ```
 - **Transports:** HTTP only for now (§10.2). The message transports *(planned)* would need a chunked envelope; NowTP also needs streaming of large messages.
 - **Generic core:** `tesser::FileTransfer` does the work (resolution, access, size, one transfer at a time, the reply), host-tested; the HTTP transport only moves bytes.
 
@@ -519,12 +532,12 @@ http.attach(handle, "/api");     // registers a wildcard URI on an existing http
 | `GET /api/<path>?depth=&keys=&exclude=&view=&shape=` | get. A shape comes either in the body or URL-encoded in `shape` (browsers can't send a GET body); both at once is `bad_request`. |
 | `PUT`, `PATCH` or `POST /api/<path>` | set. The body is JSON. |
 | `GET /api/<file>` (no `view`, or `view=value`) | download a file node (§4.6): the raw bytes. |
-| `PUT` or `POST /api/<file>` | upload to a file node: the body is the raw bytes, with any `Content-Type`. The reply is JSON. |
+| `PUT` or `POST /api/<file>?filename=` | upload to a file node: the body is the raw bytes, with any `Content-Type`. `filename`, optional, is the name the client gives the file (`FileRequest::filename`). The reply is JSON. |
 | `OPTIONS` | CORS preflight, when CORS is enabled |
 
 - Responses up to 512 bytes go out with a `Content-Length`. Larger ones are streamed with chunked encoding through the same 512-byte buffer, so there is no limit on response size.
 - Request bodies are capped by `maxRequestBody`, except uploads to file nodes, which are capped by the node's `maxSize`.
-- **File transfers** stream in 2 KB pieces from the heap. A download of known size goes out with a `Content-Length` (so clients can show progress) and a `Content-Disposition: attachment; filename="..."`; one of unknown size is chunked. A refused or failed upload's remaining body is read and dropped up to 256 KB, so the client, which sends it all before reading, gets the error; beyond that the connection is closed. With CORS, file responses carry the headers too.
+- **File transfers** stream in 2 KB pieces from the heap. A download of known size goes out with a `Content-Length` (so clients can show progress) and a `Content-Disposition: attachment; filename="..."`; one of unknown size is chunked. In that `filename`, quotes, backslashes, control and non-ASCII bytes become `_`; a non-ASCII name also comes as `filename*=UTF-8''<percent-encoded>` (RFC 6266), which browsers prefer. A refused or failed upload's remaining body is read and dropped up to 256 KB, so the client, which sends it all before reading, gets the error; beyond that the connection is closed. With CORS, file responses carry the headers too.
 - The status is mapped as in §8.
 - The handler runs in the httpd task (inline mode).
 - `begin()` starts a dedicated server with wildcard URI matching and an 8 KB stack. `attach()` uses 4 handler slots (5 with CORS, 6 with WebSocket) on an existing server, which must use `httpd_uri_match_wildcard` and should have at least 8 KB of stack. Measured peak use is about 4.9 KB: recursive rendering, newlib's float formatting and lwIP all run on it.

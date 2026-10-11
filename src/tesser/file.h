@@ -16,9 +16,9 @@ class Api;
 
 // One file transfer (docs/DESIGN.md section 4.6), driven by a transport:
 // open, then write() / read() chunks, then finish(). Opening resolves the
-// path and checks access under the API lock; the chunks run outside it.
-// Destroying an unfinished upload aborts it (its sink is destroyed without
-// finish()).
+// path, checks access and calls the node's handler under the API lock; the
+// chunks run outside it. One transfer per path at a time. Destroying an
+// unfinished upload aborts it (its sink is destroyed without finish()).
 class FileTransfer {
 public:
     enum class Open {
@@ -32,8 +32,10 @@ public:
     FileTransfer(const FileTransfer&) = delete;
     FileTransfer& operator=(const FileTransfer&) = delete;
 
-    // An upload of `size` bytes to `path`.
-    Open openUpload(std::string_view path, const Client& client, uint64_t size, Reply& reply);
+    // An upload of `size` bytes to `path`, under the name the client gave
+    // (empty if none: FileRequest::filename).
+    Open openUpload(std::string_view path, const Client& client, uint64_t size, Reply& reply,
+                    std::string_view filename = std::string_view());
     // A download of `path`.
     Open openDownload(std::string_view path, const Client& client, Reply& reply);
 
@@ -49,19 +51,21 @@ public:
     // Download: up to `cap` bytes; 0 at the end, -1 on error.
     int read(uint8_t* buf, size_t cap);
     const std::string& filename() const { return filename_; }
-    const char* contentType() const { return node_ ? node_->contentType() : "application/octet-stream"; }
+    const char* contentType() const { return contentType_.c_str(); }
     const std::string& path() const { return path_; }
 
 private:
-    Open open(std::string_view path, const Client& client, Op op, uint64_t size, Reply& reply);
+    Open open(std::string_view path, const Client& client, Op op, uint64_t size, std::string_view filename,
+              Reply& reply);
     void close();
 
     Api& api_;
-    FileNode* node_ = nullptr;
+    bool claimed_ = false;  // path_ is claimed in the API
     std::unique_ptr<FileSink> sink_;
     std::unique_ptr<FileSource> source_;
     std::string path_;
     std::string filename_;
+    std::string contentType_ = "application/octet-stream";  // copied: an element's node is gone after open
     uint64_t expected_ = 0;
     uint64_t received_ = 0;
 };

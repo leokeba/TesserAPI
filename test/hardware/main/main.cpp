@@ -277,6 +277,10 @@ void serveDemo() {
               })
         .contentType("application/json")
         .readAccess(tesser::Access::Admin);
+    // A directory in RAM (TesserKIT's Files service): /files/entries, a
+    // read-only keyed list whose elements' file nodes transfer, and
+    // /files/upload?filename=.
+    new file_cases::Dir(g_demo->api);
 
     startNetwork(g_demo->api);  // NVS is initialized there
     g_storage = new tesser::NvsStorage("tesser_test");

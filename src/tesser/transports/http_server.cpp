@@ -2,6 +2,7 @@
 
 #if defined(ESP_PLATFORM)
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -652,7 +653,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
     char* query = nullptr;
     size_t queryLen = httpd_req_get_url_query_len(req);
     char value[16];
-    std::string keys, exclude, shapeText;
+    std::string keys, exclude, shapeText, filename;
     bool bad = false;
     if (queryLen) {
         query = static_cast<char*>(malloc(queryLen + 1));
@@ -689,6 +690,13 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
         } else {
             shapeText.clear();
         }
+        // An upload's file name, as the client gave it (FileRequest::filename).
+        filename.resize(queryLen + 1);
+        if (queryParam(query, "filename", &filename[0], filename.size(), len, bad)) {
+            filename.resize(len);
+        } else {
+            filename.clear();
+        }
         free(query);
         if (bad) {
             writeError(reply, Status::BadRequest, path, "invalid query parameter");
@@ -701,7 +709,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
     if (request.op == Op::Set || request.query.view == View::Value) {
         FileTransfer file(api_);
         FileTransfer::Open o = request.op == Op::Set
-                                   ? file.openUpload(path, request.client, req->content_len, reply)
+                                   ? file.openUpload(path, request.client, req->content_len, reply, filename)
                                    : file.openDownload(path, request.client, reply);
         if (o == FileTransfer::Open::Ok) return request.op == Op::Set ? receiveFile(req, file, reply) : sendFile(req, file);
         if (o == FileTransfer::Open::Failed) {
@@ -774,6 +782,35 @@ esp_err_t HttpServer::receiveFile(httpd_req_t* req, FileTransfer& file, Reply& r
 }
 
 namespace {
+// attachment; filename="<ASCII>", plus filename*=UTF-8''<percent-encoded>
+// (RFC 6266) for other names. Names may come from a file system: quotes,
+// backslashes and control bytes would break the header.
+std::string contentDisposition(const std::string& name) {
+    std::string d = "attachment; filename=\"";
+    bool ascii = true;
+    for (char c : name) {
+        auto u = static_cast<unsigned char>(c);
+        if (u >= 0x80) ascii = false;
+        d += (u < 0x20 || u >= 0x7f || c == '"' || c == '\\') ? '_' : c;
+    }
+    d += '"';
+    if (!ascii) {
+        static const char kHex[] = "0123456789ABCDEF";
+        d += "; filename*=UTF-8''";
+        for (char c : name) {
+            auto u = static_cast<unsigned char>(c);
+            if (isalnum(u) || (c && strchr("!#$&+-.^_`|~", c))) {
+                d += c;
+            } else {
+                d += '%';
+                d += kHex[u >> 4];
+                d += kHex[u & 15];
+            }
+        }
+    }
+    return d;
+}
+
 bool sendAll(httpd_req_t* req, const char* data, size_t len) {
     while (len) {
         int n = httpd_send(req, data, len);
@@ -787,7 +824,7 @@ bool sendAll(httpd_req_t* req, const char* data, size_t len) {
 
 esp_err_t HttpServer::sendFile(httpd_req_t* req, FileTransfer& file) {
     std::unique_ptr<uint8_t[]> buf(new uint8_t[kFileChunk]);
-    std::string disposition = "attachment; filename=\"" + file.filename() + "\"";
+    std::string disposition = contentDisposition(file.filename());
     int64_t size = file.size();
     if (size < 0) {
         // Unknown size: chunked.

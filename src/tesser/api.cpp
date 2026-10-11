@@ -218,15 +218,13 @@ public:
 
     // The file node a transfer targets (FileTransfer), or null with the error
     // written; `notFile` (no error) when the path resolves to something else.
-    FileNode* file(bool& notFile) {
+    // The elements on the path move to `elements`, which the node lives in.
+    FileNode* file(bool& notFile, std::vector<std::unique_ptr<Node>>& elements) {
         Node* target = resolve();
+        elements = std::move(temps_);
         if (!target) return nullptr;
         if (target->type() != NodeType::File) {
             notFile = true;
-            return nullptr;
-        }
-        if (!temps_.empty()) {
-            replyError(Status::NotAllowed, "files in list elements can't be transferred", base_);
             return nullptr;
         }
         Access need = req_.op == Op::Set ? writeNeed_ : readNeed_;
@@ -1246,10 +1244,30 @@ void Api::handle(const Request& request, Reply& reply) {
     handleNow(request, reply);
 }
 
-FileNode* Api::fileNode(const Request& request, Reply& reply, bool& notFile) {
+FileNode* Api::fileNode(const Request& request, Reply& reply, bool& notFile,
+                        std::vector<std::unique_ptr<Node>>& elements) {
     MutexGuard guard(mutex_);
     notFile = false;
-    return Handler(*this, request, reply).file(notFile);
+    return Handler(*this, request, reply).file(notFile, elements);
+}
+
+bool Api::claimTransfer(std::string_view path) {
+    MutexGuard guard(mutex_);
+    for (const std::string& p : transfers_) {
+        if (p == path) return false;
+    }
+    transfers_.emplace_back(path);
+    return true;
+}
+
+void Api::releaseTransfer(std::string_view path) {
+    MutexGuard guard(mutex_);
+    for (size_t i = 0; i < transfers_.size(); i++) {
+        if (transfers_[i] == path) {
+            transfers_.erase(transfers_.begin() + static_cast<std::ptrdiff_t>(i));
+            return;
+        }
+    }
 }
 
 void Api::handleNow(const Request& request, Reply& reply) {

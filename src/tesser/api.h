@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -165,11 +166,17 @@ public:
     bool pendingBegin();
     void pendingDone() { pending_.fetch_sub(1); }
 
-    // Used by FileTransfer: the file node at request.path that the client
-    // may transfer (op Get: download, Set: upload), or null with the error
-    // written to `reply`. `notFile` is set, with nothing written, when the
-    // path resolves to another kind of node.
-    FileNode* fileNode(const Request& request, Reply& reply, bool& notFile);
+    // Used by FileTransfer, under the API lock: the file node at request.path
+    // that the client may transfer (op Get: download, Set: upload), or null
+    // with the error written to `reply`. `notFile` is set, with nothing
+    // written, when the path resolves to another kind of node. The temporary
+    // list and array elements on the path move to `elements`: an element's
+    // file node lives as long as they do.
+    FileNode* fileNode(const Request& request, Reply& reply, bool& notFile,
+                       std::vector<std::unique_ptr<Node>>& elements);
+    // Used by FileTransfer, under the API lock: one transfer per path.
+    bool claimTransfer(std::string_view path);
+    void releaseTransfer(std::string_view path);
 
     // Requests waiting for poll() in queued mode.
     size_t queuedRequests() const;
@@ -204,6 +211,7 @@ private:
     mutable Mutex mutex_;
     std::atomic<int> pending_{0};
     std::vector<Subscription> subs_;
+    std::vector<std::string> transfers_;  // paths of the file transfers in progress
     uint32_t lastWatchMs_ = 0;
     Authorizer authorizer_;
     TokenCheck tokenCheck_;

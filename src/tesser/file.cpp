@@ -29,15 +29,16 @@ private:
 
 class TextSink : public FileSink {
 public:
-    explicit TextSink(const FileNode::TextSetter& set) : set_(set) {}
+    explicit TextSink(std::shared_ptr<const FileNode::TextSetter> set) : set_(std::move(set)) {}
     Check write(const uint8_t* data, size_t len) override {
         text_.append(reinterpret_cast<const char*>(data), len);
         return Check::ok();
     }
-    Check finish(JsonWriter& reply) override { return set_(text_, reply); }
+    Check finish(JsonWriter& reply) override { return (*set_)(text_, reply); }
 
 private:
-    const FileNode::TextSetter& set_;  // the node's: nodes outlive transfers
+    // Shared with the node, which may be gone by now (a list element's).
+    std::shared_ptr<const FileNode::TextSetter> set_;
     std::string text_;
 };
 
@@ -49,8 +50,8 @@ FileNode& FileNode::text(TextGetter get, TextSetter set) {
         download([get = std::move(get)](FileRequest&) { return std::unique_ptr<FileSource>(new TextSource(get())); });
     }
     if (set) {
-        auto shared = std::make_shared<TextSetter>(std::move(set));
-        upload([shared](FileRequest&) { return std::unique_ptr<FileSink>(new TextSink(*shared)); });
+        auto shared = std::make_shared<const TextSetter>(std::move(set));
+        upload([shared](FileRequest&) { return std::unique_ptr<FileSink>(new TextSink(shared)); });
     }
     return *this;
 }
@@ -60,12 +61,12 @@ FileTransfer::~FileTransfer() { close(); }
 void FileTransfer::close() {
     sink_.reset();  // without finish(): aborted
     source_.reset();
-    if (node_) node_->release();
-    node_ = nullptr;
+    if (claimed_) api_.releaseTransfer(path_);
+    claimed_ = false;
 }
 
 FileTransfer::Open FileTransfer::open(std::string_view path, const Client& client, Op op, uint64_t size,
-                                      Reply& reply) {
+                                      std::string_view filename, Reply& reply) {
     close();
     Request req;
     req.op = op;
@@ -75,7 +76,10 @@ FileTransfer::Open FileTransfer::open(std::string_view path, const Client& clien
     if (path_.size() > 1 && path_.back() == '/') path_.pop_back();
     MutexGuard guard(api_.mutex());
     bool notFile = false;
-    FileNode* node = api_.fileNode(req, reply, notFile);
+    // Destroyed before the guard: list elements are built and freed under
+    // the lock. Their file nodes' handlers run while they exist.
+    std::vector<std::unique_ptr<Node>> elements;
+    FileNode* node = api_.fileNode(req, reply, notFile, elements);
     if (notFile) return Open::NotFile;
     if (!node) return Open::Failed;
     bool upload = op == Op::Set;
@@ -87,17 +91,18 @@ FileTransfer::Open FileTransfer::open(std::string_view path, const Client& clien
         writeError(reply, Status::TooLarge, path_, "file too large");
         return Open::Failed;
     }
-    if (!node->claim()) {
+    if (!api_.claimTransfer(path_)) {
         writeError(reply, Status::Busy, path_, "another transfer is in progress");
         return Open::Failed;
     }
-    node_ = node;
+    claimed_ = true;
     FileRequest r(client);
     r.size = size;
-    r.filename = node->name();
     if (upload) {
+        r.filename.assign(filename.data(), filename.size());
         sink_ = node->openUpload(r);
     } else {
+        r.filename = node->name();
         source_ = node->openDownload(r);
     }
     if (!sink_ && !source_) {
@@ -107,17 +112,19 @@ FileTransfer::Open FileTransfer::open(std::string_view path, const Client& clien
         return Open::Failed;
     }
     filename_ = std::move(r.filename);
+    contentType_ = node->contentType();
     expected_ = size;
     received_ = 0;
     return Open::Ok;
 }
 
-FileTransfer::Open FileTransfer::openUpload(std::string_view path, const Client& client, uint64_t size, Reply& reply) {
-    return open(path, client, Op::Set, size, reply);
+FileTransfer::Open FileTransfer::openUpload(std::string_view path, const Client& client, uint64_t size, Reply& reply,
+                                            std::string_view filename) {
+    return open(path, client, Op::Set, size, filename, reply);
 }
 
 FileTransfer::Open FileTransfer::openDownload(std::string_view path, const Client& client, Reply& reply) {
-    return open(path, client, Op::Get, 0, reply);
+    return open(path, client, Op::Get, 0, std::string_view(), reply);
 }
 
 bool FileTransfer::write(const uint8_t* data, size_t len, Reply& reply) {

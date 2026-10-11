@@ -106,10 +106,10 @@ struct Fixture {
 };
 
 inline std::string upload(Api& api, const char* path, const std::string& data, const tesser::Client& client,
-                          size_t chunk = 8) {
+                          size_t chunk = 8, std::string_view filename = std::string_view()) {
     FileTransfer t(api);
     tesser::StringReply reply;
-    FileTransfer::Open o = t.openUpload(path, client, data.size(), reply);
+    FileTransfer::Open o = t.openUpload(path, client, data.size(), reply, filename);
     if (o == FileTransfer::Open::NotFile) return "not a file";
     if (o == FileTransfer::Open::Failed) return reply.body;
     for (size_t at = 0; at < data.size(); at += chunk) {
@@ -253,19 +253,199 @@ TEST(file_backup_and_restore) {
              "bad_request {\"error\":\"bad_request\",\"path\":\"/backup\",\"message\":\"not a backup\"}");
 }
 
+// A directory listing (TesserKIT's Files service): a read-only keyed list
+// whose elements' file nodes transfer the files they name.
+struct Dir {
+    struct Entry {
+        std::string name;
+        int64_t size = 0;
+    };
+    std::vector<std::pair<std::string, std::string>> files;  // name, content
+    std::vector<Entry> entries;
+    int aborted = 0;
+    Api& api;
+
+    std::string* find(const std::string& name) {
+        for (auto& f : files) {
+            if (f.first == name) return &f.second;
+        }
+        return nullptr;
+    }
+    void list() {
+        entries.clear();
+        for (auto& f : files) entries.push_back({f.first, int64_t(f.second.size())});
+    }
+
+    struct Source : tesser::FileSource {
+        std::string data;
+        size_t at = 0;
+        int64_t size() const override { return int64_t(data.size()); }
+        int read(uint8_t* buf, size_t cap) override {
+            size_t n = data.size() - at < cap ? data.size() - at : cap;
+            memcpy(buf, data.data() + at, n);
+            at += n;
+            return static_cast<int>(n);
+        }
+    };
+    // Writes the file named when the upload started.
+    struct Sink : tesser::FileSink {
+        Dir& dir;
+        std::string name, data;
+        bool done = false;
+        Sink(Dir& d, std::string n) : dir(d), name(std::move(n)) {}
+        ~Sink() override {
+            if (!done) dir.aborted++;
+        }
+        tesser::Check write(const uint8_t* d, size_t n) override {
+            data.append(reinterpret_cast<const char*>(d), n);
+            return tesser::Check::ok();
+        }
+        tesser::Check finish(tesser::JsonWriter& reply) override {
+            done = true;
+            tesser::Lock lock(dir.api);  // finish() runs outside the API lock
+            if (std::string* f = dir.find(name)) {
+                *f = data;
+            } else {
+                dir.files.push_back({name, data});
+            }
+            dir.list();
+            reply.string(name);
+            return tesser::Check::ok();
+        }
+    };
+
+    explicit Dir(Api& a) : api(a) {
+        files = {{"notes.txt", "hello"}, {"cal.json", "{\"k\":1}"}};
+        list();
+        auto& dir = api.object("files");
+        dir.list("entries", entries, [this](tesser::Object& o, Entry& e) {
+               o.value("name", e.name);
+               o.value("size", e.size);
+               // Handlers capture the key by value: the element is gone
+               // once the transfer runs.
+               std::string name = e.name;
+               o.file("content")
+                   .download([this, name](tesser::FileRequest& r) -> std::unique_ptr<tesser::FileSource> {
+                       std::string* f = find(name);
+                       if (!f) {
+                           r.refuse(Status::NotFound, "no such file");
+                           return nullptr;
+                       }
+                       r.filename = name;
+                       auto* src = new Source();
+                       src->data = *f;
+                       return std::unique_ptr<tesser::FileSource>(src);
+                   })
+                   .upload([this, name](tesser::FileRequest&) {
+                       return std::unique_ptr<tesser::FileSink>(new Sink(*this, name));
+                   })
+                   .maxSize(64);
+               o.file("text").text([] { return std::string("t"); },
+                                   [this, name](std::string_view text, tesser::JsonWriter& reply) {
+                                       tesser::Lock lock(api);  // also outside the lock
+                                       std::string* f = find(name);
+                                       if (!f) return tesser::Check::fail(Status::NotFound, "no such file");
+                                       *f = std::string(text);
+                                       reply.string("saved");
+                                       return tesser::Check::ok();
+                                   });
+           })
+            .key("name")
+            .readOnly();
+        // New files, under the name the client gave.
+        dir.file("upload").upload([this](tesser::FileRequest& r) -> std::unique_ptr<tesser::FileSink> {
+            if (r.filename.empty() || r.filename.find('/') != std::string::npos) {
+                r.refuse(Status::InvalidValue, "bad file name");
+                return nullptr;
+            }
+            return std::unique_ptr<tesser::FileSink>(new Sink(*this, r.filename));
+        });
+    }
+};
+
 TEST(file_in_list_element) {
+    Api api;
+    Dir dir(api);
+    tesser::Client admin;
+    admin.authenticated = true;
+    std::string name;
+    CHECK_EQ(download(api, "/files/entries/notes.txt/content", admin, &name), "hello");
+    CHECK_EQ(name, "notes.txt");
+    CHECK_EQ(download(api, "/files/entries/cal.json/content/", admin), "{\"k\":1}");
+    CHECK(download(api, "/files/entries/gone.txt/content", admin).find("not_found") != std::string::npos);
+    // The handler runs while the element exists and may refuse.
+    dir.files.erase(dir.files.begin());
+    CHECK_EQ(download(api, "/files/entries/notes.txt/content", admin),
+             "{\"error\":\"not_found\",\"path\":\"/files/entries/notes.txt/content\",\"message\":\"no such file\"}");
+    dir.list();
+    // An upload to a read-only list's element: the handler's decision, not a
+    // list write. Sizes still apply.
+    CHECK_EQ(upload(api, "/files/entries/cal.json/content", "{\"k\":2}", admin), "ok \"cal.json\"");
+    CHECK_EQ(*dir.find("cal.json"), "{\"k\":2}");
+    CHECK(upload(api, "/files/entries/cal.json/content", std::string(65, 'x'), admin).find("too_large") !=
+          std::string::npos);
+    // text() in an element: the setter outlives the element.
+    CHECK_EQ(upload(api, "/files/entries/cal.json/text", "{}", admin), "ok \"saved\"");
+    CHECK_EQ(*dir.find("cal.json"), "{}");
+    // The list stays read-only for JSON writes.
+    CHECK_EQ(cases::set(api, "/files/entries/cal.json/name", "\"x\"").status, Status::ReadOnly);
+
+    // Indexed lists too.
     struct Item {
         int x = 0;
     };
-    Api api;
-    std::vector<Item> items(1);
+    std::vector<Item> items(2);
     api.list("items", items, [](tesser::Object& o, Item& i) {
         o.value("x", i.x);
-        o.file("blob").text([] { return std::string("b"); }, nullptr);
+        int x = i.x;
+        o.file("blob").text([x] { return std::to_string(x); }, nullptr);
     });
+    items[1].x = 7;
+    CHECK_EQ(download(api, "/items/1/blob", admin), "7");
+    CHECK(download(api, "/items/2/blob", admin).find("not_found") != std::string::npos);
+}
+
+TEST(file_busy_per_path) {
+    Api api;
+    Dir dir(api);
     tesser::Client admin;
     admin.authenticated = true;
-    CHECK(download(api, "/items/0/blob", admin).find("not_allowed") != std::string::npos);
+    FileTransfer a(api);
+    tesser::StringReply reply;
+    CHECK(a.openUpload("/files/entries/cal.json/content", admin, 4, reply) == FileTransfer::Open::Ok);
+    // The same file is busy (with or without a trailing slash), another isn't.
+    CHECK(upload(api, "/files/entries/cal.json/content", "abcd", admin).find("\"busy\"") != std::string::npos);
+    CHECK(download(api, "/files/entries/cal.json/content/", admin).find("\"busy\"") != std::string::npos);
+    CHECK_EQ(download(api, "/files/entries/notes.txt/content", admin), "hello");
+    CHECK(a.write(reinterpret_cast<const uint8_t*>("abcd"), 4, reply));
+    a.finish(reply);
+    CHECK_EQ(reply.body, "\"cal.json\"");
+    CHECK_EQ(download(api, "/files/entries/cal.json/content", admin), "abcd");
+    {
+        // An abandoned transfer frees the path too.
+        FileTransfer b(api);
+        CHECK(b.openUpload("/files/entries/cal.json/content", admin, 4, reply) == FileTransfer::Open::Ok);
+    }
+    CHECK_EQ(dir.aborted, 1);
+    CHECK_EQ(download(api, "/files/entries/cal.json/content", admin), "abcd");
+}
+
+TEST(file_upload_name) {
+    Api api;
+    Dir dir(api);
+    tesser::Client admin;
+    admin.authenticated = true;
+    CHECK_EQ(upload(api, "/files/upload", "new", admin, 8, "new.txt"), "ok \"new.txt\"");
+    CHECK_EQ(*dir.find("new.txt"), "new");
+    CHECK_EQ(download(api, "/files/entries/new.txt/content", admin), "new");
+    // The handler validates the name; none given is empty.
+    CHECK(upload(api, "/files/upload", "x", admin, 8, "a/b").find("bad file name") != std::string::npos);
+    CHECK(upload(api, "/files/upload", "x", admin).find("bad file name") != std::string::npos);
+    // Downloads still suggest the node's name by default.
+    Fixture f;
+    std::string name;
+    download(f.api, "/sys/config", tesser::Client(), &name);
+    CHECK_EQ(name, "config");
 }
 
 }  // namespace file_cases

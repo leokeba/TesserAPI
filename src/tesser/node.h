@@ -635,8 +635,10 @@ private:
 struct FileRequest {
     explicit FileRequest(const Client& c) : client(c) {}
     const Client& client;
-    uint64_t size = 0;     // upload: the bytes announced (Content-Length)
-    std::string filename;  // download: the name to suggest (default: the node's)
+    uint64_t size = 0;  // upload: the bytes announced (Content-Length)
+    // Download: the name to suggest (default: the node's). Upload: the name
+    // the client gave (HTTP: ?filename=), empty if none; unchecked.
+    std::string filename;
     Status status = Status::Ok;
     const char* message = nullptr;
     // Refuses the transfer (the handler then returns null).
@@ -673,7 +675,10 @@ public:
 
 // Binary content streamed to and from the device: firmware images, backups,
 // core dumps (docs/DESIGN.md section 4.6). Transferred by HTTP only; the
-// handlers' transfers run outside the API lock.
+// handlers' transfers run outside the API lock. In a list element, the node
+// is temporary: its handlers run while the element exists, but the sinks and
+// sources they return (and a text() setter) outlive it, so they must not
+// reference the element.
 class FileNode : public Annotated<FileNode> {
 public:
     using Upload = std::function<std::unique_ptr<FileSink>(FileRequest& request)>;
@@ -728,9 +733,6 @@ public:
     // Used by FileTransfer.
     std::unique_ptr<FileSink> openUpload(FileRequest& r) { return upload_ ? upload_(r) : nullptr; }
     std::unique_ptr<FileSource> openDownload(FileRequest& r) { return download_ ? download_(r) : nullptr; }
-    // One transfer at a time.
-    bool claim() { return !busy_.exchange(true); }
-    void release() { busy_.store(false); }
 
 private:
     Upload upload_;
@@ -738,7 +740,6 @@ private:
     uint64_t maxSize_ = 0;
     const char* contentType_ = "application/octet-stream";
     const char* accept_ = nullptr;
-    std::atomic<bool> busy_{false};
 };
 
 // An array of scalars bound to a std::vector (resizable, up to maxSize()),
