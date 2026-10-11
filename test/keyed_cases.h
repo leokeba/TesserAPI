@@ -56,7 +56,7 @@ TEST(keyed_read) {
     Resp r = cases::get(f.api, "/sources/Mars/az");
     CHECK_EQ(r.status, Status::NotFound);
     CHECK(r.body.find("\"path\":\"/sources/Mars\"") != std::string::npos);
-    CHECK_EQ(cases::get(f.api, "/sources", cases::schema(0)).body, "{\"type\":\"list\",\"maxSize\":4,\"key\":\"name\"}");
+    CHECK_EQ(cases::get(f.api, "/sources", cases::schema(0)).body, "{\"type\":\"list\",\"writable\":true,\"maxSize\":4,\"key\":\"name\"}");
     // Secrets stay hidden in elements.
     CHECK_EQ(cases::get(f.api, "/networks/home").body, "{\"ssid\":\"home\",\"password\":null,\"priority\":1}");
 }

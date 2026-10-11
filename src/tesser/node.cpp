@@ -224,6 +224,19 @@ Check Node::checkRange(double v) const {
     return Check::ok();
 }
 
+void ListNode::markReadOnly(Object& element) {
+    for (Node* n = element.first(); n; n = n->next()) {
+        switch (n->type()) {
+            case NodeType::Value: static_cast<ValueNode*>(n)->readOnly(); break;
+            case NodeType::Array: static_cast<ArrayNode*>(n)->readOnly(); break;
+            case NodeType::Custom: static_cast<CustomNode*>(n)->readOnly(); break;
+            case NodeType::List: static_cast<ListNode*>(n)->readOnly(); break;
+            case NodeType::Object: markReadOnly(*static_cast<Object*>(n)); break;
+            default: break;
+        }
+    }
+}
+
 ListNode& ListNode::key(const char* field) {
     key_ = field;
     touch();

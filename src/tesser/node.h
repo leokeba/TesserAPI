@@ -549,8 +549,12 @@ public:
         setFlag(kPersist);
         return *this;
     }
+    CustomNode& readOnly() {
+        setFlag(kReadOnly);
+        return *this;
+    }
 
-    bool writable() const { return static_cast<bool>(applier_); }
+    bool writable() const { return applier_ && !(flags_ & kReadOnly); }
     void write(JsonWriter& w) const {
         if (writer_) {
             writer_(w);
@@ -606,6 +610,20 @@ public:
         setFlag(kPersist);
         return *this;
     }
+    // Clients can't change the list: its size, its elements or their values
+    // are refused (read_only), and the schema says so. Actions in its
+    // elements still run. For state the application fills (scan results,
+    // peers nearby).
+    ListNode& readOnly() {
+        setFlag(kReadOnly);
+        return *this;
+    }
+    bool writable() const { return !(flags_ & kReadOnly); }
+
+protected:
+    // Marks what an element of a read-only list holds read-only, all the way
+    // down.
+    static void markReadOnly(Object& element);
 
 private:
     size_t maxSize_ = 32;
@@ -1283,11 +1301,13 @@ public:
     std::unique_ptr<Object> element(size_t i) const override {
         std::unique_ptr<Object> o(new Object(nullptr));
         describe_(*o, items_[i]);
+        if (!writable()) markReadOnly(*o);
         return o;
     }
     std::unique_ptr<Object> prototype() const override {
         std::unique_ptr<Prototype> p(new Prototype());
         describe_(*p, p->value);
+        if (!writable()) markReadOnly(*p);
         return std::unique_ptr<Object>(p.release());
     }
     void resize(size_t n) override { items_.resize(n); }

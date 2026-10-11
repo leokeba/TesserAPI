@@ -208,7 +208,8 @@ api.list("levels", levels, [](tesser::Object& o, int& v) { o.value("v", v); }); 
 - **Reading:** `GET /remotes` renders an array of objects; `/remotes/1` and `/remotes/1/port` address elements and fields by index (`/remotes/01` and out-of-range indexes are `not_found`).
 - **Writing:** set a field (`PUT /remotes/1/port 8080`) or patch an element (`{"port": 1}`), and actions inside elements work too.
 - **Replacing:** setting the list itself to an array replaces it. The array's length is the new size (capped by `maxSize`, default 32). Each array item is a patch for the element at that index; existing elements keep the fields the patch omits, new ones start from defaults. Every item is validated before anything changes. The same applies inside a parent patch.
-- **Schema:** `{"type": "list", "maxSize": n, "items": <element schema>}`.
+- **Schema:** `{"type": "list", "writable": true, "maxSize": n, "items": <element schema>}`.
+- **Read-only:** `api.list("nearby", peers).readOnly()` is a list the application fills (scan results, peers nearby). Replacing it, in a parent patch too, and writing its elements or their values are `read_only`; actions in its elements still run. Its schema has no `writable`, nor do its elements' values, so a user interface offers no add or remove controls. It is persisted and restored only with `.persist()`, like any list.
 - **Subscriptions and persistence** treat the list as one value: a write anywhere in it marks the list changed, change notifications carry the whole list, and `.persist()` saves it whole. Subscribing below a list is `not_allowed`, since its elements are temporary.
 
 **Keyed lists.** `.key("name")` names each element by one of its fields, a string value, so elements are addressed by key instead of by index:
@@ -391,7 +392,7 @@ GET /lamp?view=schema
 ```
 
 - **Types:** `object`, `boolean`, `integer`, `number`, `string`, `action`, `event`, `custom`, `list` (§4.4), `array` (§4.5), `remote` (§14).
-- **Optional keys:** `writable` (only when true), `min`, `max` (values and action arguments), `persist`, `description`, `arg`, `params` (an object argument's schema, §4.2), `returns` and `deferred` (actions), `maxLength` (`char[N]`), `enum`, `secret` (§4.1), `access` (the node's own write level when it isn't `public`, §13), and the presentation keys of §7.1.
+- **Optional keys:** `writable` (only when true; values, arrays, lists and custom nodes), `min`, `max` (values and action arguments), `persist`, `description`, `arg`, `params` (an object argument's schema, §4.2), `returns` and `deferred` (actions), `maxLength` (`char[N]`), `enum`, `secret` (§4.1), `access` (the node's own write level when it isn't `public`, §13), and the presentation keys of §7.1.
 - `depth`, `keys` and the shape apply to `children` the same way.
 - A schema leaf is always an object containing `"type"`. Children are always under `"children"`, so a child named `type` can't be confused with a descriptor.
 - Schema output is compiled out with `TESSER_NO_SCHEMA` when flash is tight.

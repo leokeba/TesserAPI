@@ -58,13 +58,13 @@ TEST(list_get) {
     // TesserUI reads a list's schema on its own path: the element schema
     // comes in full, nested objects included.
     CHECK_EQ(get(t.api, "/a/b/c/d/e/f/g/h/networks", cases::schema(16)).body,
-             "{\"type\":\"list\",\"maxSize\":32,\"key\":\"ssid\",\"items\":{\"type\":\"object\",\"children\":{"
+             "{\"type\":\"list\",\"writable\":true,\"maxSize\":32,\"key\":\"ssid\",\"items\":{\"type\":\"object\",\"children\":{"
              "\"ssid\":{\"type\":\"string\",\"writable\":true},\"static\":{\"type\":\"object\",\"children\":{"
              "\"dhcp\":{\"type\":\"boolean\",\"writable\":true},\"addr\":{\"type\":\"object\",\"children\":{"
              "\"ip\":{\"type\":\"integer\",\"writable\":true}}}}}}}}");
     CHECK_EQ(get(f.api, "/remotes", cases::keys("host")).status, Status::BadRequest);
     CHECK_EQ(get(f.api, "/remotes", cases::schema()).body,
-             "{\"type\":\"list\",\"maxSize\":3,\"items\":{\"type\":\"object\",\"children\":{"
+             "{\"type\":\"list\",\"writable\":true,\"maxSize\":3,\"items\":{\"type\":\"object\",\"children\":{"
              "\"host\":{\"type\":\"string\",\"writable\":true},"
              "\"port\":{\"type\":\"integer\",\"writable\":true,\"min\":1,\"max\":65535},"
              "\"enabled\":{\"type\":\"boolean\",\"writable\":true},"
@@ -107,6 +107,25 @@ TEST(list_replace) {
     CHECK_EQ(r.body, "{\"remotes\":[{\"host\":\"z\",\"port\":5,\"enabled\":true}]}");
     CHECK_EQ(set(f.api, "/", "{\"remotes\":[]}").body, "{\"remotes\":[]}");
     CHECK(f.remotes.empty());
+}
+
+// A list the application fills: clients read it and call its actions.
+TEST(list_read_only) {
+    Fixture f;
+    f.list->readOnly();
+    cases::Resp r = get(f.api, "/remotes", cases::schema());
+    CHECK(r.body.find("{\"type\":\"list\",\"maxSize\":3,") == 0);
+    CHECK(r.body.find("writable") == std::string::npos);  // nor its elements' values
+    CHECK_EQ(set(f.api, "/remotes", "[]").status, Status::ReadOnly);
+    CHECK_EQ(set(f.api, "/", "{\"remotes\":[]}").status, Status::ReadOnly);
+    CHECK_EQ(set(f.api, "/remotes/0/port", "8080").status, Status::ReadOnly);
+    CHECK_EQ(set(f.api, "/remotes/1", "{\"host\":\"c\"}").status, Status::ReadOnly);
+    CHECK_EQ(f.remotes.size(), 2u);
+    CHECK_EQ(f.remotes[0].port, 80);
+    CHECK_EQ(f.remotes[1].host, "b");
+    CHECK_EQ(get(f.api, "/remotes/1/host").body, "\"b\"");
+    CHECK_EQ(set(f.api, "/remotes/0/disable", nullptr).status, Status::Ok);
+    CHECK(!f.remotes[0].enabled);
 }
 
 TEST(list_subscriptions_and_persistence) {

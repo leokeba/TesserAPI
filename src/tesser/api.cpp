@@ -690,6 +690,10 @@ private:
             }
             case NodeType::List: {
                 w.string("list");
+                if (static_cast<const ListNode&>(n).writable()) {
+                    w.key("writable");
+                    w.boolean(true);
+                }
                 w.key("maxSize");
                 w.uinteger(static_cast<const ListNode&>(n).maxSize());
                 if (const char* k = static_cast<const ListNode&>(n).keyField()) {
@@ -1062,6 +1066,7 @@ private:
     }
 
     __attribute__((noinline)) bool validateList(ListNode& list, JsonVariantConst v, Access need) {
+        if (!list.writable()) return error(Status::ReadOnly, "read-only");
         if (!v.is<JsonArrayConst>()) return error(Status::InvalidValue, "expected array");
         JsonArrayConst items = v.as<JsonArrayConst>();
         if (items.size() > list.maxSize()) return error(Status::InvalidValue, "too many elements");
