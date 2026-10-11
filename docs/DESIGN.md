@@ -529,6 +529,7 @@ http.attach(handle, "/api");     // registers a wildcard URI on an existing http
 - `begin()` starts a dedicated server with wildcard URI matching and an 8 KB stack. `attach()` uses 4 handler slots (5 with CORS, 6 with WebSocket) on an existing server, which must use `httpd_uri_match_wildcard` and should have at least 8 KB of stack. Measured peak use is about 4.9 KB: recursive rendering, newlib's float formatting and lwIP all run on it.
 - `enableCors(origin)` adds `Access-Control-Allow-*` headers and answers `OPTIONS` preflights with 204.
 - The client's IP address is passed to the core in `Client`.
+- **mDNS:** `http.advertise("Heliostat 3", "heliostat-3")` announces a `_tesser._tcp` service on the server's port, with the API's base path and WebSocket path in its TXT record (`api=/api`, `ws=/ws`), and the hostname `heliostat-3.local`. Browsers can't browse mDNS, but they resolve `.local` names, and TesserUI's bridge lists these services. It needs the mdns component: Arduino-ESP32 ships it; on ESP-IDF the application adds `espressif/mdns`, which the component then links. If the application started mDNS itself, its hostname is kept unless one is given.
 
 ### 10.3 NowTP
 

@@ -16,6 +16,15 @@
 #include "tesser/envelope.h"
 #include "tesser/file.h"
 
+// mDNS (advertise()): Arduino-ESP32 ships the component; on ESP-IDF, the
+// component's CMakeLists links espressif/mdns when the application has it.
+#if defined(TESSER_HAVE_MDNS) || (defined(ARDUINO) && __has_include("mdns.h"))
+#define TESSER_MDNS 1
+#include "mdns.h"
+#else
+#define TESSER_MDNS 0
+#endif
+
 namespace tesser {
 
 namespace {
@@ -461,6 +470,23 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
 #endif
 }
 
+esp_err_t HttpServer::advertise(const char* instance, const char* hostname) {
+#if TESSER_MDNS
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;  // started by the application
+    if (hostname && (err = mdns_hostname_set(hostname)) != ESP_OK) return err;
+    if (instance) mdns_instance_name_set(instance);
+    std::string api = base_.empty() ? std::string("/") : base_;
+    mdns_txt_item_t txt[2] = {{"api", api.c_str()}, {"ws", wsUri_ ? wsUri_ : ""}};
+    if (mdns_service_exists("_tesser", "_tcp", nullptr)) mdns_service_remove("_tesser", "_tcp");
+    return mdns_service_add(instance, "_tesser", "_tcp", port_, txt, wsUri_ ? 2 : 1);  // the TXT is copied
+#else
+    (void)instance;
+    (void)hostname;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
 esp_err_t HttpServer::begin(uint16_t port, const char* basePath) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
@@ -475,6 +501,7 @@ esp_err_t HttpServer::begin(uint16_t port, const char* basePath) {
 
 esp_err_t HttpServer::begin(httpd_config_t config, const char* basePath) {
     if (server_) return ESP_ERR_INVALID_STATE;
+    port_ = config.server_port;
     config.uri_match_fn = httpd_uri_match_wildcard;
     if (wsUri_) {
         // Notices closed WebSocket connections at once.

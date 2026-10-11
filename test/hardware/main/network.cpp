@@ -242,5 +242,7 @@ void startNetwork(tesser::Api& api) {
         g_http->enableWebSocket("/ws");
         g_http->setToken("test-token");
         printf("HTTP err=%d url=http://%s/api/\n", int(g_http->begin(80, "/api")), g_ip);
+        // <name>.local, and a _tesser._tcp service for TesserUI's bridge.
+        printf("MDNS %d\n", int(g_http->advertise(name, name)));
     }
 }

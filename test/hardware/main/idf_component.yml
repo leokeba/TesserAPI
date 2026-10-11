@@ -1,3 +1,5 @@
 dependencies:
+  # HttpServer::advertise()
+  espressif/mdns: "^1.4"
   nowtp:
     git: https://github.com/leokeba/NowTP.git

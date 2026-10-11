@@ -38,6 +38,14 @@ if(ESP_PLATFORM)
     if(TESSER_NOWTP)
         list(APPEND TESSER_SRCS src/tesser/transports/nowtp_transport.cpp)
     endif()
+    # HttpServer::advertise() uses mDNS when the application has the
+    # espressif/mdns component.
+    set(TESSER_MDNS "")
+    foreach(c ${TESSER_BUILD_COMPONENTS})
+        if(c MATCHES "(^|__)mdns$")
+            set(TESSER_MDNS ${c})
+        endif()
+    endforeach()
     # The Bluetooth transport compiles to nothing unless the application
     # enables NimBLE. "bt" is always a requirement: requirements are resolved
     # before the configuration is known, and without BT it builds nothing.
@@ -53,6 +61,11 @@ if(ESP_PLATFORM)
         idf_component_get_property(TESSER_NOWTP_LIB ${TESSER_NOWTP} COMPONENT_LIB)
         target_link_libraries(${COMPONENT_LIB} PUBLIC ${TESSER_NOWTP_LIB})
         target_compile_definitions(${COMPONENT_LIB} PUBLIC TESSER_HAVE_NOWTP=1)
+    endif()
+    if(TESSER_MDNS)
+        idf_component_get_property(TESSER_MDNS_LIB ${TESSER_MDNS} COMPONENT_LIB)
+        target_link_libraries(${COMPONENT_LIB} PRIVATE ${TESSER_MDNS_LIB})
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE TESSER_HAVE_MDNS=1)
     endif()
     return()
 endif()

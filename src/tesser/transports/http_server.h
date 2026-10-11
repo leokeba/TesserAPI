@@ -57,6 +57,14 @@ public:
     // selects. The string must outlive the server.
     void setToken(const char* token) { token_ = token; }
 
+    // Announces the node on the local network with mDNS (docs/DESIGN.md
+    // section 10.2): a "_tesser._tcp" service named `instance`, with the
+    // API's base path and WebSocket path in its TXT record ("api", "ws"),
+    // and <hostname>.local when a hostname is given. After begin() or
+    // attach(). Needs the mdns component: Arduino-ESP32 ships it; on ESP-IDF,
+    // add espressif/mdns to the application. ESP_ERR_NOT_SUPPORTED otherwise.
+    esp_err_t advertise(const char* instance, const char* hostname = nullptr);
+
     httpd_handle_t handle() const { return server_; }
     Api& api() { return api_; }
 
@@ -81,6 +89,7 @@ private:
     Api& api_;
     httpd_handle_t server_ = nullptr;
     bool ownsServer_ = false;
+    uint16_t port_ = 80;
     std::string base_;
     std::string pattern_;
     const char* corsOrigin_ = nullptr;
