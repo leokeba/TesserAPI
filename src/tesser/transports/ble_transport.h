@@ -78,11 +78,10 @@ public:
 
     // Handles what the client wrote, in the caller's task (loop()), under
     // the API lock. After a disconnection, drops the client's subscriptions
-    // and advertises again.
+    // and token, and advertises again.
     void poll() {
         if (dropped_.exchange(false)) {
-            api_.dropSubscriber(&line_);
-            line_.feed('\n');  // ends a line cut short; its reply goes nowhere
+            line_.reset();  // subscriptions, a line cut short, the token
             BLEDevice::startAdvertising();
         }
         std::string in;
@@ -98,6 +97,8 @@ public:
 
     // Requests count as authenticated (access levels, Api::authorize())
     // only when set: for a bench, or a link the application secures itself.
+    // Otherwise the client's level is the API's token check's answer for the
+    // token it sent with {"op":"auth"}, or for none (LineTransport).
     void setAuthenticated(bool authenticated) { line_.setAuthenticated(authenticated); }
 
 private:
@@ -181,6 +182,8 @@ public:
     LineTransport& lines() { return line_; }
     // Requests count as authenticated (access levels, Api::authorize())
     // only when set: for a bench, or a link the application secures itself.
+    // Otherwise the client's level is the API's token check's answer for the
+    // token it sent with {"op":"auth"}, or for none (LineTransport).
     void setAuthenticated(bool authenticated) { line_.setAuthenticated(authenticated); }
 
     // NimBLE's callbacks (C function pointers), forwarded to the instance.

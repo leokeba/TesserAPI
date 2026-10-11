@@ -493,7 +493,7 @@ These transports are message-based and two-way, so they share one JSON envelope.
 ```
 
 - **`id`:** any JSON scalar, echoed verbatim. It may be omitted, in which case the response also has no `id`.
-- **`op`:** `get`, `set`, `sub` or `unsub`. The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `events`, `snapshot` and `body` map one-to-one onto `Request`.
+- **`op`:** `get`, `set`, `sub` or `unsub`; on serial and Bluetooth lines also `auth` (§10.4). The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `events`, `snapshot` and `body` map one-to-one onto `Request`.
 - **Unknown envelope keys** are ignored, for forward compatibility.
 - **Response:** the response is written as a stream: `{"id":…,"status":"…","body":` followed by the body and then `}`.
   - **Buffered** (NowTP, and every deferred or queued reply): the envelope is sent whole, up to `maxResponse`. A larger body is replaced with a `too_large` error.
@@ -557,6 +557,12 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 - Leading control and non-ASCII bytes are skipped, since a UART picks them up while the peer resets.
 - When the UART is also the console, log output from other tasks can interleave with a reply on the same line. Use a dedicated UART, or lower the log level once the transport is serving.
 - Responses stream (§10.1): one line however long. The output lock is held from the first piece to the end of the line, so notifications and deferred replies from other tasks wait for it.
+- **Tokens:** a line is authenticated by default (physical access, §13.2). One that isn't (`setAuthenticated(false)`, Bluetooth) is at the level the API's token check gives its token, checked for every request like an HTTP request's: the empty token at first, so a device whose check opens up to anyone (no admin account yet) is as usable over the line as over HTTP. The client presents a token with an `auth` envelope, which holds until the next one or `reset()` (a Bluetooth disconnection):
+  ```json
+  → {"id": 1, "op": "auth", "token": "3f9c…"}
+  ← {"id": 1, "status": "ok", "body": {"access": "admin"}}
+  ```
+  The reply gives the line's level now, `public` for a token the check refuses. An empty or missing token signs out. When the level drops, the line's subscriptions are dropped too, since they keep the level they were made at; a client that signs in keeps its subscriptions at their lower level and subscribes again to see more. An authenticated line accepts `auth` and stays `admin`.
 
 ### 10.5 WebSocket
 
@@ -595,7 +601,7 @@ The serial lines of §10.4 over the **Nordic UART Service**, so browsers (Web Bl
 - **Pacing, ESP-IDF:** TX offers notifications and indications, and sends what the client subscribed to (browsers take notifications). NimBLE queues an accepted notification until the link carries it, and refuses one when its buffer pool is full; the transport then waits 10 ms and tries again, which paces a long reply. Indications go one at a time, each confirmed. Measured from an ESP32 to a Mac (MTU 517): about 60 ms per request, 12.8 KB/s for long replies.
 - **Pacing, Arduino:** indications only, since the Arduino library drops the notifications its queue can't take; each confirmation paces the next. About 120 ms per request, 6.3 KB/s.
 - Replies stream (§10.1), so their size isn't limited.
-- **Authentication:** anyone in range can connect, so the line is not authenticated by default (§13.2); `setAuthenticated(true)` is for a bench or a link the application secures itself (pairing, bonding).
+- **Authentication:** anyone in range can connect, so the line is not authenticated by default (§13.2): its level is the token check's for the token sent with `auth` (§10.4), or for none. A disconnection forgets the token. `setAuthenticated(true)` is for a bench or a link the application secures itself (pairing, bonding).
 - **Flash:** NimBLE adds about 400 KB (an ESP-IDF example is 510 KB). Bluedroid on Arduino's ESP32 makes a sketch about 1.7 MB: it needs a larger app partition than the default 1.25 MB (`huge_app`).
 - **ESP-IDF component:** `bt` is a private requirement; the transport compiles to nothing without `CONFIG_BT_NIMBLE_ENABLED`.
 
@@ -690,8 +696,9 @@ api.authenticate([](std::string_view token) { return users.check(token); });   /
 
 **A client's level** (`Client::level()`) comes from its transport:
 - A transport that knows levels sets `Client::access`.
-- A transport that only knows "authenticated" (`Client::authenticated`, below) gives an authenticated client `admin` and any other `public`. That is the case of serial lines and trusted NowTP peers. A `LocalClient` is `admin` by default; `setAccess(level)` gives it any level (§14.2).
+- A transport that only knows "authenticated" (`Client::authenticated`, below) gives an authenticated client `admin` and any other `public`. That is the case of trusted NowTP peers, and of serial lines unless they are unauthenticated (below). A `LocalClient` is `admin` by default; `setAccess(level)` gives it any level (§14.2).
 - HTTP and WebSocket clients present a token. The transport's own token (`HttpServer::setToken`) gives `admin`. Any other token, or none (an empty token), goes to the API's token check, `api.authenticate(fn)`, whose answer is the client's level; without a check, `public`. A WebSocket connection's level is decided once, from its handshake.
+- Unauthenticated lines (Bluetooth) present a token with an `auth` envelope (§10.4), checked the same way for every request; until then, the empty token.
 - **Gateways:** a gateway checks levels of its own clients before forwarding. The remote node sees the gateway as its client (a trusted peer is `admin`), not the browser behind it.
 
 ### 13.2 Authorizer and authentication
@@ -706,8 +713,8 @@ api.authenticate([](std::string_view token) { return users.check(token); });   /
 | HTTP | `HttpServer::setToken(token)` is set and the request carries `Authorization: Bearer <token>` or `?token=<token>` (`admin`), or the API's token check gives its token a level above `public` (§13.1) |
 | WebSocket | Same checks, on the handshake |
 | NowTP | The sender is in `NowTpTransport::trustPeers({...})`, or `DatagramEndpoint::trust(fn)` accepts it. ESP-NOW frames carry no proof of origin, so this trusts MAC addresses; combine it with encrypted NowTP peers when that matters. |
-| Serial | Always (physical access), unless `LineTransport::setAuthenticated(false)` |
-| Bluetooth LE | Never (anyone in range can connect), unless `BleTransport::setAuthenticated(true)` |
+| Serial | Always (physical access), unless `LineTransport::setAuthenticated(false)`: then as Bluetooth LE |
+| Bluetooth LE | When the API's token check gives the line's token (`auth`, §10.4), or the empty one, a level above `public`; always with `BleTransport::setAuthenticated(true)` |
 
 - `Client` also carries the transport kind and the address (IP or MAC), for authorizers that need more.
 - Hiding nodes from the schema is not access control: the authorizer runs on every access.

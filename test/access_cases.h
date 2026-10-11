@@ -211,4 +211,61 @@ TEST(access_local_client_level) {
     CHECK_EQ(log.last(), "ok 83");
 }
 
+// An unauthenticated line (Bluetooth) gets its level from the token check,
+// for no token until it sends one with "auth".
+TEST(access_line_tokens) {
+    Device d;
+    bool open = true;  // no admin account yet: any token, none included, is admin
+    d.api.authenticate([&](std::string_view token) {
+        if (open || token == "a") return Access::Admin;
+        return token == "u" ? Access::User : Access::Public;
+    });
+    cases::Lines lines;
+    tesser::LineTransport t(d.api, [&](const char* data, size_t n) { lines.add(data, n); });
+    t.setAuthenticated(false);
+    auto line = [&](const char* text) {
+        lines.out.clear();
+        t.feed(text, strlen(text));
+        t.feed('\n');
+        return lines.out.size() == 1 ? lines.out[0] : "<" + std::to_string(lines.out.size()) + " lines>";
+    };
+    const char* setPort = "{\"op\":\"set\",\"path\":\"/net/port\",\"body\":81}";
+    CHECK_EQ(line(setPort), "{\"status\":\"ok\",\"body\":81}");
+    open = false;
+    CHECK(line(setPort).find("unauthorized") != std::string::npos);
+
+    CHECK_EQ(line("{\"id\":1,\"op\":\"auth\",\"token\":\"u\"}"), "{\"id\":1,\"status\":\"ok\",\"body\":{\"access\":\"user\"}}");
+    CHECK(line(setPort).find("unauthorized") != std::string::npos);
+    CHECK_EQ(line("{\"op\":\"set\",\"path\":\"/brightness\",\"body\":11}"), "{\"status\":\"ok\",\"body\":11}");
+    CHECK_EQ(line("{\"op\":\"auth\",\"token\":\"bad\"}"), "{\"status\":\"ok\",\"body\":{\"access\":\"public\"}}");
+    CHECK_EQ(line("{\"op\":\"auth\",\"token\":\"a\"}"), "{\"status\":\"ok\",\"body\":{\"access\":\"admin\"}}");
+    CHECK_EQ(line(setPort), "{\"status\":\"ok\",\"body\":81}");
+
+    // Signing out drops subscriptions made at the higher level.
+    CHECK_EQ(line("{\"op\":\"sub\",\"path\":\"/users\"}"), "{\"status\":\"ok\",\"body\":{\"admin\":null}}");
+    lines.out.clear();
+    d.login->emit("root");
+    d.api.poll(500);
+    CHECK_EQ(lines.out.size(), 1u);
+    CHECK_EQ(line("{\"op\":\"auth\"}"), "{\"status\":\"ok\",\"body\":{\"access\":\"public\"}}");
+    lines.out.clear();
+    d.login->emit("root");
+    d.api.poll(1000);
+    CHECK_EQ(lines.out.size(), 0u);
+
+    CHECK(line("{\"op\":\"auth\",\"token\":5}").find("token must be a string") != std::string::npos);
+    CHECK(line("{\"id\":{},\"op\":\"auth\",\"token\":\"a\"}").find("id must be a scalar") != std::string::npos);
+    CHECK(line(setPort).find("unauthorized") != std::string::npos);
+
+    // reset() (a disconnection) forgets the token.
+    line("{\"op\":\"auth\",\"token\":\"a\"}");
+    t.reset();
+    CHECK(line(setPort).find("unauthorized") != std::string::npos);
+
+    // An authenticated line stays admin whatever its token.
+    t.setAuthenticated(true);
+    CHECK_EQ(line("{\"op\":\"auth\",\"token\":\"bad\"}"), "{\"status\":\"ok\",\"body\":{\"access\":\"admin\"}}");
+    CHECK_EQ(line(setPort), "{\"status\":\"ok\",\"body\":81}");
+}
+
 }  // namespace access_cases

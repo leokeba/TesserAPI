@@ -177,15 +177,14 @@ int BleTransport::access(uint16_t, uint16_t attr, ble_gatt_access_ctxt* ctxt, vo
 }
 
 // Requests are handled here, under the API lock. After a disconnection,
-// the client's subscriptions are dropped.
+// the client's subscriptions and token are dropped.
 void BleTransport::taskEntry(void* arg) {
     auto* self = static_cast<BleTransport*>(arg);
     std::string in;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
         if (self->dropped_.exchange(false)) {
-            self->api_.dropSubscriber(&self->line_);
-            self->line_.feed('\n');  // ends a line cut short; its reply goes nowhere
+            self->line_.reset();  // subscriptions, a line cut short, the token
         }
         {
             MutexGuard guard(self->inMutex_);

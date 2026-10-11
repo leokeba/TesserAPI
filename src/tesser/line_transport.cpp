@@ -1,6 +1,7 @@
 #include "tesser/line_transport.h"
 
 #include "tesser/api.h"
+#include "tesser/call.h"
 
 namespace tesser {
 
@@ -53,11 +54,62 @@ void LineTransport::handleLine() {
     if (start >= line_.size() || line_[start] != '{') return;
     std::string_view text(line_.data() + start, line_.size() - start);
     if (!text.empty() && text.back() == '\r') text.remove_suffix(1);
-    Client client;
-    client.transport = TransportKind::Serial;
-    client.authenticated = authenticated_;
-    handleEnvelope(api_, text, client, [this](const std::string& m) { send(m); }, this,
-                   [this](const char* data, size_t len, bool first, bool final) { return sendPiece(data, len, first, final); });
+
+    JsonDocument doc;
+    Request req;
+    EnvelopeId id;
+    const char* message = nullptr;
+    Status s = parseEnvelope(text, doc, api_.config().maxDepth, req, id, message);
+    if (s != Status::Ok && doc.is<JsonObjectConst>()) {
+        // "auth" isn't a request op, so it fails to parse as one; a usable
+        // id (none, or one that was kept) means the op is what failed.
+        JsonObjectConst env = doc.as<JsonObjectConst>();
+        if (env["op"] == "auth" && (id.length || env["id"].isNull())) {
+            handleAuth(env, id);
+            return;
+        }
+    }
+    EnvelopeReply reply(id, api_.config().maxResponse, [this](const std::string& m) { send(m); });
+    reply.stream([this](const char* data, size_t len, bool first, bool final) { return sendPiece(data, len, first, final); });
+    if (s != Status::Ok) {
+        writeError(reply, s, std::string_view(), message);
+        return;
+    }
+    req.client.transport = TransportKind::Serial;
+    req.client.access = level();
+    req.client.authenticated = req.client.access != Access::Public;
+    req.subscriber = this;
+    api_.handle(req, reply);
+}
+
+Access LineTransport::level() const { return authenticated_ ? Access::Admin : api_.tokenAccess(token_); }
+
+// {"op":"auth","token":"..."} sets the line's token until the next one or
+// reset(); an empty or missing token signs out. The reply gives the level.
+void LineTransport::handleAuth(JsonObjectConst envelope, const EnvelopeId& id) {
+    EnvelopeReply reply(id, 0, [this](const std::string& m) { send(m); });
+    JsonVariantConst token = envelope["token"];
+    if (!token.isNull() && !token.is<const char*>()) {
+        writeError(reply, Status::BadRequest, std::string_view(), "token must be a string");
+        return;
+    }
+    Access before = level();
+    JsonString t = token.as<JsonString>();
+    token_.assign(t.c_str() ? t.c_str() : "", t.size());
+    Access after = level();
+    // Subscriptions keep the level they were made at: drop them rather than
+    // show the client what it can no longer read.
+    if (after < before) api_.dropSubscriber(this);
+    std::string body = std::string("{\"access\":\"") + toString(after) + "\"}";
+    reply.begin(Status::Ok).write(body.data(), body.size());
+    reply.end();
+}
+
+void LineTransport::reset() {
+    api_.dropSubscriber(this);
+    line_.clear();
+    discarding_ = false;
+    token_.clear();
 }
 
 // A streamed response line. The output lock is held from the first piece to
