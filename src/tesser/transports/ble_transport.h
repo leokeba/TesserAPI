@@ -36,6 +36,7 @@
 #include <atomic>
 #include <string>
 
+#include "tesser/api.h"
 #include "tesser/line_transport.h"
 #include "tesser/platform.h"
 
