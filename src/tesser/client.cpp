@@ -110,6 +110,7 @@ bool LocalClient::request(Op op, std::string_view path, std::string_view bodyJso
     req.body = doc.as<JsonVariantConst>();
     req.client.transport = TransportKind::Local;
     req.client.authenticated = authenticated_;
+    req.client.access = access_;
     req.subscriber = this;
     LocalReply reply(inbox_, std::move(done));
     api_.handle(req, reply);

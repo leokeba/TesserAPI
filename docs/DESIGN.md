@@ -655,7 +655,7 @@ api.authenticate([](std::string_view token) { return users.check(token); });   /
 
 **A client's level** (`Client::level()`) comes from its transport:
 - A transport that knows levels sets `Client::access`.
-- A transport that only knows "authenticated" (`Client::authenticated`, below) gives an authenticated client `admin` and any other `public`. That is the case of serial lines, trusted NowTP peers and `LocalClient`.
+- A transport that only knows "authenticated" (`Client::authenticated`, below) gives an authenticated client `admin` and any other `public`. That is the case of serial lines and trusted NowTP peers. A `LocalClient` is `admin` by default; `setAccess(level)` gives it any level (§14.2).
 - HTTP and WebSocket clients present a token. The transport's own token (`HttpServer::setToken`) gives `admin`. Any other token, or none (an empty token), goes to the API's token check, `api.authenticate(fn)`, whose answer is the client's level; without a check, `public`. A WebSocket connection's level is decided once, from its handshake.
 - **Gateways:** a gateway checks levels of its own clients before forwarding. The remote node sees the gateway as its client (a trusted peer is `admin`), not the browser behind it.
 
@@ -753,7 +753,7 @@ client.process();                                   // from the UI loop: runs th
 
 - **Callbacks run in `process()`,** in the caller's task, in arrival order. Responses and notifications are queued until then, so a single-threaded UI loop (LVGL) needs no locking. Handlers may send new requests.
 - **Bounded:** at most `maxQueued` notifications (default 16) wait between two `process()` calls. Further ones are dropped, and the server marks the next one `"overflow": true`, which tells the client to re-read. Responses are always queued.
-- **`LocalClient`** goes through `Api::handle()` like a transport, as a `Subscriber`, so subscriptions, deferred actions, queued mode and remote nodes behave as they do for remote clients. Its requests count as authenticated unless `setAuthenticated(false)`. Destroying it drops its subscriptions.
+- **`LocalClient`** goes through `Api::handle()` like a transport, as a `Subscriber`, so subscriptions, deferred actions, queued mode and remote nodes behave as they do for remote clients. Its requests count as authenticated, with `admin` access, unless `setAuthenticated(false)` (`public`). `setAccess(level)` makes its requests and subscriptions act at that level, like an HTTP client whose token has it (authenticated unless `public`): a bridge to an outside protocol such as MQTT uses `Access::User` so that its clients can't reach admin settings, and its notifications leave out what a user can't read. Destroying it drops its subscriptions.
 - **`PeerClient`** sends through a `DatagramEndpoint` and gets the notifications its peer sends to that endpoint. These are per peer, not per client: two clients of the same peer on one endpoint both see both clients' notifications. Destroying it unsubscribes what it subscribed to.
 - **Bodies** are JSON text in, `JsonVariantConst` out. A response that arrives after its client is gone is dropped.
 

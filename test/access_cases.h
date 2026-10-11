@@ -3,6 +3,7 @@
 
 #include <string>
 
+#include "client_cases.h"
 #include "core_cases.h"
 #include "subscription_cases.h"
 
@@ -164,6 +165,50 @@ TEST(access_filters_notifications_and_events) {
     CHECK_EQ(admin.last(), "{\"op\":\"event\",\"path\":\"/users/login\",\"body\":\"admin\"}");
     d.api.dropSubscriber(&user);
     d.api.dropSubscriber(&admin);
+}
+
+// A LocalClient at a given level, as a bridge to an outside protocol uses
+// one: like an HTTP client whose token has that level.
+TEST(access_local_client_level) {
+    Device d;
+    d.api.authorize(tesser::authorizers::readOnlyUnlessAuthenticated());
+    tesser::LocalClient c(d.api);
+    c.setAccess(Access::User);
+    client_cases::Log log;
+    log.watch(c);
+    c.set("/brightness", "20", log.handler());  // authenticated: the authorizer lets it write
+    c.set("/net/port", "81", log.handler());    // admin only
+    c.get("/users/admin", log.handler());       // admins read it
+    c.subscribe("/", log.handler());
+    c.process();
+    CHECK_EQ(log.lines.size(), 4u);
+    if (log.lines.size() == 4) {
+        CHECK_EQ(log.lines[0], "ok 20");
+        CHECK(log.lines[1].find("unauthorized") == 0);
+        CHECK(log.lines[2].find("unauthorized") == 0);
+        CHECK_EQ(log.lines[3], "ok {\"brightness\":20,\"net\":{\"port\":80,\"password\":null}}");
+    }
+    CHECK_EQ(d.brightness, 20);
+    CHECK_EQ(d.port, 80);
+
+    // Its subscription is filtered at its level: no admin-only events.
+    d.login->emit("root");
+    d.api.poll(1000);
+    d.port = 82;
+    d.api.object("net").changed();
+    d.api.poll(2000);
+    CHECK_EQ(c.process(), 1u);
+    CHECK_EQ(log.last(), "{\"op\":\"change\",\"path\":\"/\",\"body\":{\"net\":{\"port\":82,\"password\":null}}}");
+
+    // Public: not authenticated, so read-only; setAuthenticated(true) is admin.
+    c.setAccess(Access::Public);
+    c.set("/brightness", "30", log.handler());
+    c.process();
+    CHECK(log.last().find("unauthorized") == 0);
+    c.setAuthenticated(true);
+    c.set("/net/port", "83", log.handler());
+    c.process();
+    CHECK_EQ(log.last(), "ok 83");
 }
 
 }  // namespace access_cases

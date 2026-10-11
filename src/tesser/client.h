@@ -105,8 +105,20 @@ public:
     bool request(Op op, std::string_view path, std::string_view bodyJson, ResponseHandler done,
                  const Query& query = Query()) override;
 
-    // Requests count as authenticated (Api::authorize()) unless set to false.
-    void setAuthenticated(bool authenticated) { authenticated_ = authenticated; }
+    // Requests count as authenticated (Api::authorize()), with full access,
+    // unless set to false: then public.
+    void setAuthenticated(bool authenticated) {
+        authenticated_ = authenticated;
+        access_ = Access::Public;
+    }
+    // Requests and subscriptions at `level` (docs/DESIGN.md section 13.1), as
+    // for an HTTP client whose token has that level: authenticated unless
+    // public. A bridge to an outside protocol (MQTT, ...) that mustn't reach
+    // admin settings uses Access::User.
+    void setAccess(Access level) {
+        access_ = level;
+        authenticated_ = level != Access::Public;
+    }
 
     // Subscriber
     bool notify(const std::string& message, Delivery delivery) override;
@@ -114,6 +126,7 @@ public:
 private:
     Api& api_;
     bool authenticated_ = true;
+    Access access_ = Access::Public;  // with authenticated_: admin
 };
 
 // A client of another node's API over a DatagramEndpoint (NowTP, ...). Its
