@@ -699,6 +699,7 @@ api.authenticate([](std::string_view token) { return users.check(token); });   /
 - A transport that only knows "authenticated" (`Client::authenticated`, below) gives an authenticated client `admin` and any other `public`. That is the case of trusted NowTP peers, and of serial lines unless they are unauthenticated (below). A `LocalClient` is `admin` by default; `setAccess(level)` gives it any level (§14.2).
 - HTTP and WebSocket clients present a token. The transport's own token (`HttpServer::setToken`) gives `admin`. Any other token, or none (an empty token), goes to the API's token check, `api.authenticate(fn)`, whose answer is the client's level; without a check, `public`. A WebSocket connection's level is decided once, from its handshake.
 - Unauthenticated lines (Bluetooth) present a token with an `auth` envelope (§10.4), checked the same way for every request; until then, the empty token.
+- Untrusted NowTP peers carry no token: they get the empty token's level, as an HTTP request without one does. That is `public` unless the check opens the device to anyone.
 - **Gateways:** a gateway checks levels of its own clients before forwarding. The remote node sees the gateway as its client (a trusted peer is `admin`), not the browser behind it.
 
 ### 13.2 Authorizer and authentication
@@ -712,7 +713,7 @@ api.authenticate([](std::string_view token) { return users.check(token); });   /
 |---|---|
 | HTTP | `HttpServer::setToken(token)` is set and the request carries `Authorization: Bearer <token>` or `?token=<token>` (`admin`), or the API's token check gives its token a level above `public` (§13.1) |
 | WebSocket | Same checks, on the handshake |
-| NowTP | The sender is in `NowTpTransport::trustPeers({...})`, or `DatagramEndpoint::trust(fn)` accepts it. ESP-NOW frames carry no proof of origin, so this trusts MAC addresses; combine it with encrypted NowTP peers when that matters. |
+| NowTP | The sender is in `NowTpTransport::trustPeers({...})`, or `DatagramEndpoint::trust(fn)` accepts it (`admin`), or the API's token check gives the empty token a level above `public`. ESP-NOW frames carry no proof of origin, so trust is in MAC addresses; combine it with encrypted NowTP peers when that matters. |
 | Serial | Always (physical access), unless `LineTransport::setAuthenticated(false)`: then as Bluetooth LE |
 | Bluetooth LE | When the API's token check gives the line's token (`auth`, §10.4), or the empty one, a level above `public`; always with `BleTransport::setAuthenticated(true)` |
 

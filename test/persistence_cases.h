@@ -277,6 +277,16 @@ TEST(auth_by_transport) {
         CHECK(net.frames[1].text.find("\"status\":\"ok\"") != std::string::npos);
     }
     CHECK_EQ(d.lamp.brightness, 4);
+
+    // Untrusted peers get the token check's level for no token, like HTTP.
+    d.api.authenticate([](std::string_view token) { return token.empty() ? tesser::Access::Admin : tesser::Access::Public; });
+    net.frames.clear();
+    const char* req5 = "{\"id\":1,\"op\":\"set\",\"path\":\"/lamp/brightness\",\"body\":5}";
+    server.receive(addr(1), req5, strlen(req5), true);
+    server.process();
+    CHECK_EQ(net.frames.size(), 1u);
+    if (!net.frames.empty()) CHECK(net.frames[0].text.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK_EQ(d.lamp.brightness, 5);
 }
 
 }  // namespace persistence_cases

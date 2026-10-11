@@ -104,7 +104,9 @@ public:
     void removeClient(const ClientInbox* inbox);
 
     // Requests from peers for which `fn` returns true count as authenticated
-    // (see Api::authorize()). Without it, none do.
+    // (see Api::authorize()), with full access. Other peers get the level the
+    // API's token check gives the empty token (Api::tokenAccess("")):
+    // public, unless the check opens the device to anyone.
     void trust(std::function<bool(const PeerAddress&)> fn) { trust_ = std::move(fn); }
 
     // Notifications ("change" / "event" envelopes) from nodes this one
