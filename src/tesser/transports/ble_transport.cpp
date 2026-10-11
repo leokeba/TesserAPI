@@ -55,10 +55,13 @@ esp_err_t BleTransport::begin(const char* name, uint32_t stackSize, UBaseType_t 
         MutexGuard guard(stateMutex_);
         name_ = name;
     }
-    confirmed_ = xSemaphoreCreateBinary();
+    if (!confirmed_) confirmed_ = xSemaphoreCreateBinary();
     if (!confirmed_) return ESP_ERR_NO_MEM;
     esp_err_t err = nimble_port_init();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        instance = nullptr;
+        return err;
+    }
 
     ble_hs_cfg.sync_cb = &BleTransport::onSync;
     ble_svc_gap_init();
@@ -80,11 +83,47 @@ esp_err_t BleTransport::begin(const char* name, uint32_t stackSize, UBaseType_t 
     svcs[0].characteristics = chrs;
     if (ble_gatts_count_cfg(svcs) != 0 || ble_gatts_add_svcs(svcs) != 0) return ESP_FAIL;
 
-    if (xTaskCreate(&BleTransport::taskEntry, "tesser_ble", stackSize, this, priority, &task_) != pdPASS) {
-        return ESP_ERR_NO_MEM;
+    {
+        // After end(), the request task may not have exited yet: it stays.
+        MutexGuard guard(stateMutex_);
+        exit_ = false;
+        if (!task_ && xTaskCreate(&BleTransport::taskEntry, "tesser_ble", stackSize, this, priority, &task_) != pdPASS) {
+            task_ = nullptr;
+            return ESP_ERR_NO_MEM;
+        }
     }
+    up_ = true;
     nimble_port_freertos_init(hostTask);
     return ESP_OK;
+}
+
+esp_err_t BleTransport::end() {
+    if (instance != this || !up_) return ESP_ERR_INVALID_STATE;
+    {
+        MutexGuard guard(sendMutex_);  // waits for a write in progress
+        up_ = false;
+    }
+    synced_ = false;  // no more advertising
+    // Disconnects the client (a disconnection event: the line is reset in
+    // the task) and stops the host task.
+    if (nimble_port_stop() != 0) return ESP_FAIL;
+    esp_err_t err = nimble_port_deinit();  // and the controller
+    conn_ = -1;
+    notify_ = false;
+    indicate_ = false;
+    dropped_ = true;
+    {
+        MutexGuard guard(inMutex_);
+        inbox_.clear();
+        inbox_.shrink_to_fit();
+    }
+    instance = nullptr;
+    {
+        MutexGuard guard(stateMutex_);
+        exit_ = true;
+        if (task_) xTaskNotifyGive(task_);
+    }
+    return err;
 }
 
 void BleTransport::onSync() {
@@ -128,7 +167,7 @@ std::string BleTransport::peerAddress() const {
 
 uint16_t BleTransport::mtu() const {
     int conn = conn_;
-    return conn < 0 ? uint16_t(0) : ble_att_mtu(static_cast<uint16_t>(conn));
+    return conn < 0 || !up_ ? uint16_t(0) : ble_att_mtu(static_cast<uint16_t>(conn));
 }
 
 // The service's UUID fills the advertisement; the name goes in the scan
@@ -237,7 +276,8 @@ int BleTransport::access(uint16_t, uint16_t attr, ble_gatt_access_ctxt* ctxt, vo
 }
 
 // Requests are handled here, under the API lock. After a disconnection,
-// the client's subscriptions and token are dropped.
+// the client's subscriptions and token are dropped. After end(), the task
+// exits between requests.
 void BleTransport::taskEntry(void* arg) {
     auto* self = static_cast<BleTransport*>(arg);
     std::string in;
@@ -247,6 +287,14 @@ void BleTransport::taskEntry(void* arg) {
             self->line_.reset();  // subscriptions, a line cut short, the token
             self->report(false);
         }
+        {
+            MutexGuard guard(self->stateMutex_);
+            if (self->exit_) {
+                self->exit_ = false;
+                self->task_ = nullptr;
+                break;
+            }
+        }
         if (self->conn_ >= 0) self->report(true);
         {
             MutexGuard guard(self->inMutex_);
@@ -255,6 +303,7 @@ void BleTransport::taskEntry(void* arg) {
         if (!in.empty()) self->line_.feed(in.data(), in.size());
         in.clear();
     }
+    vTaskDelete(nullptr);
 }
 
 // In the task: once per change.
@@ -265,7 +314,8 @@ void BleTransport::report(bool connected) {
 }
 
 void BleTransport::write(const char* data, size_t len) {
-    if (conn_ < 0) return;
+    MutexGuard guard(sendMutex_);
+    if (conn_ < 0 || !up_) return;
     uint16_t mtu = ble_att_mtu(static_cast<uint16_t>(conn_.load()));
     size_t piece = mtu > 23 ? mtu - 3u : 20u;
     for (size_t i = 0; i < len && conn_ >= 0; i += piece) {

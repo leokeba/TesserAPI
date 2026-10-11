@@ -92,7 +92,7 @@ public:
     void poll() {
         if (dropped_.exchange(false)) {
             line_.reset();  // subscriptions, a line cut short, the token
-            if (enabled_) BLEDevice::startAdvertising();
+            if (enabled_ && server_) BLEDevice::startAdvertising();
             report(false);
         }
         if (connected_) report(true);
@@ -103,6 +103,22 @@ public:
         }
         if (!in.empty()) line_.feed(in.data(), in.size());
     }
+
+    // Stops the BLE stack and gives its memory back (BLEDevice::deinit(false),
+    // which allows a new init); a connected client is dropped as by a
+    // disconnection, in the next poll(). begin() starts it again. Call it in
+    // the task that calls poll(), as a setter or action does.
+    void end() {
+        if (!server_) return;
+        BLEDevice::deinit(false);
+        server_ = nullptr;
+        tx_ = nullptr;
+        connected_ = false;
+        dropped_ = true;
+        MutexGuard guard(inMutex_);
+        inbox_.clear();
+    }
+    bool begun() const { return server_ != nullptr; }
 
     // Bluetooth on and off at runtime, after begin(): stop() drops the
     // client (as a disconnection does, in the next poll()) and stops
@@ -123,6 +139,7 @@ public:
     // Advertising restarts with it; a connected client sees it after it
     // leaves. The scan response holds 29 bytes of it.
     void setName(const char* name) {
+        if (!server_) return;  // begin() takes it
         setDeviceName(name);
         if (server_ && enabled_ && !connected_) {
             BLEDevice::stopAdvertising();
@@ -274,6 +291,13 @@ public:
     // this device name, advertising, and the task that handles requests,
     // under the API lock. One transport per firmware; one client at a time.
     esp_err_t begin(const char* name, uint32_t stackSize = 6144, UBaseType_t priority = 5);
+    // Stops NimBLE and gives its memory back (the host, the controller, the
+    // request task: about 45 KB on an ESP32); a connected client is dropped
+    // as by a disconnection. begin() starts it again. Doesn't wait for the
+    // request task, so it may be called from a setter or action, even one a
+    // Bluetooth client called.
+    esp_err_t end();
+    bool begun() const { return up_; }
 
     // Bluetooth on and off at runtime: stop() drops the client (as a
     // disconnection does) and stops advertising; start() advertises again.
@@ -319,10 +343,11 @@ private:
 
     Api& api_;
     LineTransport line_;
-    mutable Mutex stateMutex_;  // name_ and peer_
+    mutable Mutex stateMutex_;  // name_, peer_, task_ and exit_
     std::string name_;
     char peer_[18] = {};
     std::atomic<bool> enabled_{true};
+    std::atomic<bool> up_{false};      // between begin() and end()
     std::atomic<bool> synced_{false};  // the host is up: advertising works
     std::atomic<int> conn_{-1};
     std::atomic<bool> notify_{false};
@@ -332,6 +357,8 @@ private:
     Mutex inMutex_;
     std::string inbox_;
     TaskHandle_t task_ = nullptr;
+    bool exit_ = false;  // end(): the task exits, unless begin() comes first
+    Mutex sendMutex_;    // held while writing, so end() never pulls NimBLE from under a write
     SemaphoreHandle_t confirmed_ = nullptr;  // an indication's confirmation
     std::function<void(bool)> onConnection_;
     bool reported_ = false;  // in the task
