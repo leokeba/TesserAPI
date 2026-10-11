@@ -2,7 +2,7 @@
 
 Describe your ESP32 firmware's state and operations **once**, as a tree of values and actions. Serve it as JSON over HTTP, over ESP-NOW (with [NowTP](https://github.com/leokeba/NowTP)), or over serial, from Arduino or ESP-IDF.
 
-> **Status: early development.** The design is in [docs/DESIGN.md](docs/DESIGN.md). Everything in the design works and is tested on hardware: the core (tree, get/set/patch, shapes, schema, lists), subscriptions and events, persistence, access control, the serial, HTTP, WebSocket and NowTP transports, and gateways that mount other nodes. The API will change before 1.0.
+> **Status: early development.** The design is in [docs/DESIGN.md](docs/DESIGN.md). Everything in the design works and is tested on hardware: the core (tree, get/set/patch, shapes, schema, lists), subscriptions and events, persistence, access control, the serial, HTTP, WebSocket, NowTP and Bluetooth LE transports, and gateways that mount other nodes. The API will change before 1.0.
 
 ```cpp
 #include <TesserAPI.h>
@@ -124,6 +124,7 @@ api.mount("right", rightMotor);
 | HTTP (`HttpServer`, on `esp_http_server`, also usable under PsychicHttp) | REST mapping, streamed chunked responses, CORS | done |
 | NowTP (`NowTpTransport`, ESP-NOW) | one JSON envelope per message, reliable unicast; also a client for other nodes | done |
 | WebSocket (`HttpServer::enableWebSocket`) | JSON envelope, subscriptions | done |
+| Bluetooth LE (`BleTransport`, Arduino, `<tesser/transports/ble_transport.h>`) | serial lines over the Nordic UART Service, indications | done |
 
 ## Examples
 
