@@ -507,7 +507,7 @@ These transports are message-based and two-way, so they share one JSON envelope.
 ```
 
 - **`id`:** any JSON scalar, echoed verbatim. It may be omitted, in which case the response also has no `id`.
-- **`op`:** `get`, `set`, `sub` or `unsub`; on serial and Bluetooth lines also `auth` (§10.4). The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `events`, `snapshot` and `body` map one-to-one onto `Request`.
+- **`op`:** `get`, `set`, `sub` or `unsub`; on serial and Bluetooth lines also `auth` (§10.4). The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `changes`, `events`, `snapshot` and `body` map one-to-one onto `Request`.
 - **Unknown envelope keys** are ignored, for forward compatibility.
 - **Response:** the response is written as a stream: `{"id":…,"status":"…","body":` followed by the body and then `}`.
   - **Buffered** (NowTP, and every deferred or queued reply): the envelope is sent whole, up to `maxResponse`. A larger body is replaced with a `too_large` error.
@@ -653,6 +653,7 @@ The serial lines of §10.4 over the **Nordic UART Service**, so browsers (Web Bl
 |---|---|
 | `keys`, `exclude`, `depth` | Same as for get, applied to both the snapshot and the notifications. Shapes are not supported. |
 | `interval` | At most one change notification per `interval` ms (default 0: every `poll()`). Intermediate states are coalesced. |
+| `changes` | Deliver change notifications (default `true`). With `false` the subscription carries only events, filtered as usual by path, `depth`, `keys`, `exclude` and access: a client can follow the notifications of a whole tree (`"path": "/"`) without its changes. `interval` then has no effect, and the snapshot is still sent unless `snapshot` is `false`. It counts against the limits like any subscription. |
 | `events` | Also deliver events under the path (default `true`). |
 | `snapshot` | Reply with the current state (default `true`). With `false` the reply body is `null`, for clients that read large subtrees in pieces with gets. |
 
@@ -672,7 +673,7 @@ The serial lines of §10.4 over the **Nordic UART Service**, so browsers (Web Bl
 - Notifications go through each transport's own bounded queue: NowTP's transmit queue, `httpd_queue_work` for WebSocket. A slow client never causes unbounded allocation.
 - Subscriptions die with their client: WebSocket close, NowTP peer lost, a `LineTransport` destroyed, or an explicit `unsub`.
 
-**Client side:** `DatagramEndpoint` (NowTP) sends `sub` requests like any other, with `interval` and `events` in its `Query`. Incoming notifications go to `onNotification(handler)`; they are never answered, so two nodes subscribed to each other can't ping-pong.
+**Client side:** `DatagramEndpoint` (NowTP) sends `sub` requests like any other, with `interval`, `changes`, `events` and `snapshot` in its `Query`. Incoming notifications go to `onNotification(handler)`; they are never answered, so two nodes subscribed to each other can't ping-pong.
 
 ## 12. Persistence
 
@@ -768,9 +769,9 @@ nowApi.remote(api, "light", kitchenMac, "/lamp").mirror(200);
 - **Forwarded subscriptions:** a subscription below a remote node, or to an unmirrored remote node itself, is forwarded. This is how a browser on the gateway follows a NowTP node's state without a mirror.
   - **Shared upstream:** local subscribers of the same path share one upstream subscription to that path, which holds the whole subtree (no keys, unlimited depth). The gateway keeps its state as a copy, merged with each notification.
   - **Snapshots:** the first subscriber's reply waits for the upstream snapshot (a deferred reply, so `maxPending` applies; transports that can't wait get `not_allowed`). Later ones are answered from the copy at once.
-  - **Filtering:** each local subscription's `keys`, `exclude` and `depth` are applied by the gateway, to its snapshot and to every relayed change. Unknown keys are not reported, since the gateway doesn't know the remote's tree. `interval` and `remotes` are taken from the first subscriber; changes are relayed as they arrive.
+  - **Filtering:** each local subscription's `keys`, `exclude` and `depth` are applied by the gateway, to its snapshot and to every relayed change. Unknown keys are not reported, since the gateway doesn't know the remote's tree. `interval` and `remotes` are taken from the first subscriber (`interval` only from one that wants changes); changes are relayed as they arrive, except to `"changes": false` subscribers.
   - **Events** under an upstream subscription's path come out under the local path, like a mirror's, to every local subscriber they concern.
-  - **Lifetime:** the upstream subscription ends with its last local subscriber (unsubscribe, or the client going away). It is renewed every `refreshMs` (default 30 s; every 2 s after a failed renewal) in case the remote restarted. If the renewed state differs from the copy, every subscriber gets the whole state as one change.
+  - **Lifetime:** the upstream subscription ends with its last local subscriber (unsubscribe, or the client going away). It is renewed every `refreshMs` (default 30 s; every 2 s after a failed renewal) in case the remote restarted. If the renewed state differs from the copy, every subscriber that wants changes gets the whole state as one change.
   - **Limit:** two remote nodes of one gateway that reach the same remote path through the same endpoint share that path's subscription on the remote, so unsubscribing one ends both. Mount a peer once.
 - **No loops:** the `remotes: false` request option leaves mirrored remote nodes out of a read or subscription. Mirrors always subscribe with it, so a mirrored copy never contains copies of copies, and two gateways mounting each other stay flat. Requests below a remote node are forwarded live and may cross several hops.
 - **Lifetime:** the API must outlive its transports. A remote node and its endpoint may be destroyed in either order: a destroyed endpoint detaches its remote nodes.

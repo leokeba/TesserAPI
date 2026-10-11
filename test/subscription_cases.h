@@ -194,6 +194,39 @@ TEST(sub_events) {
     CHECK_EQ(cases::set(api, "/button/pressed", "1").status, Status::NotAllowed);
 }
 
+// "changes": false: events only, from anywhere under the path.
+TEST(sub_events_only) {
+    Api api;
+    tesser::EventNode& joined = api.object("sys").object("wifi").event("joined");
+    int level = 0;
+    api.value("level", level);
+    cases::Lines lines;
+    tesser::LineTransport t(api, [&](const char* data, size_t n) { lines.add(data, n); });
+    const char* sub = "{\"id\":1,\"op\":\"sub\",\"path\":\"/\",\"changes\":false,\"snapshot\":false,\"interval\":60000}\n";
+    t.feed(sub, strlen(sub));
+    CHECK_EQ(lines.out.size(), 1u);
+    if (!lines.out.empty()) CHECK_EQ(lines.out[0], "{\"id\":1,\"status\":\"ok\",\"body\":null}");
+    CHECK_EQ(api.subscriptionCount(), 1u);
+
+    cases::set(api, "/level", "3");
+    api.poll(1000);
+    api.poll(70000);
+    CHECK_EQ(lines.out.size(), 1u);  // no change notifications, ever
+    joined.emit(7);
+    CHECK_EQ(lines.out.size(), 2u);
+    if (lines.out.size() == 2) CHECK_EQ(lines.out[1], "{\"op\":\"event\",\"path\":\"/sys/wifi/joined\",\"body\":7}");
+
+    const char* bad = "{\"id\":2,\"op\":\"sub\",\"path\":\"/\",\"changes\":0}\n";
+    t.feed(bad, strlen(bad));
+    CHECK(!lines.out.empty() && lines.out.back().find("changes must be a boolean") != std::string::npos);
+
+    Query q;
+    q.changes = false;
+    q.snapshot = false;
+    CHECK_EQ(tesser::buildRequestEnvelope(3, Op::Subscribe, "/", q, std::string_view()),
+             "{\"id\":3,\"op\":\"sub\",\"path\":\"/\",\"changes\":false,\"snapshot\":false}");
+}
+
 TEST(sub_watch_and_changed) {
     Api api;
     int counter = 0, untracked = 0, explicitly = 0;

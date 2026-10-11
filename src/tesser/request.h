@@ -36,6 +36,7 @@ struct Query {
     bool remotes = true;
     // Subscribe only.
     uint32_t interval = 0;  // minimum ms between change notifications
+    bool changes = true;    // deliver change notifications (false: events only)
     bool events = true;     // also deliver events under the path
     bool snapshot = true;   // reply with the current state (false: with null)
 };

@@ -49,6 +49,10 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
             w.key("interval");
             w.uinteger(query.interval);
         }
+        if (!query.changes) {
+            w.key("changes");
+            w.boolean(false);
+        }
         if (!query.events) {
             w.key("events");
             w.boolean(false);

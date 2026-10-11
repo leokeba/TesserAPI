@@ -805,6 +805,7 @@ private:
         sub.exclude.assign(req_.query.exclude.data(), req_.query.exclude.size());
         sub.depth = req_.query.depth;
         sub.interval = req_.query.interval;
+        sub.changes = req_.query.changes;
         sub.events = req_.query.events;
         sub.remotes = req_.query.remotes;
         sub.access = level_;

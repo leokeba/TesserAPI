@@ -218,6 +218,27 @@ TEST(remote_forwarded_subscriptions) {
     CHECK_EQ(r.gateway.pending(), 0);
 }
 
+// An events-only forwarded subscription: relayed events, no relayed changes,
+// no whole state after a renewal.
+TEST(remote_forwarded_events_only) {
+    Rig r;
+    CHECK_EQ(r.ask("{\"id\":1,\"op\":\"sub\",\"path\":\"/kitchen\",\"changes\":false,\"snapshot\":false}"),
+             "{\"id\":1,\"status\":\"ok\",\"body\":null}");
+    r.lines.out.clear();
+    cases::set(r.device.api, "/lamp/brightness", "42");
+    r.device.api.poll(1000);
+    r.net.run();
+    CHECK_EQ(r.lines.out.size(), 0u);
+    r.pressed.emit(5);
+    r.net.run();
+    CHECK_EQ(r.lines.out.size(), 1u);
+    if (!r.lines.out.empty()) CHECK_EQ(r.lines.out[0], "{\"op\":\"event\",\"path\":\"/kitchen/button/pressed\",\"body\":5}");
+    r.device.lamp.brightness = 77;  // no changed(): only a renewal finds it
+    r.net.clock += 31000;
+    r.net.run();
+    CHECK_EQ(r.lines.out.size(), 1u);
+}
+
 TEST(remote_forwarded_subscription_failures) {
     Rig r;
     r.gateway.remote("ghost", r.gatewayEnd, addr(9)).timeout(500);

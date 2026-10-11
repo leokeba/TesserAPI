@@ -402,12 +402,14 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
     sub.exclude.assign(req.query.exclude.data(), req.query.exclude.size());
     sub.depth = req.query.depth;
     sub.interval = req.query.interval;
+    sub.changes = req.query.changes;
     sub.events = req.query.events;
     sub.remotes = req.query.remotes;
     sub.forwarded = true;
     sub.snapshot = req.query.snapshot;
 
     bool start = false;
+    uint32_t interval = 0;
     {
         MutexGuard guard(mutex_);
         Upstream* u = findUpstream(rest);
@@ -434,15 +436,16 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
             upstreams_.emplace_back(new Upstream());
             u = upstreams_.back().get();
             u->rest.assign(rest.data(), rest.size());
-            u->interval = req.query.interval;
+            // An events-only subscriber doesn't pace the others' changes.
+            u->interval = sub.changes ? req.query.interval : 0;
         }
+        interval = u->interval;
         if (!u->subscribing) {
             u->subscribing = true;
             u->lastSubscribeMs = endpoint_->now();
             start = true;
         }
     }
-    uint32_t interval = req.query.interval;
     std::string r(rest);
     api.addSubscription(std::move(sub));  // waiting for the upstream snapshot
     if (start && !sendUpstream(r, interval, false)) upstreamReply(r, Status::Busy, JsonVariantConst());
@@ -514,7 +517,7 @@ void RemoteNode::upstreamReply(const std::string& rest, Status s, JsonVariantCon
             sub.waiting = nullptr;
             api->pendingDone();
             if (s != Status::Ok) return false;
-        } else if (s == Status::Ok && wasReady && changedCopy) {
+        } else if (s == Status::Ok && wasReady && changedCopy && sub.changes) {
             // Renewed after the remote changed without telling us (it
             // restarted, or notifications were lost): send the whole state.
             notifyChange(sub, [&](JsonWriter& w) { writeSnapshot(w, copy, sub); });
@@ -542,7 +545,7 @@ bool RemoteNode::relayChange(std::string_view rest, JsonVariantConst patch) {
     merge(u->copy.as<JsonVariant>(), patch);
     std::string localPath = localPath_ + std::string(rest);
     api->forwardedSubscriptions(this, [&](Subscription& sub) {
-        if (sub.path != localPath || sub.waiting) return true;
+        if (sub.path != localPath || sub.waiting || !sub.changes) return true;
         if (!patch.is<JsonObjectConst>()) {
             notifyChange(sub, [&](JsonWriter& w) { w.variant(patch); });
         } else if (hasChanges(patch, depthOf(sub), &sub)) {

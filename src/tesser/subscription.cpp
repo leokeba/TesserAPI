@@ -296,6 +296,7 @@ void Api::sampleWatched(Node& node) {
 }
 
 void Api::flush(Subscription& sub, uint32_t nowMs) {
+    if (!sub.changes) return;  // events only
     if (sub.interval && nowMs - sub.lastFlushMs < sub.interval) return;
     uint16_t gen = currentGeneration();
     if (gen == sub.since) return;
