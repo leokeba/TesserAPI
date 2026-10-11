@@ -462,6 +462,28 @@ TEST(set_patch_runs_actions_after_values) {
     CHECK_EQ(position, 5);
 }
 
+// An action refuses with a message, as setters do.
+TEST(action_returns_check) {
+    Api api;
+    bool claimed = true;
+    int jogs = 0;
+    api.action("jog", [&] {
+        if (claimed) return tesser::Check::fail(Status::Busy, "driven by tracking");
+        jogs++;
+        return tesser::Check::ok();
+    });
+    CHECK_EQ(get(api, "/jog", schema()).body, "{\"type\":\"action\"}");  // no "returns"
+    Resp r = set(api, "/jog", "null");
+    CHECK_EQ(r.status, Status::Busy);
+    CHECK_EQ(r.body, "{\"error\":\"busy\",\"path\":\"/jog\",\"message\":\"driven by tracking\"}");
+    r = set(api, "/", "{\"jog\":null}");
+    CHECK_EQ(r.status, Status::Busy);
+    CHECK(r.body.find("driven by tracking") != std::string::npos);
+    claimed = false;
+    CHECK_EQ(set(api, "/jog", "null").body, "null");
+    CHECK_EQ(jogs, 1);
+}
+
 TEST(set_rejects_query_options) {
     Device d;
     tesser::Query q;

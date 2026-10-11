@@ -929,6 +929,9 @@ void runAndReply(F& f, Call& call, A&&... args) {
     } else if constexpr (std::is_same<Bare<R>, Status>::value) {
         Status s = f(std::forward<A>(args)...);
         if (s != Status::Ok) call.fail(s);
+    } else if constexpr (std::is_same<Bare<R>, Check>::value) {
+        Check c = f(std::forward<A>(args)...);  // a refusal with a message
+        if (!c.isOk()) call.fail(c.status, c.message);
     } else {
         assertSupported<Bare<R>>();
         call.reply(f(std::forward<A>(args)...));
@@ -937,7 +940,7 @@ void runAndReply(F& f, Call& call, A&&... args) {
 
 template <class R>
 const char* returnKindName() {
-    if constexpr (std::is_void<R>::value || std::is_same<Bare<R>, Status>::value) {
+    if constexpr (std::is_void<R>::value || std::is_same<Bare<R>, Status>::value || std::is_same<Bare<R>, Check>::value) {
         return nullptr;
     } else {
         return kindName(ValueTraits<Bare<R>>::kind);

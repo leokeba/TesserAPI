@@ -128,6 +128,9 @@ o.action("reboot", [] { esp_restart(); });                       // no arguments
 o.action("moveTo", [](float deg) { motor.moveTo(deg); });        // one typed argument
 o.action("count",  [] { return counter; });                      // returns a value
 o.action("addRemote", [](JsonVariantConst v) { ... return tesser::Status::Ok; });  // raw argument
+o.action("jog", [] {                                             // refuses with a message
+    return claimed ? tesser::Check::fail(tesser::Status::Busy, "driven by tracking") : tesser::Check::ok();
+});
 o.action("calibrate", [](tesser::Call& call) {                   // deferred completion
     auto pending = call.defer();
     startCalibration([pending](float r) mutable { pending.reply(r); });
@@ -334,7 +337,7 @@ Rendering walks only the requested branch and streams it straight to the reply, 
 ### 6.2 Set on a value or an action
 
 - **Value:** the body is the new value. The response is the value read back after the write.
-- **Action:** the body is the argument. The response is the return value, `null` for `void` or `Status::Ok`, or the deferred result.
+- **Action:** the body is the argument. The response is the return value, `null` for `void`, `Status::Ok` or `Check::ok()`, or the deferred result. A failing `Status` or `Check` is the error; a `Check`'s message (a string that outlives the call, as for setters) goes in the error's `message`.
 - **Object:** see §6.3.
 
 `PUT /lamp/brightness 200` → `200`. `POST /lamp/toggle` → `null`.
