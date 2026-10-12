@@ -7,10 +7,12 @@ Usage:
 
 Runs the conformance vectors through A's /peer prefix, then checks error
 paths, the mirror, change notifications and events relayed to a WebSocket
-client on A, B's discovery mount under /peers, and subscriptions forwarded
-through it. Prints "E2E pass=<n> fail=<n>".
+client on A, B's discovery mount under /peers, subscriptions forwarded
+through it, and file transfers relayed to B. Prints "E2E pass=<n> fail=<n>".
 """
+import base64
 import json
+import os
 import statistics
 import sys
 import time
@@ -142,9 +144,46 @@ def main():
     b.call('set', '/lamp/label', {}, 'desk')
     b.call('set', '/lamp/brightness', {}, 128)
 
+    # File transfers below a remote node are relayed to it: envelopes over
+    # WebSocket on A, each reply deferred until B's comes...
+    ws = WebSocket(ip_a)
+    relayed = conformance.envelope_sender(lambda op, path, **kw: ws.request(op, base + path, timeout=15, **kw))
+    conformance.run_files(relayed, 'relayed ws files', check, size=20000)
+    # ...and raw bytes over HTTP, which first asks B whether the path is a file.
+    token = {'Authorization': 'Bearer test-token'}
+    blob = os.urandom(30000)
+    t0 = time.time()
+    code, data, _, _ = a.raw('PUT', base + '/files/blob', None, blob, token)
+    up = len(blob) / 1024 / (time.time() - t0)
+    check(f'relayed HTTP upload ({up:.1f} KB/s)', code == 200 and json.loads(data) == {'bytes': len(blob)},
+          (code, data[:200]))
+    t0 = time.time()
+    code, data, headers, _ = a.raw('GET', base + '/files/blob', None, ABSENT, token)
+    down = len(blob) / 1024 / (time.time() - t0)
+    check(f'relayed HTTP download ({down:.1f} KB/s)', code == 200 and data == blob and
+          headers.get('Content-Length') == str(len(blob)), (code, len(data), headers))
+    code, data, _, _ = a.raw('PUT', base + '/files/blob', None, os.urandom(40000), token)
+    check('relayed refusal mapped', code == 413 and json.loads(data)['path'] == base + '/files/blob', (code, data))
+    code, data, _, _ = a.raw('PUT', base + '/lamp/label', None, 'relay')
+    check('not a file: forwarded as a set', code == 200 and b.call('get', '/lamp/label', {}, ABSENT) == ('ok', 'relay'),
+          (code, data))
+    # One transfer per remote node: B keeps one per client, and A is one.
+    r = ws.request('upload', base + '/files/blob', size=4, timeout=15)
+    check('relay holds B', r.get('status') == 'ok' and r['body'].get('received') == 0, r)
+    code, data, _, _ = a.raw('GET', '/peer/files/blob', None, ABSENT, token)
+    check('another transfer to B is busy', json.loads(data).get('message') ==
+          'another transfer to this node is in progress', (code, data))
+    check('reads of B go on', a.call('get', base + '/lamp/label', {}, ABSENT) == ('ok', 'relay'))
+    r = ws.request('upload', base + '/files/blob', offset=0, data=base64.b64encode(b'abcd').decode(), timeout=15)
+    check('the end frees B', r.get('status') == 'ok' and r.get('body') == {'bytes': 4}, r)
+    ws.close()
+    b.call('set', '/lamp/label', {}, 'desk')
+
     # Forwarded GET latency, end to end over HTTP + ESP-NOW.
     times = [a.raw('GET', '/peer/lamp')[3] for _ in range(10)]
-    print(f'     GET /peer/lamp via gateway: median {statistics.median(times):.0f} ms')
+    print(f'     GET /peer/lamp via gateway: median {statistics.median(times):.0f} ms (B asked first if it is a file)')
+    times = [a.raw('GET', '/peer/lamp', {'view': 'schema'})[3] for _ in range(10)]
+    print(f'     GET /peer/lamp?view=schema via gateway: median {statistics.median(times):.0f} ms (one round trip)')
 
     print(f'E2E pass={sum(results)} fail={len(results) - sum(results)}')
     sys.exit(0 if all(results) else 1)

@@ -227,11 +227,12 @@ FileTransfer::Open FileTransfer::openRelay(Op op, uint64_t size, std::string_vie
         return Open::Remote;
     }
     // The client named no operation (HTTP): whether the peer's node is a
-    // file decides, as for a local path. Another answer is left to the
-    // request forwarded as usual.
+    // file decides, as for a local path. The peer's other answers about the
+    // path are left to the request forwarded as usual; no answer (timeout,
+    // busy, offline) is an error.
     JsonDocument body;
     Status s = waitFor(*relay_, [this](FileRelay::Done d) { relay_->probe(std::move(d)); }, body);
-    if (s != Status::Ok && body.isNull()) {
+    if (s == Status::Timeout || s == Status::Busy || s == Status::Internal) {
         relay_->writeReply(reply, s, body.as<JsonVariantConst>());
         close();
         return Open::Failed;

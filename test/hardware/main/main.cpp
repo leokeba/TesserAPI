@@ -231,8 +231,11 @@ void serveDemo() {
     // read, since it holds secrets).
     auto& files = g_demo->api.object("files");
     files.file("blob")
-        .upload([](tesser::FileRequest&) -> std::unique_ptr<tesser::FileSink> {
+        .upload([](tesser::FileRequest& r) -> std::unique_ptr<tesser::FileSink> {
             struct Sink : tesser::FileSink {
+                // Reserved whole: grown by doubling next to the last blob,
+                // it ran a board without PSRAM out of memory.
+                explicit Sink(size_t size) { data.reserve(size); }
                 std::string data;
                 tesser::Check write(const uint8_t* d, size_t n) override {
                     data.append(reinterpret_cast<const char*>(d), n);
@@ -247,7 +250,7 @@ void serveDemo() {
                     return tesser::Check::ok();
                 }
             };
-            return std::unique_ptr<tesser::FileSink>(new Sink());
+            return std::unique_ptr<tesser::FileSink>(new Sink(static_cast<size_t>(r.size)));
         })
         .download([](tesser::FileRequest& r) -> std::unique_ptr<tesser::FileSource> {
             r.filename = "blob.bin";

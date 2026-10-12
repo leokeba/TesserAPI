@@ -367,10 +367,15 @@ TEST(relay_waiting) {
         CHECK_EQ(reply.body, "null");
         CHECK_EQ(r.got, "");
         // An unreachable device: an error, not a fall back to forwarding.
-        r.gateway.remote("ghost", r.gatewayEnd, addr(9)).timeout(100);
+        tesser::RemoteNode& ghost = r.gateway.remote("ghost", r.gatewayEnd, addr(9)).timeout(100);
         CHECK(f.openDownload("/ghost/f", admin, reply) == FileTransfer::Open::Failed);
         CHECK_EQ(reply.status, Status::Timeout);
         CHECK_EQ(reply.body, "{\"error\":\"timeout\",\"path\":\"/ghost\",\"message\":\"remote node didn't answer\"}");
+        // A lost one too, though its error has a body.
+        r.gatewayEnd.forgetPeer(addr(9));
+        for (int i = 0; i < 1000 && ghost.online(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(f.openUpload("/ghost/f", admin, 4, reply) == FileTransfer::Open::Failed);
+        CHECK_EQ(reply.body, "{\"error\":\"timeout\",\"path\":\"/ghost\",\"message\":\"peer offline\"}");
     }
     {
         // A failed write ends the upload with the device's error.
