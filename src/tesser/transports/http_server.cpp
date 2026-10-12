@@ -10,12 +10,14 @@
 #include <atomic>
 #include <memory>
 
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "lwip/sockets.h"
 #include "sdkconfig.h"
 #include "tesser/envelope.h"
 #include "tesser/file.h"
+#include "tesser/stream_subscriber.h"
 
 // mDNS (advertise()): Arduino-ESP32 ships the component; on ESP-IDF, the
 // component's CMakeLists links espressif/mdns when the application has it.
@@ -47,6 +49,16 @@ bool drain(httpd_req_t* req, size_t left) {
         if (n <= 0) return false;
         timeouts = 0;
         left -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool sendAll(httpd_req_t* req, const char* data, size_t len) {
+    while (len) {
+        int n = httpd_send(req, data, len);
+        if (n <= 0) return false;
+        data += n;
+        len -= static_cast<size_t>(n);
     }
     return true;
 }
@@ -102,6 +114,39 @@ bool queryParam(const char* query, const char* key, char* buf, size_t cap, size_
     len = urlDecode(buf, strlen(buf), true);
     buf[len] = '\0';
     return true;
+}
+
+// A boolean query parameter: true/false/1/0. Leaves `out` alone when absent.
+void boolParam(const char* query, const char* key, bool& out, bool& bad) {
+    char buf[8];
+    size_t len = 0;
+    if (!queryParam(query, key, buf, sizeof(buf), len, bad)) return;
+    std::string_view v(buf, len);
+    if (v == "true" || v == "1") {
+        out = true;
+    } else if (v == "false" || v == "0") {
+        out = false;
+    } else {
+        bad = true;
+    }
+}
+
+// A flag that may come bare (?sub) or with a boolean value (?sub=1).
+bool flagParam(const char* query, const char* key, bool& bad) {
+    size_t keyLen = strlen(key);
+    for (const char* p = query; p && *p;) {
+        const char* amp = strchr(p, '&');
+        size_t n = amp ? static_cast<size_t>(amp - p) : strlen(p);
+        if (n == keyLen && memcmp(p, key, keyLen) == 0) return true;
+        p = amp ? amp + 1 : nullptr;
+    }
+    char buf[8];
+    size_t len = 0;
+    if (!queryParam(query, key, buf, sizeof(buf), len, bad)) return false;
+    if (len == 0) return true;  // ?sub=
+    bool on = false;
+    boolParam(query, key, on, bad);
+    return on;
 }
 
 // Shared between a parked HTTP handler and the deferred reply that completes
@@ -264,6 +309,26 @@ private:
 
 public:
     int fd;
+};
+
+// One streamed subscription: the socket it holds and its subscriber. It is
+// the socket's session context, so it goes when the socket closes
+// (freeStream()).
+class HttpServer::Stream {
+public:
+    Stream(HttpServer& owner, httpd_handle_t httpd, int socket)
+        : server(&owner),
+          handle(httpd),
+          fd(socket),
+          subscriber(owner.api_, [this](const std::string& piece) {
+              HttpServer* s = this->server.load();
+              return s && s->streamSend(this, piece);
+          }) {}
+
+    std::atomic<HttpServer*> server;  // null once the server ended
+    httpd_handle_t handle;
+    int fd;
+    StreamSubscriber subscriber;
 };
 
 HttpServer::HttpServer(Api& api) : api_(api) {}
@@ -575,6 +640,23 @@ esp_err_t HttpServer::attach(httpd_handle_t server, const char* basePath) {
 
 void HttpServer::end() {
     if (!server_) return;
+    if (keepAliveTimer_) {
+        esp_timer_stop(keepAliveTimer_);
+        esp_timer_delete(keepAliveTimer_);
+        keepAliveTimer_ = nullptr;
+    }
+    // Streams outlive the server object until their sockets close: orphaned
+    // here, freed by freeStream().
+    std::vector<Stream*> streams;
+    {
+        MutexGuard guard(streamsMutex_);  // also waits for a running keep-alive
+        streams.swap(streams_);
+    }
+    for (Stream* s : streams) {
+        s->server = nullptr;
+        s->subscriber.close();
+        if (!ownsServer_) httpd_sess_trigger_close(server_, s->fd);
+    }
     for (;;) {
         int fd = -1;
         {
@@ -655,6 +737,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
     char value[16];
     std::string keys, exclude, shapeText, filename;
     bool bad = false;
+    bool sub = false;
     if (queryLen) {
         query = static_cast<char*>(malloc(queryLen + 1));
         if (!query || httpd_req_get_url_query_str(req, query, queryLen + 1) != ESP_OK) {
@@ -683,6 +766,18 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
             !parseView(std::string_view(value, len), request.query.view)) {
             bad = true;
         }
+        // A streamed subscription (?sub, sub=1 or sub=true) and its options.
+        sub = flagParam(query, "sub", bad);
+        if (queryParam(query, "interval", value, sizeof(value), len, bad)) {
+            char* end = nullptr;
+            unsigned long ms = strtoul(value, &end, 10);
+            if (len == 0 || *end || value[0] == '-') bad = true;
+            request.query.interval = static_cast<uint32_t>(ms);
+        }
+        boolParam(query, "changes", request.query.changes, bad);
+        boolParam(query, "events", request.query.events, bad);
+        boolParam(query, "snapshot", request.query.snapshot, bad);
+        boolParam(query, "remotes", request.query.remotes, bad);
         // Browsers can't send a GET body, so a shape may also come as ?shape=<json>.
         shapeText.resize(queryLen + 1);
         if (queryParam(query, "shape", &shapeText[0], shapeText.size(), len, bad)) {
@@ -706,7 +801,11 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
 
     // File nodes (docs/DESIGN.md section 4.6): raw bytes both ways, before
     // the body is read, so maxRequestBody doesn't apply to uploads.
-    if (request.op == Op::Set || request.query.view == View::Value) {
+    if (sub && request.op != Op::Get) {
+        writeError(reply, Status::BadRequest, path, "subscribe with GET");
+        return ESP_OK;
+    }
+    if (!sub && (request.op == Op::Set || request.query.view == View::Value)) {
         FileTransfer file(api_);
         FileTransfer::Open o = request.op == Op::Set
                                    ? file.openUpload(path, request.client, req->content_len, reply, filename)
@@ -749,6 +848,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
         }
         request.body = doc.as<JsonVariantConst>();
     }
+    if (sub) return serveStream(req, request, reply);
 
     api_.handle(request, reply);
 
@@ -760,6 +860,147 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
         }
         st->unref();
     }
+    return ESP_OK;
+}
+
+// ---- streamed subscriptions ------------------------------------------------
+
+size_t HttpServer::streams() const {
+    MutexGuard guard(streamsMutex_);
+    return streams_.size();
+}
+
+namespace {
+struct StreamWork {
+    HttpServer* server;
+    httpd_handle_t handle;
+    void* stream;
+    int fd;
+    std::string chunk;
+};
+}  // namespace
+
+// Like WebSocket frames, chunks are written only from the httpd task
+// (httpd_queue_work), so writes from other tasks never interleave.
+bool HttpServer::streamSend(Stream* stream, const std::string& piece) {
+    char size[12];
+    snprintf(size, sizeof(size), "%x\r\n", static_cast<unsigned>(piece.size()));
+    auto* work = new StreamWork{this, stream->handle, stream, stream->fd, std::string(size) + piece + "\r\n"};
+    esp_err_t err = httpd_queue_work(
+        stream->handle,
+        [](void* arg) {
+            auto* w = static_cast<StreamWork*>(arg);
+            bool live = false;
+            {
+                // Still open, and the socket still its own: a closed socket's
+                // descriptor may already serve another connection.
+                MutexGuard guard(w->server->streamsMutex_);
+                for (Stream* s : w->server->streams_) {
+                    if (s == w->stream) live = httpd_sess_get_ctx(w->handle, w->fd) == s;
+                }
+            }
+            if (live) {
+                const char* data = w->chunk.data();
+                size_t left = w->chunk.size();
+                while (left) {
+                    int n = httpd_socket_send(w->handle, w->fd, data, left, 0);
+                    if (n <= 0) break;
+                    data += n;
+                    left -= static_cast<size_t>(n);
+                }
+                if (left) {
+                    httpd_sess_trigger_close(w->handle, w->fd);  // freeStream() follows
+                } else {
+                    // Keeps the stream from being the first socket purged.
+                    httpd_sess_update_lru_counter(w->handle, w->fd);
+                }
+            }
+            delete w;
+        },
+        work);
+    if (err != ESP_OK) {
+        delete work;
+        return false;
+    }
+    return true;
+}
+
+void HttpServer::freeStream(void* ctx) {
+    auto* stream = static_cast<Stream*>(ctx);
+    if (HttpServer* self = stream->server.load()) {
+        MutexGuard guard(self->streamsMutex_);
+        for (size_t i = 0; i < self->streams_.size(); i++) {
+            if (self->streams_[i] == stream) {
+                self->streams_.erase(self->streams_.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+        }
+    }
+    delete stream;  // drops its subscription
+}
+
+void HttpServer::onKeepAlive(void* arg) {
+    auto* self = static_cast<HttpServer*>(arg);
+    MutexGuard guard(self->streamsMutex_);
+    uint32_t now = millis32();
+    for (Stream* s : self->streams_) s->subscriber.keepAlive(now, self->keepAliveMs_);
+}
+
+esp_err_t HttpServer::serveStream(httpd_req_t* req, const Request& request, Reply& reply) {
+    {
+        MutexGuard guard(streamsMutex_);
+        if (streams_.size() >= maxStreams_) {
+            writeError(reply, Status::Busy, request.path, "too many streams");
+            return ESP_OK;
+        }
+    }
+    if (!keepAliveTimer_ && keepAliveMs_) {
+        esp_timer_create_args_t args = {};
+        args.callback = &HttpServer::onKeepAlive;
+        args.arg = this;
+        args.name = "tesser_stream";
+        if (esp_timer_create(&args, &keepAliveTimer_) == ESP_OK) {
+            // Checked three times per period: a stream is silent for at most
+            // 5/3 of it.
+            esp_timer_start_periodic(keepAliveTimer_, static_cast<uint64_t>(keepAliveMs_) * 1000 / 3);
+        } else {
+            keepAliveTimer_ = nullptr;
+        }
+    }
+    auto* stream = new Stream(*this, req->handle, httpd_req_to_sockfd(req));
+    {
+        MutexGuard guard(streamsMutex_);
+        streams_.push_back(stream);
+    }
+    // Nothing is written before the subscription is accepted, so a refusal
+    // is an ordinary response. The snapshot and the first notifications
+    // are queued: they go out after the head, once this handler returns.
+    bool ok = stream->subscriber.open(request, reply) == Status::Ok;
+    if (ok) {
+        std::string head =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n"
+            "Cache-Control: no-store\r\n";
+        if (corsOrigin_) {
+            head += "Access-Control-Allow-Origin: ";
+            head += corsOrigin_;
+            head += "\r\n";
+        }
+        head += "\r\n";
+        ok = sendAll(req, head.data(), head.size());
+    }
+    if (!ok) {
+        {
+            MutexGuard guard(streamsMutex_);
+            for (size_t i = 0; i < streams_.size(); i++) {
+                if (streams_[i] == stream) streams_.erase(streams_.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+        }
+        delete stream;
+        return ESP_OK;
+    }
+    // The socket's session context: freed, with the stream, when it closes.
+    req->sess_ctx = stream;
+    req->free_ctx = &HttpServer::freeStream;
     return ESP_OK;
 }
 
@@ -811,15 +1052,6 @@ std::string contentDisposition(const std::string& name) {
     return d;
 }
 
-bool sendAll(httpd_req_t* req, const char* data, size_t len) {
-    while (len) {
-        int n = httpd_send(req, data, len);
-        if (n <= 0) return false;
-        data += n;
-        len -= static_cast<size_t>(n);
-    }
-    return true;
-}
 }  // namespace
 
 esp_err_t HttpServer::sendFile(httpd_req_t* req, FileTransfer& file) {

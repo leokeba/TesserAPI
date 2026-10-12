@@ -7,6 +7,7 @@ set(TESSER_CORE_SRCS
     src/tesser/call.cpp
     src/tesser/api.cpp
     src/tesser/fan_out.cpp
+    src/tesser/stream_subscriber.cpp
     src/tesser/envelope.cpp
     src/tesser/line_transport.cpp
     src/tesser/datagram.cpp

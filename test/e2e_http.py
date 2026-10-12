@@ -6,11 +6,13 @@ Usage:
 Runs the conformance vectors, then HTTP-specific checks. Standard library
 only. Prints "E2E pass=<n> fail=<n>".
 """
+import http.client
 import json
 import os
 import statistics
 import sys
 import threading
+import time
 import urllib.parse
 
 import conformance
@@ -146,6 +148,45 @@ def main():
     # Deferred action: the handler parks until the reply arrives.
     got, data, _, ms = h.raw('POST', '/system/later')
     check('deferred reply', got == 200 and json.loads(data) == 'done' and ms >= 180, (got, data, ms))
+
+    # Streamed subscriptions: one notification per line on a long GET.
+    url = urllib.parse.urlsplit(base)
+    subs0 = h.call('get', '/system/subscriptions', {}, ABSENT)[1]
+
+    def stream(query, path='/'):
+        c = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=30)
+        c.request('GET', url.path + path + '?' + query)
+        return c, c.getresponse()
+
+    c1, r1 = stream('sub&interval=60000&changes=false&snapshot=false')
+    check('stream opens', r1.status == 200 and r1.getheader('Content-Type') == 'application/x-ndjson' and
+          r1.getheader('Transfer-Encoding') == 'chunked' and r1.getheader('Access-Control-Allow-Origin') == '*',
+          (r1.status, r1.getheaders()))
+    h.call('set', '/demo/fire', {}, 5)
+    line = r1.readline()
+    check('stream carries events', json.loads(line) == {'op': 'event', 'path': '/demo/fired', 'body': 5}, line)
+    c2, r2 = stream('sub=1&snapshot=false')
+    c3, r3 = stream('sub&snapshot=false')
+    body3 = r3.read()
+    check('third stream -> 503 busy', r3.status == 503 and json.loads(body3)['error'] == 'busy', (r3.status, body3))
+    c3.close()
+    got, data, _, _ = h.raw('GET', '/lamp', {'sub': 'maybe'})
+    check('bad sub flag -> 400', got == 400, (got, data))
+    got, data, _, _ = h.raw('POST', '/lamp', {'sub': ''}, {'on': False})
+    check('sub with POST -> 400', got == 400, (got, data))
+    c2.close()
+    t0 = time.time()
+    line = r1.readline()  # nothing else happens: the keep-alive
+    check(f'stream keep-alive ({time.time() - t0:.0f} s)', line == b'\n' and time.time() - t0 < 26, line)
+    c1.close()
+    time.sleep(0.5)
+    check('closed streams drop their subscriptions',
+          h.call('get', '/system/subscriptions', {}, ABSENT)[1] == subs0, subs0)
+    c5, r5 = stream('sub&snapshot=false', '/nope')
+    body5 = r5.read()
+    check('refused stream -> ordinary error', r5.status == 404 and r5.getheader('Content-Type') == 'application/json',
+          (r5.status, body5))
+    c5.close()
 
     # Concurrent clients.
     errors = []

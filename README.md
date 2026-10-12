@@ -39,7 +39,7 @@ Every subtree is addressable. These examples use HTTP; the same requests work ov
 
 ## Live updates
 
-Message transports (serial, WebSocket, NowTP) can subscribe to any subtree, and get sparse change notifications and events:
+Message transports (serial, WebSocket, NowTP, Bluetooth) can subscribe to any subtree, and get sparse change notifications and events. Plain HTTP can too, with a long `GET /api/<path>?sub` that streams one notification per line:
 
 ```cpp
 auto& button = api.object("button");
@@ -122,7 +122,7 @@ api.mount("right", rightMotor);
 | Transport | Framing | Status |
 |---|---|---|
 | Serial (`LineTransport`, `StreamTransport`, `UartTransport`) | one JSON envelope per line | done |
-| HTTP (`HttpServer`, on `esp_http_server`, also usable under PsychicHttp) | REST mapping, streamed chunked responses, CORS, mDNS announcement | done |
+| HTTP (`HttpServer`, on `esp_http_server`, also usable under PsychicHttp) | REST mapping, streamed chunked responses, streamed subscriptions (`?sub`), CORS, mDNS announcement | done |
 | NowTP (`NowTpTransport`, ESP-NOW) | one JSON envelope per message, reliable unicast; also a client for other nodes | done |
 | WebSocket (`HttpServer::enableWebSocket`) | JSON envelope, subscriptions | done |
 | Bluetooth LE (`BleTransport`, `<tesser/transports/ble_transport.h>`; Arduino, ESP-IDF with NimBLE) | serial lines over the Nordic UART Service | done |

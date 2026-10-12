@@ -560,7 +560,8 @@ http.attach(handle, "/api");     // registers a wildcard URI on an existing http
 
 | HTTP | Operation |
 |---|---|
-| `GET /api/<path>?depth=&keys=&exclude=&view=&shape=` | get. A shape comes either in the body or URL-encoded in `shape` (browsers can't send a GET body); both at once is `bad_request`. |
+| `GET /api/<path>?depth=&keys=&exclude=&view=&remotes=&shape=` | get. A shape comes either in the body or URL-encoded in `shape` (browsers can't send a GET body); both at once is `bad_request`. |
+| `GET /api/<path>?sub&interval=&changes=&events=&snapshot=&depth=&keys=&exclude=&remotes=` | streamed subscription: the response stays open, one notification per line (below). |
 | `PUT`, `PATCH` or `POST /api/<path>` | set. The body is JSON. |
 | `GET /api/<file>` (no `view`, or `view=value`) | download a file node (§4.6): the raw bytes. |
 | `PUT` or `POST /api/<file>?filename=` | upload to a file node: the body is the raw bytes, with any `Content-Type`. `filename`, optional, is the name the client gives the file (`FileRequest::filename`). The reply is JSON. |
@@ -574,6 +575,14 @@ http.attach(handle, "/api");     // registers a wildcard URI on an existing http
 - `begin()` starts a dedicated server with wildcard URI matching and an 8 KB stack. `attach()` uses 4 handler slots (5 with CORS, 6 with WebSocket) on an existing server, which must use `httpd_uri_match_wildcard` and should have at least 8 KB of stack. Measured peak use is about 4.9 KB: recursive rendering, newlib's float formatting and lwIP all run on it.
 - `enableCors(origin)` adds `Access-Control-Allow-*` headers and answers `OPTIONS` preflights with 204.
 - The client's IP address is passed to the core in `Client`.
+- **Streamed subscriptions:** `GET` with `?sub` (also `sub=`, `sub=1` or `sub=true`) subscribes to the path and keeps the response open, for clients that can't use WebSocket, such as an HTTPS page reaching a device by address.
+  - **Request:** the other query parameters have the envelope's names and meanings (§10.1, §11). Booleans are `true`, `false`, `1` or `0`. `?sub` with another method is `bad_request`. Authentication is as for any request, and the client's level is fixed when the stream opens: it filters the notifications as on WebSocket.
+  - **Response:** `200`, `Content-Type: application/x-ndjson`, chunked, `Cache-Control: no-store`, CORS headers when enabled. Each line is one notification envelope, exactly as on WebSocket: `{"op":"event",...}` or `{"op":"change",...}`, with `"overflow": true` after lost notifications. With a snapshot (the default, as for `sub`), the first line is `{"op":"change","path":<path>,"body":<snapshot>}`, the snapshot bounded by `maxResponse`. Without one, the head goes out at once and nothing follows until something happens.
+  - **Keep-alive:** a bare `"\n"` once nothing has gone out for `setStreamKeepAlive(ms)` (default 15 s; checked every third of it, so a stream is silent for at most 25 s). Clients skip empty lines, and can take 40 s of silence as a dead stream.
+  - **Refusals** are ordinary responses with the JSON error body, sent before any stream byte: `busy` beyond `setMaxStreams(n)` streams (default 2) or the subscription budget (§11), `not_found`, `unauthorized`, and so on. A subscription that would wait for a remote node (forwarded, §14) is `not_allowed`. A client should take anything but a `200` with `application/x-ndjson` as "no stream here", which also covers older firmware answering the value as JSON.
+  - **Lifetime:** one subscription per stream, which ends when the connection does; there is no `unsub`. Each stream is a `Subscriber` of its own (`StreamSubscriber`, platform-independent and host-tested), so `maxSubscriptionsPerClient` applies per stream.
+  - **Sockets:** a stream holds one of the server's sockets (`max_open_sockets`, 7 by default) and no handler. The handler returns once the head is out, leaving the socket open. Lines go out from the httpd task through `httpd_queue_work`, like WebSocket frames, so they never block it or interleave with other writes. The stream is the socket's session context, so a closed socket drops its subscription at once, with `attach()` too. A failed write closes the socket. Each write refreshes the socket's LRU counter, so with `lru_purge_enable` idle keep-alive connections are purged before an active stream. A purged stream is closed like any other, and the client reopens it.
+  - ESP-IDF's asynchronous request API would also work, but it needs 5.3, and it doesn't watch the socket for a close.
 - **mDNS:** `http.advertise("Heliostat 3", "heliostat-3")` announces a `_tesser._tcp` service on the server's port, with the API's base path and WebSocket path in its TXT record (`api=/api`, `ws=/ws`), and the hostname `heliostat-3.local`. Browsers can't browse mDNS, but they resolve `.local` names, and TesserUI's bridge lists these services. It needs the mdns component: Arduino-ESP32 ships it; on ESP-IDF the application adds `espressif/mdns`, which the component then links. If the application started mDNS itself, its hostname is kept unless one is given.
 
 ### 10.3 NowTP
@@ -668,7 +677,7 @@ The serial lines of §10.4 over the **Nordic UART Service**, so browsers (Web Bl
 
 **Delivering:** `Api::poll()` sends pending change notifications. Call it from `loop()`, or let `api.startTask(periodMs)` (ESP, default 20 ms) do it. It does nothing while nobody is subscribed.
 
-**Subscribing** (message transports: serial, NowTP, WebSocket; plain HTTP answers `not_allowed`):
+**Subscribing** (message transports: serial, NowTP, WebSocket, Bluetooth; over plain HTTP, a streamed GET, §10.2; another HTTP `sub` answers `not_allowed`):
 
 ```json
 → {"id": 3, "op": "sub", "path": "/sensors", "keys": "temperature,humidity", "interval": 500}
@@ -701,8 +710,8 @@ The serial lines of §10.4 over the **Nordic UART Service**, so browsers (Web Bl
 
 **Limits and cleanup:**
 - At most `maxSubscriptions` (16) subscriptions in total, and `maxSubscriptionsPerClient` (4) per client. Beyond that, `busy`.
-- Notifications go through each transport's own bounded queue: NowTP's transmit queue, `httpd_queue_work` for WebSocket. A slow client never causes unbounded allocation.
-- Subscriptions die with their client: WebSocket close, NowTP peer lost, a `LineTransport` destroyed, or an explicit `unsub`.
+- Notifications go through each transport's own bounded queue: NowTP's transmit queue, `httpd_queue_work` for WebSocket and HTTP streams. A slow client never causes unbounded allocation.
+- Subscriptions die with their client: WebSocket close, an HTTP stream's socket closed, NowTP peer lost, a `LineTransport` destroyed, or an explicit `unsub`.
 
 **Client side:** `DatagramEndpoint` (NowTP) sends `sub` requests like any other, with `interval`, `changes`, `events` and `snapshot` in its `Query`. Incoming notifications go to `onNotification(handler)`; they are never answered, so two nodes subscribed to each other can't ping-pong.
 
@@ -939,6 +948,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | done |
 | 8 | Bluetooth LE transport (Arduino and ESP-IDF), for TesserUI's launcher | done |
 | 9 | Fan-out writes: a `*` path segment in Set, for TesserKIT's sequencer | done |
+| 10 | Streamed subscriptions over plain HTTP, for TesserUI on HTTPS pages | done |
 
 ## 19. Decisions on former open questions
 

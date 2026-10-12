@@ -11,6 +11,7 @@
 #include "tesser/line_transport.h"
 #include "tesser/remote.h"
 #include "tesser/storage.h"
+#include "tesser/stream_subscriber.h"
 #include "tesser/transports/http_server.h"
 #include "tesser/transports/nowtp_transport.h"
 #include "tesser/transports/stream_transport.h"

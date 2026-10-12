@@ -12,6 +12,8 @@
 #include "esp_http_server.h"
 #include "tesser/api.h"
 
+struct esp_timer;  // esp_timer.h, kept out of applications' include path
+
 namespace tesser {
 
 class FileTransfer;
@@ -48,6 +50,15 @@ public:
     void enableWebSocket(const char* uri = "/ws") { wsUri_ = uri; }
     size_t webSocketClients() const;
 
+    // Streamed subscriptions (docs/DESIGN.md section 10.2): GET with ?sub
+    // keeps the response open and sends one notification per line. Each
+    // stream holds one of the server's sockets; past `n` streams, requests
+    // get busy. A stream idle for `keepAliveMs` gets a bare "\n", so a gone
+    // client is noticed. Call before begin()/attach().
+    void setMaxStreams(uint8_t n) { maxStreams_ = n; }
+    void setStreamKeepAlive(uint32_t ms) { keepAliveMs_ = ms; }
+    size_t streams() const;
+
     // Requests carrying "Authorization: Bearer <token>" (or ?token=<token>,
     // for WebSocket handshakes from browsers) count as authenticated, with
     // full access; see Api::authorize(). Other tokens go to the API's token
@@ -70,6 +81,7 @@ public:
 
 private:
     class WsClient;
+    class Stream;
 
     static esp_err_t onRequest(httpd_req_t* req);
     static esp_err_t onOptions(httpd_req_t* req);
@@ -85,6 +97,10 @@ private:
     void dropWsClient(int fd);
     bool wsSend(int fd, const std::string& message);
     Access access(httpd_req_t* req) const;
+    esp_err_t serveStream(httpd_req_t* req, const Request& request, Reply& reply);
+    bool streamSend(Stream* stream, const std::string& piece);
+    static void freeStream(void* ctx);
+    static void onKeepAlive(void* arg);
 
     Api& api_;
     httpd_handle_t server_ = nullptr;
@@ -98,6 +114,11 @@ private:
     mutable Mutex wsMutex_;
     std::vector<WsClient*> wsClients_;
     bool wsAuthWarned_ = false;
+    mutable Mutex streamsMutex_;  // never held while taking the API lock
+    std::vector<Stream*> streams_;
+    uint8_t maxStreams_ = 2;
+    uint32_t keepAliveMs_ = 15000;
+    struct esp_timer* keepAliveTimer_ = nullptr;
     friend class HttpReply;
 };
 
