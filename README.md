@@ -85,7 +85,7 @@ A node can graft another node's tree into its own, reached over ESP-NOW:
 nowApi.remote(api, "kitchen", kitchenMac).mirror();   // GET /api/kitchen/lamp is forwarded over ESP-NOW
 ```
 
-With a mirror, the remote's state also appears in local reads and subscriptions, events included.
+With a mirror, the remote's state also appears in local reads and subscriptions, events included. File transfers are relayed too: `PUT /api/kitchen/sys/firmware` updates the remote node's firmware through the gateway, in the remote's chunks.
 
 ## Persistence and access control
 

@@ -98,6 +98,10 @@ public:
     // section 10.1.1), with its "id" replaced by the call's.
     bool request(const PeerAddress& to, JsonObjectConst envelope, ResponseHandler done, uint32_t timeoutMs = 0,
                  const void* owner = nullptr);
+    // Sends an envelope whose members after its "id" are `fields`: JSON text
+    // without the braces (`"op":"download","path":"/sys/backup"`).
+    bool requestFields(const PeerAddress& to, std::string_view fields, ResponseHandler done, uint32_t timeoutMs = 0,
+                       const void* owner = nullptr);
     // Drops (without calling) the pending calls tagged with `owner`.
     void cancelCalls(const void* owner);
 
@@ -149,6 +153,8 @@ public:
     Stats stats() const;
     size_t pendingCalls() const;
     uint32_t now() const { return clock_ ? clock_() : 0; }
+    // The default call timeout (Options::timeoutMs).
+    uint32_t timeoutMs() const { return options_.timeoutMs; }
     Api* api() const { return api_; }
 
 private:

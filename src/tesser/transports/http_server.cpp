@@ -808,7 +808,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
         return ESP_OK;
     }
     if (!sub && (request.op == Op::Set || request.query.view == View::Value)) {
-        FileTransfer file(api_);
+        FileTransfer file(api_, FileTransfer::Remotes::Wait);
         FileTransfer::Open o = request.op == Op::Set
                                    ? file.openUpload(path, request.client, req->content_len, reply, filename)
                                    : file.openDownload(path, request.client, reply);

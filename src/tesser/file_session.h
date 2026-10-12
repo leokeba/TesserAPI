@@ -22,7 +22,9 @@ struct Config;
 // bytes in base64 chunks, each one a request carrying its offset. One
 // transfer at a time; a new one replaces the last. Platform-independent: the
 // serial, Bluetooth, WebSocket and NowTP transports keep one per client and
-// hand it these envelopes. Holds nothing while no transfer is open.
+// hand it these envelopes. Holds nothing while no transfer is open. A path
+// below a remote node is relayed to the peer without waiting for it: each
+// envelope's reply is deferred until the peer's comes.
 class FileSession {
 public:
     explicit FileSession(Api& api);
@@ -39,7 +41,7 @@ public:
     // An unfinished upload is aborted.
     void reset();
     // A transfer is open, or its last chunk can still be sent again.
-    bool busy() const { return state_ != nullptr; }
+    bool busy() const;
 
     // The largest chunk of file data, in bytes, that an upload envelope may
     // carry and a download reply carries, under `config`'s limits.
@@ -52,6 +54,11 @@ private:
                 Reply& reply);
     void download(JsonObjectConst envelope, std::string_view path, uint64_t offset, const Client& client,
                   Reply& reply);
+    // Below a remote node: the transfer is relayed (docs/DESIGN.md section
+    // 14), and the reply deferred until the peer's comes.
+    void relayUpload(bool opening, uint64_t size, std::string_view filename, uint64_t offset,
+                     std::vector<uint8_t> data, Reply& reply);
+    void relayDownload(bool opening, uint64_t offset, size_t length, size_t max, Reply& reply);
 
     Api& api_;
     std::unique_ptr<State> state_;

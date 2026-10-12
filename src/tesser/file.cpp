@@ -6,6 +6,7 @@
 
 #include "tesser/api.h"
 #include "tesser/call.h"
+#include "tesser/remote.h"
 
 namespace tesser {
 
@@ -67,6 +68,15 @@ void FileTransfer::close() {
     source_.reset();
     if (claimed_) api_.releaseTransfer(path_);
     claimed_ = false;
+    if (relay_) relay_->close();
+    relay_.reset();
+    relayBuf_.clear();
+    relayBuf_.shrink_to_fit();
+    relayAt_ = 0;
+    relayReply_.clear();
+    relaySize_ = -1;
+    relayPosition_ = 0;
+    relayEnd_ = false;
 }
 
 void FileTransfer::cancel() {
@@ -76,7 +86,7 @@ void FileTransfer::cancel() {
 
 bool FileTransfer::active() const {
     MutexGuard guard(mutex_);
-    return sink_ || source_;
+    return sink_ || source_ || (relay_ && relay_->open());
 }
 
 bool FileTransfer::expireIfIdle(uint32_t nowMs, uint32_t idleMs) {
@@ -103,14 +113,30 @@ FileTransfer::Open FileTransfer::open(std::string_view path, const Client& clien
     req.client = client;
     path_.assign(path.data(), path.size());
     if (path_.size() > 1 && path_.back() == '/') path_.pop_back();
-    MutexGuard guard(api_.mutex());
-    bool notFile = false;
-    // Destroyed before the guard: list elements are built and freed under
-    // the lock. Their file nodes' handlers run while they exist.
-    std::vector<std::unique_ptr<Node>> elements;
-    FileNode* node = api_.fileNode(req, reply, notFile, elements);
-    if (notFile) return Open::NotFile;
-    if (!node) return Open::Failed;
+    Api::RemoteTarget remote;
+    {
+        MutexGuard guard(api_.mutex());
+        bool notFile = false;
+        // Destroyed before the guard: list elements are built and freed
+        // under the lock. Their file nodes' handlers run while they exist.
+        std::vector<std::unique_ptr<Node>> elements;
+        FileNode* node = api_.fileNode(req, reply, notFile, elements, &remote);
+        if (notFile) return Open::NotFile;
+        if (node) return openLocal(*node, client, op, size, filename, reply);
+        if (!remote.node) return Open::Failed;
+        relay_ = remote.node->relayFile(api_, remote.rest, remote.base);
+    }
+    // Relayed: the peer's replies come from another task, outside the lock.
+    if (!relay_) {
+        writeError(reply, Status::Internal, path_, "no endpoint");
+        return Open::Failed;
+    }
+    return openRelay(op, size, filename, reply);
+}
+
+FileTransfer::Open FileTransfer::openLocal(FileNode& file, const Client& client, Op op, uint64_t size,
+                                           std::string_view filename, Reply& reply) {
+    FileNode* node = &file;
     bool upload = op == Op::Set;
     if (upload ? !node->writable() : !node->readable()) {
         writeError(reply, Status::NotAllowed, path_, upload ? "this file can't be uploaded" : "this file can't be downloaded");
@@ -148,15 +174,6 @@ FileTransfer::Open FileTransfer::open(std::string_view path, const Client& clien
     return Open::Ok;
 }
 
-FileTransfer::Open FileTransfer::openUpload(std::string_view path, const Client& client, uint64_t size, Reply& reply,
-                                            std::string_view filename) {
-    return open(path, client, Op::Set, size, filename, reply);
-}
-
-FileTransfer::Open FileTransfer::openDownload(std::string_view path, const Client& client, Reply& reply) {
-    return open(path, client, Op::Get, 0, std::string_view(), reply);
-}
-
 namespace {
 void noTransfer(Reply& reply, const std::string& path, bool expired, const char* what) {
     if (expired) {
@@ -167,9 +184,142 @@ void noTransfer(Reply& reply, const std::string& path, bool expired, const char*
 }
 }  // namespace
 
+namespace {
+
+// One relay call waited for (FileTransfer::Remotes::Wait).
+struct Waited {
+    Signal signal;
+    Status status = Status::Timeout;
+    JsonDocument body;
+};
+
+Status waitFor(FileRelay& relay, const std::function<void(FileRelay::Done)>& start, JsonDocument& body) {
+    auto w = std::make_shared<Waited>();
+    start([w](Status s, JsonVariantConst b) {
+        w->status = s;
+        w->body.set(b);
+        w->signal.give();
+    });
+    // The relay always answers, after its attempts. This only guards
+    // against calls dropped without an answer (their remote node destroyed).
+    for (int round = 0; !w->signal.take(relay.patienceMs()); round++) {
+        if (round > 0 || !relay.busy()) {
+            if (w->signal.take(100)) break;
+            body.clear();
+            return Status::Timeout;
+        }
+    }
+    body = std::move(w->body);
+    return w->status;
+}
+
+}  // namespace
+
+FileTransfer::Open FileTransfer::openRelay(Op op, uint64_t size, std::string_view filename, Reply& reply) {
+    expected_ = size;
+    received_ = 0;
+    activeMs_ = millis32();
+    if (remotes_ == Remotes::Return) {
+        if (!relay_->claim(reply)) {
+            close();
+            return Open::Failed;
+        }
+        return Open::Remote;
+    }
+    // The client named no operation (HTTP): whether the peer's node is a
+    // file decides, as for a local path. Another answer is left to the
+    // request forwarded as usual.
+    JsonDocument body;
+    Status s = waitFor(*relay_, [this](FileRelay::Done d) { relay_->probe(std::move(d)); }, body);
+    if (s != Status::Ok && body.isNull()) {
+        relay_->writeReply(reply, s, body.as<JsonVariantConst>());
+        close();
+        return Open::Failed;
+    }
+    if (s != Status::Ok || body["type"] != "file") {
+        close();
+        return Open::NotFile;
+    }
+    if (!relay_->claim(reply)) {
+        close();
+        return Open::Failed;
+    }
+    if (op == Op::Set) {
+        s = waitFor(*relay_, [&](FileRelay::Done d) { relay_->openUpload(size, filename, std::move(d)); }, body);
+        if (s == Status::Ok && relay_->finished()) serializeJson(body, relayReply_);  // size 0
+        filename_.assign(filename.data(), filename.size());
+    } else {
+        s = waitFor(*relay_, [this](FileRelay::Done d) { relay_->download(0, 0, std::move(d)); }, body);
+        if (s == Status::Ok && !takeChunk(body.as<JsonVariantConst>())) {
+            body.clear();
+            s = Status::Internal;
+        }
+        if (s == Status::Ok) {
+            relaySize_ = body["size"].is<int64_t>() ? body["size"].as<int64_t>() : -1;
+            filename_ = body["filename"] | "";
+            contentType_ = body["contentType"] | "application/octet-stream";
+        }
+    }
+    if (s != Status::Ok) {
+        relay_->writeReply(reply, s, body.as<JsonVariantConst>());
+        close();
+        return Open::Failed;
+    }
+    activeMs_ = millis32();
+    return Open::Ok;
+}
+
+bool FileTransfer::takeChunk(JsonVariantConst body) {
+    JsonString data = body["data"].as<JsonString>();
+    if (!detail::base64Decode(std::string_view(data.c_str() ? data.c_str() : "", data.size()), relayBuf_)) return false;
+    relayAt_ = 0;
+    relayPosition_ = body["offset"].as<uint64_t>() + relayBuf_.size();
+    relayEnd_ = body["end"] == true;
+    return true;
+}
+
+bool FileTransfer::fetchRelay() {
+    JsonDocument body;
+    uint64_t at = relayPosition_;
+    Status s = waitFor(*relay_, [&](FileRelay::Done d) { relay_->download(at, 0, std::move(d)); }, body);
+    return s == Status::Ok && takeChunk(body.as<JsonVariantConst>());
+}
+
+bool FileTransfer::flushRelay(Reply& reply, bool all) {
+    if (!relay_->open()) {
+        noTransfer(reply, path_, relay_->expired(), "no upload in progress");
+        close();
+        return false;
+    }
+    size_t chunk = relay_->chunk();
+    size_t n = all || !chunk ? relayBuf_.size() : relayBuf_.size() / chunk * chunk;
+    if (!n) return true;
+    std::vector<uint8_t> part(relayBuf_.begin(), relayBuf_.begin() + static_cast<std::ptrdiff_t>(n));
+    relayBuf_.erase(relayBuf_.begin(), relayBuf_.begin() + static_cast<std::ptrdiff_t>(n));
+    JsonDocument body;
+    Status s = waitFor(*relay_, [&](FileRelay::Done d) { relay_->write(std::move(part), std::move(d)); }, body);
+    if (s != Status::Ok) {
+        relay_->writeReply(reply, s, body.as<JsonVariantConst>());
+        close();
+        return false;
+    }
+    if (relay_->finished()) serializeJson(body, relayReply_);
+    activeMs_ = millis32();
+    return true;
+}
+
+FileTransfer::Open FileTransfer::openUpload(std::string_view path, const Client& client, uint64_t size, Reply& reply,
+                                            std::string_view filename) {
+    return open(path, client, Op::Set, size, filename, reply);
+}
+
+FileTransfer::Open FileTransfer::openDownload(std::string_view path, const Client& client, Reply& reply) {
+    return open(path, client, Op::Get, 0, std::string_view(), reply);
+}
+
 bool FileTransfer::write(const uint8_t* data, size_t len, Reply& reply) {
     MutexGuard guard(mutex_);
-    if (!sink_) {
+    if (!sink_ && !relay_) {
         noTransfer(reply, path_, expired_, "no upload in progress");
         return false;
     }
@@ -177,6 +327,13 @@ bool FileTransfer::write(const uint8_t* data, size_t len, Reply& reply) {
         close();
         writeError(reply, Status::TooLarge, path_, "more bytes than announced");
         return false;
+    }
+    if (relay_) {
+        // Whole chunks of the peer's size, and the rest at the end.
+        relayBuf_.insert(relayBuf_.end(), data, data + len);
+        received_ += len;
+        activeMs_ = millis32();
+        return flushRelay(reply, received_ == expected_);
     }
     Check c = sink_->write(data, len);
     if (!c.isOk()) {
@@ -191,6 +348,24 @@ bool FileTransfer::write(const uint8_t* data, size_t len, Reply& reply) {
 
 void FileTransfer::finish(Reply& reply) {
     MutexGuard guard(mutex_);
+    if (relay_) {
+        if (received_ != expected_) {
+            close();
+            writeError(reply, Status::BadRequest, path_, "upload cut short");
+            return;
+        }
+        if (relayReply_.empty() && !flushRelay(reply, true)) return;
+        if (relayReply_.empty()) {
+            close();
+            writeError(reply, Status::Internal, path_, "the remote node didn't end the upload");
+            return;
+        }
+        JsonWriter out(reply.begin(Status::Ok));
+        out.raw(relayReply_);
+        detail::finishBody(reply, out, path_);
+        close();
+        return;
+    }
     if (!sink_) {
         noTransfer(reply, path_, expired_, "no upload in progress");
         return;
@@ -221,11 +396,30 @@ void FileTransfer::finish(Reply& reply) {
 
 int64_t FileTransfer::size() const {
     MutexGuard guard(mutex_);
+    if (relay_) return relaySize_;
     return source_ ? source_->size() : -1;
 }
 
 int FileTransfer::read(uint8_t* buf, size_t cap) {
     MutexGuard guard(mutex_);
+    if (relay_) {
+        while (relayAt_ == relayBuf_.size()) {
+            if (relayEnd_) {
+                close();
+                return 0;
+            }
+            if (!fetchRelay()) {
+                close();
+                return -1;
+            }
+            activeMs_ = millis32();
+        }
+        size_t n = relayBuf_.size() - relayAt_;
+        if (n > cap) n = cap;
+        memcpy(buf, relayBuf_.data() + relayAt_, n);
+        relayAt_ += n;
+        return static_cast<int>(n);
+    }
     if (!source_) return -1;
     int n = source_->read(buf, cap);
     if (n <= 0) close();
@@ -338,6 +532,12 @@ bool FileSession::handles(JsonObjectConst envelope) {
 
 void FileSession::reset() { state_.reset(); }
 
+bool FileSession::busy() const {
+    if (!state_) return false;
+    const std::shared_ptr<FileRelay>& relay = state_->transfer.relay();
+    return !relay || relay->open();
+}
+
 void FileSession::handle(JsonObjectConst envelope, const Client& client, Reply& reply) {
     JsonVariantConst p = envelope["path"];
     std::string_view path = "/";
@@ -387,14 +587,14 @@ void FileSession::upload(JsonObjectConst envelope, std::string_view path, uint64
         }
         state_.reset();
         auto state = std::unique_ptr<State>(new State(api_));
-        FileTransfer::Open o =
-            state->transfer.openUpload(path, client, size.as<uint64_t>(), reply,
-                                       filename.isNull() ? std::string_view() : text(filename));
+        std::string_view name = filename.isNull() ? std::string_view() : text(filename);
+        FileTransfer::Open o = state->transfer.openUpload(path, client, size.as<uint64_t>(), reply, name);
         if (o == FileTransfer::Open::NotFile) writeError(reply, Status::NotAllowed, path, "not a file");
-        if (o != FileTransfer::Open::Ok) return;
+        if (o != FileTransfer::Open::Ok && o != FileTransfer::Open::Remote) return;
         state->upload = true;
         state->path.assign(path.data(), path.size());
         state_ = std::move(state);
+        if (o == FileTransfer::Open::Remote) return relayUpload(true, size.as<uint64_t>(), name, 0, std::move(data), reply);
     } else if (!state_ || !state_->upload || state_->path != path || !state_->transfer.active()) {
         bool expired = state_ && state_->upload && state_->path == path && state_->transfer.expired();
         if (expired) {
@@ -403,6 +603,8 @@ void FileSession::upload(JsonObjectConst envelope, std::string_view path, uint64
             writeError(reply, Status::BadRequest, path, "no upload in progress at this path");
         }
         return;
+    } else if (state_->transfer.relay()) {
+        return relayUpload(false, 0, std::string_view(), offset, std::move(data), reply);
     }
     FileTransfer& t = state_->transfer;
     uint64_t received = t.received();
@@ -455,10 +657,13 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
         auto state = std::unique_ptr<State>(new State(api_));
         FileTransfer::Open o = state->transfer.openDownload(path, client, reply);
         if (o == FileTransfer::Open::NotFile) writeError(reply, Status::NotAllowed, path, "not a file");
-        if (o != FileTransfer::Open::Ok) return;
+        if (o != FileTransfer::Open::Ok && o != FileTransfer::Open::Remote) return;
         state->path.assign(path.data(), path.size());
         state->size = state->transfer.size();
         state_ = std::move(state);
+        if (o == FileTransfer::Open::Remote) return relayDownload(true, 0, length, max, reply);
+    } else if (state_ && !state_->upload && state_->path == path && state_->transfer.relay()) {
+        return relayDownload(false, offset, length, max, reply);
     } else if (!state_ || state_->upload || state_->path != path) {
         writeError(reply, Status::BadRequest, path, "no download in progress at this path");
         return;
@@ -525,6 +730,128 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
     w.boolean(s.end);
     w.endObject();
     detail::finishBody(reply, w, path);
+}
+
+// ---- relayed transfers ------------------------------------------------------
+
+namespace {
+
+// Defers `reply` for a relay call: false, with the error written, if it can't.
+Reply* deferFor(Api& api, Reply& reply, const std::string& path) {
+    if (!api.pendingBegin()) {
+        writeError(reply, Status::Busy, path, "too many pending calls");
+        return nullptr;
+    }
+    Reply* detached = reply.detach();
+    if (!detached) {
+        api.pendingDone();
+        writeError(reply, Status::NotAllowed, path, "this transport can't wait for remote nodes");
+    }
+    return detached;
+}
+
+// Whether `relay` can take the next envelope; otherwise the error is written.
+bool relayReady(const FileRelay& relay, Reply& reply, const std::string& path, bool upload) {
+    if (relay.busy()) {
+        writeError(reply, Status::Busy, path, "the last chunk is still on its way");
+        return false;
+    }
+    if (relay.open()) return true;
+    if (relay.expired()) {
+        writeError(reply, Status::Timeout, path, "the transfer was idle too long");
+    } else {
+        writeError(reply, Status::BadRequest, path,
+                   upload ? "no upload in progress at this path" : "no download in progress at this path");
+    }
+    return false;
+}
+
+}  // namespace
+
+void FileSession::relayUpload(bool opening, uint64_t size, std::string_view filename, uint64_t offset,
+                              std::vector<uint8_t> data, Reply& reply) {
+    std::shared_ptr<FileRelay> relay = state_->transfer.relay();
+    const std::string& path = state_->path;
+    if (!relayReady(*relay, reply, path, true)) return;
+    if (!opening) {
+        uint64_t received = relay->received();
+        if (offset > received) {
+            char message[64];
+            snprintf(message, sizeof(message), "offset must be at most %llu", static_cast<unsigned long long>(received));
+            writeError(reply, Status::BadRequest, path, message);
+            return;
+        }
+        // Bytes the peer has already (a chunk sent again): only the rest.
+        uint64_t skip = received - offset;
+        data.erase(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(skip < data.size() ? skip : data.size()));
+    }
+    Reply* detached = deferFor(api_, reply, path);
+    if (!detached) return;
+    Api* api = &api_;
+    size_t chunk = uploadChunk(api_.config());
+    // The client's reply: the peer's progress, or the upload's reply.
+    auto answer = [relay, detached, api, opening, chunk, path](Status s, JsonVariantConst body) {
+        if (s != Status::Ok || relay->finished()) {
+            relay->writeReply(*detached, s, body);
+        } else {
+            JsonWriter w(detached->begin(Status::Ok));
+            w.beginObject();
+            w.key("received");
+            w.uinteger(relay->received());
+            if (opening) {
+                // Chunks the gateway takes and the peer too: one call each.
+                size_t c = relay->chunk();
+                w.key("chunk");
+                w.uinteger(c && c < chunk ? c : chunk);
+            }
+            w.endObject();
+            detail::finishBody(*detached, w, path);
+        }
+        detached->release();
+        api->pendingDone();
+    };
+    if (opening) {
+        relay->openUpload(size, filename, [relay, data, answer](Status s, JsonVariantConst body) {
+            if (s != Status::Ok || relay->finished() || data.empty()) return answer(s, body);
+            relay->write(data, answer);
+        });
+    } else if (data.empty()) {
+        answer(Status::Ok, JsonVariantConst());
+    } else {
+        relay->write(std::move(data), answer);
+    }
+}
+
+void FileSession::relayDownload(bool opening, uint64_t offset, size_t length, size_t max, Reply& reply) {
+    std::shared_ptr<FileRelay> relay = state_->transfer.relay();
+    const std::string& path = state_->path;
+    if (!opening && !relayReady(*relay, reply, path, false)) return;
+    Reply* detached = deferFor(api_, reply, path);
+    if (!detached) return;
+    Api* api = &api_;
+    relay->download(offset, length, [relay, detached, api, max, path](Status s, JsonVariantConst body) {
+        if (s != Status::Ok || !body.is<JsonObjectConst>()) {
+            relay->writeReply(*detached, s, body);
+        } else {
+            // The peer's chunk as it came, base64 and all; only its largest
+            // chunk is capped at ours.
+            JsonWriter w(detached->begin(Status::Ok));
+            w.beginObject();
+            for (JsonPairConst kv : body.as<JsonObjectConst>()) {
+                w.key(std::string_view(kv.key().c_str(), kv.key().size()));
+                if (kv.key() == "chunk") {
+                    size_t c = kv.value().as<size_t>();
+                    w.uinteger(c && c < max ? c : max);
+                } else {
+                    w.variant(kv.value());
+                }
+            }
+            w.endObject();
+            detail::finishBody(*detached, w, path);
+        }
+        detached->release();
+        api->pendingDone();
+    });
 }
 
 }  // namespace tesser

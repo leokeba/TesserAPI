@@ -284,7 +284,7 @@ api.object("sys").file("backup").contentType("application/json").readAccess(tess
       return createFile(r.filename);
   });
   ```
-- **Transports:** HTTP moves the raw bytes (§10.2); the message transports (serial, Bluetooth, WebSocket, NowTP) move them in base64 chunks, one `upload` or `download` envelope each (§10.1.1).
+- **Transports:** HTTP moves the raw bytes (§10.2); the message transports (serial, Bluetooth, WebSocket, NowTP) move them in base64 chunks, one `upload` or `download` envelope each (§10.1.1). Below a remote node, a gateway relays the transfer to the remote node (§14).
 - **Abandoned transfers:** a transfer that has moved nothing for `Config::transferIdleMs` (30 s by default; 0 is never) is taken over by the next one to its path, from any client and transport: an unfinished upload is aborted, and its client gets `timeout` on its next chunk. A message transport has no connection to lose, so this is how a client that went quiet stops blocking the path.
 - **Generic core:** `tesser::FileTransfer` does the work (resolution, access, size, one transfer at a time, the reply), host-tested; the HTTP transport only moves bytes, and `tesser::FileSession` drives it from envelopes.
 
@@ -573,6 +573,7 @@ File nodes (§4.6) transfer over these transports too. The client sends one enve
 - **Chunk sizes:** a download chunk is at most 4 KB, and smaller when `maxResponse` couldn't hold its base64 with room for the rest of the envelope (`(maxResponse − 256) × 3/4`), since NowTP buffers replies. An upload envelope must fit the transport's request limit: the device's `chunk` is `(maxRequestBody − 256) × 3/4`, at most 4 KB: 2880 bytes by default. Base64 adds a third.
 - **One transfer per client:** each client (a serial or Bluetooth line, a WebSocket connection, a NowTP peer) has one `FileSession`. Its transfer ends with the client: a Bluetooth disconnection (`reset()`), a closed WebSocket, a lost NowTP peer, a line's level falling with `auth` (the transfer was opened at the higher level). A NowTP peer's session is also dropped after `transferIdleMs` without a request. Otherwise, an abandoned transfer is taken over (§4.6).
 - **Threading:** as over HTTP, the handler runs under the API lock and the chunks outside it, in the transport's task, in queued mode too. A download chunk is read whole, and kept, before its reply goes out: up to 4 KB, plus its base64.
+- **Below a remote node,** the transfer is relayed to the remote node (§14), and each reply is deferred until the remote's comes.
 - **Generic core:** `tesser::FileSession`, platform-independent and host-tested; the transports only hand it these envelopes. `DatagramEndpoint::request(to, envelope, done)` sends them from a client.
 
 ### 10.2 HTTP (`esp_http_server`)
@@ -596,7 +597,7 @@ http.attach(handle, "/api");     // registers a wildcard URI on an existing http
 
 - Responses up to 512 bytes go out with a `Content-Length`. Larger ones are streamed with chunked encoding through the same 512-byte buffer, so there is no limit on response size.
 - Request bodies are capped by `maxRequestBody`, except uploads to file nodes, which are capped by the node's `maxSize`.
-- **File transfers** stream in 2 KB pieces from the heap. A download of known size goes out with a `Content-Length` (so clients can show progress) and a `Content-Disposition: attachment; filename="..."`; one of unknown size is chunked. In that `filename`, quotes, backslashes, control and non-ASCII bytes become `_`; a non-ASCII name also comes as `filename*=UTF-8''<percent-encoded>` (RFC 6266), which browsers prefer. A refused or failed upload's remaining body is read and dropped up to 256 KB, so the client, which sends it all before reading, gets the error; beyond that the connection is closed. With CORS, file responses carry the headers too.
+- **File transfers** stream in 2 KB pieces from the heap. A download of known size goes out with a `Content-Length` (so clients can show progress) and a `Content-Disposition: attachment; filename="..."`; one of unknown size is chunked. In that `filename`, quotes, backslashes, control and non-ASCII bytes become `_`; a non-ASCII name also comes as `filename*=UTF-8''<percent-encoded>` (RFC 6266), which browsers prefer. A refused or failed upload's remaining body is read and dropped up to 256 KB, so the client, which sends it all before reading, gets the error; beyond that the connection is closed. With CORS, file responses carry the headers too. Below a remote node, the server first asks the remote whether the path is a file node, and a relayed transfer holds the httpd task until it ends (§14).
 - The status is mapped as in §8.
 - The handler runs in the httpd task (inline mode).
 - `begin()` starts a dedicated server with wildcard URI matching and an 8 KB stack. `attach()` uses 4 handler slots (5 with CORS, 6 with WebSocket) on an existing server, which must use `httpd_uri_match_wildcard` and should have at least 8 KB of stack. Measured peak use is about 4.9 KB: recursive rendering, newlib's float formatting and lwIP all run on it.
@@ -830,6 +831,14 @@ nowApi.remote(api, "light", kitchenMac, "/lamp").mirror(200);
 ```
 
 - **Forwarding:** get and set on `/kitchen/...` are forwarded with the path rewritten, and complete through a deferred reply (`maxPending` applies). Error paths in the remote's reply are mapped back under the local path (`/kitchen/nope`). A silent node answers `timeout` after the node's `timeout()` (default: the endpoint's 3 s). Transports that can't wait get `not_allowed`.
+- **File transfers** to a file node below a remote node (`PUT /api/peers/lamp/sys/firmware`) are relayed to the remote as `upload` and `download` envelopes (§10.1.1), one at a time, in the remote's chunks, whatever the client's transport.
+  - **Message clients** (serial, Bluetooth, WebSocket, NowTP) send their envelopes to the gateway as to any node. Each reply is deferred until the remote's comes (`maxPending` applies; transports that can't wait get `not_allowed`), so the gateway's task never waits for the remote. `received` counts the bytes the remote has. The opening reply's `chunk` is the smaller of the gateway's and the remote's, so each envelope takes one round trip; a larger one is split. Downloads come in the remote's chunks as it sent them, base64 included: the client's `length` is passed on, capped at the gateway's own chunk.
+  - **HTTP** moves raw bytes, and its requests don't say whether the path is a file. A `GET` (value view), `PUT` or `POST` below a remote node therefore first asks the remote for the path's schema, at depth 0: one round trip. A file node is relayed; anything else is forwarded as usual, and an unreachable remote is an error at once. The relay runs in the httpd task, which waits for each chunk's reply, so the body is read only as fast as the remote takes it, and the client's upload progress follows the remote. Meanwhile the server, WebSocket connections included, serves nothing else: a 1 MB image over NowTP (about 15 KB/s) holds it for a bit over a minute. A user interface that must stay live while it updates a remote node uploads over WebSocket envelopes instead, whose relay never holds the task.
+  - **One transfer per remote:** a node keeps one transfer per client, and the gateway is one client of it, so the gateway relays one transfer per remote at a time. Another, to any path of the same remote, is `busy`; transfers to different remotes run side by side. Get, set and subscriptions aren't affected. An idle relay is taken over after `transferIdleMs`, as in §4.6.
+  - **Errors** from the remote come back under the local path, as for get and set. A chunk whose reply hasn't come within the node's `timeout()` is sent again, twice at most (the envelopes can be repeated, §10.1.1), then the transfer fails with `timeout`. A remote that is offline (§14.1) fails at once with `timeout` and `peer offline`. Any error but `bad_request` (a wrong offset, which the client can correct) ends the relay.
+  - **Abandoned uploads:** envelopes have no abort, so an upload that ends early on the gateway (its client gone, an error, a takeover) stays open on the remote until it has been idle for the remote's `transferIdleMs`, or until the gateway's next transfer to it. Its sink is then destroyed without `finish()`: an update isn't committed.
+  - **The remote's handler** must open a transfer within the node's `timeout()`: an update that erases its whole partition when it opens needs a longer one.
+  - **Generic core:** `tesser::FileRelay`, made by `RemoteNode::relayFile()`, host-tested. `FileTransfer` drives it waiting for each reply (HTTP); `FileSession` drives it without waiting.
 - **Writes** must target the remote subtree: a patch of the parent can't include a remote node. A `*` (§6.5) can match remote nodes, and the matches are forwarded together.
 - **Without a mirror**, a remote node renders as `null` in a parent read, and as `{"type": "remote"}` in the schema; reads below it are always forwarded live, and subscriptions are forwarded (below).
 - **`.mirror(intervalMs, refreshMs)`** keeps a local copy through a subscription. The copy is renewed every `refreshMs`, in case the remote node restarted.
@@ -983,6 +992,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 9 | Fan-out writes: a `*` path segment in Set, for TesserKIT's sequencer | done |
 | 10 | Streamed subscriptions over plain HTTP, for TesserUI on HTTPS pages | done |
 | 11 | File transfers over the message transports (serial, Bluetooth, WebSocket, NowTP) | done |
+| 12 | File transfers relayed through gateways, for TesserKIT's fleet updates | done |
 
 ## 19. Decisions on former open questions
 

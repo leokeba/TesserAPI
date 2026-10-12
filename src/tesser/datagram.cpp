@@ -498,6 +498,24 @@ bool DatagramEndpoint::request(const PeerAddress& to, JsonObjectConst envelope, 
     return sendRequest(to, id, text, std::move(done), timeoutMs, owner);
 }
 
+bool DatagramEndpoint::requestFields(const PeerAddress& to, std::string_view fields, ResponseHandler done,
+                                     uint32_t timeoutMs, const void* owner) {
+    uint32_t id;
+    {
+        MutexGuard guard(mutex_);
+        id = nextId_++;
+        if (nextId_ == 0) nextId_ = 1;
+    }
+    char head[20];
+    int n = snprintf(head, sizeof(head), "{\"id\":%lu,", static_cast<unsigned long>(id));
+    std::string text;
+    text.reserve(static_cast<size_t>(n) + fields.size() + 1);
+    text.append(head, static_cast<size_t>(n));
+    text.append(fields.data(), fields.size());
+    text += '}';
+    return sendRequest(to, id, text, std::move(done), timeoutMs, owner);
+}
+
 void DatagramEndpoint::cancelCalls(const void* owner) {
     MutexGuard guard(mutex_);
     for (size_t i = 0; i < calls_.size();) {

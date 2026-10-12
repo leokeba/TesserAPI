@@ -222,7 +222,9 @@ public:
     // The file node a transfer targets (FileTransfer), or null with the error
     // written; `notFile` (no error) when the path resolves to something else.
     // The elements on the path move to `elements`, which the node lives in.
-    FileNode* file(bool& notFile, std::vector<std::unique_ptr<Node>>& elements) {
+    // Below a remote node, `remote` (if given) is set instead, with nothing
+    // written: the transfer is relayed.
+    FileNode* file(bool& notFile, std::vector<std::unique_ptr<Node>>& elements, Api::RemoteTarget* remote) {
         Node* target = resolve();
         elements = std::move(temps_);
         if (!target) return nullptr;
@@ -230,13 +232,20 @@ public:
             replyError(Status::BadRequest, "'*' doesn't apply to files", base_);
             return nullptr;
         }
-        if (target->type() != NodeType::File) {
+        bool relayed = remote && target->type() == NodeType::Remote && !remoteRest_.empty();
+        if (target->type() != NodeType::File && !relayed) {
             notFile = true;
             return nullptr;
         }
         Access need = req_.op == Op::Set ? writeNeed_ : readNeed_;
         if (level_ < need || !allowed(*target)) {
             replyError(Status::Unauthorized, "not authorized", base_);
+            return nullptr;
+        }
+        if (relayed) {
+            remote->node = static_cast<RemoteNode*>(target);
+            remote->rest.assign(remoteRest_.data(), remoteRest_.size());
+            remote->base.assign(base_.data(), base_.size());
             return nullptr;
         }
         return static_cast<FileNode*>(target);
@@ -1306,13 +1315,13 @@ void Api::handle(const Request& request, Reply& reply) {
 }
 
 FileNode* Api::fileNode(const Request& request, Reply& reply, bool& notFile,
-                        std::vector<std::unique_ptr<Node>>& elements) {
+                        std::vector<std::unique_ptr<Node>>& elements, RemoteTarget* remote) {
     MutexGuard guard(mutex_);
     notFile = false;
-    return Handler(*this, request, reply).file(notFile, elements);
+    return Handler(*this, request, reply).file(notFile, elements, remote);
 }
 
-bool Api::claimTransfer(std::string_view path, FileTransfer* holder) {
+bool Api::claimTransfer(std::string_view path, TransferHolder* holder) {
     MutexGuard guard(mutex_);
     for (const Transfer& t : transfers_) {
         if (t.path != path) continue;

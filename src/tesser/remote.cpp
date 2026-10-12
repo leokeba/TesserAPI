@@ -1,8 +1,11 @@
 #include "tesser/remote.h"
 
+#include <stdio.h>
+
 #include "tesser/api.h"
 #include "tesser/call.h"
 #include "tesser/detail/lazy_patch.h"
+#include "tesser/file.h"
 
 namespace tesser {
 
@@ -574,6 +577,372 @@ void RemoteNode::released(std::string_view localPath) {
             peer_, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {}, Query(),
             timeoutMs_, this);
     }
+}
+
+// ---- relayed file transfers --------------------------------------------------
+
+namespace {
+
+constexpr int kAttempts = 3;            // a call whose reply timed out is sent twice more
+constexpr size_t kFallbackChunk = 192;  // a peer that gave no chunk size
+
+std::string fieldsOf(const std::function<void(JsonWriter&)>& write) {
+    std::string text;
+    StringSink sink(text);
+    JsonWriter w(sink);
+    w.beginObject();
+    write(w);
+    w.endObject();
+    return text.substr(1, text.size() - 2);  // the members, without the braces
+}
+
+class RemoteFile : public FileRelay, public TransferHolder, public std::enable_shared_from_this<RemoteFile> {
+public:
+    RemoteFile(Api& api, RemoteNode& node, std::string remotePath, std::string localBase, std::string remoteBase,
+               std::string localPath)
+        : api_(api),
+          node_(node),
+          remotePath_(std::move(remotePath)),
+          localBase_(std::move(localBase)),
+          remoteBase_(std::move(remoteBase)),
+          localPath_(std::move(localPath)) {
+        // The claim is on the peer, under a key no path can have.
+        char hex[24];
+        snprintf(hex, sizeof(hex), "@%lx:", static_cast<unsigned long>(reinterpret_cast<uintptr_t>(node.endpoint())));
+        key_ = hex;
+        for (uint8_t i = 0; i < node.peer().length; i++) {
+            snprintf(hex, sizeof(hex), "%02x", node.peer().bytes[i]);
+            key_ += hex;
+        }
+    }
+    // Owners close() first; this only covers a relay dropped while claimed.
+    ~RemoteFile() override {
+        if (claimed_) api_.releaseTransfer(key_);
+    }
+
+    bool claim(Reply& reply) override {
+        MutexGuard guard(mutex_);
+        if (!claimed_ && !api_.claimTransfer(key_, this)) {
+            writeError(reply, Status::Busy, localPath_, "another transfer to this node is in progress");
+            return false;
+        }
+        claimed_ = true;
+        activeMs_ = millis32();
+        return true;
+    }
+
+    void probe(Done done) override {
+        std::string path = remotePath_;
+        call(std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
+                 w.key("op");
+                 w.string("get");
+                 w.key("path");
+                 w.string(path);
+                 w.key("view");
+                 w.string("schema");
+                 w.key("depth");
+                 w.integer(0);
+             })),
+             std::move(done));
+    }
+
+    void openUpload(uint64_t size, std::string_view filename, Done done) override {
+        {
+            MutexGuard guard(mutex_);
+            size_ = size;
+            received_ = 0;
+            pending_.clear();
+        }
+        std::string path = remotePath_;
+        auto self = shared_from_this();
+        call(std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
+                 w.key("op");
+                 w.string("upload");
+                 w.key("path");
+                 w.string(path);
+                 w.key("size");
+                 w.uinteger(size);
+                 if (!filename.empty()) {
+                     w.key("filename");
+                     w.string(filename);
+                 }
+             })),
+             [self, done](Status s, JsonVariantConst body) {
+                 if (s == Status::Ok) {
+                     MutexGuard guard(self->mutex_);
+                     if (self->size_ == 0) {
+                         self->finishLocked();  // nothing to send: that was the upload's reply
+                     } else {
+                         self->chunk_ = body["chunk"].as<size_t>();
+                         self->received_ = body["received"].as<uint64_t>();
+                     }
+                 } else {
+                     self->failed(s);
+                 }
+                 done(s, body);
+             });
+    }
+
+    void write(std::vector<uint8_t> data, Done done) override {
+        {
+            MutexGuard guard(mutex_);
+            pending_.insert(pending_.end(), data.begin(), data.end());
+        }
+        pump(std::move(done));
+    }
+
+    void download(uint64_t offset, size_t length, Done done) override {
+        std::string path = remotePath_;
+        auto self = shared_from_this();
+        call(std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
+                 w.key("op");
+                 w.string("download");
+                 w.key("path");
+                 w.string(path);
+                 if (offset) {
+                     w.key("offset");
+                     w.uinteger(offset);
+                 }
+                 if (length) {
+                     w.key("length");
+                     w.uinteger(length);
+                 }
+             })),
+             [self, done](Status s, JsonVariantConst body) {
+                 if (s == Status::Ok) {
+                     MutexGuard guard(self->mutex_);
+                     if (body["chunk"].is<size_t>()) self->chunk_ = body["chunk"].as<size_t>();
+                     // The end: the peer is free again, though the last chunk
+                     // can still be asked for again.
+                     if (body["end"] == true) {
+                         self->finished_ = true;
+                         self->release();
+                     }
+                 } else {
+                     self->failed(s);
+                 }
+                 done(s, body);
+             });
+    }
+
+    void close() override {
+        MutexGuard guard(mutex_);
+        closed_ = true;
+        release();
+    }
+
+    void writeReply(Reply& reply, Status status, JsonVariantConst body) const override {
+        writeMapped(reply, status, body, localBase_, remoteBase_);
+    }
+
+    uint64_t received() const override {
+        MutexGuard guard(mutex_);
+        return received_;
+    }
+    size_t chunk() const override {
+        MutexGuard guard(mutex_);
+        return chunk_;
+    }
+    bool busy() const override {
+        MutexGuard guard(mutex_);
+        return inFlight_;
+    }
+    bool finished() const override {
+        MutexGuard guard(mutex_);
+        return finished_;
+    }
+    bool open() const override {
+        MutexGuard guard(mutex_);
+        return !closed_;
+    }
+    bool expired() const override {
+        MutexGuard guard(mutex_);
+        return expired_;
+    }
+    uint32_t patienceMs() const override {
+        uint32_t t = node_.timeoutMs();
+        if (!t) {
+            DatagramEndpoint* ep = node_.endpoint();
+            t = ep ? ep->timeoutMs() : 3000;
+        }
+        return t * kAttempts + 1000;
+    }
+
+    bool expireIfIdle(uint32_t nowMs, uint32_t idleMs) override {
+        // Never waits: the caller holds the API lock, which claim() and
+        // release() take after this mutex.
+        if (!idleMs || !mutex_.tryLock()) return false;
+        bool idle = claimed_ && !inFlight_ && nowMs - activeMs_ >= idleMs;
+        if (idle) {
+            closed_ = true;
+            expired_ = true;
+            release();
+        }
+        mutex_.unlock();
+        return idle;
+    }
+
+private:
+    // Sends one envelope, again on a timeout while the relay is open and
+    // the peer online. An offline peer isn't sent to.
+    void call(std::shared_ptr<const std::string> fields, Done done, int attempt = 0) {
+        if (!node_.online()) {
+            JsonDocument error;
+            error["error"] = "timeout";
+            error["path"] = remoteBase_.empty() ? std::string("/") : remoteBase_;
+            error["message"] = "peer offline";
+            done(Status::Timeout, error.as<JsonVariantConst>());
+            return;
+        }
+        {
+            MutexGuard guard(mutex_);
+            inFlight_ = true;
+            activeMs_ = millis32();
+        }
+        DatagramEndpoint* ep = node_.endpoint();
+        auto self = shared_from_this();
+        bool sent = ep && ep->requestFields(
+                              node_.peer(), *fields,
+                              [self, fields, done, attempt](Status s, JsonVariantConst body) {
+                                  if (s == Status::Timeout && attempt + 1 < kAttempts && self->open() &&
+                                      self->node_.online()) {
+                                      self->call(fields, done, attempt + 1);
+                                      return;
+                                  }
+                                  self->landed();
+                                  done(s, body);
+                              },
+                              node_.timeoutMs(), &node_);
+        if (!sent) {
+            landed();
+            done(Status::Busy, JsonVariantConst());
+        }
+    }
+
+    void landed() {
+        MutexGuard guard(mutex_);
+        inFlight_ = false;
+        activeMs_ = millis32();
+    }
+
+    // Upload: sends the next part of pending_.
+    void pump(Done done) {
+        std::shared_ptr<const std::string> fields;
+        uint64_t offset = 0;
+        size_t part = 0;
+        bool closed, idle;
+        {
+            MutexGuard guard(mutex_);
+            closed = closed_;
+            idle = pending_.empty();
+            if (!closed && !idle) {
+                offset = received_;
+                part = chunk_ ? chunk_ : kFallbackChunk;
+                if (part > pending_.size()) part = pending_.size();
+                std::string data = "\"";
+                detail::base64Encode(pending_.data(), part, data);
+                data += '"';
+                fields = std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
+                    w.key("op");
+                    w.string("upload");
+                    w.key("path");
+                    w.string(remotePath_);
+                    w.key("offset");
+                    w.uinteger(offset);
+                    w.key("data");
+                    w.raw(data);
+                }));
+            }
+        }
+        if (closed || idle) {
+            done(closed ? Status::Busy : Status::Ok, JsonVariantConst());
+            return;
+        }
+        auto self = shared_from_this();
+        call(fields, [self, done, offset, part](Status s, JsonVariantConst body) {
+            if (s != Status::Ok) {
+                self->failed(s);
+                done(s, body);
+                return;
+            }
+            bool more = false;
+            bool stuck = false;
+            {
+                MutexGuard guard(self->mutex_);
+                if (offset + part >= self->size_) {
+                    // The part that completes the file: that was the upload's reply.
+                    self->received_ = self->size_;
+                    self->pending_.clear();
+                    self->finishLocked();
+                } else {
+                    uint64_t got = body["received"].as<uint64_t>();
+                    if (got <= offset || got > offset + part) {
+                        stuck = true;
+                    } else {
+                        self->pending_.erase(self->pending_.begin(),
+                                             self->pending_.begin() + static_cast<std::ptrdiff_t>(got - offset));
+                        self->received_ = got;
+                        more = !self->pending_.empty();
+                    }
+                }
+            }
+            if (stuck) {
+                self->close();
+                JsonDocument error;
+                error["error"] = "internal";
+                error["path"] = self->remotePath_;
+                error["message"] = "the remote node didn't take the chunk";
+                done(Status::Internal, error.as<JsonVariantConst>());
+            } else if (more) {
+                self->pump(done);
+            } else {
+                done(Status::Ok, body);
+            }
+        });
+    }
+
+    // An error ends the transfer, except a bad offset, which the client can
+    // correct.
+    void failed(Status s) {
+        if (s != Status::BadRequest) close();
+    }
+
+    void finishLocked() {
+        finished_ = true;
+        closed_ = true;
+        release();
+    }
+
+    void release() {
+        if (claimed_) api_.releaseTransfer(key_);
+        claimed_ = false;
+    }
+
+    Api& api_;
+    RemoteNode& node_;
+    const std::string remotePath_, localBase_, remoteBase_, localPath_;
+    std::string key_;
+    mutable Mutex mutex_;
+    bool claimed_ = false;
+    bool closed_ = false;
+    bool finished_ = false;
+    bool inFlight_ = false;
+    bool expired_ = false;
+    uint32_t activeMs_ = 0;
+    size_t chunk_ = 0;
+    uint64_t size_ = 0;
+    uint64_t received_ = 0;
+    std::vector<uint8_t> pending_;  // upload bytes from received_ on
+};
+
+}  // namespace
+
+std::shared_ptr<FileRelay> RemoteNode::relayFile(Api& api, std::string_view rest, std::string_view base) {
+    if (!endpoint_) return nullptr;
+    std::string remoteBase = remotePath_ == "/" ? std::string() : remotePath_;
+    std::string localBase(base.substr(0, base.size() - rest.size()));
+    return std::make_shared<RemoteFile>(api, *this, remotePathOf(rest), std::move(localBase), std::move(remoteBase),
+                                        std::string(base));
 }
 
 RemoteNode& Object::remote(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer,

@@ -59,6 +59,8 @@ struct Subscription {
 
 class Storage;
 class FileTransfer;
+class RemoteNode;
+class TransferHolder;
 
 // Decides whether a client may perform an operation on a node. Consulted for
 // the target of every request, and for every node a patch touches.
@@ -177,12 +179,20 @@ public:
     // with the error written to `reply`. `notFile` is set, with nothing
     // written, when the path resolves to another kind of node. The temporary
     // list and array elements on the path move to `elements`: an element's
-    // file node lives as long as they do.
+    // file node lives as long as they do. With `remote`, a path below a
+    // remote node that the client may transfer is null with nothing written,
+    // and `remote` set: the transfer is relayed (docs/DESIGN.md section 14).
+    struct RemoteTarget {
+        RemoteNode* node = nullptr;
+        std::string rest;  // the path below it
+        std::string base;  // the full local path
+    };
     FileNode* fileNode(const Request& request, Reply& reply, bool& notFile,
-                       std::vector<std::unique_ptr<Node>>& elements);
-    // Used by FileTransfer, under the API lock: one transfer per path. A
-    // claim held by a transfer idle for Config::transferIdleMs is taken over.
-    bool claimTransfer(std::string_view path, FileTransfer* holder);
+                       std::vector<std::unique_ptr<Node>>& elements, RemoteTarget* remote = nullptr);
+    // Used by FileTransfer and FileRelay, under the API lock: one transfer
+    // per path (a relay claims a peer's key). A claim held by a transfer idle
+    // for Config::transferIdleMs is taken over.
+    bool claimTransfer(std::string_view path, TransferHolder* holder);
     void releaseTransfer(std::string_view path);
 
     // Requests waiting for poll() in queued mode.
@@ -220,7 +230,7 @@ private:
     std::vector<Subscription> subs_;
     struct Transfer {
         std::string path;
-        FileTransfer* holder;
+        TransferHolder* holder;
     };
     std::vector<Transfer> transfers_;  // the file transfers in progress
     uint32_t lastWatchMs_ = 0;

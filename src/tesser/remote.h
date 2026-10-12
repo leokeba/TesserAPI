@@ -14,6 +14,7 @@
 
 namespace tesser {
 
+class FileRelay;
 struct Subscription;
 
 // Another node's tree grafted into this one (docs/DESIGN.md section 14):
@@ -77,6 +78,11 @@ public:
     // request handler, under the API lock.
     virtual void subscribe(Api& api, const Request& request, std::string_view rest, std::string_view base,
                            Reply& reply);
+    // A file transfer relayed to the peer (docs/DESIGN.md section 14), not
+    // yet claimed: `rest` is the path below this node, `base` the full local
+    // path. Null without an endpoint. Virtual like forward().
+    virtual std::shared_ptr<FileRelay> relayFile(Api& api, std::string_view rest, std::string_view base);
+
     // The last local subscription to `localPath` is gone. Called by the API,
     // under its lock.
     virtual void released(std::string_view localPath);
