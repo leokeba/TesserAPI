@@ -1,0 +1,10 @@
+menu "Example Configuration"
+
+config EXAMPLE_LED_GPIO
+    int "LED GPIO"
+    default 2
+    help
+        The pin of the LED the API drives with PWM. GPIO 2 is the onboard
+        LED of most ESP32 devkits.
+
+endmenu
