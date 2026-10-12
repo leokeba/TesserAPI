@@ -111,7 +111,8 @@ def main():
         'type': 'file', 'readable': True, 'writable': True, 'maxSize': 32768,
         'contentType': 'application/octet-stream', 'accept': '.bin'}, data)
     r = h.call('get', '/files', {}, ABSENT)
-    check('file left out of values', r == ('ok', {}), r)
+    # Only the directory listing: blob, backup and upload are file nodes.
+    check('file left out of values', r[0] == 'ok' and list(r[1]) == ['entries'], r)
     # A directory listing: file nodes in a read-only keyed list's elements,
     # uploads named by ?filename=. Idempotent: the directory lives in RAM.
     got, data, _, _ = h.raw('PUT', '/files/entries/notes.txt/content', None, b'edited')
