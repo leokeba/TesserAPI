@@ -5,7 +5,7 @@
 
 namespace tesser {
 
-LineTransport::LineTransport(Api& api, Output output) : api_(api), output_(std::move(output)) {}
+LineTransport::LineTransport(Api& api, Output output) : api_(api), output_(std::move(output)), files_(api) {}
 
 LineTransport::~LineTransport() { api_.dropSubscriber(this); }
 
@@ -60,11 +60,15 @@ void LineTransport::handleLine() {
     EnvelopeId id;
     const char* message = nullptr;
     Status s = parseEnvelope(text, doc, api_.config().maxDepth, req, id, message);
+    // "auth", "upload" and "download" aren't request ops, so they fail to
+    // parse as requests: read their id alone.
+    bool auth = false, file = false;
     if (s != Status::Ok && doc.is<JsonObjectConst>()) {
-        // "auth" isn't a request op, so it fails to parse as one; a usable
-        // id (none, or one that was kept) means the op is what failed.
         JsonObjectConst env = doc.as<JsonObjectConst>();
-        if (env["op"] == "auth" && (id.length || env["id"].isNull())) {
+        auth = env["op"] == "auth";
+        file = FileSession::handles(env);
+        if (auth || file) s = envelopeId(env, id, message);
+        if (auth && s == Status::Ok) {
             handleAuth(env, id);
             return;
         }
@@ -78,6 +82,10 @@ void LineTransport::handleLine() {
     req.client.transport = TransportKind::Serial;
     req.client.access = level();
     req.client.authenticated = req.client.access != Access::Public;
+    if (file) {
+        files_.handle(doc.as<JsonObjectConst>(), req.client, reply);
+        return;
+    }
     req.subscriber = this;
     api_.handle(req, reply);
 }
@@ -99,7 +107,11 @@ void LineTransport::handleAuth(JsonObjectConst envelope, const EnvelopeId& id) {
     Access after = level();
     // Subscriptions keep the level they were made at: drop them rather than
     // show the client what it can no longer read.
-    if (after < before) api_.dropSubscriber(this);
+    // A transfer opened at the higher level ends too.
+    if (after < before) {
+        api_.dropSubscriber(this);
+        files_.reset();
+    }
     std::string body = std::string("{\"access\":\"") + toString(after) + "\"}";
     reply.begin(Status::Ok).write(body.data(), body.size());
     reply.end();
@@ -110,6 +122,7 @@ void LineTransport::reset() {
     line_.clear();
     discarding_ = false;
     token_.clear();
+    files_.reset();
 }
 
 // A streamed response line. The output lock is held from the first piece to

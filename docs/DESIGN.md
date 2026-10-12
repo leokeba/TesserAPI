@@ -284,8 +284,9 @@ api.object("sys").file("backup").contentType("application/json").readAccess(tess
       return createFile(r.filename);
   });
   ```
-- **Transports:** HTTP only for now (§10.2). The message transports *(planned)* would need a chunked envelope; NowTP also needs streaming of large messages.
-- **Generic core:** `tesser::FileTransfer` does the work (resolution, access, size, one transfer at a time, the reply), host-tested; the HTTP transport only moves bytes.
+- **Transports:** HTTP moves the raw bytes (§10.2); the message transports (serial, Bluetooth, WebSocket, NowTP) move them in base64 chunks, one `upload` or `download` envelope each (§10.1.1).
+- **Abandoned transfers:** a transfer that has moved nothing for `Config::transferIdleMs` (30 s by default; 0 is never) is taken over by the next one to its path, from any client and transport: an unfinished upload is aborted, and its client gets `timeout` on its next chunk. A message transport has no connection to lose, so this is how a client that went quiet stops blocking the path.
+- **Generic core:** `tesser::FileTransfer` does the work (resolution, access, size, one transfer at a time, the reply), host-tested; the HTTP transport only moves bytes, and `tesser::FileSession` drives it from envelopes.
 
 ### 4.7 Names and the tree's lifetime
 
@@ -538,7 +539,7 @@ These transports are message-based and two-way, so they share one JSON envelope.
 ```
 
 - **`id`:** any JSON scalar, echoed verbatim. It may be omitted, in which case the response also has no `id`.
-- **`op`:** `get`, `set`, `sub` or `unsub`; on serial and Bluetooth lines also `auth` (§10.4). The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `changes`, `events`, `snapshot` and `body` map one-to-one onto `Request`.
+- **`op`:** `get`, `set`, `sub` or `unsub`; `upload` and `download` for file nodes (§10.1.1); on serial and Bluetooth lines also `auth` (§10.4). The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `changes`, `events`, `snapshot` and `body` map one-to-one onto `Request`.
 - **Unknown envelope keys** are ignored, for forward compatibility.
 - **Response:** the response is written as a stream: `{"id":…,"status":"…","body":` followed by the body and then `}`.
   - **Buffered** (NowTP, and every deferred or queued reply): the envelope is sent whole, up to `maxResponse`. A larger body is replaced with a `too_large` error.
@@ -547,6 +548,32 @@ These transports are message-based and two-way, so they share one JSON envelope.
   - Serial: one envelope per line (`\n`). Non-JSON lines from the log are ignored by clients.
   - NowTP: one envelope per message.
   - WebSocket: one per text frame.
+
+#### 10.1.1 File transfers
+
+File nodes (§4.6) transfer over these transports too. The client sends one envelope per chunk and gives each one's `offset`; the bytes are base64:
+
+```json
+→ {"id": 1, "op": "download", "path": "/sys/backup"}
+← {"id": 1, "status": "ok", "body": {"size": 5000, "filename": "backup", "contentType": "application/json", "chunk": 4096, "offset": 0, "data": "eyJjZmciOnsi…", "end": false}}
+→ {"id": 2, "op": "download", "path": "/sys/backup", "offset": 4096}
+← {"id": 2, "status": "ok", "body": {"offset": 4096, "data": "…", "end": true}}
+
+→ {"id": 3, "op": "upload", "path": "/sys/firmware", "size": 6000, "filename": "fw.bin", "data": "6QMCIAA…"}
+← {"id": 3, "status": "ok", "body": {"received": 2880, "chunk": 2880}}
+→ {"id": 4, "op": "upload", "path": "/sys/firmware", "offset": 2880, "data": "…"}
+← {"id": 4, "status": "ok", "body": {"received": 5760}}
+→ {"id": 5, "op": "upload", "path": "/sys/firmware", "offset": 5760, "data": "…"}
+← {"id": 5, "status": "ok", "body": null}                    // all 6000 bytes: the upload's reply
+```
+
+- **Opening:** a download starts at `offset` 0 (or none). An upload starts with its `size`, at offset 0, and may give a `filename` (`FileRequest::filename`) and its first `data`; later upload envelopes leave `size` out, so a client may open without data, learn the device's `chunk`, then send from offset 0. Either ends the client's previous transfer (an unfinished upload is aborted). Resolution, access, `maxSize`, the handler and one transfer per path work as over HTTP, with the same errors; a path that isn't a file node is `not_allowed`.
+- **Downloads:** each reply holds the chunk at `offset`, and `end` is true on the last one. A file of unknown size may end with an empty chunk. The opening reply adds `size` (left out when unknown), `filename`, `contentType` and `chunk`, the largest chunk the device sends; `length` asks for smaller ones. The next request's `offset` is where the last chunk ended. The last chunk's own `offset` sends that chunk again, for a client whose reply was lost, even after the end. Any other offset is `bad_request`, with the expected one in the message.
+- **Uploads:** each reply gives the bytes `received`, and the opening one also the largest `chunk` the device takes. The bytes of a chunk before `received` are skipped, so a chunk sent again is acknowledged, not written twice. An offset past `received` is `bad_request`. The chunk that completes `size` gets the upload's reply instead (the sink's `finish()`, or its error), so the client knows which reply ends it. After that the upload is over: that last reply can't be asked again.
+- **Chunk sizes:** a download chunk is at most 4 KB, and smaller when `maxResponse` couldn't hold its base64 with room for the rest of the envelope (`(maxResponse − 256) × 3/4`), since NowTP buffers replies. An upload envelope must fit the transport's request limit: the device's `chunk` is `(maxRequestBody − 256) × 3/4`, at most 4 KB: 2880 bytes by default. Base64 adds a third.
+- **One transfer per client:** each client (a serial or Bluetooth line, a WebSocket connection, a NowTP peer) has one `FileSession`. Its transfer ends with the client: a Bluetooth disconnection (`reset()`), a closed WebSocket, a lost NowTP peer, a line's level falling with `auth` (the transfer was opened at the higher level). A NowTP peer's session is also dropped after `transferIdleMs` without a request. Otherwise, an abandoned transfer is taken over (§4.6).
+- **Threading:** as over HTTP, the handler runs under the API lock and the chunks outside it, in the transport's task, in queued mode too. A download chunk is read whole, and kept, before its reply goes out: up to 4 KB, plus its base64.
+- **Generic core:** `tesser::FileSession`, platform-independent and host-tested; the transports only hand it these envelopes. `DatagramEndpoint::request(to, envelope, done)` sends them from a client.
 
 ### 10.2 HTTP (`esp_http_server`)
 
@@ -593,7 +620,8 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 
 - **Requests:** one envelope per NowTP message on the configured port (default 84). `set` requests must arrive in NowTP's reliable mode, which is unicast-only, so a broadcast or unreliable `set` is answered `not_allowed`. A broadcast `get` is answered by every node.
 - **Responses:** reliable unicast to the sender's MAC.
-- **Response size:** buffered in full (NowTP has no streaming), up to `min(maxResponse, nowtp maxMessageSize)`. Anything larger gets a `too_large` reply. Clients on NowTP should use `depth`, `keys` and shapes.
+- **Response size:** buffered in full (NowTP has no streaming), up to `min(maxResponse, nowtp maxMessageSize)`. Anything larger gets a `too_large` reply. Clients on NowTP should use `depth`, `keys` and shapes. Files move in chunks that fit (§10.1.1).
+- **Files:** `upload` envelopes, like `set`, must arrive reliably. Each peer has a file session, dropped when the peer is lost or after `transferIdleMs` without a request.
 - **Notifications** use reliable mode, like responses (§11 explains why not latest-only). `sub` requests, like `set`, must arrive reliably.
 - **Client identity:** the MAC address. NowTP's "peer lost" discovery event drops that client's subscriptions.
 - **Security:** ESP-NOW frames aren't authenticated. Writes over NowTP should be restricted with an allowlist of MACs or encrypted peers (§13).
@@ -616,7 +644,8 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
   → {"id": 1, "op": "auth", "token": "3f9c…"}
   ← {"id": 1, "status": "ok", "body": {"access": "admin"}}
   ```
-  The reply gives the line's level now, `public` for a token the check refuses. An empty or missing token signs out. When the level drops, the line's subscriptions are dropped too, since they keep the level they were made at; a client that signs in keeps its subscriptions at their lower level and subscribes again to see more. An authenticated line accepts `auth` and stays `admin`.
+  The reply gives the line's level now, `public` for a token the check refuses. An empty or missing token signs out. When the level drops, the line's subscriptions and file transfer are dropped too, since they keep the level they were made at; a client that signs in keeps its subscriptions at their lower level and subscribes again to see more. An authenticated line accepts `auth` and stays `admin`.
+- **Files** (§10.1.1): the line is one client, with one transfer at a time. An upload chunk's line must fit the line limit (`maxRequestBody` + 256), which the device's `chunk` does.
 
 ### 10.5 WebSocket
 
@@ -625,7 +654,8 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 - One text message per envelope. Each connection is a client (`Subscriber`).
 - **Large replies** stream (§10.1) as a fragmented message: a text frame, then continuation frames, the last one final. Browsers reassemble it into one message.
 - **Ordering:** notifications, deferred replies and replies that fit in one piece are written from the httpd task through `httpd_queue_work`, so writes from other tasks never interleave. A fragmented reply is written directly while the httpd task handles its request, so no queued frame can come in between, but it can overtake notifications queued just before the request.
-- **Cleanup:** when `begin()` owns the server, `close_fn` drops a closed connection's subscriptions at once. With `attach()`, a closed connection is noticed on the next send to it.
+- **Cleanup:** when `begin()` owns the server, `close_fn` drops a closed connection's subscriptions and file transfer at once. With `attach()`, a closed connection is noticed on the next send to it.
+- **Files** (§10.1.1): one transfer per connection. An upload chunk's message must fit `maxRequestBody`, which the device's `chunk` does.
 - **Handshake:** a connection's authentication (§13) is decided from its handshake. ESP-IDF 6.1 stopped calling a WebSocket handler with the handshake's GET, so `HttpServer` reads the handshake in the pre-handshake callback, which needs `CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT`. The component's Kconfig selects it; older ESP-IDF versions and Arduino-ESP32 3.x still call the handler. When neither path saw the handshake, the server logs a warning once and the connection is unauthenticated.
 
 ### 10.6 Bluetooth LE
@@ -650,7 +680,7 @@ The serial lines of §10.4 over the **Nordic UART Service**, so browsers (Web Bl
 | RX | `6e400002-b5a3-f393-e0a9-e50e24dcca9e` | The client writes request lines, in any pieces; a write longer than the MTU is a long write (up to 512 bytes). |
 | TX | `6e400003-b5a3-f393-e0a9-e50e24dcca9e` | Replies and notifications, in pieces of the MTU (minus 3): notifications or indications, see below. |
 
-- **One `LineTransport`**, so one client at a time: advertising stops while it is connected. On disconnection, its subscriptions and token are dropped and advertising starts again.
+- **One `LineTransport`**, so one client at a time: advertising stops while it is connected. On disconnection, its subscriptions, token and file transfer are dropped and advertising starts again.
 - **Runtime control**, for a device's Bluetooth settings:
   - `stop()` drops the client and stops advertising; `start()` advertises again. The stack stays up. `enabled()` says which.
   - `end()` stops the BLE stack and gives its memory back: the host, the controller and the request task. Measured on an ESP32 with NimBLE (TesserKIT's full example): 53 KB of heap free with Bluetooth on, 113 KB after `end()`, more than at boot with Bluetooth never started, since the deinit also frees what NimBLE reserved; on/off cycles come back within 150 bytes. Only the transport object itself stays. A connected client is dropped as by a disconnection, and `begin()` starts it all again. On ESP-IDF, `end()` doesn't wait for the request task, which exits between requests (or carries on, if `begin()` comes first), so a setter or action may call it, even one a Bluetooth client called. On Arduino it is `BLEDevice::deinit(false)`, which allows a new init; call it in `poll()`'s task. The Arduino library doesn't free the old server's service and characteristic objects, so each cycle leaks them.
@@ -892,6 +922,8 @@ Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware
 | HTTP GET over Wi-Fi, new TCP connection each time | 55–85 ms median |
 | NowTP request and response between two boards | 13–14 ms median, fragmented 1.5 KB responses included |
 | GET through a gateway (HTTP, then NowTP to the remote node) | 85 ms median |
+| File transfer in envelopes (§10.1.1), 12–20 KB in the device's chunks | serial at 115200 baud: 8 KB/s each way (the wire's limit with base64); WebSocket: 60 KB/s up, 52 KB/s down; NowTP: 15 KB/s up, 20 KB/s down, each chunk relayed by an HTTP call to the other board |
+| UART task stack during file transfers | 2.6 KB free, 290 B less than requests alone |
 
 **Flash:** `examples/idf/http_api` against its `FOOTPRINT_BASELINE` build (the same app on bare `esp_http_server`):
 - **Total:** 45.5 KB for the core, the HTTP transport and ArduinoJson. With `TESSER_NO_SCHEMA`, `TESSER_NO_MESSAGES` and `TESSER_NO_DESCRIPTIONS` it is 43.8 KB.
@@ -909,6 +941,7 @@ Configuration (`tesser::Config`, at runtime):
 | `maxDepth` (levels rendered; request bodies nest at most one more) | 16 |
 | `deferTimeoutMs` | 10000 |
 | `maxPending` | 4 |
+| `transferIdleMs` (a file transfer idle this long is taken over, §4.6) | 30000 |
 
 Compile-time switches: `TESSER_NO_SCHEMA`, `TESSER_NO_DESCRIPTIONS`, `TESSER_NO_MESSAGES`, `TESSER_NO_UI`.
 
@@ -949,6 +982,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 8 | Bluetooth LE transport (Arduino and ESP-IDF), for TesserUI's launcher | done |
 | 9 | Fan-out writes: a `*` path segment in Set, for TesserKIT's sequencer | done |
 | 10 | Streamed subscriptions over plain HTTP, for TesserUI on HTTPS pages | done |
+| 11 | File transfers over the message transports (serial, Bluetooth, WebSocket, NowTP) | done |
 
 ## 19. Decisions on former open questions
 

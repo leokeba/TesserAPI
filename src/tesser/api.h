@@ -29,6 +29,10 @@ struct Config {
     // in poll(), in the application's task, instead of in the transport's.
     bool queued = false;
     uint8_t maxQueued = 8;
+    // A file transfer that has moved no bytes for this long is taken over by
+    // the next one to the same path (its client went quiet without going
+    // away). 0: never.
+    uint32_t transferIdleMs = 30000;
 };
 
 // One client's interest in a subtree (see docs/DESIGN.md section 11).
@@ -54,6 +58,7 @@ struct Subscription {
 };
 
 class Storage;
+class FileTransfer;
 
 // Decides whether a client may perform an operation on a node. Consulted for
 // the target of every request, and for every node a patch touches.
@@ -175,8 +180,9 @@ public:
     // file node lives as long as they do.
     FileNode* fileNode(const Request& request, Reply& reply, bool& notFile,
                        std::vector<std::unique_ptr<Node>>& elements);
-    // Used by FileTransfer, under the API lock: one transfer per path.
-    bool claimTransfer(std::string_view path);
+    // Used by FileTransfer, under the API lock: one transfer per path. A
+    // claim held by a transfer idle for Config::transferIdleMs is taken over.
+    bool claimTransfer(std::string_view path, FileTransfer* holder);
     void releaseTransfer(std::string_view path);
 
     // Requests waiting for poll() in queued mode.
@@ -212,7 +218,11 @@ private:
     mutable Mutex mutex_;
     std::atomic<int> pending_{0};
     std::vector<Subscription> subs_;
-    std::vector<std::string> transfers_;  // paths of the file transfers in progress
+    struct Transfer {
+        std::string path;
+        FileTransfer* holder;
+    };
+    std::vector<Transfer> transfers_;  // the file transfers in progress
     uint32_t lastWatchMs_ = 0;
     Authorizer authorizer_;
     TokenCheck tokenCheck_;

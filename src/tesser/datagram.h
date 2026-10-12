@@ -18,6 +18,7 @@
 namespace tesser {
 
 class Api;
+class FileSession;
 class Object;
 class RemoteNode;
 struct ClientInbox;
@@ -93,6 +94,10 @@ public:
                  const void* owner = nullptr);
     bool request(const PeerAddress& to, Op op, std::string_view path, JsonVariantConst body, ResponseHandler done,
                  const Query& query = Query(), uint32_t timeoutMs = 0, const void* owner = nullptr);
+    // Sends any envelope, e.g. "upload" or "download" (docs/DESIGN.md
+    // section 10.1.1), with its "id" replaced by the call's.
+    bool request(const PeerAddress& to, JsonObjectConst envelope, ResponseHandler done, uint32_t timeoutMs = 0,
+                 const void* owner = nullptr);
     // Drops (without calling) the pending calls tagged with `owner`.
     void cancelCalls(const void* owner);
 
@@ -116,8 +121,8 @@ public:
     void onNotification(NotificationHandler fn) { onNotification_ = std::move(fn); }
 
     // The peer is gone (e.g. NowTP reported it lost): its pending calls get
-    // Status::Timeout, its subscriptions are dropped and its remote nodes
-    // show it offline. Safe from any task, including link callbacks: the
+    // Status::Timeout, its subscriptions and file transfer are dropped and
+    // its remote nodes show it offline. Safe from any task, including link callbacks: the
     // work happens in the next process().
     void forgetPeer(const PeerAddress& peer);
 
@@ -172,6 +177,13 @@ private:
         uint32_t schemaHash;
     };
 
+    // A peer's file transfers, dropped once idle for Config::transferIdleMs.
+    struct PeerFiles {
+        PeerAddress peer;
+        std::unique_ptr<FileSession> session;
+        uint32_t usedMs;
+    };
+
     struct CallSlot {
         uint32_t id;
         PeerAddress to;
@@ -190,6 +202,8 @@ private:
     void applySeen(const Seen& seen);
     void markOnline(const PeerAddress& peer, bool online);
     void checkAdvertisement(uint32_t now);
+    void handleFile(JsonObjectConst envelope, const Incoming& msg, const Client& client);
+    void dropFiles(const PeerAddress* peer, uint32_t now);
 
     Api* api_;
     TransportKind kind_;
@@ -212,6 +226,7 @@ private:
     Mutex subscribersMutex_;              // taken before the API lock, never after
     std::vector<PeerSubscriber*> subscribers_;
     std::vector<RemoteNode*> remotes_;  // guarded by mutex_
+    std::vector<PeerFiles> files_;      // used in process() only
     std::vector<std::pair<PeerAddress, std::shared_ptr<ClientInbox>>> clients_;  // guarded by mutex_
     uint32_t nextId_ = 1;
     Stats stats_;

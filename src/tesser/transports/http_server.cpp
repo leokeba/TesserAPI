@@ -297,10 +297,10 @@ private:
     DeferredState* deferred_ = nullptr;
 };
 
-// One WebSocket connection: a client that can subscribe.
+// One WebSocket connection: a client that can subscribe and transfer files.
 class HttpServer::WsClient : public Subscriber {
 public:
-    WsClient(HttpServer& server, int socket) : server_(server), fd(socket) {}
+    WsClient(HttpServer& server, int socket) : server_(server), fd(socket), files(server.api_) {}
     Access access = Access::Public;
     bool notify(const std::string& message, Delivery) override { return server_.wsSend(fd, message); }
 
@@ -309,6 +309,7 @@ private:
 
 public:
     int fd;
+    FileSession files;  // used in the httpd task
 };
 
 // One streamed subscription: the socket it holds and its subscriber. It is
@@ -528,7 +529,8 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
             out.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(data));
             out.len = len;
             return httpd_ws_send_frame(req, &out) == ESP_OK;
-        });
+        },
+        &ws->files);
     return ESP_OK;
 #else
     (void)req;

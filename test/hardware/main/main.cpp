@@ -25,6 +25,7 @@
 #include "array_cases.h"
 #include "keyed_cases.h"
 #include "file_cases.h"
+#include "file_envelope_cases.h"
 #include "validate_cases.h"
 #include "wildcard_cases.h"
 #include "stream_sub_cases.h"
@@ -225,8 +226,9 @@ void serveDemo() {
         return &n != g_secureNode && &n != g_secretNode;
     });
 
-    // File nodes (HTTP only): a blob kept in RAM, and a backup of the
-    // persisted state (Admin-only to read, since it holds secrets).
+    // File nodes (over HTTP, and in envelopes over the other transports): a
+    // blob kept in RAM, and a backup of the persisted state (Admin-only to
+    // read, since it holds secrets).
     auto& files = g_demo->api.object("files");
     files.file("blob")
         .upload([](tesser::FileRequest&) -> std::unique_ptr<tesser::FileSink> {

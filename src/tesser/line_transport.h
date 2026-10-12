@@ -6,6 +6,7 @@
 #include <string>
 
 #include "tesser/envelope.h"
+#include "tesser/file_session.h"
 #include "tesser/platform.h"
 
 namespace tesser {
@@ -22,7 +23,8 @@ class Api;
 // The line is one client: it can subscribe, and notifications are written to
 // the output like responses. Responses are streamed to the output as they
 // are rendered, so Config::maxResponse doesn't limit them; deferred replies
-// are buffered and limited by it.
+// are buffered and limited by it. File nodes transfer with "upload" and
+// "download" envelopes (docs/DESIGN.md section 10.1.1).
 class LineTransport : public Subscriber {
 public:
     using Output = std::function<void(const char* data, size_t len)>;
@@ -43,7 +45,7 @@ public:
     void setAuthenticated(bool authenticated) { authenticated_ = authenticated; }
 
     // The line's client is gone (a Bluetooth disconnection): drops its
-    // subscriptions, any partial line and its token.
+    // subscriptions, any partial line, its token and its file transfer.
     void reset();
 
     // Lines dropped for exceeding the limit (Config::maxRequestBody + 256).
@@ -63,6 +65,7 @@ private:
     bool discarding_ = false;
     bool authenticated_ = true;
     std::string token_;  // from the last "auth" envelope
+    FileSession files_;
     size_t overflows_ = 0;
 };
 

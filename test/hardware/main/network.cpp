@@ -153,8 +153,10 @@ void describeNet(tesser::Object& net) {
         JsonVariantConst a = call.arg();
         nowtp::Mac mac;
         tesser::Op op = tesser::Op::Get;
+        // "upload" and "download" go as they are (the extra keys are ignored).
+        bool file = a["op"] == "upload" || a["op"] == "download";
         if (!g_nowApi || !parseMac(a["mac"].as<const char*>(), mac) ||
-            (a["op"].is<const char*>() && !tesser::parseOp(a["op"].as<const char*>(), op))) {
+            (!file && a["op"].is<const char*>() && !tesser::parseOp(a["op"].as<const char*>(), op))) {
             call.fail(tesser::Status::InvalidValue, "expected {mac, op, path, ...}");
             return;
         }
@@ -168,22 +170,23 @@ void describeNet(tesser::Object& net) {
         tesser::Pending pending = call.defer();
         if (!pending) return;
         int64_t t0 = esp_timer_get_time();
-        bool sent = g_nowApi->endpoint().request(
-            tesser::NowTpTransport::address(mac), op, a["path"] | "/", a["body"],
-            [pending, t0](tesser::Status s, JsonVariantConst body) mutable {
-                int64_t ms = (esp_timer_get_time() - t0) / 1000;
-                pending.replyWith([&](tesser::JsonWriter& w) {
-                    w.beginObject();
-                    w.key("status");
-                    w.string(tesser::toString(s));
-                    w.key("body");
-                    w.variant(body);
-                    w.key("ms");
-                    w.integer(ms);
-                    w.endObject();
-                });
-            },
-            q, a["timeoutMs"] | 0u);
+        auto done = [pending, t0](tesser::Status s, JsonVariantConst body) mutable {
+            int64_t ms = (esp_timer_get_time() - t0) / 1000;
+            pending.replyWith([&](tesser::JsonWriter& w) {
+                w.beginObject();
+                w.key("status");
+                w.string(tesser::toString(s));
+                w.key("body");
+                w.variant(body);
+                w.key("ms");
+                w.integer(ms);
+                w.endObject();
+            });
+        };
+        tesser::PeerAddress to = tesser::NowTpTransport::address(mac);
+        bool sent = file ? g_nowApi->endpoint().request(to, a.as<JsonObjectConst>(), done, a["timeoutMs"] | 0u)
+                         : g_nowApi->endpoint().request(to, op, a["path"] | "/", a["body"], done, q,
+                                                        a["timeoutMs"] | 0u);
         if (!sent) pending.fail(tesser::Status::Busy, "NowTP send failed");
     });
 }

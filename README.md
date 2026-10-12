@@ -75,7 +75,7 @@ api.file("firmware").maxSize(0x1E0000).accept(".bin").upload([](tesser::FileRequ
 api.file("backup").text([] { return api.persistedState(); }, restoreBackup);   // GET downloads, PUT uploads
 ```
 
-Over HTTP, a file node streams raw bytes both ways, outside the request body limit. File nodes work in list elements too, so a directory can be a keyed list with a `content` file per entry, and uploads carry the client's file name (`?filename=`).
+Over HTTP, a file node streams raw bytes both ways, outside the request body limit. Over serial, Bluetooth, WebSocket and NowTP, the client moves it in base64 chunks with `upload` and `download` envelopes, each giving its offset, so a chunk can be sent again after a lost reply. File nodes work in list elements too, so a directory can be a keyed list with a `content` file per entry, and uploads carry the client's file name (`?filename=` or `"filename"`).
 
 ## Gateway
 

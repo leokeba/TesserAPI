@@ -10,6 +10,7 @@
 #include "tesser/detail/fan_out.h"
 #include "tesser/detail/lazy_patch.h"
 #include "tesser/envelope.h"
+#include "tesser/file.h"
 #include "tesser/remote.h"
 
 namespace tesser {
@@ -1311,19 +1312,24 @@ FileNode* Api::fileNode(const Request& request, Reply& reply, bool& notFile,
     return Handler(*this, request, reply).file(notFile, elements);
 }
 
-bool Api::claimTransfer(std::string_view path) {
+bool Api::claimTransfer(std::string_view path, FileTransfer* holder) {
     MutexGuard guard(mutex_);
-    for (const std::string& p : transfers_) {
-        if (p == path) return false;
+    for (const Transfer& t : transfers_) {
+        if (t.path != path) continue;
+        // A client that went quiet without going away (a message transport
+        // has no connection to lose) loses its transfer to the next one.
+        // Expiring releases the claim, so the loop must end here.
+        if (!t.holder || !t.holder->expireIfIdle(millis32(), config_.transferIdleMs)) return false;
+        break;
     }
-    transfers_.emplace_back(path);
+    transfers_.push_back(Transfer{std::string(path), holder});
     return true;
 }
 
 void Api::releaseTransfer(std::string_view path) {
     MutexGuard guard(mutex_);
     for (size_t i = 0; i < transfers_.size(); i++) {
-        if (transfers_[i] == path) {
+        if (transfers_[i].path == path) {
             transfers_.erase(transfers_.begin() + static_cast<std::ptrdiff_t>(i));
             return;
         }

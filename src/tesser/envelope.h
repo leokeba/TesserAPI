@@ -14,6 +14,7 @@
 namespace tesser {
 
 class Api;
+class FileSession;
 
 // The request id, kept as serialized JSON so it can be echoed verbatim after
 // the request document is gone (deferred replies).
@@ -42,6 +43,10 @@ Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth,
 
 // Same, from an already parsed envelope object.
 Status requestFromEnvelope(JsonObjectConst envelope, Request& request, EnvelopeId& id, const char*& message);
+
+// Reads only the envelope's id, for envelopes that aren't requests ("auth",
+// "upload", "download"). An unusable id is BadRequest with `message`.
+Status envelopeId(JsonObjectConst envelope, EnvelopeId& id, const char*& message);
 
 // Buffers one response envelope and hands it to `send` when complete.
 // Detaching copies it, so deferred replies work for any message transport
@@ -99,8 +104,10 @@ private:
 // Handles one envelope end to end: parse, dispatch, reply through `send`.
 // `subscriber` enables "sub"/"unsub" for transports with a persistent client.
 // With `stream`, the reply is streamed through it (EnvelopeReply::stream()),
-// and `send` only carries deferred replies.
+// and `send` only carries deferred replies. `files` enables "upload" and
+// "download" (docs/DESIGN.md section 10.1.1) for the client it belongs to.
 void handleEnvelope(Api& api, std::string_view text, const Client& client, const EnvelopeReply::Send& send,
-                    Subscriber* subscriber = nullptr, const EnvelopeReply::Fragment& stream = nullptr);
+                    Subscriber* subscriber = nullptr, const EnvelopeReply::Fragment& stream = nullptr,
+                    FileSession* files = nullptr);
 
 }  // namespace tesser

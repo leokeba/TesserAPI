@@ -50,6 +50,7 @@ def main():
     b_to_a = NowtpRelay(b, mac_a)
     conformance.run(a_to_b, 'nowtp A->B', check)
     conformance.run(b_to_a, 'nowtp B->A', check)
+    conformance.run_files(a_to_b.envelope, 'nowtp A->B files', check)
 
     # Effects are real: a write over ESP-NOW shows up in B's own HTTP API.
     a_to_b.call('set', '/lamp/label', {}, 'radio')

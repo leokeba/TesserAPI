@@ -21,10 +21,12 @@ public:
     Mutex() : handle_(xSemaphoreCreateRecursiveMutexStatic(&storage_)) {}
     void lock() { xSemaphoreTakeRecursive(handle_, portMAX_DELAY); }
     void unlock() { xSemaphoreGiveRecursive(handle_); }
+    bool tryLock() { return xSemaphoreTakeRecursive(handle_, 0) == pdTRUE; }
 #else
     Mutex() = default;
     void lock() { mutex_.lock(); }
     void unlock() { mutex_.unlock(); }
+    bool tryLock() { return mutex_.try_lock(); }
 #endif
 
     Mutex(const Mutex&) = delete;

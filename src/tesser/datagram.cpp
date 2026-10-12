@@ -7,6 +7,7 @@
 #include "tesser/call.h"
 #include "tesser/client.h"
 #include "tesser/envelope.h"
+#include "tesser/file_session.h"
 #include "tesser/json_writer.h"
 #include "tesser/remote.h"
 
@@ -98,6 +99,7 @@ DatagramEndpoint::~DatagramEndpoint() {
         for (RemoteNode* r : remotes_) r->detach();
         remotes_.clear();
     }
+    files_.clear();
     MutexGuard guard(subscribersMutex_);
     for (PeerSubscriber* s : subscribers_) {
         if (api_) api_->dropSubscriber(s);
@@ -120,6 +122,7 @@ Subscriber* DatagramEndpoint::subscriberFor(const PeerAddress& peer, bool create
 void DatagramEndpoint::dropPeer(const PeerAddress& peer) {
     expire(0, true, &peer);
     markOnline(peer, false);
+    dropFiles(&peer, 0);
     MutexGuard guard(subscribersMutex_);
     for (size_t i = 0; i < subscribers_.size(); i++) {
         if (subscribers_[i]->peer != peer) continue;
@@ -188,6 +191,7 @@ bool DatagramEndpoint::process() {
         remotes = remotes_;
     }
     for (RemoteNode* r : remotes) r->tick(now);
+    dropFiles(nullptr, now);
     checkAdvertisement(now);
     return worked || pendingCalls() != before;
 }
@@ -354,6 +358,10 @@ void DatagramEndpoint::handle(Incoming& msg) {
         req.client.access = api_->tokenAccess(std::string_view());
         req.client.authenticated = req.client.access != Access::Public;
     }
+    if (FileSession::handles(env)) {
+        handleFile(env, msg, req.client);
+        return;
+    }
     EnvelopeId id;
     const char* message = nullptr;
     Status s = requestFromEnvelope(env, req, id, message);
@@ -378,6 +386,54 @@ void DatagramEndpoint::handle(Incoming& msg) {
         req.subscriber = subscriberFor(msg.from, req.op == Op::Subscribe);
     }
     api_->handle(req, reply);
+}
+
+// "upload" and "download" (docs/DESIGN.md section 10.1.1): each peer has a
+// session, kept while it transfers.
+void DatagramEndpoint::handleFile(JsonObjectConst envelope, const Incoming& msg, const Client& client) {
+    EnvelopeId id;
+    const char* message = nullptr;
+    Status s = envelopeId(envelope, id, message);
+    PeerAddress to = msg.from;
+    SendFn send = send_;
+    EnvelopeReply reply(id, api_->config().maxResponse, [send, to](const std::string& m) {
+        if (send) send(to, m, Delivery::Reliable);
+    });
+    if (s != Status::Ok) {
+        writeError(reply, s, std::string_view(), message);
+        return;
+    }
+    if (envelope["op"] == "upload" && options_.requireReliableSet && !msg.reliable) {
+        writeError(reply, Status::NotAllowed, std::string_view(), "uploads must be sent reliably");
+        return;
+    }
+    uint32_t now = clock_ ? clock_() : 0;
+    PeerFiles* files = nullptr;
+    for (PeerFiles& f : files_) {
+        if (f.peer == msg.from) files = &f;
+    }
+    if (!files) {
+        files_.push_back(PeerFiles{msg.from, std::unique_ptr<FileSession>(new FileSession(*api_)), now});
+        files = &files_.back();
+    }
+    files->usedMs = now;
+    files->session->handle(envelope, client, reply);
+}
+
+// Drops the sessions of `peer`, or, without one, those with nothing open
+// and those idle for Config::transferIdleMs.
+void DatagramEndpoint::dropFiles(const PeerAddress* peer, uint32_t now) {
+    uint32_t idleMs = api_ ? api_->config().transferIdleMs : 0;
+    for (size_t i = 0; i < files_.size();) {
+        PeerFiles& f = files_[i];
+        bool drop = peer ? f.peer == *peer
+                         : !f.session->busy() || (idleMs && now - f.usedMs >= idleMs);
+        if (drop) {
+            files_.erase(files_.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            i++;
+        }
+    }
 }
 
 bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope,
@@ -417,6 +473,29 @@ bool DatagramEndpoint::request(const PeerAddress& to, Op op, std::string_view pa
     std::string json;
     if (!body.isNull()) serializeJson(body, json);
     return request(to, op, path, std::string_view(json), std::move(done), query, timeoutMs, owner);
+}
+
+bool DatagramEndpoint::request(const PeerAddress& to, JsonObjectConst envelope, ResponseHandler done,
+                               uint32_t timeoutMs, const void* owner) {
+    uint32_t id;
+    {
+        MutexGuard guard(mutex_);
+        id = nextId_++;
+        if (nextId_ == 0) nextId_ = 1;
+    }
+    std::string text;
+    StringSink sink(text);
+    JsonWriter w(sink);
+    w.beginObject();
+    w.key("id");
+    w.uinteger(id);
+    for (JsonPairConst kv : envelope) {
+        if (kv.key() == "id") continue;
+        w.key(std::string_view(kv.key().c_str(), kv.key().size()));
+        w.variant(kv.value());
+    }
+    w.endObject();
+    return sendRequest(to, id, text, std::move(done), timeoutMs, owner);
 }
 
 void DatagramEndpoint::cancelCalls(const void* owner) {

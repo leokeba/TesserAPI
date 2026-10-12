@@ -674,11 +674,12 @@ public:
 };
 
 // Binary content streamed to and from the device: firmware images, backups,
-// core dumps (docs/DESIGN.md section 4.6). Transferred by HTTP only; the
-// handlers' transfers run outside the API lock. In a list element, the node
-// is temporary: its handlers run while the element exists, but the sinks and
-// sources they return (and a text() setter) outlive it, so they must not
-// reference the element.
+// core dumps (docs/DESIGN.md section 4.6). Transferred by HTTP, and in
+// chunks by the message transports (FileSession); the handlers' transfers
+// run outside the API lock. In a list element, the node is temporary: its
+// handlers run while the element exists, but the sinks and sources they
+// return (and a text() setter) outlive it, so they must not reference the
+// element.
 class FileNode : public Annotated<FileNode> {
 public:
     using Upload = std::function<std::unique_ptr<FileSink>(FileRequest& request)>;

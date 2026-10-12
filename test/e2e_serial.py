@@ -153,6 +153,10 @@ def main():
     print(f'     heap free: {heap} bytes, minimum since boot: {min_heap} bytes')
 
     conformance.run(b, 'serial', check)
+    conformance.run_files(conformance.envelope_sender(b.request), 'serial files', check)
+    r = b.request('set', '/system/stackFree')
+    check('uart task stack after file transfers', r['status'] == 'ok' and r['body'] > 1024, r)
+    print(f"     uart task stack free after file transfers: {r.get('body')} bytes")
 
     # A reply larger than maxResponse (8 KB) streams as one long line.
     b.request('set', '/demo/tableRows', body=300)

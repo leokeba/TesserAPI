@@ -4,6 +4,7 @@
 
 #include "tesser/api.h"
 #include "tesser/call.h"
+#include "tesser/file_session.h"
 
 namespace tesser {
 
@@ -55,7 +56,7 @@ Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth,
     return requestFromEnvelope(doc.as<JsonObjectConst>(), request, id, message);
 }
 
-Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id, const char*& message) {
+Status envelopeId(JsonObjectConst env, EnvelopeId& id, const char*& message) {
     id.length = 0;
     JsonVariantConst idv = env["id"];
     if (!idv.isUnbound() && !idv.isNull()) {
@@ -72,7 +73,12 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
         id.length = w.length();
         id.json[id.length] = '\0';
     }
+    return Status::Ok;
+}
 
+Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id, const char*& message) {
+    Status s = envelopeId(env, id, message);
+    if (s != Status::Ok) return s;
     JsonVariantConst op = env["op"];
     if (!op.is<const char*>() || !parseOp(view(op), request.op)) {
         message = "op must be \"get\", \"set\", \"sub\" or \"unsub\"";
@@ -243,7 +249,7 @@ void EnvelopeReply::release() {
 }
 
 void handleEnvelope(Api& api, std::string_view text, const Client& client, const EnvelopeReply::Send& send,
-                    Subscriber* subscriber, const EnvelopeReply::Fragment& stream) {
+                    Subscriber* subscriber, const EnvelopeReply::Fragment& stream, FileSession* files) {
     JsonDocument doc;
     Request req;
     req.client = client;
@@ -251,8 +257,14 @@ void handleEnvelope(Api& api, std::string_view text, const Client& client, const
     EnvelopeId id;
     const char* message = nullptr;
     Status s = parseEnvelope(text, doc, api.config().maxDepth, req, id, message);
+    bool file = s != Status::Ok && files && doc.is<JsonObjectConst>() && FileSession::handles(doc.as<JsonObjectConst>());
+    if (file) s = envelopeId(doc.as<JsonObjectConst>(), id, message);
     EnvelopeReply reply(id, api.config().maxResponse, send);
     if (stream) reply.stream(stream);
+    if (file && s == Status::Ok) {
+        files->handle(doc.as<JsonObjectConst>(), client, reply);
+        return;
+    }
     if (s != Status::Ok) {
         writeError(reply, s, std::string_view(), message);
         return;

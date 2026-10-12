@@ -13,6 +13,7 @@
 #include "array_cases.h"
 #include "keyed_cases.h"
 #include "file_cases.h"
+#include "file_envelope_cases.h"
 #include "validate_cases.h"
 #include "wildcard_cases.h"
 #include "stream_sub_cases.h"

@@ -150,6 +150,18 @@ def main():
     base_subs = subs()
     ws = WebSocket(host)
     conformance.run(ws, 'ws', check)
+    conformance.run_files(conformance.envelope_sender(ws.request), 'ws files', check, size=20000)
+
+    # A closed connection's upload is aborted at once: the path is free.
+    c = WebSocket(host)
+    r = c.request('upload', '/files/blob', size=100)
+    check('ws upload open', r.get('status') == 'ok', r)
+    code, data, _, _ = http.raw('PUT', '/files/blob', None, b'x')
+    check('busy while open', code == 503, (code, data))
+    c.close()
+    time.sleep(0.5)
+    code, data, _, _ = http.raw('PUT', '/files/blob', None, b'x')
+    check('free once closed', code == 200, (code, data))
 
     # Change notifications for writes made over another transport.
     r = ws.request('sub', '/lamp', keys='on,brightness')
