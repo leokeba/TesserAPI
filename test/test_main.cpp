@@ -14,5 +14,6 @@
 #include "keyed_cases.h"
 #include "file_cases.h"
 #include "validate_cases.h"
+#include "wildcard_cases.h"
 
 int main(int argc, char** argv) { return check::run(argc > 1 ? argv[1] : nullptr) ? 1 : 0; }

@@ -35,6 +35,7 @@ Every subtree is addressable. These examples use HTTP; the same requests work ov
 | `PUT /api/lamp/brightness` body `200` | set one value |
 | `POST /api/lamp` body `{"on":true,"brightness":10}` | patch several values: all are validated before any is applied |
 | `POST /api/lamp/toggle` | call an action |
+| `PUT /api/peers/*/lamp/on` body `true` | the same write to every child that has the path, remote nodes included: each one's result by name |
 
 ## Live updates
 

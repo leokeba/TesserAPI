@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "tesser/detail/fan_out.h"
 #include "tesser/detail/lazy_patch.h"
 #include "tesser/envelope.h"
 #include "tesser/remote.h"
@@ -194,6 +195,7 @@ public:
     void run() {
         Node* target = resolve();
         if (!target) return;
+        if (star_) return fanOut(*target);
         if (req_.op != Op::Unsubscribe) {
             Access need = req_.op == Op::Set ? writeNeed_ : readNeed_;
             if (level_ < need || !allowed(*target)) return replyError(Status::Unauthorized, "not authorized", base_);
@@ -223,6 +225,10 @@ public:
         Node* target = resolve();
         elements = std::move(temps_);
         if (!target) return nullptr;
+        if (star_) {
+            replyError(Status::BadRequest, "'*' doesn't apply to files", base_);
+            return nullptr;
+        }
         if (target->type() != NodeType::File) {
             notFile = true;
             return nullptr;
@@ -331,6 +337,14 @@ private:
             if (seg.empty()) {
                 replyError(Status::BadRequest, "empty path segment", p);
                 return nullptr;
+            }
+            if (seg == "*") {
+                if (req_.op != Op::Set) {
+                    replyError(Status::BadRequest, "only set takes '*'", p);
+                    return nullptr;
+                }
+                star_ = pos;  // fanOut() expands it
+                return node;
             }
             Node* next = nullptr;
             if (node->type() == NodeType::Object) {
@@ -767,6 +781,50 @@ private:
     // Virtual, so the datagram and forwarding code is only linked into
     // applications that create remote nodes.
     void forward(RemoteNode& remote) { remote.forward(api_, req_, remoteRest_, base_, reply_); }
+
+    // ---- '*' ----------------------------------------------------------
+
+    // A set whose path has a '*' segment, at star_: one set per child of
+    // `parent`, each run like a request of its own (docs/DESIGN.md section
+    // 6.5). Children the client can't read aren't matched.
+    __attribute__((noinline)) void fanOut(Node& parent) {
+        if (req_.query.view != View::Value || !req_.query.keys.empty() || !req_.query.exclude.empty()) {
+            return replyError(Status::BadRequest, "set takes no query options", base_);
+        }
+        if (level_ < readNeed_) return replyError(Status::Unauthorized, "not authorized", base_);
+        std::vector<detail::Match> matches;
+        auto add = [&](std::string name, bool offline) {
+            matches.emplace_back();
+            matches.back().name = std::move(name);
+            matches.back().offline = offline;
+        };
+        auto indexes = [&](size_t n) {
+            for (size_t i = 0; i < n; i++) add(std::to_string(i), false);
+        };
+        switch (parent.type()) {
+            case NodeType::Object:
+                for (const Node* c = static_cast<const Object&>(parent).first(); c; c = c->next()) {
+                    if (!readable(*c)) continue;
+                    bool offline = c->type() == NodeType::Remote && !static_cast<const RemoteNode*>(c)->online();
+                    add(c->name(), offline);
+                }
+                break;
+            case NodeType::List: {
+                auto& list = static_cast<ListNode&>(parent);
+                if (!list.keyField()) {
+                    indexes(list.size());
+                    break;
+                }
+                std::vector<std::string> keys;
+                list.keys(keys);
+                for (std::string& k : keys) add(std::move(k), false);
+                break;
+            }
+            case NodeType::Array: indexes(static_cast<ArrayNode&>(parent).size()); break;
+            default: return replyError(Status::NotFound, "no such node", base_.substr(0, star_ + 1));
+        }
+        detail::fanOut(api_, req_, reply_, base_.substr(0, star_ - 1), base_.substr(star_ + 1), base_, matches);
+    }
 
     // ---- subscriptions ------------------------------------------------
 
@@ -1220,6 +1278,7 @@ private:
     uint16_t indexes_[kMaxTrail];                 // list indexes in the trail...
     uint32_t indexMask_ = 0;                      // ...at the levels whose bit is set
     std::string_view remoteRest_;                 // path below a remote node, forwarded as is
+    size_t star_ = 0;                             // position of a '*' segment in base_ (set only)
 };
 
 }  // namespace
@@ -1274,6 +1333,12 @@ void Api::releaseTransfer(std::string_view path) {
 void Api::handleNow(const Request& request, Reply& reply) {
     MutexGuard guard(mutex_);
     Handler(*this, request, reply).run();
+}
+
+void detail::handleNested(Api& api, const Request& request, Reply& reply) {
+    MutexGuard guard(api.mutex());
+    std::unique_ptr<Handler> handler(new Handler(api, request, reply));
+    handler->run();
 }
 
 // ---- queued mode ------------------------------------------------------------

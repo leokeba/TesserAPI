@@ -15,7 +15,7 @@ TesserAPI lets ESP32 firmware describe its state and operations **once**, as a t
 ### Non-goals
 
 - Automatic reflection over C++ members. Exposure is explicit.
-- A general query language: no JSONPath, predicates or wildcards.
+- A general query language: no JSONPath, predicates or wildcards, except one: a `*` path segment fans a Set out to every child (§6.5).
 - A custom JSON parser. We use ArduinoJson to *parse*. *Writing* JSON is simple, so we stream it ourselves.
 - Being an HTTP framework: routing for HTML pages, static files, uploads and so on stays in whatever server the application already uses.
 
@@ -310,6 +310,7 @@ struct Request {
 - `/` or the empty path is the root.
 - A trailing slash is ignored: `/lamp` and `/lamp/` are the same resource. An empty segment (`//`) is `bad_request`.
 - A path that leaves the tree, for example `/lamp/nope/x`, is `not_found`. The error's `path` is the prefix up to the first segment that didn't resolve (`/lamp/nope`).
+- A segment that is exactly `*` matches every child, in Set only (§6.5). Other operations answer `bad_request`. Names can't contain `*`, so it never shadows a child.
 - No percent-decoding inside the core, since names can't contain characters that need it. HTTP decodes the URL before handing over the path.
 
 ### 5.2 Query options (Get)
@@ -382,6 +383,36 @@ This mirrors the predecessor's model, where a POST body mixed values and trigger
 ### 6.4 Subscribe and Unsubscribe
 
 See §11.
+
+### 6.5 Set on many nodes: `*`
+
+A Set whose path has a `*` segment writes to every child at that point, as if each had been named:
+
+```json
+POST /peers/*/sequencer/play  "intro"
+→ {"spinner-1": null, "spinner-2": null}
+```
+
+- **Matches:** the `*` matches every child of an object, every element of a list (by key for keyed lists, by index otherwise) and every element of an array (by index). Children the client can't read (§13) aren't matched. A `*` below a value or an action is `not_found`.
+- **Independent sets:** each match runs as a Set of its own, with the rest of the path and the same body: a value, an action's argument or a patch. Each is validated and authorized on its own, and the sets aren't atomic across matches: a match that fails doesn't undo the others.
+- **Missing paths are skipped:** a match where the rest of the path doesn't resolve (a peer without `/sequencer`) is left out of the reply. A match where it resolves but the write fails is reported, including a patch key that doesn't exist. If nothing is left, the reply is `not_found` with the message `no match`.
+- **Several `*`** in one path expand one after the other, each nested level replying like a match.
+- **Remote nodes:** a match that is a remote node (§14) is forwarded like any request below it, and all of them are in flight together. The reply waits until every match has answered or timed out. Each waiting match takes a pending slot (`maxPending`), and one past the limit fails with `busy`; the fan-out itself takes none. A remote node whose peer is offline (§14.1) isn't sent to: it fails at once with `timeout` and the message `peer offline`. A transport that can't wait gets `not_allowed` for each match that would wait. A `*` below a remote node is forwarded as is, and the remote expands it.
+- **Deferred actions** may be targets: the reply waits for each match's deferred result, as for remote nodes.
+
+**Reply.** When every match succeeds, the status is `ok` and the body has each match's result under its name, in tree order: the value read back, the action's return value, or the patched keys.
+
+When any match fails, the reply is an error with the first failed match's status (in tree order). The standard error body (§8) gets three more keys: `failed`, each failed match's error body by name; `ok`, the successful matches' results by name, present when there are any; and `partial: true` when some matches succeeded. The message names the count and the first failure, ready to show:
+
+```json
+{"error": "timeout", "path": "/peers/*/sequencer/play",
+ "message": "1 of 3 failed: spinner-2: remote node didn't answer",
+ "partial": true,
+ "failed": {"spinner-2": {"error": "timeout", "path": "/peers/spinner-2", "message": "remote node didn't answer"}},
+ "ok": {"spinner-1": null, "spinner-3": null}}
+```
+
+Each match's result is buffered, up to `maxResponse`, until the last one answers. A reply that had to wait is bounded by `maxResponse` too, like any deferred reply.
 
 ## 7. Representations
 
@@ -760,7 +791,7 @@ nowApi.remote(api, "light", kitchenMac, "/lamp").mirror(200);
 ```
 
 - **Forwarding:** get and set on `/kitchen/...` are forwarded with the path rewritten, and complete through a deferred reply (`maxPending` applies). Error paths in the remote's reply are mapped back under the local path (`/kitchen/nope`). A silent node answers `timeout` after the node's `timeout()` (default: the endpoint's 3 s). Transports that can't wait get `not_allowed`.
-- **Writes** must target the remote subtree: a patch of the parent can't include a remote node.
+- **Writes** must target the remote subtree: a patch of the parent can't include a remote node. A `*` (§6.5) can match remote nodes, and the matches are forwarded together.
 - **Without a mirror**, a remote node renders as `null` in a parent read, and as `{"type": "remote"}` in the schema; reads below it are always forwarded live, and subscriptions are forwarded (below).
 - **`.mirror(intervalMs, refreshMs)`** keeps a local copy through a subscription. The copy is renewed every `refreshMs`, in case the remote node restarted.
   - Parent reads include the copy, respecting `depth`.
@@ -907,6 +938,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 6 | Groundwork for TesserUI: presentation metadata, forwarded subscriptions, discovered peers, `ApiClient` | done |
 | 7 | Groundwork for [TesserKIT](https://github.com/leokeba/TesserKIT): access levels and token checks, secret values; typed object arguments, keyed lists, scalar arrays, file nodes, streamed envelope replies, `view=hash`, re-advertisement, `Storage::erase()` and `Api::restore()` | done |
 | 8 | Bluetooth LE transport (Arduino and ESP-IDF), for TesserUI's launcher | done |
+| 9 | Fan-out writes: a `*` path segment in Set, for TesserKIT's sequencer | done |
 
 ## 19. Decisions on former open questions
 
