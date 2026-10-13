@@ -117,7 +117,7 @@ bool UdpTransport::sendTo(const PeerAddress& to, const uint8_t* data, size_t len
     return ok;
 }
 
-bool UdpTransport::begin(uint16_t port, bool runTask, uint32_t stackSize, UBaseType_t priority) {
+bool UdpTransport::begin(uint16_t port, Tasks tasks, uint32_t stackSize, UBaseType_t priority) {
     MutexGuard taskGuard(taskMutex_);
     if (running_) return false;
     int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -148,22 +148,28 @@ bool UdpTransport::begin(uint16_t port, bool runTask, uint32_t stackSize, UBaseT
     }
     port_ = port;
     socket_ = s;
+    tasks_ = tasks;
     running_ = true;
     link_.start(esp_random());
-    if (!runTask) {
+    if (tasks != Tasks::Both && ownHook_) {
+        // Our previous worker's: the application's own hook is left alone.
         link_.onQueued(nullptr);
-        return true;
+        ownHook_ = false;
     }
-    // A worker that end() let finish may still be there: it carries on.
-    if (!workTask_ && xTaskCreate(&UdpTransport::workEntry, "tesser_udp", stackSize, this, priority, &workTask_) !=
-                          pdPASS) {
+    if (tasks == Tasks::None) return true;
+    bool worker = tasks == Tasks::Both;
+    // A worker that end() let finish may still be there: it carries on
+    // (with Tasks::Both; otherwise it exits).
+    if (worker && !workTask_ &&
+        xTaskCreate(&UdpTransport::workEntry, "tesser_udp", stackSize, this, priority, &workTask_) != pdPASS) {
         workTask_ = nullptr;
     }
-    if (workTask_) {
+    if (worker && workTask_) {
         TaskHandle_t task = workTask_;
         link_.onQueued([task] { xTaskNotifyGive(task); });
+        ownHook_ = true;
     }
-    if (!workTask_ ||
+    if ((worker && !workTask_) ||
         xTaskCreate(&UdpTransport::receiveEntry, "tesser_udp_rx", 4096, this, priority + 1, &receiveTask_) != pdPASS) {
         receiveTask_ = nullptr;
         running_ = false;
@@ -202,7 +208,7 @@ void UdpTransport::receiveWaiting() {
 }
 
 void UdpTransport::poll() {
-    if (running_) receiveWaiting();
+    if (running_ && tasks_ == Tasks::None) receiveWaiting();
     link_.tick();
 }
 
@@ -229,6 +235,16 @@ void UdpTransport::workEntry(void* arg) {
     for (;;) {
         // Wake on new messages; tick for retransmissions and timeouts.
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        if (self->running_ && self->tasks_ != Tasks::Both) {
+            // begin() came again without a worker: poll() does the work now.
+            MutexGuard guard(self->taskMutex_);
+            if (self->running_ && self->tasks_ != Tasks::Both) {
+                self->workTask_ = nullptr;
+                break;
+            }
+        }
+        // Never under taskMutex_: a request may wait for a task that holds
+        // the API lock and calls begin().
         self->link_.tick();
         if (self->running_) continue;
         self->link_.tick();  // the peers end() forgot

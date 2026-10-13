@@ -43,6 +43,7 @@ bool NowTpTransport::begin(bool runTask, uint32_t stackSize, UBaseType_t priorit
         }
         TaskHandle_t task = task_;
         endpoint_.onQueued([task] { xTaskNotifyGive(task); });
+        ownHook_ = true;
     }
     now_.listen(port_, [this](const nowtp::Message& m) {
         endpoint_.receive(address(m.src), reinterpret_cast<const char*>(m.data), m.len, m.reliable);
@@ -58,7 +59,9 @@ void NowTpTransport::end() {
         xTaskNotifyGive(task_);
         while (task_) vTaskDelay(pdMS_TO_TICKS(5));
     }
-    endpoint_.onQueued(nullptr);
+    // Only our worker's hook: without a task, the application's stays.
+    if (ownHook_) endpoint_.onQueued(nullptr);
+    ownHook_ = false;
 }
 
 void NowTpTransport::taskEntry(void* arg) {

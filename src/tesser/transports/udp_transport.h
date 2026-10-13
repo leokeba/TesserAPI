@@ -22,6 +22,13 @@ class UdpTransport {
 public:
     static constexpr uint16_t kDefaultPort = 8484;
 
+    // Which tasks begin() starts (docs/DESIGN.md section 10.7).
+    enum class Tasks : uint8_t {
+        None,     // poll() reads the socket and does the work
+        Receive,  // a receive task reads the socket; poll() does the work
+        Both,     // a receive task and a worker: nothing to call
+    };
+
     // `api` may be null for a client-only node.
     explicit UdpTransport(Api* api, UdpLink::Options options = UdpLink::Options(),
                           DatagramEndpoint::Options endpointOptions = UdpLink::endpointOptions());
@@ -32,22 +39,30 @@ public:
     UdpTransport& operator=(const UdpTransport&) = delete;
 
     // Opens the socket on `port` (all interfaces) once the network is up.
-    // With runTask, a receive task and a worker task handle the traffic and
-    // the requests; otherwise call poll() from loop(). Advertises the
-    // device's Wi-Fi station MAC as its id, and, unless setName() came
-    // first, "tesser-<last two MAC bytes>" as its name.
+    // `tasks` says which tasks handle the traffic and the requests; without
+    // a worker, call poll() at least every 20 ms, and when the endpoint's
+    // onQueued() hook fires, which begin() leaves to the application then.
+    // `stackSize` is the worker's, `priority` the worker's (the receive
+    // task runs one above). Advertises the device's Wi-Fi station MAC as its
+    // id, and, unless setName() came first, "tesser-<last two MAC bytes>" as
+    // its name.
+    bool begin(uint16_t port, Tasks tasks, uint32_t stackSize = 6144, UBaseType_t priority = 4);
+    // runTask: Tasks::Both, else Tasks::None.
     bool begin(uint16_t port = kDefaultPort, bool runTask = true, uint32_t stackSize = 6144,
-               UBaseType_t priority = 4);
-    // Says goodbye, closes the socket, and forgets every peer. Safe from a
-    // request handler, including one this transport runs: it doesn't wait
-    // for the worker, which finishes the request at hand and exits (or
-    // carries on, if begin() comes first). begin() again to restart, on any
-    // port.
+               UBaseType_t priority = 4) {
+        return begin(port, runTask ? Tasks::Both : Tasks::None, stackSize, priority);
+    }
+    // Says goodbye, closes the socket, and forgets every peer (without a
+    // worker, at the next poll()). Safe from a request handler, including
+    // one this transport runs: it doesn't wait for the worker, which
+    // finishes the request at hand and exits (or carries on, if begin()
+    // with a worker comes first). begin() again to restart, on any port.
     void end();
     bool running() const { return running_.load(); }
     uint16_t port() const { return port_; }
-    // Without a task: handles what arrived, then retransmits, advertises and
-    // runs the requests.
+    // Without a worker: handles what arrived (reading the socket too
+    // without a receive task), then retransmits, advertises and runs the
+    // requests.
     void poll();
 
     // ---- discovery (docs/DESIGN.md section 14.1) ------------------------
@@ -101,6 +116,8 @@ private:
     std::atomic<bool> running_{false};
     uint16_t port_ = 0;
     bool named_ = false;
+    std::atomic<Tasks> tasks_{Tasks::Both};
+    bool ownHook_ = false;  // onQueued() wakes our worker: ours to clear
     TaskHandle_t receiveTask_ = nullptr;
     TaskHandle_t workTask_ = nullptr;
     std::vector<uint8_t> buffer_;

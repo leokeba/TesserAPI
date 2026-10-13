@@ -35,7 +35,9 @@ public:
     NowTpTransport& operator=(const NowTpTransport&) = delete;
 
     // Listens on the port. With runTask, a worker task handles requests and
-    // client callbacks; otherwise call poll() from loop(). Requests never run
+    // client callbacks; otherwise call poll() from loop(), or from a task
+    // that endpoint().onQueued() wakes (begin() and end() leave that hook
+    // alone then). Requests never run
     // inside NowTP's own callbacks (which hold NowTP's lock).
     bool begin(bool runTask = true, uint32_t stackSize = 6144, UBaseType_t priority = 4);
     void end();
@@ -102,6 +104,7 @@ private:
     DatagramEndpoint endpoint_;
     TaskHandle_t task_ = nullptr;
     volatile bool running_ = false;
+    bool ownHook_ = false;  // onQueued() wakes our worker: ours to clear
 };
 
 }  // namespace tesser
