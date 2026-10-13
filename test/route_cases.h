@@ -358,7 +358,11 @@ TEST(route_declared_device) {
     DatagramEndpoint now(&gw, TransportKind::NowTP, r.radio.sender(datagram_cases::addr(2)), r.net.clockFn());
     r.net.nodes.push_back({ip(2), &udp});
     r.radio.nodes.push_back({datagram_cases::addr(2), &now});
-    RemoteNode& declared = peers.remote("far-lamp", udp.endpoint(), ip(20));
+    // Named at run time: the node keeps a copy of the name.
+    std::string name = "far-";
+    name += "lamp";
+    RemoteNode& declared = peers.remote(name, udp.endpoint(), ip(20));
+    name = "overwritten";
     std::vector<RemoteNode*> announced;
     RemoteNode::onStateChange([&](RemoteNode& node) { announced.push_back(&node); });
     udp.mountPeers(peers);

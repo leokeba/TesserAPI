@@ -1214,6 +1214,9 @@ public:
     // grafted here: requests below it are forwarded. See tesser/remote.h.
     RemoteNode& remote(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer,
                        const char* remotePath = "/");
+    // Same, keeping a copy of `name`: for nodes declared at run time.
+    RemoteNode& remote(std::string name, DatagramEndpoint& endpoint, const PeerAddress& peer,
+                       const char* remotePath = "/");
 
     // Writer renders the node; the optional applier accepts writes.
     CustomNode& custom(const char* name, CustomNode::Writer writer, CustomNode::Applier applier = nullptr) {

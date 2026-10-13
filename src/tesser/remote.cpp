@@ -1494,4 +1494,9 @@ RemoteNode& Object::remote(const char* name, DatagramEndpoint& endpoint, const P
     return add(new RemoteNode(name, endpoint, peer, remotePath ? remotePath : "/"));
 }
 
+RemoteNode& Object::remote(std::string name, DatagramEndpoint& endpoint, const PeerAddress& peer,
+                           const char* remotePath) {
+    return add(new RemoteNode(std::move(name), endpoint, peer, remotePath ? remotePath : "/"));
+}
+
 }  // namespace tesser
