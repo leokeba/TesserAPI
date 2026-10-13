@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <atomic>
@@ -98,6 +99,10 @@ public:
     void receive(const PeerAddress& from, const char* data, size_t len, bool reliable, bool broadcast = false);
     // Same, taking the message (a link's reassembly buffer) without a copy.
     void receive(const PeerAddress& from, std::string&& text, bool reliable, bool broadcast = false);
+    // Same, taking `buffer`, allocated with malloc (freed with free()):
+    // a link that hands its reassembly buffer over (NowTP's
+    // Message::buffer), so a large message is never on the heap twice.
+    void receiveOwned(const PeerAddress& from, void* buffer, size_t len, bool reliable, bool broadcast = false);
 
     // Handles queued messages and expires client calls. Returns true if it did
     // anything.
@@ -257,11 +262,19 @@ public:
     Api* api() const { return api_; }
 
 private:
+    struct FreeDeleter {
+        void operator()(char* p) const { free(p); }
+    };
+    // A message waiting for process(): its text, or a buffer the link
+    // handed over (receiveOwned()).
     struct Incoming {
         PeerAddress from;
         std::string text;
-        bool reliable;
-        bool broadcast;
+        bool reliable = false;
+        bool broadcast = false;
+        std::unique_ptr<char, FreeDeleter> owned;
+        size_t ownedLen = 0;
+        std::string_view view() const { return owned ? std::string_view(owned.get(), ownedLen) : std::string_view(text); }
     };
     class PeerSubscriber : public Subscriber {
     public:
@@ -328,6 +341,7 @@ private:
     void sendAuth(const PeerAddress& peer, const std::string& token);
     void authDone(const PeerAddress& peer, Status status, JsonVariantConst body);
     void handle(Incoming& msg);
+    void queue(Incoming&& msg);
     void handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply);
     Access levelOf(const PeerAddress& peer);
     void reject(const Incoming& msg, Status status, const char* message);

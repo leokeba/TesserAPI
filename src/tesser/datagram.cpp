@@ -257,7 +257,26 @@ void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t
 }
 
 void DatagramEndpoint::receive(const PeerAddress& from, std::string&& text, bool reliable, bool broadcast) {
-    Incoming msg{from, std::move(text), reliable, broadcast};
+    Incoming msg;
+    msg.from = from;
+    msg.text = std::move(text);
+    msg.reliable = reliable;
+    msg.broadcast = broadcast;
+    queue(std::move(msg));
+}
+
+void DatagramEndpoint::receiveOwned(const PeerAddress& from, void* buffer, size_t len, bool reliable,
+                                    bool broadcast) {
+    Incoming msg;
+    msg.from = from;
+    msg.owned.reset(static_cast<char*>(buffer));
+    msg.ownedLen = len;
+    msg.reliable = reliable;
+    msg.broadcast = broadcast;
+    queue(std::move(msg));
+}
+
+void DatagramEndpoint::queue(Incoming&& msg) {
     bool queued = false;
     {
         MutexGuard guard(mutex_);
@@ -351,7 +370,8 @@ void DatagramEndpoint::reject(const Incoming& msg, Status status, const char* me
     filter["id"] = true;
     filter["op"] = true;
     JsonDocument doc;
-    if (deserializeJson(doc, msg.text, DeserializationOption::Filter(filter),
+    std::string_view text = msg.view();
+    if (deserializeJson(doc, text.data(), text.size(), DeserializationOption::Filter(filter),
                         DeserializationOption::NestingLimit(kWrittenNesting))) {
         return;
     }
@@ -487,7 +507,8 @@ bool DatagramEndpoint::takeRaw(const Incoming& msg) {
     filter["id"] = true;
     filter["status"] = true;
     JsonDocument head;  // without the body: small whatever its size
-    if (deserializeJson(head, msg.text.data(), msg.text.size(), DeserializationOption::Filter(filter),
+    std::string_view text = msg.view();
+    if (deserializeJson(head, text.data(), text.size(), DeserializationOption::Filter(filter),
                         DeserializationOption::NestingLimit(kWrittenNesting)) ||
         head["status"] != "ok" || !head["id"].is<uint32_t>()) {
         return false;
@@ -513,7 +534,7 @@ bool DatagramEndpoint::takeRaw(const Incoming& msg) {
     uint32_t rtt = (clock_ ? clock_() : 0) - sentMs;
     for (RemoteNode* r : remotes) r->routeRoundTrip(this, msg.from, rtt);
     std::string_view body;
-    if (!jsonMember(msg.text, "body", body)) body = "null";
+    if (!jsonMember(text, "body", body)) body = "null";
     raw(body);
     return true;
 }
@@ -522,7 +543,8 @@ void DatagramEndpoint::handle(Incoming& msg) {
     if (takeRaw(msg)) return;
     // Parsed, a large message takes about as much again: only above the
     // heap floor (dropped otherwise, like a lost datagram).
-    if (msg.text.size() > 1024 && !heapAbove(2 * msg.text.size())) {
+    std::string_view text = msg.view();
+    if (text.size() > 1024 && !heapAbove(2 * text.size())) {
         MutexGuard guard(mutex_);
         stats_.dropped++;
         return;
@@ -530,7 +552,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
     // Responses and notifications nest as deep as the peer wrote them;
     // requests are held to the same limit as on other transports below.
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, msg.text.data(), msg.text.size(),
+    DeserializationError err = deserializeJson(doc, text.data(), text.size(),
                                                DeserializationOption::NestingLimit(kWrittenNesting));
     if (err || !doc.is<JsonObjectConst>()) {
         MutexGuard guard(mutex_);
@@ -616,7 +638,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
                 if (c.first == msg.from) inboxes.push_back(c.second);
             }
         }
-        for (auto& inbox : inboxes) inbox->notification(msg.text);
+        for (auto& inbox : inboxes) inbox->notification(std::string(text));
         if (onNotification_) onNotification_(msg.from, env);
         return;
     }

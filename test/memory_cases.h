@@ -239,4 +239,35 @@ TEST(memory_remote_state_needs_room) {
     CHECK_EQ(r.gateway.pending(), 0);
 }
 
+TEST(memory_receive_owned_buffer) {
+    // A link hands its malloc'd reassembly buffer over: answered like any
+    // message, freed by the endpoint (ASan checks), also when it is dropped.
+    cases::Device dev;
+    datagram_cases::Net net;
+    tesser::DatagramEndpoint::Options o;
+    o.queueLimit = 1;
+    tesser::DatagramEndpoint server(&dev.api, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(2)),
+                                    net.clockFn(), o);
+    tesser::DatagramEndpoint client(nullptr, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(1)),
+                                    net.clockFn());
+    net.nodes = {{datagram_cases::addr(1), &client}, {datagram_cases::addr(2), &server}};
+    datagram_cases::Result r;
+    client.request(datagram_cases::addr(2), tesser::Op::Get, "/lamp/brightness", "", datagram_cases::capture(r));
+    // Taken off the network by hand, as a link would, and handed over.
+    CHECK_EQ(net.frames.size(), 1u);
+    std::string text = net.frames.front().text;
+    net.frames.pop_front();
+    auto handOver = [&](const std::string& t) {
+        char* buffer = static_cast<char*>(malloc(t.size()));
+        memcpy(buffer, t.data(), t.size());
+        server.receiveOwned(datagram_cases::addr(1), buffer, t.size(), true);
+    };
+    handOver(text);
+    handOver("{\"id\":99,\"op\":\"get\",\"path\":\"/lamp/on\"}");  // the queue is full: dropped, and freed
+    CHECK_EQ(server.stats().dropped, 1u);
+    net.run();
+    CHECK(r.called);
+    CHECK_EQ(r.body, "128");
+}
+
 }  // namespace memory_cases
