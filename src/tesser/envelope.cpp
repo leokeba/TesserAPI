@@ -174,6 +174,11 @@ bool EnvelopeReply::LimitedSink::write(const char* data, size_t len) {
         return r_.buf_.size() < r_.chunk_ || r_.flush();
     }
     if (r_.limit_ && r_.buf_.size() + len + 1 > r_.limit_) return false;  // keep room for '}'
+    // Buffered whole: on a fragmented heap, refuse rather than abort.
+    if (!growFor(r_.buf_, r_.buf_.size() + len + 1)) {
+        r_.lowMemory_ = true;
+        return false;
+    }
     r_.buf_.append(data, len);
     return true;
 }
@@ -202,6 +207,7 @@ bool EnvelopeReply::flush() {
 
 Sink& EnvelopeReply::begin(Status status) {
     buf_.clear();
+    lowMemory_ = false;
     buf_ += '{';
     if (id_.length) {
         buf_ += "\"id\":";

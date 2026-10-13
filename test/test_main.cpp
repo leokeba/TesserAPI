@@ -20,5 +20,6 @@
 #include "stream_sub_cases.h"
 #include "udp_cases.h"
 #include "route_cases.h"
+#include "memory_cases.h"
 
 int main(int argc, char** argv) { return check::run(argc > 1 ? argv[1] : nullptr) ? 1 : 0; }

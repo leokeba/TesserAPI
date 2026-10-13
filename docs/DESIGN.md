@@ -1043,6 +1043,13 @@ Targets to be measured on a classic ESP32 and a C3, and enforced in CI:
 | Request handling | Request body document (bounded by `maxRequestBody`) + 512 B streaming buffer (HTTP) or 1 KB (serial, WebSocket), or the response buffer (NowTP and deferred replies, bounded by `maxResponse`) |
 | Stack | Rendering depth bounded by `maxDepth` (default 16). JSON parsing: request bodies nest at most `maxDepth` + 1 levels (one more for an envelope); responses, notifications and stored records up to 65, the most a node's JSON writer produces, since a schema nests two or three levels per tree level and the writing peer's `maxDepth` may differ. On Xtensa with `-Og` (ESP-IDF's default), each tree level costs about 230 B of stack to render a schema or apply a patch, and each JSON level about 96 B to parse (6.2 KB at 65) |
 
+**Large buffers on a fragmented heap.** Without PSRAM, an ESP32 running Wi-Fi, NowTP, UDP and Bluetooth can have 20 KB free in fragments, and an allocation that fails aborts the device (no exceptions). So:
+
+- A buffered reply (NowTP, UDP, deferred replies) grows by half again at a time, and before growing past 1 KB it asks for the largest free block (`largestFreeBlock()`, `heap_caps_get_largest_free_block()` on target). It must hold the new buffer, one copy of the message further down (a link's own buffer, NowTP's), and 1 KB of headroom. Otherwise the reply is refused with `busy` and "not enough memory for the response", which the client can try again. Measured on DEVKIT-R1 before this: a 4.8 KB subscription snapshot over UDP aborted the device when the link copied it.
+- Change notifications are rendered straight into their envelope (the body isn't built apart and copied), behind the same check. A notification that doesn't fit now is put off, and its changes go with the next flush, merged with newer ones.
+- The datagram links take a reply without copying it: `DatagramEndpoint::SendFn` takes the message by value, and UdpLink keeps the very buffer for retransmissions. A notification is still copied once per subscriber.
+- `setLargestFreeBlockProbe()` replaces the probe in tests.
+
 Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware`):
 
 | Item | Measured |

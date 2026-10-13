@@ -170,7 +170,7 @@ private:
         bool broadcast;
     };
 
-    bool sendMessage(const PeerAddress& to, const std::string& message, Delivery delivery);
+    bool sendMessage(const PeerAddress& to, std::string message, Delivery delivery);
     void transmit(const PeerAddress& to, uint32_t id, const std::string& data, uint8_t count, uint64_t mask,
                   uint8_t flags);
     void sendAck(const PeerAddress& to, uint32_t id, uint8_t status, uint64_t got);

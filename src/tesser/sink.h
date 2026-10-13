@@ -32,6 +32,31 @@ private:
     size_t limit_;
 };
 
+// Grows `s` to hold `need` bytes, by half again at a time, unless the heap
+// can't give a block that size and leave room for one copy of the message
+// further down (a link's own buffer) plus a little headroom: false then,
+// and `s` is untouched. Buffers under 1 KB aren't checked.
+bool growFor(std::string& s, size_t need);
+
+// A StringSink that refuses to grow beyond what the heap can give
+// (growFor()); `lowMemory` tells why it failed.
+class MemorySink : public Sink {
+public:
+    explicit MemorySink(std::string& out) : out_(out) {}
+    bool write(const char* data, size_t len) override {
+        if (!growFor(out_, out_.size() + len)) {
+            lowMemory = true;
+            return false;
+        }
+        out_.append(data, len);
+        return true;
+    }
+    bool lowMemory = false;
+
+private:
+    std::string& out_;
+};
+
 // Counts bytes without storing them.
 class CountingSink : public Sink {
 public:

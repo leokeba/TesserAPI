@@ -129,6 +129,9 @@ public:
     virtual Reply* detach() { return nullptr; }
     // Called on a detached reply after end(); typically `delete this`.
     virtual void release() {}
+    // The last write failed because the heap couldn't hold the reply: the
+    // core answers "busy" rather than "too_large".
+    virtual bool outOfMemory() const { return false; }
 };
 
 // Reply that captures status and body into memory: handy for tests and for

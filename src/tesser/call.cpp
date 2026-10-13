@@ -31,7 +31,11 @@ namespace detail {
 
 void finishBody(Reply& reply, JsonWriter& w, std::string_view path) {
     if (!w.ok() && reply.rollback()) {
-        writeError(reply, Status::TooLarge, path, "response too large");
+        if (reply.outOfMemory()) {
+            writeError(reply, Status::Busy, path, "not enough memory for the response");
+        } else {
+            writeError(reply, Status::TooLarge, path, "response too large");
+        }
         return;
     }
     reply.end();

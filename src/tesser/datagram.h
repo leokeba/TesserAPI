@@ -61,7 +61,9 @@ const char* toString(PeerLoss reason);
 
 class DatagramEndpoint {
 public:
-    using SendFn = std::function<bool(const PeerAddress& to, const std::string& message, Delivery delivery)>;
+    // The message is passed by value: a link that keeps it (for
+    // retransmissions) takes it without a copy when the caller moves it.
+    using SendFn = std::function<bool(const PeerAddress& to, std::string message, Delivery delivery)>;
     using ClockFn = std::function<uint32_t()>;
     using ResponseHandler = std::function<void(Status status, JsonVariantConst body)>;
     // A reply to a broadcast request; see broadcast().

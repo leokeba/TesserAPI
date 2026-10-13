@@ -56,7 +56,8 @@ Status envelopeId(JsonObjectConst envelope, EnvelopeId& id, const char*& message
 // so its size isn't limited (docs/DESIGN.md section 10.1).
 class EnvelopeReply : public Reply {
 public:
-    using Send = std::function<void(const std::string& message)>;
+    // The message may be taken (moved from): it isn't used afterwards.
+    using Send = std::function<void(std::string& message)>;
     // One piece of a streamed envelope. `first` and `final` mark the ends;
     // a piece with both is the whole envelope. After a failed piece, only a
     // final, empty one follows. Returns false if it couldn't be sent.
@@ -76,6 +77,7 @@ public:
     bool rollback() override;
     Reply* detach() override;
     void release() override;
+    bool outOfMemory() const override { return lowMemory_; }
 
 private:
     class LimitedSink : public Sink {
@@ -95,6 +97,7 @@ private:
     std::string buf_;
     LimitedSink sink_{*this};
     bool detached_ = false;
+    bool lowMemory_ = false;
     Fragment fragment_;
     size_t chunk_ = 0;
     bool flushed_ = false;   // a piece is out: no rollback, a final piece is owed

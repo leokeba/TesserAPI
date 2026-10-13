@@ -1,9 +1,13 @@
 #include "tesser/platform.h"
 
+#include "tesser/sink.h"
+
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 
 #if defined(ESP_PLATFORM)
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
@@ -34,6 +38,30 @@ void logv(char level, const char* fmt, va_list ap) {
 }
 
 }  // namespace
+
+namespace {
+size_t (*g_probe)() = nullptr;
+}
+
+void setLargestFreeBlockProbe(size_t (*probe)()) { g_probe = probe; }
+
+size_t largestFreeBlock() {
+    if (g_probe) return g_probe();
+#if defined(ESP_PLATFORM)
+    return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+#else
+    return SIZE_MAX;
+#endif
+}
+
+bool growFor(std::string& s, size_t need) {
+    if (need <= s.capacity()) return true;
+    size_t grown = s.capacity() + s.capacity() / 2;
+    size_t capacity = need > grown ? need : grown;
+    if (capacity > 1024 && largestFreeBlock() < capacity + need + 1024) return false;
+    s.reserve(capacity);
+    return true;
+}
 
 bool stationMac(uint8_t mac[6]) {
 #if defined(ESP_PLATFORM)

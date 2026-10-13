@@ -94,6 +94,13 @@ private:
 // Milliseconds since boot (wraps after ~49 days).
 uint32_t millis32();
 
+// The largest block the heap can allocate now (bytes; SIZE_MAX off target).
+// Large buffers check it first, so a fragmented heap refuses a reply instead
+// of aborting the device (docs/DESIGN.md section 15).
+size_t largestFreeBlock();
+// Replaces the probe (tests); null restores the platform's.
+void setLargestFreeBlockProbe(size_t (*probe)());
+
 // The chip's Wi-Fi station MAC, the device id UDP advertises and NowTP
 // addresses (false off target).
 bool stationMac(uint8_t mac[6]);

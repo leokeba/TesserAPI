@@ -157,7 +157,7 @@ UdpLink::UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock, Optio
       options_(options),
       endpoint_(
           api, TransportKind::Udp,
-          [this](const PeerAddress& to, const std::string& m, Delivery d) { return sendMessage(to, m, d); },
+          [this](const PeerAddress& to, std::string m, Delivery d) { return sendMessage(to, std::move(m), d); },
           std::move(clock), endpointOptions),
       api_(api) {
     if (options_.fragmentSize < 64) options_.fragmentSize = 64;
@@ -264,7 +264,7 @@ void UdpLink::transmit(const PeerAddress& to, uint32_t id, const std::string& da
     }
 }
 
-bool UdpLink::sendMessage(const PeerAddress& to, const std::string& message, Delivery delivery) {
+bool UdpLink::sendMessage(const PeerAddress& to, std::string message, Delivery delivery) {
     if (!running_ || message.size() > options_.maxMessage) return false;
     size_t size = options_.fragmentSize;
     uint8_t count = static_cast<uint8_t>(message.empty() ? 1 : (message.size() + size - 1) / size);
@@ -282,9 +282,12 @@ bool UdpLink::sendMessage(const PeerAddress& to, const std::string& message, Del
         return true;
     }
     uint32_t t = now();
-    outgoing_.push_back(
-        Outgoing{to, id, message, count, 0, t + options_.ackTimeoutMs, options_.ackTimeoutMs, t + options_.sendTimeoutMs});
-    transmit(to, id, message, count, allOf(count), kReliable);
+    // Kept for retransmissions: taken, not copied (a large reply on a
+    // fragmented heap had no room for a second block).
+    outgoing_.push_back(Outgoing{to, id, std::move(message), count, 0, t + options_.ackTimeoutMs, options_.ackTimeoutMs,
+                                 t + options_.sendTimeoutMs});
+    const Outgoing& o = outgoing_.back();
+    transmit(to, id, o.data, count, allOf(count), kReliable);
     return true;
 }
 

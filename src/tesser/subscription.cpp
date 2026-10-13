@@ -301,8 +301,21 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
     uint16_t gen = currentGeneration();
     if (gen == sub.since) return;
 
-    std::string body;
-    StringSink sink(body);
+    // Rendered straight into the envelope (no separate body to copy), and
+    // refused, to be tried again at the next flush, if the heap can't hold
+    // it: an abort would take the device down.
+    std::string msg;
+    {
+        StringSink head(msg);
+        JsonWriter m(head);
+        m.beginObject();
+        m.key("op");
+        m.string("change");
+        m.key("path");
+        m.string(sub.path.empty() ? std::string_view("/") : std::string_view(sub.path));
+        m.key("body");
+    }
+    MemorySink sink(msg);
     JsonWriter w(sink);
     bool any = false;
     const Node& n = *sub.node;
@@ -318,21 +331,11 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
         detail::writeLeaf(w, n, options);
         any = true;
     }
+    if (sink.lowMemory) return;  // `since` stays: the changes go with the next flush
     if (!any) {
         sub.since = gen;
         return;
     }
-
-    std::string msg;
-    StringSink msgSink(msg);
-    JsonWriter m(msgSink);
-    m.beginObject();
-    m.key("op");
-    m.string("change");
-    m.key("path");
-    m.string(sub.path.empty() ? std::string_view("/") : std::string_view(sub.path));
-    m.key("body");
-    m.raw(body);
     bool overflow = sub.subscriber->missed.exchange(false);
     closeEnvelope(msg, overflow);
     if (sub.subscriber->notify(msg, Delivery::Reliable)) {

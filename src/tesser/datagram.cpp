@@ -358,8 +358,8 @@ void DatagramEndpoint::reject(const Incoming& msg, Status status, const char* me
     }
     PeerAddress to = msg.from;
     SendFn send = send_;
-    EnvelopeReply reply(id, 0, [send, to](const std::string& m) {
-        if (send) send(to, m, Delivery::Reliable);
+    EnvelopeReply reply(id, 0, [send, to](std::string& m) {
+        if (send) send(to, std::move(m), Delivery::Reliable);
     });
     writeError(reply, status, std::string_view(), message);
 }
@@ -525,8 +525,8 @@ void DatagramEndpoint::handle(Incoming& msg) {
     SendFn send = send_;
     // A broadcast request without an id is never answered.
     bool silent = msg.broadcast && id.length == 0;
-    EnvelopeReply reply(id, api_->config().maxResponse, [send, to, silent](const std::string& m) {
-        if (send && !silent) send(to, m, Delivery::Reliable);
+    EnvelopeReply reply(id, api_->config().maxResponse, [send, to, silent](std::string& m) {
+        if (send && !silent) send(to, std::move(m), Delivery::Reliable);
     });
     if (s != Status::Ok) {
         writeError(reply, s, std::string_view(), message);
@@ -616,8 +616,8 @@ void DatagramEndpoint::handleFile(JsonObjectConst envelope, const Incoming& msg,
     PeerAddress to = msg.from;
     SendFn send = send_;
     bool silent = msg.broadcast && id.length == 0;
-    EnvelopeReply reply(id, api_->config().maxResponse, [send, to, silent](const std::string& m) {
-        if (send && !silent) send(to, m, Delivery::Reliable);
+    EnvelopeReply reply(id, api_->config().maxResponse, [send, to, silent](std::string& m) {
+        if (send && !silent) send(to, std::move(m), Delivery::Reliable);
     });
     if (s != Status::Ok) {
         writeError(reply, s, std::string_view(), message);
