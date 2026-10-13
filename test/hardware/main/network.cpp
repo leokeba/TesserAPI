@@ -263,6 +263,54 @@ void describeUdp(tesser::Object& net) {
             tesser::Access a;
             if (tesser::parseAccess(s, a)) g_udp->setPeerAccess(a);
         });
+    // "ethernet", "wifi", "ap", comma-separated, or "all": restarts UDP on
+    // them (docs/DESIGN.md section 10.7).
+    udp.value(
+        "interfaces",
+        [] {
+            uint8_t m = g_udp->interfaces();
+            if (m == tesser::UdpTransport::kAllInterfaces) return std::string("all");
+            std::string s;
+            for (auto i : {tesser::NetInterface::Ethernet, tesser::NetInterface::Wifi, tesser::NetInterface::Ap}) {
+                if (!(m & tesser::UdpTransport::interfaceBit(i))) continue;
+                if (!s.empty()) s += ",";
+                s += tesser::toString(i);
+            }
+            return s;
+        },
+        [](const std::string& text) {
+            uint8_t m = 0;
+            if (text == "all") m = tesser::UdpTransport::kAllInterfaces;
+            size_t pos = 0;
+            while (m != tesser::UdpTransport::kAllInterfaces && pos < text.size()) {
+                size_t comma = text.find(',', pos);
+                if (comma == std::string::npos) comma = text.size();
+                tesser::NetInterface i;
+                if (tesser::parseNetInterface(std::string_view(text).substr(pos, comma - pos), i)) {
+                    m |= tesser::UdpTransport::interfaceBit(i);
+                }
+                pos = comma + 1;
+            }
+            if (!m) return false;
+            g_udp->setInterfaces(m);
+            g_udp->end();
+            g_udpEnabled = g_udp->begin();
+            return true;
+        });
+    // The interface each peer under /lan is reached by.
+    udp.value("route", [] {
+        std::string out;
+        for (const tesser::Node* c = g_api->child("lan") ? static_cast<const tesser::Object*>(g_api->child("lan"))->first()
+                                                         : nullptr;
+             c; c = c->next()) {
+            if (c->type() != tesser::NodeType::Remote) continue;
+            tesser::RemoteNode::Route r;
+            if (!static_cast<const tesser::RemoteNode*>(c)->route(r)) continue;
+            if (!out.empty()) out += ",";
+            out += std::string(c->name()) + "=" + r.name() + (r.online ? "" : "(offline)");
+        }
+        return out;
+    });
     auto& stats = udp.object("stats");
     stats.value("sent", [] { return g_udp->link().stats().sent; });
     stats.value("received", [] { return g_udp->link().stats().received; });

@@ -17,6 +17,30 @@ namespace tesser {
 class FileRelay;
 struct Subscription;
 
+// An entry of a route order (docs/DESIGN.md section 14.3): a transport, and
+// optionally the interface it leaves by. A bare transport (TransportKind::Udp
+// converts) matches its routes on any interface.
+struct RouteKind {
+    TransportKind transport = TransportKind::Local;
+    NetInterface iface = NetInterface::Any;
+
+    RouteKind() = default;
+    RouteKind(TransportKind t, NetInterface i = NetInterface::Any) : transport(t), iface(i) {}  // NOLINT: implicit
+    bool operator==(const RouteKind& o) const { return transport == o.transport && iface == o.iface; }
+    bool operator!=(const RouteKind& o) const { return !(*this == o); }
+    // This entry covers routes of `kind` leaving by `i`.
+    bool covers(TransportKind kind, NetInterface i) const {
+        return transport == kind && (iface == NetInterface::Any || iface == i);
+    }
+};
+// "udp", "udp/ethernet".
+std::string toString(const RouteKind& kind);
+// "udp/ethernet, nowtp" (commas, spaces allowed): false, with `out`
+// untouched, if an entry isn't a transport or transport/interface.
+bool parseRouteOrder(std::string_view text, std::vector<RouteKind>& out);
+// The other way round: "udp/ethernet, nowtp".
+std::string formatRouteOrder(const std::vector<RouteKind>& order);
+
 // Another node's tree grafted into this one (docs/DESIGN.md section 14):
 // requests below it are forwarded over a DatagramEndpoint (NowTP, ...), and
 // the remote's answer comes back as a deferred reply. A gateway uses it to
@@ -38,7 +62,12 @@ public:
         bool online = true;
         uint32_t heardMs = 0;  // when a message last came this way (endpoint clock; 0: never)
         uint32_t rttMs = 0;    // smoothed round trip of the calls made this way (0: none yet)
+        // The local interface it leaves by (UDP; Any when unknown or for
+        // NowTP), as the endpoint saw it when the route came online.
+        NetInterface iface = NetInterface::Any;
         TransportKind kind() const;
+        // "nowtp", "udp/ethernet" (or "udp" when the interface is unknown).
+        std::string name() const { return toString(RouteKind(kind(), iface)); }
     };
     // See onStateChange().
     using StateHandler = std::function<void(RemoteNode& node)>;
@@ -94,12 +123,12 @@ public:
     // The order routes are tried in, by transport; routes of a transport the
     // list doesn't name come after, in the order they were added. Empty:
     // the default order. Takes effect at once.
-    RemoteNode& routeOrder(std::vector<TransportKind> order);
-    std::vector<TransportKind> routeOrder() const;
+    RemoteNode& routeOrder(std::vector<RouteKind> order);
+    std::vector<RouteKind> routeOrder() const;
     // The order of nodes without their own (initially empty: routes in the
     // order they were added). Any task.
-    static void setDefaultRouteOrder(std::vector<TransportKind> order);
-    static std::vector<TransportKind> defaultRouteOrder();
+    static void setDefaultRouteOrder(std::vector<RouteKind> order);
+    static std::vector<RouteKind> defaultRouteOrder();
     // Called, from an endpoint's process() and without the API lock, when a
     // node is created or gets a route, and when its online state or route in
     // use changes. One for every node.
@@ -252,7 +281,7 @@ private:
 
     mutable Mutex routesMutex_;  // a leaf: nothing is called while it is held
     std::vector<RouteSlot> routes_;
-    std::vector<TransportKind> order_;
+    std::vector<RouteKind> order_;
     bool hasOrder_ = false;
     uint32_t nextRoute_ = 0;
     PeerAddress device_;

@@ -39,33 +39,21 @@ sockaddr_in toSockaddr(const PeerAddress& p) {
 
 constexpr size_t kMaxInterfaces = 6;
 
-struct Interfaces {
+struct Netifs {
     esp_netif_t* list[kMaxInterfaces];
     size_t count = 0;
 };
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
 bool collect(esp_netif_t* netif, void* ctx) {
-    auto* found = static_cast<Interfaces*>(ctx);
+    auto* found = static_cast<Netifs*>(ctx);
     if (found->count < kMaxInterfaces) found->list[found->count++] = netif;
     return false;  // visit them all
 }
 #endif
 
-}  // namespace
-
-UdpTransport::UdpTransport(Api* api, UdpLink::Options options, DatagramEndpoint::Options endpointOptions)
-    : link_(
-          api, [this](const PeerAddress& to, const uint8_t* data, size_t len) { return sendTo(to, data, len); },
-          &nowMs, options, endpointOptions) {}
-
-UdpTransport::~UdpTransport() {
-    end();
-    while (workTask_) vTaskDelay(pdMS_TO_TICKS(5));
-}
-
-std::vector<PeerAddress> UdpTransport::broadcastAddresses(uint16_t port) {
-    Interfaces found;
+Netifs allNetifs() {
+    Netifs found;
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
     esp_netif_find_if(&collect, &found);
 #else
@@ -73,6 +61,88 @@ std::vector<PeerAddress> UdpTransport::broadcastAddresses(uint16_t port) {
         found.list[found.count++] = n;
     }
 #endif
+    return found;
+}
+
+bool startsWith(const char* s, const char* prefix) { return s && strncmp(s, prefix, strlen(prefix)) == 0; }
+
+// What an esp_netif is, by its key (ESP-IDF's and Arduino's defaults:
+// WIFI_STA_DEF, WIFI_AP_DEF, ETH_DEF, ...) or its description.
+NetInterface typeOf(esp_netif_t* n) {
+    const char* key = esp_netif_get_ifkey(n);
+    const char* desc = esp_netif_get_desc(n);
+    if (startsWith(key, "WIFI_STA") || startsWith(desc, "sta")) return NetInterface::Wifi;
+    if (startsWith(key, "WIFI_AP") || startsWith(desc, "ap")) return NetInterface::Ap;
+    if (startsWith(key, "ETH") || startsWith(desc, "eth")) return NetInterface::Ethernet;
+    return NetInterface::Any;
+}
+
+}  // namespace
+
+uint8_t UdpTransport::interfaceBit(NetInterface iface) {
+    switch (iface) {
+        case NetInterface::Ethernet: return kEthernet;
+        case NetInterface::Wifi: return kWifi;
+        case NetInterface::Ap: return kAp;
+        case NetInterface::Any: break;
+    }
+    return 0;
+}
+
+uint8_t UdpTransport::candidates(const PeerAddress& peer) const {
+    NetInterface bound = bound_.load();
+    if (bound != NetInterface::Any) return interfaceBit(bound);
+    if (peer.length < 4) return 0;
+    uint32_t ip;
+    memcpy(&ip, peer.bytes, 4);  // network order, like esp_netif's
+    Netifs found = allNetifs();
+    uint8_t bits = 0;
+    for (size_t i = 0; i < found.count; i++) {
+        esp_netif_ip_info_t info;
+        if (!esp_netif_is_netif_up(found.list[i]) || esp_netif_get_ip_info(found.list[i], &info) != ESP_OK ||
+            info.ip.addr == 0) {
+            continue;
+        }
+        if (((ip ^ info.ip.addr) & info.netmask.addr) == 0) bits |= interfaceBit(typeOf(found.list[i]));
+    }
+    if (!bits) {
+        // Beyond every subnet: the default route's interface.
+        if (esp_netif_t* d = esp_netif_get_default_netif()) bits = interfaceBit(typeOf(d));
+    }
+    return bits;
+}
+
+NetInterface UdpTransport::interfaceOf(const PeerAddress& peer) const {
+    switch (candidates(peer)) {
+        case kEthernet: return NetInterface::Ethernet;
+        case kWifi: return NetInterface::Wifi;
+        case kAp: return NetInterface::Ap;
+        default: return NetInterface::Any;  // several, or none known
+    }
+}
+
+// A peer reached only by interfaces UDP mustn't use is ignored both ways.
+bool UdpTransport::allowed(const PeerAddress& peer) const {
+    uint8_t mask = interfaces_.load();
+    if (mask == kAllInterfaces || bound_.load() != NetInterface::Any) return true;
+    uint8_t c = candidates(peer);
+    return !c || (c & mask);
+}
+
+UdpTransport::UdpTransport(Api* api, UdpLink::Options options, DatagramEndpoint::Options endpointOptions)
+    : link_(
+          api, [this](const PeerAddress& to, const uint8_t* data, size_t len) { return sendTo(to, data, len); },
+          &nowMs, options, endpointOptions) {
+    link_.endpoint().classifyInterfaces([this](const PeerAddress& p) { return interfaceOf(p); });
+}
+
+UdpTransport::~UdpTransport() {
+    end();
+    while (workTask_) vTaskDelay(pdMS_TO_TICKS(5));
+}
+
+std::vector<PeerAddress> UdpTransport::broadcastAddresses(uint16_t port, uint8_t mask) {
+    Netifs found = allNetifs();
     std::vector<PeerAddress> out;
     for (size_t i = 0; i < found.count; i++) {
         esp_netif_ip_info_t info;
@@ -80,6 +150,9 @@ std::vector<PeerAddress> UdpTransport::broadcastAddresses(uint16_t port) {
             info.ip.addr == 0) {
             continue;
         }
+        // An interface of no known kind goes with "all" only.
+        uint8_t bit = interfaceBit(typeOf(found.list[i]));
+        if (mask != kAllInterfaces && !(bit & mask)) continue;
         // Both in network order, so the bits line up either way.
         uint32_t b = info.ip.addr | ~info.netmask.addr;
         uint8_t ip[4];
@@ -94,9 +167,10 @@ std::vector<PeerAddress> UdpTransport::broadcastAddresses(uint16_t port) {
 
 bool UdpTransport::sendTo(const PeerAddress& to, const uint8_t* data, size_t len) {
     std::vector<PeerAddress> targets;
+    NetInterface bound = bound_.load();
     if (to.length == 0) {
-        targets = broadcastAddresses(port_);
-    } else if (to.length == 6) {
+        targets = broadcastAddresses(port_, bound != NetInterface::Any ? interfaceBit(bound) : interfaces_.load());
+    } else if (to.length == 6 && allowed(to)) {
         targets.push_back(to);
     }
     bool ok = !targets.empty();
@@ -125,6 +199,23 @@ bool UdpTransport::begin(uint16_t port, Tasks tasks, uint32_t stackSize, UBaseTy
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    // One interface: bound to it, so traffic can't leave by another one on
+    // the same subnet. Not there yet: filtered by subnet instead.
+    bound_ = NetInterface::Any;
+    uint8_t mask = interfaces_.load();
+    if (mask == kEthernet || mask == kWifi || mask == kAp) {
+        Netifs found = allNetifs();
+        for (size_t i = 0; i < found.count; i++) {
+            NetInterface type = typeOf(found.list[i]);
+            if (interfaceBit(type) != mask) continue;
+            struct ifreq ifr = {};
+            if (esp_netif_get_netif_impl_name(found.list[i], ifr.ifr_name) == ESP_OK &&
+                setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) == 0) {
+                bound_ = type;
+            }
+            break;
+        }
+    }
     sockaddr_in a = {};
     a.sin_family = AF_INET;
     a.sin_port = htons(port);
@@ -203,7 +294,8 @@ void UdpTransport::receiveWaiting() {
         int n = recvfrom(s, buffer_.data(), buffer_.size(), MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&from),
                          &fromLen);
         if (n <= 0) return;
-        link_.packet(fromSockaddr(from), buffer_.data(), static_cast<size_t>(n));
+        PeerAddress peer = fromSockaddr(from);
+        if (allowed(peer)) link_.packet(peer, buffer_.data(), static_cast<size_t>(n));
     }
 }
 
@@ -221,7 +313,8 @@ void UdpTransport::receiveEntry(void* arg) {
         int n = recvfrom(s, self->buffer_.data(), self->buffer_.size(), 0, reinterpret_cast<sockaddr*>(&from),
                          &fromLen);
         if (n > 0) {
-            self->link_.packet(fromSockaddr(from), self->buffer_.data(), static_cast<size_t>(n));
+            PeerAddress peer = fromSockaddr(from);
+            if (self->allowed(peer)) self->link_.packet(peer, self->buffer_.data(), static_cast<size_t>(n));
         } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }

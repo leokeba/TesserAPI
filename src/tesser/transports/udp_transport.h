@@ -65,6 +65,21 @@ public:
     // requests.
     void poll();
 
+    // ---- interfaces (docs/DESIGN.md section 10.7) -------------------------
+    static constexpr uint8_t kEthernet = 1, kWifi = 2, kAp = 4, kAllInterfaces = 7;
+    static uint8_t interfaceBit(NetInterface iface);
+    // The interfaces UDP may use (default all): nothing is served,
+    // advertised, broadcast or routed on the others. With exactly one, the
+    // socket is bound to it at begin() (SO_BINDTODEVICE), so everything
+    // leaves by it even when interfaces share a subnet; with several,
+    // peers are told apart by subnet. Takes full effect at the next begin().
+    void setInterfaces(uint8_t mask) { interfaces_ = mask & kAllInterfaces; }
+    uint8_t interfaces() const { return interfaces_.load(); }
+    // The interface `peer` is reached by: the one the socket is bound to,
+    // else the one interface that is up whose subnet holds it (the default
+    // interface for a peer beyond them); Any when several share the subnet.
+    NetInterface interfaceOf(const PeerAddress& peer) const;
+
     // ---- discovery (docs/DESIGN.md section 14.1) ------------------------
     void setName(std::string_view name) {
         named_ = true;
@@ -97,8 +112,9 @@ public:
     // can raise it. Datagrams carry no proof of origin.
     void setPeerAccess(Access level) { link_.endpoint().setPeerAccess(level); }
 
-    // The broadcast address of each interface that is up, on `port`.
-    static std::vector<PeerAddress> broadcastAddresses(uint16_t port);
+    // The broadcast address of each interface that is up, on `port` (of
+    // those in `mask`).
+    static std::vector<PeerAddress> broadcastAddresses(uint16_t port, uint8_t mask = kAllInterfaces);
 
     UdpLink& link() { return link_; }
     DatagramEndpoint& endpoint() { return link_.endpoint(); }
@@ -108,6 +124,9 @@ private:
     static void workEntry(void* arg);
     bool sendTo(const PeerAddress& to, const uint8_t* data, size_t len);
     void receiveWaiting();
+    // The interfaces (bits) whose subnet holds `peer`; the bound one's.
+    uint8_t candidates(const PeerAddress& peer) const;
+    bool allowed(const PeerAddress& peer) const;
 
     UdpLink link_;
     Mutex socketMutex_;  // the socket isn't closed during a send
@@ -117,6 +136,8 @@ private:
     uint16_t port_ = 0;
     bool named_ = false;
     std::atomic<Tasks> tasks_{Tasks::Both};
+    std::atomic<uint8_t> interfaces_{kAllInterfaces};
+    std::atomic<NetInterface> bound_{NetInterface::Any};  // the socket's interface, if bound
     bool ownHook_ = false;  // onQueued() wakes our worker: ours to clear
     TaskHandle_t receiveTask_ = nullptr;
     TaskHandle_t workTask_ = nullptr;

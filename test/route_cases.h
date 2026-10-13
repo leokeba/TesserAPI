@@ -510,4 +510,86 @@ TEST(route_probe_backoff) {
     CHECK_EQ(probes, 7);
 }
 
+TEST(route_order_text) {
+    std::vector<tesser::RouteKind> order;
+    CHECK(tesser::parseRouteOrder("udp/ethernet, nowtp,udp/wifi , udp", order));
+    CHECK_EQ(order.size(), 4u);
+    CHECK((order[0] == tesser::RouteKind(TransportKind::Udp, tesser::NetInterface::Ethernet)));
+    CHECK((order[1] == tesser::RouteKind(TransportKind::NowTP)));
+    CHECK_EQ(tesser::formatRouteOrder(order), "udp/ethernet, nowtp, udp/wifi, udp");
+    CHECK(tesser::parseRouteOrder("", order));
+    CHECK(order.empty());
+    CHECK(tesser::parseRouteOrder("udp/ap", order));
+    CHECK_EQ(tesser::formatRouteOrder(order), "udp/ap");
+    CHECK(!tesser::parseRouteOrder("udp/lte", order));
+    CHECK(!tesser::parseRouteOrder("pigeon", order));
+    CHECK(!tesser::parseRouteOrder("udp,,nowtp", order));
+    CHECK(!tesser::parseRouteOrder("udp/", order));
+    CHECK_EQ(tesser::formatRouteOrder(order), "udp/ap");  // untouched on failure
+    // A plain transport covers its routes on every interface.
+    CHECK(tesser::RouteKind(TransportKind::Udp).covers(TransportKind::Udp, tesser::NetInterface::Wifi));
+    CHECK(!tesser::RouteKind(TransportKind::Udp, tesser::NetInterface::Ethernet)
+               .covers(TransportKind::Udp, tesser::NetInterface::Wifi));
+}
+
+TEST(route_per_interface) {
+    // A device on two subnets, 10.0.0.x by Ethernet and 192.168.1.x by
+    // Wi-Fi as the master sees them: one node, a UDP route each, ordered by
+    // interface.
+    Defaults d;
+    cases::Device dev;
+    tesser::Api master;
+    auto& peers = master.object("peers");
+    udp_cases::Net net;
+    PeerAddress eth = tesser::udpAddress(10, 0, 0, 20, 8484), wifi = ip(20);
+    UdpLink devEth(&dev.api, net.sender(eth), net.clockFn());
+    UdpLink devWifi(&dev.api, net.sender(wifi), net.clockFn());
+    UdpLink gw(&master, net.sender(ip(1)), net.clockFn());
+    gw.endpoint().classifyInterfaces([](const PeerAddress& a) {
+        return a.bytes[0] == 10 ? tesser::NetInterface::Ethernet : tesser::NetInterface::Wifi;
+    });
+    net.nodes = {{eth, &devEth}, {wifi, &devWifi}, {ip(1), &gw}};
+    PeerAddress mac = datagram_cases::addr(0x7c);
+    for (UdpLink* l : {&devEth, &devWifi}) {
+        l->setName("lamp");
+        l->setDeviceId(mac.bytes);
+        l->advertise();
+    }
+    gw.mountPeers(peers);
+    net.start();
+    CHECK_EQ(cases::get(master, "/peers", cases::depth(1)).body, "{\"lamp\":null}");
+    RemoteNode& n = *RemoteNode::byDevice(peers, mac);
+    std::vector<std::string> names;
+    for (const RemoteNode::Route& r : n.routes()) names.push_back(r.name());
+    CHECK_EQ(names.size(), 2u);
+    auto active = [&] {
+        RemoteNode::Route r;
+        return n.route(r) ? r.name() : std::string();
+    };
+    std::vector<tesser::RouteKind> order;
+    CHECK(tesser::parseRouteOrder("udp/ethernet, udp/wifi", order));
+    RemoteNode::setDefaultRouteOrder(order);
+    CHECK_EQ(active(), "udp/ethernet");
+    tesser::Query q = cases::schema(1);
+    CHECK(cases::get(master, "/peers", q).body.find("\"route\":\"udp/ethernet\"") != std::string::npos);
+    CHECK(tesser::parseRouteOrder("udp/wifi", order));
+    n.routeOrder(order);
+    CHECK_EQ(active(), "udp/wifi");
+    n.routeOrder({});
+
+    // Ethernet unplugged: Wi-Fi takes over, writes still in order.
+    CHECK_EQ(n.stream("/lamp", "{\"brightness\":10}"), Status::Ok);
+    net.run();
+    CHECK_EQ(dev.lamp.brightness, 10);
+    net.lose = [&](const udp_cases::Net::Datagram& d) { return d.to == eth || d.from == eth; };
+    CHECK_EQ(n.stream("/lamp", "{\"brightness\":11}"), Status::Ok);
+    net.advance(3200);
+    CHECK_EQ(active(), "udp/wifi");
+    CHECK_EQ(dev.lamp.brightness, 11);
+    // Back: the next advertisement over Ethernet.
+    net.lose = nullptr;
+    net.advance(5100);
+    CHECK_EQ(active(), "udp/ethernet");
+}
+
 }  // namespace route_cases

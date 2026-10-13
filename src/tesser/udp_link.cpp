@@ -231,8 +231,9 @@ void UdpLink::mountPeers(Object& parent, uint32_t mirrorIntervalMs) {
 }
 
 bool UdpLink::sendDatagram(const PeerAddress& to, const uint8_t* data, size_t len) {
-    stats_.sent++;
-    return send_ && send_(to, data, len);
+    bool ok = send_ && send_(to, data, len);
+    if (ok) stats_.sent++;  // refused ones (an interface UDP mustn't use, a full buffer) don't count
+    return ok;
 }
 
 // Sends the fragments in `mask`; a reliable message asks for an

@@ -45,6 +45,14 @@ enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket, Udp 
 
 // "local" / "serial" / "http" / "nowtp" / "websocket" / "udp".
 const char* toString(TransportKind kind);
+bool parseTransportKind(std::string_view s, TransportKind& out);
+
+// The local network interface a route leaves by (docs/DESIGN.md section
+// 14.3): Any when it doesn't apply (NowTP) or isn't known.
+enum class NetInterface : uint8_t { Any, Ethernet, Wifi, Ap };
+// "" / "ethernet" / "wifi" (the station) / "ap" (the soft-AP).
+const char* toString(NetInterface iface);
+bool parseNetInterface(std::string_view s, NetInterface& out);
 
 // Access levels, ordered (docs/DESIGN.md section 13): a client has one, and a
 // node may require one to be read or written.

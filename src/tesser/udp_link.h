@@ -57,7 +57,7 @@ public:
     };
 
     struct Stats {
-        uint32_t sent = 0;         // datagrams
+        uint32_t sent = 0;         // datagrams the adapter took
         uint32_t received = 0;     // datagrams, our own broadcasts excluded
         uint32_t retransmits = 0;  // datagrams sent again
         uint32_t failed = 0;       // reliable messages never acknowledged

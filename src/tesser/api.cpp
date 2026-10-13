@@ -55,6 +55,39 @@ const char* toString(TransportKind kind) {
     return "local";
 }
 
+bool parseTransportKind(std::string_view s, TransportKind& out) {
+    static const TransportKind all[] = {TransportKind::Local,     TransportKind::Serial, TransportKind::Http,
+                                        TransportKind::NowTP,     TransportKind::WebSocket, TransportKind::Udp};
+    for (TransportKind k : all) {
+        if (s == toString(k)) {
+            out = k;
+            return true;
+        }
+    }
+    return false;
+}
+
+const char* toString(NetInterface iface) {
+    switch (iface) {
+        case NetInterface::Any: return "";
+        case NetInterface::Ethernet: return "ethernet";
+        case NetInterface::Wifi: return "wifi";
+        case NetInterface::Ap: return "ap";
+    }
+    return "";
+}
+
+bool parseNetInterface(std::string_view s, NetInterface& out) {
+    static const NetInterface all[] = {NetInterface::Ethernet, NetInterface::Wifi, NetInterface::Ap};
+    for (NetInterface i : all) {
+        if (s == toString(i)) {
+            out = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 const char* toString(Access a) {
     switch (a) {
         case Access::Public: return "public";
@@ -752,7 +785,7 @@ private:
                 RemoteNode::Route route;
                 if (!hashing_ && r.routes().size() > 1 && r.route(route)) {
                     w.key("route");
-                    w.string(toString(route.kind()));
+                    w.string(route.name());
                 }
                 if (uint32_t hash = hashing_ ? 0 : r.advertisedSchema()) {
                     char hex[9];

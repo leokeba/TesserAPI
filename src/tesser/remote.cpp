@@ -190,8 +190,8 @@ Mutex& sharedMutex() {
     static Mutex m;
     return m;
 }
-std::vector<TransportKind>& sharedOrder() {
-    static std::vector<TransportKind> order;
+std::vector<RouteKind>& sharedOrder() {
+    static std::vector<RouteKind> order;
     return order;
 }
 RemoteNode::StateHandler& sharedStateHandler() {
@@ -224,6 +224,48 @@ bool overlaps(const std::string& a, const std::string& b) {
 }  // namespace
 
 TransportKind RemoteNode::Route::kind() const { return endpoint ? endpoint->kind() : TransportKind::Local; }
+
+std::string toString(const RouteKind& kind) {
+    std::string s = toString(kind.transport);
+    if (kind.iface != NetInterface::Any) {
+        s += '/';
+        s += toString(kind.iface);
+    }
+    return s;
+}
+
+bool parseRouteOrder(std::string_view text, std::vector<RouteKind>& out) {
+    std::vector<RouteKind> order;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t comma = text.find(',', pos);
+        if (comma == std::string_view::npos) comma = text.size();
+        std::string_view item = text.substr(pos, comma - pos);
+        while (!item.empty() && item.front() == ' ') item.remove_prefix(1);
+        while (!item.empty() && item.back() == ' ') item.remove_suffix(1);
+        pos = comma + 1;
+        if (item.empty()) {
+            if (comma == text.size() && order.empty()) break;  // "" is the empty order
+            return false;
+        }
+        size_t slash = item.find('/');
+        RouteKind k;
+        if (!parseTransportKind(item.substr(0, slash), k.transport)) return false;
+        if (slash != std::string_view::npos && !parseNetInterface(item.substr(slash + 1), k.iface)) return false;
+        order.push_back(k);
+    }
+    out = std::move(order);
+    return true;
+}
+
+std::string formatRouteOrder(const std::vector<RouteKind>& order) {
+    std::string s;
+    for (const RouteKind& k : order) {
+        if (!s.empty()) s += ", ";
+        s += toString(k);
+    }
+    return s;
+}
 
 RemoteNode::RemoteNode(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath)
     : Annotated(name, NodeType::Remote), remotePath_(std::move(remotePath)) {
@@ -259,6 +301,7 @@ RemoteNode::~RemoteNode() {
 
 void RemoteNode::addRoute(DatagramEndpoint& endpoint, const PeerAddress& peer) {
     bool registered = false;
+    NetInterface iface = endpoint.interfaceOf(peer);
     {
         MutexGuard guard(routesMutex_);
         for (const RouteSlot& r : routes_) {
@@ -269,6 +312,7 @@ void RemoteNode::addRoute(DatagramEndpoint& endpoint, const PeerAddress& peer) {
         RouteSlot slot;
         slot.route.endpoint = &endpoint;
         slot.route.peer = peer;
+        slot.route.iface = iface;
         slot.added = nextRoute_++;
         routes_.push_back(slot);
         if (!lastEndpoint_) {
@@ -328,10 +372,10 @@ bool RemoteNode::hasRoute(const DatagramEndpoint* endpoint, const PeerAddress& p
 // The index of the route in use: the best ranked online one, or the best
 // ranked one when none is online.
 int RemoteNode::activeLocked() const {
-    std::vector<TransportKind> order = hasOrder_ ? order_ : defaultRouteOrder();
+    std::vector<RouteKind> order = hasOrder_ ? order_ : defaultRouteOrder();
     auto rank = [&](const RouteSlot& r) {
         size_t i = 0;
-        while (i < order.size() && order[i] != r.route.kind()) i++;
+        while (i < order.size() && !order[i].covers(r.route.kind(), r.route.iface)) i++;
         return (uint64_t(i) << 32) | r.added;
     };
     int best = -1, bestOnline = -1;
@@ -348,7 +392,7 @@ int RemoteNode::activeLocked() const {
 
 std::vector<RemoteNode::Route> RemoteNode::routes() const {
     std::vector<RouteSlot> slots;
-    std::vector<TransportKind> order;
+    std::vector<RouteKind> order;
     {
         MutexGuard guard(routesMutex_);
         slots = routes_;
@@ -356,7 +400,7 @@ std::vector<RemoteNode::Route> RemoteNode::routes() const {
     }
     auto rank = [&](const RouteSlot& r) {
         size_t i = 0;
-        while (i < order.size() && order[i] != r.route.kind()) i++;
+        while (i < order.size() && !order[i].covers(r.route.kind(), r.route.iface)) i++;
         return (uint64_t(i) << 32) | r.added;
     };
     // A handful of routes: insertion sort.
@@ -386,7 +430,7 @@ PeerAddress RemoteNode::peer() const {
     return route(r) ? r.peer : PeerAddress();
 }
 
-RemoteNode& RemoteNode::routeOrder(std::vector<TransportKind> order) {
+RemoteNode& RemoteNode::routeOrder(std::vector<RouteKind> order) {
     {
         MutexGuard guard(routesMutex_);
         hasOrder_ = !order.empty();
@@ -395,17 +439,17 @@ RemoteNode& RemoteNode::routeOrder(std::vector<TransportKind> order) {
     return *this;
 }
 
-std::vector<TransportKind> RemoteNode::routeOrder() const {
+std::vector<RouteKind> RemoteNode::routeOrder() const {
     MutexGuard guard(routesMutex_);
     return order_;
 }
 
-void RemoteNode::setDefaultRouteOrder(std::vector<TransportKind> order) {
+void RemoteNode::setDefaultRouteOrder(std::vector<RouteKind> order) {
     MutexGuard guard(sharedMutex());
     sharedOrder() = std::move(order);
 }
 
-std::vector<TransportKind> RemoteNode::defaultRouteOrder() {
+std::vector<RouteKind> RemoteNode::defaultRouteOrder() {
     MutexGuard guard(sharedMutex());
     return sharedOrder();
 }
@@ -456,9 +500,17 @@ void RemoteNode::setOnline(bool online) {
 
 void RemoteNode::setRouteOnline(const DatagramEndpoint* endpoint, const PeerAddress& peer, bool online,
                                 uint32_t nowMs) {
+    // Back online: the interface may have changed (addresses come and go).
+    bool back = false;
+    if (online) {
+        MutexGuard guard(routesMutex_);
+        for (const RouteSlot& r : routes_) back = back || (r.route.endpoint == endpoint && r.route.peer == peer && !r.route.online);
+    }
+    NetInterface iface = back ? endpoint->interfaceOf(peer) : NetInterface::Any;
     MutexGuard guard(routesMutex_);
     for (RouteSlot& r : routes_) {
         if (r.route.endpoint != endpoint || r.route.peer != peer) continue;
+        if (back) r.route.iface = iface;
         if (r.route.online && !online) {
             lastProbeMs_ = nowMs;  // the first probe waits probeMs
             probeWaitMs_ = probeMs_;

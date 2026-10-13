@@ -183,6 +183,16 @@ public:
     using AuthHandler = std::function<void(const PeerAddress& peer, Status status, Access level)>;
     void onAuth(AuthHandler fn) { onAuth_ = std::move(fn); }
 
+    // ---- interfaces -------------------------------------------------------
+    // Which local interface reaches `peer` (docs/DESIGN.md section 14.3),
+    // for route orders that name one: the link's adapter tells (UdpTransport
+    // by the subnets of its interfaces). Any without one, or when unknown.
+    using InterfaceFn = std::function<NetInterface(const PeerAddress& peer)>;
+    void classifyInterfaces(InterfaceFn fn) { interfaceOf_ = std::move(fn); }
+    NetInterface interfaceOf(const PeerAddress& peer) const {
+        return interfaceOf_ ? interfaceOf_(peer) : NetInterface::Any;
+    }
+
     // ---- peers ------------------------------------------------------------
     // A peer this endpoint had heard from was forgotten, for `reason`:
     // `device` is its MAC when known (a NowTP address; the "id" a UDP peer
@@ -329,6 +339,7 @@ private:
     std::function<void()> onQueued_;
     NotificationHandler onNotification_;
     PeerLossHandler onPeerLost_;
+    InterfaceFn interfaceOf_;
     AuthHandler onAuth_;
     std::function<bool(const PeerAddress&)> trust_;
     std::atomic<Access> peerAccess_{Access::Public};
