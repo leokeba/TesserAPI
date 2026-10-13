@@ -167,12 +167,14 @@ struct DeferredState {
 
 class DeferredHttpReply : public Reply {
 public:
-    DeferredHttpReply(DeferredState* st, size_t limit) : st_(st), sink_(st->body, limit) {}
+    DeferredHttpReply(DeferredState* st, size_t limit) : st_(st), sink_(st->body, limit, true) {}
     Sink& begin(Status s) override {
         st_->status = s;
         st_->body.clear();
+        sink_.lowMemory = false;
         return sink_;
     }
+    bool outOfMemory() const override { return sink_.lowMemory; }
     void end() override { xSemaphoreGive(st_->done); }
     bool rollback() override {
         st_->body.clear();

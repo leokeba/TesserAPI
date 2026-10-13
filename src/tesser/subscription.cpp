@@ -315,7 +315,7 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
         m.string(sub.path.empty() ? std::string_view("/") : std::string_view(sub.path));
         m.key("body");
     }
-    MemorySink sink(msg);
+    StringSink sink(msg, 0, true);
     JsonWriter w(sink);
     bool any = false;
     const Node& n = *sub.node;

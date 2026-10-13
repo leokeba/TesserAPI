@@ -96,6 +96,8 @@ public:
     // `broadcast`: the message was sent to every node; a request without an
     // "id" that came this way gets no reply.
     void receive(const PeerAddress& from, const char* data, size_t len, bool reliable, bool broadcast = false);
+    // Same, taking the message (a link's reassembly buffer) without a copy.
+    void receive(const PeerAddress& from, std::string&& text, bool reliable, bool broadcast = false);
 
     // Handles queued messages and expires client calls. Returns true if it did
     // anything.
@@ -115,6 +117,13 @@ public:
                  const void* owner = nullptr);
     bool request(const PeerAddress& to, Op op, std::string_view path, JsonVariantConst body, ResponseHandler done,
                  const Query& query = Query(), uint32_t timeoutMs = 0, const void* owner = nullptr);
+    // Same, but an "ok" reply's body reaches `raw` as the peer's JSON text,
+    // unparsed, so a gateway relays it without holding it twice (parsed and
+    // rewritten); other replies, and timeouts, reach `done`.
+    using RawHandler = std::function<void(std::string_view bodyJson)>;
+    bool requestRaw(const PeerAddress& to, Op op, std::string_view path, JsonVariantConst body, RawHandler raw,
+                    ResponseHandler done, const Query& query = Query(), uint32_t timeoutMs = 0,
+                    const void* owner = nullptr);
     // Sends any envelope, e.g. "upload" or "download" (docs/DESIGN.md
     // section 10.1.1), with its "id" replaced by the call's.
     bool request(const PeerAddress& to, JsonObjectConst envelope, ResponseHandler done, uint32_t timeoutMs = 0,
@@ -290,6 +299,7 @@ private:
         const void* owner;
         BroadcastHandler each;  // a broadcast call: replies from any peer
         uint32_t sentMs;
+        RawHandler raw;        // requestRaw(): an "ok" reply's body, unparsed
         std::string text;      // to a peer with a token: kept to send it again after "unauthorized"
         bool held = false;     // waiting for the token's answer before it is sent
         bool retried = false;  // sent again once already
@@ -311,7 +321,8 @@ private:
     };
 
     bool sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope, ResponseHandler done,
-                     uint32_t timeoutMs, const void* owner, bool internal = false);
+                     uint32_t timeoutMs, const void* owner, bool internal = false, RawHandler raw = nullptr);
+    bool takeRaw(const Incoming& msg);
     uint32_t nextCallId();
     PeerAuth* authLocked(const PeerAddress& peer);
     void sendAuth(const PeerAddress& peer, const std::string& token);
@@ -382,6 +393,10 @@ private:
 // reported twice.
 void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLossHandler lost);
 void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLostHandler lost);
+
+// The text of member `key` of a JSON object (`json` must be valid JSON):
+// false if it has none.
+bool jsonMember(std::string_view json, std::string_view key, std::string_view& out);
 
 // Builds a request envelope; `id` 0 leaves the "id" out. `bodyJson` is
 // inserted verbatim when not empty.

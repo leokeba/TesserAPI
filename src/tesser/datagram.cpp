@@ -245,11 +245,16 @@ void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::Pe
 
 void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t len, bool reliable,
                                bool broadcast) {
+    receive(from, std::string(data, len), reliable, broadcast);
+}
+
+void DatagramEndpoint::receive(const PeerAddress& from, std::string&& text, bool reliable, bool broadcast) {
+    Incoming msg{from, std::move(text), reliable, broadcast};
     bool queued = false;
     {
         MutexGuard guard(mutex_);
         if (queue_.size() < options_.queueLimit) {
-            queue_.push_back(Incoming{from, std::string(data, len), reliable, broadcast});
+            queue_.push_back(std::move(msg));
             queued = true;
         } else {
             stats_.dropped++;
@@ -260,7 +265,6 @@ void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t
         return;
     }
     // Full: answer requests with "busy" so clients needn't wait for a timeout.
-    Incoming msg{from, std::string(data, len), reliable, broadcast};
     reject(msg, Status::Busy, "request queue full");
 }
 
@@ -387,7 +391,127 @@ int nesting(JsonVariantConst v) {
 
 }  // namespace
 
+namespace {
+
+constexpr size_t kNone = std::string_view::npos;
+
+size_t skipSpace(std::string_view s, size_t i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) i++;
+    return i;
+}
+
+// Past the string whose opening quote is at `i`.
+size_t skipString(std::string_view s, size_t i) {
+    for (i++; i < s.size(); i++) {
+        if (s[i] == '\\') {
+            i++;
+        } else if (s[i] == '"') {
+            return i + 1;
+        }
+    }
+    return kNone;
+}
+
+// Past the value starting at `i`.
+size_t skipValue(std::string_view s, size_t i) {
+    if (i >= s.size()) return kNone;
+    if (s[i] == '"') return skipString(s, i);
+    if (s[i] == '{' || s[i] == '[') {
+        int depth = 0;
+        while (i < s.size()) {
+            char c = s[i];
+            if (c == '"') {
+                i = skipString(s, i);
+                if (i == kNone) return kNone;
+                continue;
+            }
+            if (c == '{' || c == '[') depth++;
+            if ((c == '}' || c == ']') && --depth == 0) return i + 1;
+            i++;
+        }
+        return kNone;
+    }
+    while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']' && s[i] != ' ' && s[i] != '\n' &&
+           s[i] != '\r' && s[i] != '\t') {
+        i++;
+    }
+    return i;
+}
+
+}  // namespace
+
+// The text of member `key` of the JSON object `json` (valid JSON).
+bool jsonMember(std::string_view json, std::string_view key, std::string_view& out) {
+    size_t i = skipSpace(json, 0);
+    if (i >= json.size() || json[i] != '{') return false;
+    i = skipSpace(json, i + 1);
+    if (i < json.size() && json[i] == '}') return false;
+    for (;;) {
+        if (i >= json.size() || json[i] != '"') return false;
+        size_t end = skipString(json, i);
+        if (end == kNone) return false;
+        std::string_view k = json.substr(i + 1, end - i - 2);
+        i = skipSpace(json, end);
+        if (i >= json.size() || json[i] != ':') return false;
+        i = skipSpace(json, i + 1);
+        size_t valueEnd = skipValue(json, i);
+        if (valueEnd == kNone) return false;
+        if (k == key) {
+            out = json.substr(i, valueEnd - i);
+            return true;
+        }
+        i = skipSpace(json, valueEnd);
+        if (i >= json.size() || json[i] != ',') return false;
+        i = skipSpace(json, i + 1);
+    }
+}
+
+// An "ok" reply to a requestRaw() call: its body goes as the peer wrote it.
+bool DatagramEndpoint::takeRaw(const Incoming& msg) {
+    {
+        // At most maxCalls: cheaper than parsing every reply twice.
+        MutexGuard guard(mutex_);
+        bool any = false;
+        for (const CallSlot& c : calls_) any = any || c.raw;
+        if (!any) return false;
+    }
+    JsonDocument filter;
+    filter["id"] = true;
+    filter["status"] = true;
+    JsonDocument head;  // without the body: small whatever its size
+    if (deserializeJson(head, msg.text.data(), msg.text.size(), DeserializationOption::Filter(filter),
+                        DeserializationOption::NestingLimit(kWrittenNesting)) ||
+        head["status"] != "ok" || !head["id"].is<uint32_t>()) {
+        return false;
+    }
+    uint32_t id = head["id"].as<uint32_t>();
+    RawHandler raw;
+    uint32_t sentMs = 0;
+    std::vector<RemoteNode*> remotes;
+    {
+        MutexGuard guard(mutex_);
+        for (size_t i = 0; i < calls_.size(); i++) {
+            CallSlot& c = calls_[i];
+            if (c.id != id || c.to != msg.from || !c.raw || c.held || c.each) continue;
+            raw = std::move(c.raw);
+            sentMs = c.sentMs;
+            calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(i));
+            stats_.responses++;
+            remotes = remotes_;
+            break;
+        }
+    }
+    if (!raw) return false;
+    uint32_t rtt = (clock_ ? clock_() : 0) - sentMs;
+    for (RemoteNode* r : remotes) r->routeRoundTrip(this, msg.from, rtt);
+    std::string_view body;
+    if (!jsonMember(msg.text, "body", body)) body = "null";
+    raw(body);
+    return true;
+}
+
 void DatagramEndpoint::handle(Incoming& msg) {
+    if (takeRaw(msg)) return;
     // Responses and notifications nest as deep as the peer wrote them;
     // requests are held to the same limit as on other transports below.
     JsonDocument doc;
@@ -657,7 +781,8 @@ void DatagramEndpoint::dropFiles(const PeerAddress* peer, uint32_t now) {
 }
 
 bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope,
-                                   ResponseHandler done, uint32_t timeoutMs, const void* owner, bool internal) {
+                                   ResponseHandler done, uint32_t timeoutMs, const void* owner, bool internal,
+                                   RawHandler raw) {
     uint32_t now = clock_ ? clock_() : 0;
     bool hold = false, startAuth = false;
     std::string token;
@@ -666,7 +791,7 @@ bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, const std
         // A token's own "auth" doesn't count: it would hold up what waits for it.
         if (!internal && calls_.size() >= options_.maxCalls) return false;
         CallSlot slot{id, to, now + (timeoutMs ? timeoutMs : options_.timeoutMs), std::move(done), owner, nullptr, now,
-                      std::string(), false, false};
+                      std::move(raw), std::string(), false, false};
         if (PeerAuth* a = internal ? nullptr : authLocked(to)) {
             slot.text = envelope;
             if (a->state != PeerAuth::Done) {
@@ -812,6 +937,16 @@ void DatagramEndpoint::authDone(const PeerAddress& peer, Status status, JsonVari
     }
 }
 
+bool DatagramEndpoint::requestRaw(const PeerAddress& to, Op op, std::string_view path, JsonVariantConst body,
+                                  RawHandler raw, ResponseHandler done, const Query& query, uint32_t timeoutMs,
+                                  const void* owner) {
+    std::string json;
+    if (!body.isNull()) serializeJson(body, json);
+    uint32_t id = nextCallId();
+    return sendRequest(to, id, buildRequestEnvelope(id, op, path, query, json), std::move(done), timeoutMs, owner,
+                       false, std::move(raw));
+}
+
 bool DatagramEndpoint::request(const PeerAddress& to, Op op, std::string_view path, std::string_view bodyJson,
                                ResponseHandler done, const Query& query, uint32_t timeoutMs, const void* owner) {
     uint32_t id;
@@ -885,7 +1020,7 @@ bool DatagramEndpoint::broadcast(const PeerAddress& to, Op op, std::string_view 
         id = nextId_++;
         if (nextId_ == 0) nextId_ = 1;
         calls_.push_back(CallSlot{id, to, now + (windowMs ? windowMs : options_.timeoutMs), nullptr, owner,
-                                  std::move(onReply), now, std::string(), false, false});
+                                  std::move(onReply), now, nullptr, std::string(), false, false});
     }
     if (send_ && send_(to, buildRequestEnvelope(id, op, path, Query(), bodyJson), Delivery::BestEffort)) {
         return true;

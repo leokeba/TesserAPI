@@ -120,7 +120,7 @@ void writeChanges(JsonWriter& w, JsonVariantConst v, int depth, const Subscripti
 // Sends one change notification to a forwarded subscriber.
 void notifyChange(Subscription& sub, const std::function<void(JsonWriter&)>& body) {
     std::string msg;
-    StringSink sink(msg);
+    StringSink sink(msg, 0, true);
     JsonWriter m(sink);
     m.beginObject();
     m.key("op");
@@ -135,8 +135,8 @@ void notifyChange(Subscription& sub, const std::function<void(JsonWriter&)>& bod
     }
     m.endObject();
     // There is nothing to resend from later: "overflow" tells the client to
-    // re-read.
-    if (!sub.subscriber->notify(msg, Delivery::Reliable)) sub.subscriber->missed = true;
+    // re-read. So it is when the heap couldn't hold this one.
+    if (!m.ok() || !sub.subscriber->notify(msg, Delivery::Reliable)) sub.subscriber->missed = true;
 }
 
 // A remote node's reply, written to a local reply: error paths are mapped
@@ -175,11 +175,6 @@ void writeMapped(Reply& reply, Status s, JsonVariantConst body, const std::strin
     detail::finishBody(reply, w, localPath);
 }
 
-std::string serialized(JsonVariantConst v) {
-    std::string s;
-    serializeJson(v, s);
-    return s;
-}
 
 }  // namespace
 
@@ -814,8 +809,25 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
         detached->release();
         a->pendingDone();
     };
-    if (!r.endpoint->request(r.peer, request.op, remotePathOf(rest), request.body, done, request.query, timeoutMs_,
-                             this)) {
+    // An "ok" body goes on as the remote wrote it: parsed and rewritten, a
+    // large one would be on the heap twice.
+    std::string okPath = localBase.empty() ? std::string("/") : localBase;
+    auto raw = [detached, a, okPath](std::string_view json) {
+        Sink& out = detached->begin(Status::Ok);
+        if (!out.write(json.data(), json.size()) && detached->rollback()) {
+            if (detached->outOfMemory()) {
+                writeError(*detached, Status::Busy, okPath, "not enough memory for the response");
+            } else {
+                writeError(*detached, Status::TooLarge, okPath, "response too large");
+            }
+        } else {
+            detached->end();
+        }
+        detached->release();
+        a->pendingDone();
+    };
+    if (!r.endpoint->requestRaw(r.peer, request.op, remotePathOf(rest), request.body, raw, done, request.query,
+                                timeoutMs_, this)) {
         writeError(*detached, Status::Busy, basePath, "couldn't send to the remote node");
         detached->release();
         api.pendingDone();
@@ -1090,7 +1102,9 @@ void RemoteNode::upstreamReply(const std::string& rest, Status s, JsonVariantCon
     bool wasReady = u->ready;
     bool changedCopy = false;
     if (s == Status::Ok) {
-        changedCopy = !wasReady || serialized(u->copy.as<JsonVariantConst>()) != serialized(body);
+        // Compared in place: two serialized copies of a large state could
+        // exhaust a fragmented heap.
+        changedCopy = !wasReady || u->copy.as<JsonVariantConst>() != body;
         u->copy.set(body);
         u->ready = true;
         u->stale = false;

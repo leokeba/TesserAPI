@@ -138,14 +138,16 @@ public:
 // transports that build their own framing around the body.
 class StringReply : public Reply {
 public:
-    explicit StringReply(size_t limit = 0) : sink_(body, limit) {}
+    explicit StringReply(size_t limit = 0) : sink_(body, limit, true) {}
 
     Sink& begin(Status s) override {
         status = s;
         body.clear();
         begun = true;
+        sink_.lowMemory = false;
         return sink_;
     }
+    bool outOfMemory() const override { return sink_.lowMemory; }
     void end() override { ended = true; }
     bool rollback() override {
         body.clear();

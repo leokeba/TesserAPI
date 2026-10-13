@@ -72,9 +72,11 @@ public:
     Sink& begin(Status s) override {
         status_ = s;
         body_.clear();
+        sink_.lowMemory = false;
         return sink_;
     }
     void end() override { inbox_->response(std::move(done_), status_, std::move(body_)); }
+    bool outOfMemory() const override { return sink_.lowMemory; }
     bool rollback() override {
         body_.clear();
         return true;
@@ -87,7 +89,7 @@ private:
     ApiClient::ResponseHandler done_;
     Status status_ = Status::Internal;
     std::string body_;
-    StringSink sink_{body_};
+    StringSink sink_{body_, 0, true};
 };
 
 }  // namespace

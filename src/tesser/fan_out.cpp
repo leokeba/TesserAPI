@@ -17,13 +17,15 @@ class FanOut;
 // result back.
 class MatchReply : public Reply {
 public:
-    MatchReply(FanOut& fan, size_t index, size_t limit) : fan_(fan), index_(index), sink_(body, limit) {}
+    MatchReply(FanOut& fan, size_t index, size_t limit) : fan_(fan), index_(index), sink_(body, limit, true) {}
 
     Sink& begin(Status s) override {
         status = s;
         body.clear();
+        sink_.lowMemory = false;
         return sink_;
     }
+    bool outOfMemory() const override { return sink_.lowMemory; }
     void end() override { ended = true; }
     bool rollback() override {
         body.clear();

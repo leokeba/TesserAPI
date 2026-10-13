@@ -468,7 +468,9 @@ void UdpLink::handleData(const PeerAddress& from, Peer& peer, const uint8_t* dat
         return;
     }
     if (!p) {
-        if (!makeRoom(h.length)) {
+        // A heap too fragmented for the message: dropped, and the sender
+        // tries again, rather than an abort.
+        if (!makeRoom(h.length) || largestFreeBlock() < size_t(h.length) + 1024) {
             stats_.dropped++;
             return;
         }
@@ -582,7 +584,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
     }
     // A peer that restarted lost its calls and subscriptions: forget them.
     if (restarted) endpoint_.forgetPeer(from, PeerLoss::Restarted);
-    for (Inbound& in : inbound) endpoint_.receive(in.from, in.data.data(), in.data.size(), in.reliable, in.broadcast);
+    for (Inbound& in : inbound) endpoint_.receive(in.from, std::move(in.data), in.reliable, in.broadcast);
     if (announced) endpoint_.peerSeen(from, name, hash, device);
     if (bye) endpoint_.forgetPeer(from, PeerLoss::Goodbye);
 }

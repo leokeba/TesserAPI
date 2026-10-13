@@ -5,6 +5,7 @@
 #include <string>
 
 #include "core_cases.h"
+#include "remote_cases.h"
 #include "subscription_cases.h"
 #include "udp_cases.h"
 
@@ -67,6 +68,72 @@ TEST(memory_notification_waits_for_room) {
     CHECK_EQ(sub.messages.size(), 1u);
     CHECK(sub.last().find("yyyy") != std::string::npos);
     CHECK(sub.last().find("\"overflow\"") == std::string::npos);
+}
+
+TEST(memory_json_member) {
+    std::string_view out;
+    CHECK(tesser::jsonMember("{\"id\":3,\"status\":\"ok\",\"body\":{\"a\":[1,{\"b\":\"}\"}]}}", "body", out));
+    CHECK_EQ(std::string(out), "{\"a\":[1,{\"b\":\"}\"}]}");
+    // Spaced out (another implementation), the body not last, escapes.
+    CHECK(tesser::jsonMember("{ \"body\" : \"x\\\"y,}\" , \"id\" : 1 }", "body", out));
+    CHECK_EQ(std::string(out), "\"x\\\"y,}\"");
+    CHECK(tesser::jsonMember("{\"status\":\"ok\",\"body\":-12.5e3}", "body", out));
+    CHECK_EQ(std::string(out), "-12.5e3");
+    CHECK(tesser::jsonMember("{\"body\":null}", "body", out));
+    CHECK_EQ(std::string(out), "null");
+    CHECK(!tesser::jsonMember("{\"id\":1,\"status\":\"ok\"}", "body", out));
+    CHECK(!tesser::jsonMember("{}", "body", out));
+    CHECK(!tesser::jsonMember("[1]", "body", out));
+    // A key that only looks like it, inside a value, doesn't count.
+    CHECK(tesser::jsonMember("{\"x\":{\"body\":1},\"body\":2}", "body", out));
+    CHECK_EQ(std::string(out), "2");
+}
+
+TEST(memory_gateway_relays_bodies_raw) {
+    // An "ok" body goes from the remote to the client as the remote wrote
+    // it; errors still map their paths.
+    remote_cases::Rig r;
+    std::string big = "q\"uo\\te\u00e9 " + std::string(2000, 'z');
+    r.device.api.value("big", big);
+    std::string reply = r.ask("{\"id\":1,\"op\":\"get\",\"path\":\"/kitchen/big\"}");
+    std::string direct = cases::get(r.device.api, "/big").body;
+    CHECK_EQ(reply, "{\"id\":1,\"status\":\"ok\",\"body\":" + direct + "}");
+    CHECK(r.ask("{\"id\":2,\"op\":\"get\",\"path\":\"/kitchen/nope\"}").find("\"path\":\"/kitchen/nope\"") !=
+          std::string::npos);
+    CHECK_EQ(r.gateway.pending(), 0);
+}
+
+TEST(memory_gateway_relay_refused_when_heap_is_short) {
+    // The device answers; then the gateway's heap is short: its client
+    // gets "busy" for the relayed reply, and the gateway lives on.
+    remote_cases::Rig r;
+    std::string big(3000, 'x');
+    r.device.api.value("big", big);
+    auto deliver = [&] {
+        while (!r.net.frames.empty()) {
+            auto f = r.net.frames.front();
+            r.net.frames.pop_front();
+            for (auto& n : r.net.nodes) {
+                if (n.first == f.to) {
+                    n.second->receive(f.from, f.text.data(), f.text.size(), f.delivery == tesser::Delivery::Reliable);
+                }
+            }
+        }
+    };
+    r.lines.out.clear();
+    std::string line = "{\"id\":5,\"op\":\"get\",\"path\":\"/kitchen/big\"}\n";
+    r.line.feed(line.data(), line.size());  // forwarded
+    deliver();
+    r.deviceEnd.process();  // the device answers
+    Heap heap(5000);
+    deliver();
+    r.gatewayEnd.process();  // the relay
+    CHECK_EQ(r.lines.out.size(), 1u);
+    if (!r.lines.out.empty()) {
+        CHECK_EQ(r.lines.out[0], "{\"id\":5,\"status\":\"busy\",\"body\":{\"error\":\"busy\",\"path\":\"/kitchen\","
+                                 "\"message\":\"not enough memory for the response\"}}");
+    }
+    CHECK_EQ(r.gateway.pending(), 0);
 }
 
 }  // namespace memory_cases
