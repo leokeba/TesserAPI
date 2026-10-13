@@ -3,6 +3,8 @@
 #include "tesser/sink.h"
 
 #include <stdarg.h>
+
+#include <atomic>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -41,9 +43,34 @@ void logv(char level, const char* fmt, va_list ap) {
 
 namespace {
 size_t (*g_probe)() = nullptr;
-}
+size_t (*g_freeProbe)() = nullptr;
+#if defined(ESP_PLATFORM)
+std::atomic<size_t> g_floor{8192};
+#else
+std::atomic<size_t> g_floor{0};
+#endif
+}  // namespace
 
 void setLargestFreeBlockProbe(size_t (*probe)()) { g_probe = probe; }
+void setFreeHeapProbe(size_t (*probe)()) { g_freeProbe = probe; }
+void setHeapFloor(size_t bytes) { g_floor = bytes; }
+size_t heapFloor() { return g_floor.load(); }
+
+size_t freeHeap() {
+    if (g_freeProbe) return g_freeProbe();
+#if defined(ESP_PLATFORM)
+    return heap_caps_get_free_size(MALLOC_CAP_8BIT);
+#else
+    return SIZE_MAX;
+#endif
+}
+
+bool heapAbove(size_t bytes) {
+    size_t floor = heapFloor();
+    if (!floor) return true;
+    size_t free = freeHeap();
+    return free >= floor && free - floor >= bytes;
+}
 
 size_t largestFreeBlock() {
     if (g_probe) return g_probe();
@@ -58,7 +85,14 @@ bool growFor(std::string& s, size_t need) {
     if (need <= s.capacity()) return true;
     size_t grown = s.capacity() + s.capacity() / 2;
     size_t capacity = need > grown ? need : grown;
-    if (capacity > 1024 && largestFreeBlock() < capacity + need + 1024) return false;
+    // Small buffers (error replies) always go: refusing them would leave the
+    // client with nothing at all.
+    if (capacity > 256) {
+        // The heap as a whole: leave the floor to everything else.
+        if (!heapAbove(capacity - s.capacity())) return false;
+        // One block that size, a copy further down, and headroom.
+        if (capacity > 1024 && largestFreeBlock() < capacity + need + 1024) return false;
+    }
     s.reserve(capacity);
     return true;
 }

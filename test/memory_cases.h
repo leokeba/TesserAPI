@@ -15,6 +15,22 @@ using tesser::Status;
 
 inline size_t g_largest = SIZE_MAX;
 inline size_t probe() { return g_largest; }
+inline size_t g_free = SIZE_MAX;
+inline size_t freeProbe() { return g_free; }
+
+// A heap floor and the free heap the library sees; restored after.
+struct Floor {
+    Floor(size_t floor, size_t free) {
+        g_free = free;
+        tesser::setFreeHeapProbe(&freeProbe);
+        tesser::setHeapFloor(floor);
+    }
+    ~Floor() {
+        tesser::setFreeHeapProbe(nullptr);
+        tesser::setHeapFloor(0);
+    }
+    void free(size_t bytes) { g_free = bytes; }
+};
 
 // Sets the largest free block the library sees, and restores the platform's.
 struct Heap {
@@ -134,6 +150,40 @@ TEST(memory_gateway_relay_refused_when_heap_is_short) {
                                  "\"message\":\"not enough memory for the response\"}}");
     }
     CHECK_EQ(r.gateway.pending(), 0);
+}
+
+TEST(memory_heap_floor) {
+    // Under the floor, a reply past 256 bytes is refused even though some
+    // block could hold it: the heap as a whole is short. Errors still go.
+    udp_cases::Pair p;
+    std::string mid(600, 'm');
+    p.dev.api.value("mid", mid);
+    Floor floor(8000, 8500);
+    udp_cases::Result r = p.call(tesser::Op::Get, "/mid");
+    CHECK_EQ(r.status, Status::Busy);
+    CHECK(r.body.find("not enough memory") != std::string::npos);
+    CHECK_EQ(p.call(tesser::Op::Get, "/nope").status, Status::NotFound);
+    CHECK_EQ(p.call(tesser::Op::Get, "/lamp/on").body, "false");
+    floor.free(20000);
+    CHECK_EQ(p.call(tesser::Op::Get, "/mid").status, Status::Ok);
+}
+
+TEST(memory_remote_subscription_admission) {
+    // A forwarded subscription that needs its own copy of the remote's
+    // state wants twice the floor free; one the shared copy covers doesn't.
+    remote_cases::Rig r;
+    Floor floor(8000, 12000);
+    CHECK_EQ(r.ask("{\"id\":1,\"op\":\"sub\",\"path\":\"/kitchen/lamp\"}"),
+             "{\"id\":1,\"status\":\"busy\",\"body\":{\"error\":\"busy\",\"path\":\"/kitchen/lamp\","
+             "\"message\":\"not enough memory for another remote subscription\"}}");
+    CHECK_EQ(r.device.api.subscriptionCount(), 0u);
+    floor.free(20000);
+    CHECK(r.ask("{\"id\":2,\"op\":\"sub\",\"path\":\"/kitchen/lamp\"}").find("\"status\":\"ok\"") != std::string::npos);
+    floor.free(12000);
+    subscription_cases::FakeSubscriber covered;
+    CHECK_EQ(subscription_cases::subscribe(r.gateway, &covered, "/kitchen/lamp", cases::keys("on")).body,
+             "{\"on\":false}");
+    r.gateway.dropSubscriber(&covered);
 }
 
 }  // namespace memory_cases

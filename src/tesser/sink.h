@@ -18,8 +18,9 @@ public:
 
 // Grows `s` to hold `need` bytes, by half again at a time, unless the heap
 // can't give a block that size and leave room for one copy of the message
-// further down (a link's own buffer) plus a little headroom: false then,
-// and `s` is untouched. Buffers under 1 KB aren't checked.
+// further down (a link's own buffer) plus a little headroom, or past 256
+// bytes, unless it leaves the heap floor free (setHeapFloor()): false
+// then, and `s` is untouched.
 bool growFor(std::string& s, size_t need);
 
 // Appends to a string, up to `limit` bytes (0: none). `guarded`: grows

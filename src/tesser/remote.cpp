@@ -1130,6 +1130,11 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
             return writeError(reply, Status::Timeout, localBase.empty() ? std::string_view("/") : localBase,
                               "peer offline");
         }
+        // A new or wider copy of the remote's state, and the snapshots
+        // rendered from it: only with room to spare above the heap floor.
+        if (!heapAbove(heapFloor())) {
+            return writeError(reply, Status::Busy, basePath, "not enough memory for another remote subscription");
+        }
         if (!api.pendingBegin()) return writeError(reply, Status::Busy, basePath, "too many pending calls");
         Reply* detached = reply.detach();
         if (!detached) {

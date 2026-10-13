@@ -100,6 +100,19 @@ uint32_t millis32();
 size_t largestFreeBlock();
 // Replaces the probe (tests); null restores the platform's.
 void setLargestFreeBlockProbe(size_t (*probe)());
+// The heap free in all (bytes; SIZE_MAX off target), and its probe.
+size_t freeHeap();
+void setFreeHeapProbe(size_t (*probe)());
+// What guarded buffers leave free (docs/DESIGN.md section 15): growing one
+// past 256 bytes must leave this much of the heap, or replies answer busy
+// and notifications wait, before the heap is so short that some small
+// allocation elsewhere aborts. Forwarded subscriptions needing a new copy
+// of a remote's state want twice as much. 8 KB on target by default, 0
+// (off) elsewhere. Any task.
+void setHeapFloor(size_t bytes);
+size_t heapFloor();
+// Free heap is at least `bytes` above the floor (always without a floor).
+bool heapAbove(size_t bytes);
 
 // The chip's Wi-Fi station MAC, the device id UDP advertises and NowTP
 // addresses (false off target).

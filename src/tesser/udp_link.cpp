@@ -470,7 +470,7 @@ void UdpLink::handleData(const PeerAddress& from, Peer& peer, const uint8_t* dat
     if (!p) {
         // A heap too fragmented for the message: dropped, and the sender
         // tries again, rather than an abort.
-        if (!makeRoom(h.length) || largestFreeBlock() < size_t(h.length) + 1024) {
+        if (!makeRoom(h.length) || largestFreeBlock() < size_t(h.length) + 1024 || !heapAbove(h.length)) {
             stats_.dropped++;
             return;
         }
