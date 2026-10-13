@@ -811,7 +811,7 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
         cur.peer, Op::Subscribe, remotePath_, std::string_view(),
         [this](Status s, JsonVariantConst body) {
             subscribing_ = false;
-            if (s != Status::Ok) return;
+            if (s != Status::Ok || !heapAbove(2 * measureJson(body))) return;  // retried in 2 s
             {
                 MutexGuard guard(mutex_);
                 copy_.set(body);
@@ -1262,6 +1262,17 @@ void RemoteNode::upstreamReply(const std::string& rest, Status s, JsonVariantCon
             return;
         }
         u->subscribing = false;
+        // A copy of the remote's state takes about twice its text: only
+        // above the heap floor; else as if the remote were busy (kept stale,
+        // tried again soon).
+        JsonDocument noRoom;
+        if (s == Status::Ok && !heapAbove(2 * measureJson(body))) {
+            noRoom["error"] = "busy";
+            noRoom["path"] = remotePathOf(rest);
+            noRoom["message"] = "not enough memory for the remote's state";
+            s = Status::Busy;
+            body = noRoom.as<JsonVariantConst>();
+        }
         bool wasReady = u->ready;
         bool changedCopy = false;
         bool reshaped = false;  // the copy now holds more or less, not newer state

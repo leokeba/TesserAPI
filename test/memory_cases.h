@@ -186,4 +186,57 @@ TEST(memory_remote_subscription_admission) {
     r.gateway.dropSubscriber(&covered);
 }
 
+TEST(memory_large_receive_dropped_under_floor) {
+    // A link's lent buffer (NowTP) isn't copied when the heap can't spare
+    // it: the message is lost, as datagrams can be.
+    cases::Device dev;
+    datagram_cases::Net net;
+    tesser::DatagramEndpoint ep(&dev.api, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(2)),
+                                net.clockFn());
+    std::string big = "{\"id\":1,\"op\":\"get\",\"path\":\"/lamp\",\"pad\":\"" + std::string(600, 'p') + "\"}";
+    Floor floor(8000, 8800);
+    ep.receive(datagram_cases::addr(1), big.data(), big.size(), true);
+    CHECK_EQ(ep.stats().dropped, 1u);
+    std::string small = "{\"id\":2,\"op\":\"get\",\"path\":\"/lamp/on\"}";
+    ep.receive(datagram_cases::addr(1), small.data(), small.size(), true);
+    ep.process();
+    CHECK_EQ(ep.stats().requests, 1u);
+    floor.free(20000);
+    ep.receive(datagram_cases::addr(1), big.data(), big.size(), true);
+    ep.process();
+    CHECK_EQ(ep.stats().requests, 2u);
+}
+
+TEST(memory_remote_state_needs_room) {
+    // Admitted while there was room, the remote's state then finds none:
+    // the waiting subscriber hears "busy", and nothing is copied.
+    remote_cases::Rig r;
+    auto deliver = [&] {
+        while (!r.net.frames.empty()) {
+            auto f = r.net.frames.front();
+            r.net.frames.pop_front();
+            for (auto& n : r.net.nodes) {
+                if (n.first == f.to) {
+                    n.second->receive(f.from, f.text.data(), f.text.size(), f.delivery == tesser::Delivery::Reliable);
+                }
+            }
+        }
+    };
+    Floor floor(8000, 20000);
+    r.lines.out.clear();
+    std::string line = "{\"id\":7,\"op\":\"sub\",\"path\":\"/kitchen/lamp\"}\n";
+    r.line.feed(line.data(), line.size());
+    deliver();
+    r.deviceEnd.process();
+    floor.free(8050);
+    deliver();
+    r.gatewayEnd.process();
+    CHECK_EQ(r.lines.out.size(), 1u);
+    if (!r.lines.out.empty()) {
+        CHECK(r.lines.out[0].find("\"status\":\"busy\"") != std::string::npos);
+        CHECK(r.lines.out[0].find("not enough memory for the remote's state") != std::string::npos);
+    }
+    CHECK_EQ(r.gateway.pending(), 0);
+}
+
 }  // namespace memory_cases

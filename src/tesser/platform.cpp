@@ -88,8 +88,9 @@ bool growFor(std::string& s, size_t need) {
     // Small buffers (error replies) always go: refusing them would leave the
     // client with nothing at all.
     if (capacity > 256) {
-        // The heap as a whole: leave the floor to everything else.
-        if (!heapAbove(capacity - s.capacity())) return false;
+        // The heap as a whole: the growth and a copy further down, and the
+        // floor left to everything else.
+        if (!heapAbove(capacity - s.capacity() + need)) return false;
         // One block that size, a copy further down, and headroom.
         if (capacity > 1024 && largestFreeBlock() < capacity + need + 1024) return false;
     }

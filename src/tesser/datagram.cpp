@@ -245,6 +245,14 @@ void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::Pe
 
 void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t len, bool reliable,
                                bool broadcast) {
+    // The link's buffer (NowTP's) is only lent: a large message is copied,
+    // if the heap can spare it. If not, it is dropped like a lost datagram,
+    // and the call it belongs to times out.
+    if (len > 256 && (!heapAbove(2 * len) || largestFreeBlock() < len + 1024)) {
+        MutexGuard guard(mutex_);
+        stats_.dropped++;
+        return;
+    }
     receive(from, std::string(data, len), reliable, broadcast);
 }
 
@@ -512,6 +520,13 @@ bool DatagramEndpoint::takeRaw(const Incoming& msg) {
 
 void DatagramEndpoint::handle(Incoming& msg) {
     if (takeRaw(msg)) return;
+    // Parsed, a large message takes about as much again: only above the
+    // heap floor (dropped otherwise, like a lost datagram).
+    if (msg.text.size() > 1024 && !heapAbove(2 * msg.text.size())) {
+        MutexGuard guard(mutex_);
+        stats_.dropped++;
+        return;
+    }
     // Responses and notifications nest as deep as the peer wrote them;
     // requests are held to the same limit as on other transports below.
     JsonDocument doc;
