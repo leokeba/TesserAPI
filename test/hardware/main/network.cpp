@@ -193,6 +193,55 @@ void describeNet(tesser::Object& net) {
     });
 }
 
+// /net/routes: streamed sets to the boards under /both (test/e2e_routes.py).
+uint32_t g_streamSeq = 0;
+void describeRoutes(tesser::Object& net, tesser::Object& both) {
+    auto& routes = net.object("routes");
+    // {count, node}: streams /demo/seq = 1, 2, ... (counting on from the
+    // last run) to the node of that name under /both (every one without),
+    // at once; replies with the last value and how many sets were refused.
+    routes.action("stream", [&both](tesser::Call& call) {
+        uint32_t count = call.arg()["count"] | 1u;
+        std::string only = call.arg()["node"] | "";
+        uint32_t refused = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            g_streamSeq++;
+            char body[32];
+            snprintf(body, sizeof(body), "{\"seq\":%lu}", static_cast<unsigned long>(g_streamSeq));
+            for (const tesser::Node* c = both.first(); c; c = c->next()) {
+                if (c->type() != tesser::NodeType::Remote || (!only.empty() && only != c->name())) continue;
+                auto* node = const_cast<tesser::RemoteNode*>(static_cast<const tesser::RemoteNode*>(c));
+                if (node->stream("/demo", body) != tesser::Status::Ok) refused++;
+            }
+        }
+        JsonDocument out;
+        out["last"] = g_streamSeq;
+        out["refused"] = refused;
+        call.reply(out.as<JsonVariantConst>());
+    });
+    // Per node: route in use, routes known, stream statistics.
+    routes.value("state", [&both] {
+        std::string s = "{";
+        for (const tesser::Node* c = both.first(); c; c = c->next()) {
+            if (c->type() != tesser::NodeType::Remote) continue;
+            auto* node = static_cast<const tesser::RemoteNode*>(c);
+            tesser::RemoteNode::Route r;
+            bool have = node->route(r);
+            tesser::RemoteNode::StreamStats st = node->streamStats();
+            char item[200];
+            snprintf(item, sizeof(item),
+                     "%s\"%s\":{\"route\":\"%s\",\"routes\":%u,\"online\":%s,\"rttMs\":%lu,\"merged\":%lu,"
+                     "\"sent\":%lu,\"failed\":%lu}",
+                     s.size() > 1 ? "," : "", c->name(), have ? tesser::toString(r.kind()) : "none",
+                     unsigned(node->routes().size()), node->online() ? "true" : "false",
+                     static_cast<unsigned long>(have ? r.rttMs : 0), static_cast<unsigned long>(st.merged),
+                     static_cast<unsigned long>(st.sent), static_cast<unsigned long>(st.failed));
+            s += item;
+        }
+        return s + "}";
+    });
+}
+
 // /net/udp: the UDP transport's state and controls (test/e2e_udp.py).
 void describeUdp(tesser::Object& net) {
     auto& udp = net.object("udp");
@@ -332,4 +381,12 @@ void startNetwork(tesser::Api& api) {
     g_udpEnabled = wifi && g_udp->begin();
     printf("UDP %s port=%u advertise=%d\n", g_udpEnabled ? "started" : "off", unsigned(g_udp->port()),
            int(g_udp->advertise()));
+
+    // Every board both ways (docs/DESIGN.md section 14.3): one node per
+    // board, with a route per transport, UDP first (test/e2e_routes.py).
+    tesser::RemoteNode::setDefaultRouteOrder({tesser::TransportKind::Udp, tesser::TransportKind::NowTP});
+    auto& both = api.object("both").doc("TesserAPI boards over UDP and NowTP: a route each");
+    g_udp->mountPeers(both);
+    g_nowApi->mountPeers(both);
+    describeRoutes(api.object("net"), both);
 }

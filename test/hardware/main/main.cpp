@@ -127,6 +127,8 @@ cases::Device* g_demo;
 bool g_running = false;
 uint32_t g_counter = 0;
 uint32_t g_ticks = 0;
+uint32_t g_seq = 0;
+uint32_t g_seqBackwards = 0;
 tesser::ValueNode* g_ticksNode;
 tesser::EventNode* g_fired;
 char g_settingName[24] = "unnamed";
@@ -180,6 +182,15 @@ void serveDemo() {
     g_ticksNode = &demo.value("ticks", g_ticks);
     g_fired = &demo.event("fired");
     demo.action("fire", [](JsonVariantConst payload) { g_fired->emit(payload); });
+    // Streamed sets land here (test/e2e_routes.py): a write older than the
+    // one before it is counted.
+    demo.value(
+        "seq", [] { return g_seq; },
+        [](uint32_t v) {
+            if (v < g_seq) g_seqBackwards++;
+            g_seq = v;
+        });
+    demo.value("seqBackwards", [] { return g_seqBackwards; });
     // Empty until a test sets tableRows, so whole-tree reads (the gateway's
     // mirror over NowTP) stay small.
     demo.list("table", g_table, [](tesser::Object& o, Row& r) {

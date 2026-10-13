@@ -5,6 +5,7 @@
 #include "tesser/api.h"
 #include "tesser/call.h"
 #include "tesser/detail/lazy_patch.h"
+#include "tesser/envelope.h"
 #include "tesser/file.h"
 
 namespace tesser {
@@ -182,11 +183,49 @@ std::string serialized(JsonVariantConst v) {
 
 }  // namespace
 
+namespace {
+
+// Routes: the library-wide order and state handler.
+Mutex& sharedMutex() {
+    static Mutex m;
+    return m;
+}
+std::vector<TransportKind>& sharedOrder() {
+    static std::vector<TransportKind> order;
+    return order;
+}
+RemoteNode::StateHandler& sharedStateHandler() {
+    static RemoteNode::StateHandler fn;
+    return fn;
+}
+
+constexpr uint8_t kStreamAttempts = 3;  // a streamed set that timed out is sent twice more
+
+// A path below a remote node: "" for the node, else "/a/b".
+std::string normalPath(std::string_view p) {
+    std::string s(p);
+    if (!s.empty() && s.front() != '/') s.insert(0, "/");
+    while (!s.empty() && s.back() == '/') s.pop_back();
+    return s;
+}
+
+// One path is the other or below it.
+bool overlaps(const std::string& a, const std::string& b) {
+    const std::string& shorter = a.size() < b.size() ? a : b;
+    const std::string& longer = a.size() < b.size() ? b : a;
+    return longer.compare(0, shorter.size(), shorter) == 0 &&
+           (longer.size() == shorter.size() || longer[shorter.size()] == '/');
+}
+
+}  // namespace
+
+TransportKind RemoteNode::Route::kind() const { return endpoint ? endpoint->kind() : TransportKind::Local; }
+
 RemoteNode::RemoteNode(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath)
-    : Annotated(name, NodeType::Remote), endpoint_(&endpoint), peer_(peer), remotePath_(std::move(remotePath)) {
+    : Annotated(name, NodeType::Remote), remotePath_(std::move(remotePath)) {
     if (remotePath_.empty() || remotePath_.front() != '/') remotePath_.insert(0, "/");
     while (remotePath_.size() > 1 && remotePath_.back() == '/') remotePath_.pop_back();
-    endpoint_->addRemote(this);
+    addRoute(endpoint, peer);
 }
 
 RemoteNode::RemoteNode(std::string name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath)
@@ -196,20 +235,254 @@ RemoteNode::RemoteNode(std::string name, DatagramEndpoint& endpoint, const PeerA
     flags_ &= static_cast<uint8_t>(~kTemporary);  // named after all
 }
 
-void RemoteNode::setOnline(bool online) {
+RemoteNode::~RemoteNode() {
+    std::vector<DatagramEndpoint*> endpoints;
+    {
+        MutexGuard guard(routesMutex_);
+        for (const RouteSlot& r : routes_) {
+            bool known = false;
+            for (DatagramEndpoint* e : endpoints) known = known || e == r.route.endpoint;
+            if (!known) endpoints.push_back(r.route.endpoint);
+        }
+    }
+    for (DatagramEndpoint* e : endpoints) {
+        e->removeRemote(this);
+        e->cancelCalls(this);
+    }
+}
+
+// ---- routes -----------------------------------------------------------------
+
+void RemoteNode::addRoute(DatagramEndpoint& endpoint, const PeerAddress& peer) {
+    bool registered = false;
+    {
+        MutexGuard guard(routesMutex_);
+        for (const RouteSlot& r : routes_) {
+            if (r.route.endpoint != &endpoint) continue;
+            if (r.route.peer == peer) return;
+            registered = true;
+        }
+        RouteSlot slot;
+        slot.route.endpoint = &endpoint;
+        slot.route.peer = peer;
+        slot.added = nextRoute_++;
+        routes_.push_back(slot);
+        if (!lastEndpoint_) {
+            lastEndpoint_ = &endpoint;
+            lastPeer_ = peer;
+        }
+    }
+    if (!registered) endpoint.addRemote(this);
+    endpoint.routeAdded(this, peer);
+    announce_ = true;
+}
+
+bool RemoteNode::hasRoute(const DatagramEndpoint* endpoint, const PeerAddress& peer) const {
+    MutexGuard guard(routesMutex_);
+    for (const RouteSlot& r : routes_) {
+        if (r.route.endpoint == endpoint && r.route.peer == peer) return true;
+    }
+    return false;
+}
+
+// The index of the route in use: the best ranked online one, or the best
+// ranked one when none is online.
+int RemoteNode::activeLocked() const {
+    std::vector<TransportKind> order = hasOrder_ ? order_ : defaultRouteOrder();
+    auto rank = [&](const RouteSlot& r) {
+        size_t i = 0;
+        while (i < order.size() && order[i] != r.route.kind()) i++;
+        return (uint64_t(i) << 32) | r.added;
+    };
+    int best = -1, bestOnline = -1;
+    for (size_t i = 0; i < routes_.size(); i++) {
+        int n = static_cast<int>(i);
+        if (best < 0 || rank(routes_[i]) < rank(routes_[static_cast<size_t>(best)])) best = n;
+        if (routes_[i].route.online &&
+            (bestOnline < 0 || rank(routes_[i]) < rank(routes_[static_cast<size_t>(bestOnline)]))) {
+            bestOnline = n;
+        }
+    }
+    return bestOnline >= 0 ? bestOnline : best;
+}
+
+std::vector<RemoteNode::Route> RemoteNode::routes() const {
+    std::vector<RouteSlot> slots;
+    std::vector<TransportKind> order;
+    {
+        MutexGuard guard(routesMutex_);
+        slots = routes_;
+        order = hasOrder_ ? order_ : defaultRouteOrder();
+    }
+    auto rank = [&](const RouteSlot& r) {
+        size_t i = 0;
+        while (i < order.size() && order[i] != r.route.kind()) i++;
+        return (uint64_t(i) << 32) | r.added;
+    };
+    // A handful of routes: insertion sort.
+    for (size_t i = 1; i < slots.size(); i++) {
+        for (size_t j = i; j > 0 && rank(slots[j]) < rank(slots[j - 1]); j--) std::swap(slots[j], slots[j - 1]);
+    }
+    std::vector<Route> out;
+    for (const RouteSlot& r : slots) out.push_back(r.route);
+    return out;
+}
+
+bool RemoteNode::route(Route& out) const {
+    MutexGuard guard(routesMutex_);
+    int i = activeLocked();
+    if (i < 0) return false;
+    out = routes_[static_cast<size_t>(i)].route;
+    return true;
+}
+
+DatagramEndpoint* RemoteNode::endpoint() const {
+    Route r;
+    return route(r) ? r.endpoint : nullptr;
+}
+
+PeerAddress RemoteNode::peer() const {
+    Route r;
+    return route(r) ? r.peer : PeerAddress();
+}
+
+RemoteNode& RemoteNode::routeOrder(std::vector<TransportKind> order) {
+    {
+        MutexGuard guard(routesMutex_);
+        hasOrder_ = !order.empty();
+        order_ = std::move(order);
+    }
+    return *this;
+}
+
+std::vector<TransportKind> RemoteNode::routeOrder() const {
+    MutexGuard guard(routesMutex_);
+    return order_;
+}
+
+void RemoteNode::setDefaultRouteOrder(std::vector<TransportKind> order) {
+    MutexGuard guard(sharedMutex());
+    sharedOrder() = std::move(order);
+}
+
+std::vector<TransportKind> RemoteNode::defaultRouteOrder() {
+    MutexGuard guard(sharedMutex());
+    return sharedOrder();
+}
+
+void RemoteNode::onStateChange(StateHandler fn) {
+    MutexGuard guard(sharedMutex());
+    sharedStateHandler() = std::move(fn);
+}
+
+RemoteNode* RemoteNode::byDevice(const Object& parent, const PeerAddress& device) {
+    if (!device.length) return nullptr;
+    for (const Node* c = parent.first(); c; c = c->next()) {
+        if (c->type() != NodeType::Remote) continue;
+        auto* r = const_cast<RemoteNode*>(static_cast<const RemoteNode*>(c));
+        if (r->device() == device) return r;
+    }
+    return nullptr;
+}
+
+PeerAddress RemoteNode::device() const {
+    MutexGuard guard(routesMutex_);
+    return device_;
+}
+
+void RemoteNode::setDevice(const PeerAddress& device) {
+    {
+        MutexGuard guard(routesMutex_);
+        if (device_ == device) return;
+        device_ = device;
+    }
+    changed();  // shown in the schema
+}
+
+// Under routesMutex_: online if any route is. True if that changed.
+void RemoteNode::updateOnlineLocked() {
+    bool any = false;
+    for (const RouteSlot& r : routes_) any = any || r.route.online;
     // Shown in the schema, but not part of its hash (docs/DESIGN.md section
     // 7): subscribers of the parent hear about it as a change.
-    if (online_.exchange(online) != online) changed();
+    if (online_.exchange(any) != any) changed();
+}
+
+void RemoteNode::setOnline(bool online) {
+    MutexGuard guard(routesMutex_);
+    for (RouteSlot& r : routes_) r.route.online = online;
+    updateOnlineLocked();
+}
+
+void RemoteNode::setRouteOnline(const DatagramEndpoint* endpoint, const PeerAddress& peer, bool online,
+                                uint32_t nowMs) {
+    MutexGuard guard(routesMutex_);
+    for (RouteSlot& r : routes_) {
+        if (r.route.endpoint != endpoint || r.route.peer != peer) continue;
+        if (r.route.online && !online) lastProbeMs_ = nowMs;  // the first probe waits probeMs
+        r.route.online = online;
+        if (online && nowMs) r.route.heardMs = nowMs;
+    }
+    updateOnlineLocked();
+}
+
+void RemoteNode::routeRoundTrip(const DatagramEndpoint* endpoint, const PeerAddress& peer, uint32_t rttMs) {
+    if (!rttMs) rttMs = 1;
+    MutexGuard guard(routesMutex_);
+    for (RouteSlot& r : routes_) {
+        if (r.route.endpoint != endpoint || r.route.peer != peer) continue;
+        // Smoothed like TCP's: an eighth of each new sample.
+        r.route.rttMs = r.route.rttMs ? (r.route.rttMs * 7 + rttMs + 4) / 8 : rttMs;
+    }
 }
 
 void RemoteNode::setAdvertisedSchema(uint32_t hash) {
     if (advertisedSchema_.exchange(hash) != hash) changed();
 }
 
-RemoteNode::~RemoteNode() {
-    if (!endpoint_) return;
-    endpoint_->removeRemote(this);
-    endpoint_->cancelCalls(this);
+void RemoteNode::detach(const DatagramEndpoint* endpoint) {
+    MutexGuard guard(routesMutex_);
+    for (size_t i = 0; i < routes_.size();) {
+        if (routes_[i].route.endpoint == endpoint) {
+            routes_.erase(routes_.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            i++;
+        }
+    }
+    if (lastEndpoint_ == endpoint) lastEndpoint_ = nullptr;
+    if (routes_.empty()) {
+        online_ = false;
+    } else {
+        updateOnlineLocked();
+    }
+}
+
+// The route in use changed (`from` was it before): subscriptions move to the
+// new one, now.
+void RemoteNode::rerouted(const Route& from, uint32_t nowMs) {
+    std::vector<std::string> paths;
+    {
+        MutexGuard guard(mutex_);
+        for (auto& u : upstreams_) {
+            if (!u->ready) continue;
+            paths.push_back(remotePathOf(u->rest));
+            u->stale = true;  // renewed below, on the new route
+            u->lastSubscribeMs = nowMs - 2000;
+        }
+    }
+    if (mirror_) {
+        paths.push_back(remotePath_);
+        subscribedOnce_ = false;  // tick() subscribes again at once
+    }
+    // Back to a preferred route while the other one still works: drop what
+    // the device sends that way. (A lost route's subscriptions end on their
+    // own: the device fails to deliver to it.)
+    if (!from.endpoint || !from.online || !hasRoute(from.endpoint, from.peer)) return;
+    for (const std::string& p : paths) {
+        from.endpoint->request(
+            from.peer, Op::Unsubscribe, p, std::string_view(), [](Status, JsonVariantConst) {}, Query(), timeoutMs_,
+            this);
+    }
 }
 
 RemoteNode& RemoteNode::mirror(uint32_t intervalMs, uint32_t refreshMs) {
@@ -253,7 +526,64 @@ RemoteNode::Upstream* RemoteNode::findUpstream(std::string_view rest) {
     return nullptr;
 }
 
-void RemoteNode::tick(uint32_t nowMs) {
+void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
+    // Every endpoint of the node ticks it; the one in use does the work.
+    Route cur;
+    if (!route(cur) || cur.endpoint != &by) return;
+    bool on = online();
+    bool switched = false, stateChanged = false;
+    Route from;
+    {
+        MutexGuard guard(routesMutex_);
+        if (!lastEndpoint_) {
+            lastEndpoint_ = cur.endpoint;
+            lastPeer_ = cur.peer;
+            lastOnline_ = on;
+        }
+        if (lastEndpoint_ != cur.endpoint || lastPeer_ != cur.peer) {
+            switched = true;
+            from.endpoint = lastEndpoint_;
+            from.peer = lastPeer_;
+            for (const RouteSlot& r : routes_) {
+                if (r.route.endpoint == from.endpoint && r.route.peer == from.peer) from.online = r.route.online;
+            }
+            lastEndpoint_ = cur.endpoint;
+            lastPeer_ = cur.peer;
+        }
+        stateChanged = switched || lastOnline_ != on || announce_.exchange(false);
+        lastOnline_ = on;
+    }
+    if (switched) {
+        changed();  // the schema shows the route
+        rerouted(from, nowMs);
+    }
+    if (stateChanged) {
+        StateHandler fn;
+        {
+            MutexGuard guard(sharedMutex());
+            fn = sharedStateHandler();
+        }
+        if (fn) fn(*this);
+    }
+
+    // Offline routes: does the device answer? Any reply puts the route back.
+    std::vector<Route> probes;
+    {
+        MutexGuard guard(routesMutex_);
+        if (probeMs_ && nowMs - lastProbeMs_ >= probeMs_) {
+            for (const RouteSlot& r : routes_) {
+                if (!r.route.online) probes.push_back(r.route);
+            }
+            if (!probes.empty()) lastProbeMs_ = nowMs;
+        }
+    }
+    for (const Route& r : probes) {
+        Query q;
+        q.depth = 0;
+        r.endpoint->request(
+            r.peer, Op::Get, remotePath_, std::string_view(), [](Status, JsonVariantConst) {}, q, timeoutMs_, this);
+    }
+
     // Forwarded subscriptions: renewed every refreshMs in case the remote
     // node restarted, every 2 s after a failed renewal.
     std::vector<std::pair<std::string, uint32_t>> renew;
@@ -275,7 +605,10 @@ void RemoteNode::tick(uint32_t nowMs) {
         }
     }
 
-    if (!mirror_ || subscribing_ || !endpoint_) return;
+    // Streamed sets that couldn't be sent (no call slot, a busy peer).
+    pump();
+
+    if (!mirror_ || subscribing_) return;
     if (subscribedOnce_) {
         // Renew: after refreshMs with a copy, every 2 s while there is none.
         uint32_t every = hasCopy() ? refreshMs_ : 2000;
@@ -285,14 +618,14 @@ void RemoteNode::tick(uint32_t nowMs) {
     lastSubscribeMs_ = nowMs;
     subscribing_ = true;
     // Drop any previous subscription first, so renewals don't pile up.
-    endpoint_->request(
-        peer_, Op::Unsubscribe, remotePath_, std::string_view(), [](Status, JsonVariantConst) {}, Query(), timeoutMs_,
-        this);
+    cur.endpoint->request(
+        cur.peer, Op::Unsubscribe, remotePath_, std::string_view(), [](Status, JsonVariantConst) {}, Query(),
+        timeoutMs_, this);
     Query q;
     q.interval = mirrorIntervalMs_;
     q.remotes = false;  // never mirror the peer's own mirrors: no loops between gateways
-    bool sent = endpoint_->request(
-        peer_, Op::Subscribe, remotePath_, std::string_view(),
+    bool sent = cur.endpoint->request(
+        cur.peer, Op::Subscribe, remotePath_, std::string_view(),
         [this](Status s, JsonVariantConst body) {
             subscribing_ = false;
             if (s != Status::Ok) return;
@@ -313,8 +646,11 @@ bool RemoteNode::localPath(std::string& out) {
     return api_ != nullptr;
 }
 
-bool RemoteNode::handleNotification(const PeerAddress& from, JsonObjectConst envelope) {
-    if (from != peer_) return false;
+bool RemoteNode::handleNotification(const DatagramEndpoint& by, const PeerAddress& from, JsonObjectConst envelope) {
+    // Only the route in use: a device reached two ways may still notify the
+    // other for a moment after a switch.
+    Route cur;
+    if (!route(cur) || cur.endpoint != &by || cur.peer != from) return false;
     JsonVariantConst p = envelope["path"];
     if (!p.is<const char*>()) return false;
     std::string_view path(p.as<const char*>());
@@ -355,7 +691,17 @@ bool RemoteNode::handleNotification(const PeerAddress& from, JsonObjectConst env
 void RemoteNode::forward(Api& api, const Request& request, std::string_view rest, std::string_view base,
                          Reply& reply) {
     std::string_view basePath = base.empty() ? std::string_view("/") : base;
-    if (!endpoint_) return writeError(reply, Status::Internal, basePath, "no endpoint");
+    Route r;
+    if (!route(r)) return writeError(reply, Status::Internal, basePath, "no endpoint");
+    // The local path of this node: error paths in the remote's replies are
+    // mapped back under it.
+    std::string localBase(base.substr(0, base.size() - rest.size()));
+    // Known to be unreachable: fail now rather than hold a pending slot
+    // until the timeout, as fan-out and file relays do.
+    if (!online()) {
+        return writeError(reply, Status::Timeout, localBase.empty() ? std::string_view("/") : localBase,
+                          "peer offline");
+    }
     if (!api.pendingBegin()) return writeError(reply, Status::Busy, basePath, "too many pending calls");
     Reply* detached = reply.detach();
     if (!detached) {
@@ -363,21 +709,169 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
         return writeError(reply, Status::NotAllowed, basePath, "this transport can't wait for remote nodes");
     }
     std::string remoteBase = remotePath_ == "/" ? std::string() : remotePath_;
-    // The local path of this node: error paths in the remote's replies are
-    // mapped back under it.
-    std::string localBase(base.substr(0, base.size() - rest.size()));
     Api* a = &api;
     auto done = [detached, a, localBase, remoteBase](Status s, JsonVariantConst body) {
         writeMapped(*detached, s, body, localBase, remoteBase);
         detached->release();
         a->pendingDone();
     };
-    if (!endpoint_->request(peer_, request.op, remotePathOf(rest), request.body, done, request.query, timeoutMs_,
-                            this)) {
+    if (!r.endpoint->request(r.peer, request.op, remotePathOf(rest), request.body, done, request.query, timeoutMs_,
+                             this)) {
         writeError(*detached, Status::Busy, basePath, "couldn't send to the remote node");
         detached->release();
         api.pendingDone();
     }
+}
+
+// ---- streamed sets -----------------------------------------------------------
+
+Status RemoteNode::stream(std::string_view path, std::string_view bodyJson) {
+    if (!online()) return Status::Timeout;
+    JsonDocument body;
+    if (deserializeJson(body, bodyJson.data(), bodyJson.size(), DeserializationOption::NestingLimit(kWrittenNesting))) {
+        return Status::BadRequest;
+    }
+    std::string p = normalPath(path);
+    {
+        MutexGuard guard(streamMutex_);
+        // On top of the last set queued for the path, unless a set to a path
+        // above or below it came after (they must stay in order).
+        bool merged = false;
+        for (size_t i = queue_.size(); i-- > 0;) {
+            if (queue_[i].path == p) {
+                merge(queue_[i].body.as<JsonVariant>(), body.as<JsonVariantConst>());
+                merged = true;
+                break;
+            }
+            if (overlaps(queue_[i].path, p)) break;
+        }
+        if (merged) {
+            streamStats_.queued++;
+            streamStats_.merged++;
+        } else {
+            if (queue_.size() >= streamLimit_) return Status::Busy;
+            queue_.emplace_back();
+            queue_.back().path = std::move(p);
+            queue_.back().body = std::move(body);
+            streamStats_.queued++;
+        }
+    }
+    pump();
+    return Status::Ok;
+}
+
+void RemoteNode::onStreamError(StreamErrorHandler fn) {
+    MutexGuard guard(streamMutex_);
+    onStreamError_ = std::move(fn);
+}
+
+RemoteNode::StreamStats RemoteNode::streamStats() const {
+    MutexGuard guard(streamMutex_);
+    return streamStats_;
+}
+
+size_t RemoteNode::streaming() const {
+    MutexGuard guard(streamMutex_);
+    return queue_.size() + (inFlight_ ? 1 : 0);
+}
+
+uint32_t RemoteNode::streamTimeoutMs() const {
+    // Longer than the link takes to give up on a message (UDP's sendTimeoutMs
+    // is the endpoint's default timeout): a set that times out can't still
+    // arrive after the one sent in its place.
+    uint32_t t = timeoutMs_;
+    if (!t) {
+        DatagramEndpoint* ep = endpoint();
+        t = ep ? ep->timeoutMs() : 3000;
+    }
+    return t * 2;
+}
+
+// Puts a set that must go again at the front, with the later sets to its
+// path merged on top (up to one to a path above or below it).
+void RemoteNode::requeue(std::vector<Pending>& queue, Pending p) {
+    for (size_t i = 0; i < queue.size();) {
+        if (queue[i].path == p.path) {
+            merge(p.body.as<JsonVariant>(), queue[i].body.as<JsonVariantConst>());
+            queue.erase(queue.begin() + static_cast<std::ptrdiff_t>(i));
+            continue;
+        }
+        if (overlaps(queue[i].path, p.path)) break;
+        i++;
+    }
+    queue.insert(queue.begin(), std::move(p));
+}
+
+// Sends the next streamed set if none is in flight; drops them all if the
+// node is offline.
+void RemoteNode::pump() {
+    Route r;
+    bool reachable = route(r) && online();
+    std::vector<Pending> dropped;
+    std::string path, body;
+    StreamErrorHandler onError;
+    {
+        MutexGuard guard(streamMutex_);
+        if (inFlight_ || queue_.empty()) return;
+        if (!reachable) {
+            dropped.swap(queue_);
+            streamStats_.failed += static_cast<uint32_t>(dropped.size());
+            onError = onStreamError_;
+        } else {
+            flying_ = std::move(queue_.front());
+            queue_.erase(queue_.begin());
+            inFlight_ = true;
+            streamStats_.sent++;
+            path = flying_.path;
+            serializeJson(flying_.body, body);
+        }
+    }
+    if (!reachable) {
+        if (!onError) return;
+        JsonDocument error;
+        error["error"] = "timeout";
+        error["message"] = "peer offline";
+        for (const Pending& p : dropped) {
+            error["path"] = p.path.empty() ? std::string("/") : p.path;
+            onError(p.path, Status::Timeout, error.as<JsonVariantConst>());
+        }
+        return;
+    }
+    bool sent = r.endpoint->request(
+        r.peer, Op::Set, remotePathOf(path), std::string_view(body),
+        [this](Status s, JsonVariantConst reply) { streamDone(s, reply); }, Query(), streamTimeoutMs(), this);
+    if (!sent) {
+        // No call slot or no room on the link: tick() tries again.
+        MutexGuard guard(streamMutex_);
+        inFlight_ = false;
+        streamStats_.sent--;
+        requeue(queue_, std::move(flying_));
+    }
+}
+
+void RemoteNode::streamDone(Status s, JsonVariantConst body) {
+    bool retry = s == Status::Timeout || s == Status::Busy;
+    std::string failed;
+    StreamErrorHandler onError;
+    {
+        MutexGuard guard(streamMutex_);
+        if (!inFlight_) return;
+        inFlight_ = false;
+        Pending p = std::move(flying_);
+        if (retry && ++p.attempts < kStreamAttempts) {
+            // Applied or not, it goes again, under anything newer: on the
+            // next route if this one was lost.
+            requeue(queue_, std::move(p));
+        } else if (s != Status::Ok) {
+            failed = p.path;
+            streamStats_.failed++;
+            onError = onStreamError_;
+            retry = false;
+        }
+    }
+    if (onError) onError(failed, s, body);
+    // A busy peer gets a moment: tick() sends it again.
+    if (s != Status::Busy) pump();
 }
 
 // ---- forwarded subscriptions ------------------------------------------------
@@ -390,7 +884,8 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
         return writeError(reply, Status::BadRequest, basePath, "subscriptions take keys, exclude and depth, not shapes");
     }
     if (req.query.view != View::Value) return writeError(reply, Status::BadRequest, basePath, "subscriptions are on values");
-    if (!endpoint_) return writeError(reply, Status::Internal, basePath, "no endpoint");
+    Route route;
+    if (!this->route(route)) return writeError(reply, Status::Internal, basePath, "no endpoint");
     Status allowed = api.subscriptionAllowed(req.subscriber);
     if (allowed != Status::Ok) return writeError(reply, allowed, basePath, "too many subscriptions");
 
@@ -428,6 +923,11 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
             api.addSubscription(std::move(sub));
             return;
         }
+        if (!online()) {
+            std::string localBase(base.substr(0, base.size() - rest.size()));
+            return writeError(reply, Status::Timeout, localBase.empty() ? std::string_view("/") : localBase,
+                              "peer offline");
+        }
         if (!api.pendingBegin()) return writeError(reply, Status::Busy, basePath, "too many pending calls");
         Reply* detached = reply.detach();
         if (!detached) {
@@ -445,7 +945,7 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
         interval = u->interval;
         if (!u->subscribing) {
             u->subscribing = true;
-            u->lastSubscribeMs = endpoint_->now();
+            u->lastSubscribeMs = route.endpoint->now();
             start = true;
         }
     }
@@ -455,17 +955,18 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
 }
 
 bool RemoteNode::sendUpstream(const std::string& rest, uint32_t interval, bool renew) {
-    if (!endpoint_) return false;
+    Route r;
+    if (!route(r)) return false;
     std::string path = remotePathOf(rest);
     if (renew) {
-        endpoint_->request(
-            peer_, Op::Unsubscribe, path, std::string_view(), [](Status, JsonVariantConst) {}, Query(), timeoutMs_,
+        r.endpoint->request(
+            r.peer, Op::Unsubscribe, path, std::string_view(), [](Status, JsonVariantConst) {}, Query(), timeoutMs_,
             this);
     }
     Query q;
     q.interval = interval;
-    return endpoint_->request(
-        peer_, Op::Subscribe, path, std::string_view(),
+    return r.endpoint->request(
+        r.peer, Op::Subscribe, path, std::string_view(),
         [this, rest](Status s, JsonVariantConst body) { upstreamReply(rest, s, body); }, q, timeoutMs_, this);
 }
 
@@ -478,9 +979,10 @@ void RemoteNode::upstreamReply(const std::string& rest, Status s, JsonVariantCon
     Upstream* u = findUpstream(rest);
     if (!u) {
         // Released while subscribing: drop the subscription it made.
-        if (s == Status::Ok && endpoint_) {
-            endpoint_->request(
-                peer_, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {},
+        Route r;
+        if (s == Status::Ok && route(r)) {
+            r.endpoint->request(
+                r.peer, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {},
                 Query(), timeoutMs_, this);
         }
         return;
@@ -572,9 +1074,10 @@ void RemoteNode::released(std::string_view localPath) {
             break;
         }
     }
-    if (found && endpoint_) {
-        endpoint_->request(
-            peer_, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {}, Query(),
+    Route r;
+    if (found && route(r)) {
+        r.endpoint->request(
+            r.peer, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {}, Query(),
             timeoutMs_, this);
     }
 }
@@ -610,8 +1113,9 @@ public:
         char hex[24];
         snprintf(hex, sizeof(hex), "@%lx:", static_cast<unsigned long>(reinterpret_cast<uintptr_t>(node.endpoint())));
         key_ = hex;
-        for (uint8_t i = 0; i < node.peer().length; i++) {
-            snprintf(hex, sizeof(hex), "%02x", node.peer().bytes[i]);
+        PeerAddress peer = node.peer();
+        for (uint8_t i = 0; i < peer.length; i++) {
+            snprintf(hex, sizeof(hex), "%02x", peer.bytes[i]);
             key_ += hex;
         }
     }
@@ -938,7 +1442,7 @@ private:
 }  // namespace
 
 std::shared_ptr<FileRelay> RemoteNode::relayFile(Api& api, std::string_view rest, std::string_view base) {
-    if (!endpoint_) return nullptr;
+    if (!endpoint()) return nullptr;
     std::string remoteBase = remotePath_ == "/" ? std::string() : remotePath_;
     std::string localBase(base.substr(0, base.size() - rest.size()));
     return std::make_shared<RemoteFile>(api, *this, remotePathOf(rest), std::move(localBase), std::move(remoteBase),

@@ -417,7 +417,7 @@ TEST(udp_discovery) {
     snprintf(hash, sizeof(hash), "%08lx", static_cast<unsigned long>(lamp.api.schemaHash()));
     CHECK_EQ(cases::get(gateway, "/peers", q).body,
              std::string("{\"type\":\"object\",\"children\":{\"lamp\":{\"type\":\"remote\",\"schema\":\"") + hash +
-                 "\"}}}");
+                 "\",\"id\":\"10521c75f37c\"}}}");
 
     // Forwarded through the mounted node.
     tesser::LocalClient client(gateway);

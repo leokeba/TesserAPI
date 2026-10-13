@@ -305,7 +305,8 @@ TEST(remote_discovered_peers) {
     r.gatewayEnd.peerSeen(addr(2), "kitchen", 0xabc);
     r.gatewayEnd.process();
     CHECK_EQ(stub("/", "kitchen"),
-             "{\"type\":\"object\",\"children\":{\"kitchen\":{\"type\":\"remote\",\"schema\":\"00000abc\"}}}");
+             "{\"type\":\"object\",\"children\":{\"kitchen\":{\"type\":\"remote\",\"schema\":\"00000abc\","
+             "\"id\":\"10521c75f302\"}}}");
     r.gateway.poll(900);
     CHECK_EQ(watcher.last(), "{\"op\":\"change\",\"path\":\"/peers\",\"body\":{\"kitchen\":null}}");
 
@@ -315,7 +316,8 @@ TEST(remote_discovered_peers) {
     r.gatewayEnd.peerSeen(addr(5), "kitchen lamp!", 0x1234abcd);
     r.gatewayEnd.process();
     CHECK_EQ(stub("/peers", "kitchen-lamp"),
-             "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":{\"type\":\"remote\",\"schema\":\"1234abcd\"}}}");
+             "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":{\"type\":\"remote\",\"schema\":\"1234abcd\","
+             "\"id\":\"10521c75f305\"}}}");
     r.gateway.poll(1000);
     CHECK_EQ(watcher.last(), "{\"op\":\"change\",\"path\":\"/peers\",\"body\":{\"kitchen-lamp\":null}}");
     // Remote nodes declared later know the hash too.
@@ -339,17 +341,26 @@ TEST(remote_discovered_peers) {
     r.gatewayEnd.forgetPeer(addr(5));
     r.gatewayEnd.process();
     CHECK_EQ(stub("/peers", "kitchen-lamp"), "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":"
-                                             "{\"type\":\"remote\",\"online\":false,\"schema\":\"1234abcd\"}}}");
+                                             "{\"type\":\"remote\",\"online\":false,\"schema\":\"1234abcd\","
+                                             "\"id\":\"10521c75f305\"}}}");
     r.gateway.poll(1100);
     CHECK_EQ(watcher.last(), "{\"op\":\"change\",\"path\":\"/peers\",\"body\":{\"kitchen-lamp\":null}}");
-    r.ask("{\"id\":2,\"op\":\"get\",\"path\":\"/peers/kitchen-lamp/lamp/on\"}");  // the device answers
+    // Requests fail at once while it is offline, and a probe finds it again.
+    CHECK_EQ(r.ask("{\"id\":2,\"op\":\"get\",\"path\":\"/peers/kitchen-lamp/lamp/on\"}"),
+             "{\"id\":2,\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"path\":\"/peers/kitchen-lamp\","
+             "\"message\":\"peer offline\"}}");
+    CHECK_EQ(r.gateway.pending(), 0);
+    r.net.clock += 5000;
+    r.net.run();
     CHECK_EQ(stub("/peers", "kitchen-lamp"),
-             "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":{\"type\":\"remote\",\"schema\":\"1234abcd\"}}}");
+             "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":{\"type\":\"remote\",\"schema\":\"1234abcd\","
+             "\"id\":\"10521c75f305\"}}}");
     // A new schema hash is shown as soon as it is announced.
     r.gatewayEnd.peerSeen(addr(5), "kitchen lamp!", 0xfeed);
     r.gatewayEnd.process();
     CHECK_EQ(stub("/peers", "kitchen-lamp"),
-             "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":{\"type\":\"remote\",\"schema\":\"0000feed\"}}}");
+             "{\"type\":\"object\",\"children\":{\"kitchen-lamp\":{\"type\":\"remote\",\"schema\":\"0000feed\","
+             "\"id\":\"10521c75f305\"}}}");
 
     // Advertisements.
     std::string ad = tesser::buildAdvertisement(84, 0xfeed);

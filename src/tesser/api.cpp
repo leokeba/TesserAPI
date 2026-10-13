@@ -43,6 +43,18 @@ bool parseView(std::string_view s, View& out) {
     return true;
 }
 
+const char* toString(TransportKind kind) {
+    switch (kind) {
+        case TransportKind::Local: return "local";
+        case TransportKind::Serial: return "serial";
+        case TransportKind::Http: return "http";
+        case TransportKind::NowTP: return "nowtp";
+        case TransportKind::WebSocket: return "websocket";
+        case TransportKind::Udp: return "udp";
+    }
+    return "local";
+}
+
 const char* toString(Access a) {
     switch (a) {
         case Access::Public: return "public";
@@ -735,10 +747,25 @@ private:
                     w.key("online");
                     w.boolean(false);
                 }
+                // The device and the transport in use (docs/DESIGN.md section
+                // 14.3): state, not part of the hash.
+                RemoteNode::Route route;
+                if (!hashing_ && r.routes().size() > 1 && r.route(route)) {
+                    w.key("route");
+                    w.string(toString(route.kind()));
+                }
                 if (uint32_t hash = hashing_ ? 0 : r.advertisedSchema()) {
                     char hex[9];
                     snprintf(hex, sizeof(hex), "%08lx", static_cast<unsigned long>(hash));
                     w.key("schema");
+                    w.string(hex);
+                }
+                PeerAddress device = hashing_ ? PeerAddress() : r.device();
+                if (device.length == 6) {
+                    char hex[13];
+                    snprintf(hex, sizeof(hex), "%02x%02x%02x%02x%02x%02x", device.bytes[0], device.bytes[1],
+                             device.bytes[2], device.bytes[3], device.bytes[4], device.bytes[5]);
+                    w.key("id");
                     w.string(hex);
                 }
                 break;
@@ -1347,13 +1374,19 @@ void Api::releaseTransfer(std::string_view path) {
 
 void Api::handleNow(const Request& request, Reply& reply) {
     MutexGuard guard(mutex_);
+    const Client* outer = current_;
+    current_ = &request.client;
     Handler(*this, request, reply).run();
+    current_ = outer;
 }
 
 void detail::handleNested(Api& api, const Request& request, Reply& reply) {
     MutexGuard guard(api.mutex());
+    const Client* outer = api.current_;
+    api.current_ = &request.client;
     std::unique_ptr<Handler> handler(new Handler(api, request, reply));
     handler->run();
+    api.current_ = outer;
 }
 
 // ---- queued mode ------------------------------------------------------------

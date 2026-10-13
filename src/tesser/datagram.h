@@ -121,9 +121,11 @@ public:
     // Drops (without calling) the pending calls tagged with `owner`.
     void cancelCalls(const void* owner);
 
-    // Used by RemoteNode.
+    // Used by RemoteNode: a node with a route through this endpoint, and
+    // that route (`peer`), so it gets the peer's advertised hash.
     void addRemote(RemoteNode* remote);
     void removeRemote(RemoteNode* remote);
+    void routeAdded(RemoteNode* remote, const PeerAddress& peer);
     // Used by PeerClient: notifications from `peer` are queued in `inbox`.
     void addClient(const PeerAddress& peer, std::shared_ptr<ClientInbox> inbox);
     void removeClient(const ClientInbox* inbox);
@@ -152,10 +154,24 @@ public:
     // work happens in the next process().
     void forgetPeer(const PeerAddress& peer);
 
+    // ---- peers ------------------------------------------------------------
+    // A peer this endpoint had heard from was forgotten (a failed delivery,
+    // a goodbye, a restart, silence, the link stopped): `device` is its MAC
+    // when known (a NowTP address; the "id" a UDP peer advertises), else
+    // empty. Runs in process(), without the API lock. A node that a client
+    // drives undoes what it did here (docs/DESIGN.md section 14.4).
+    using PeerLostHandler = std::function<void(const PeerAddress& peer, const PeerAddress& device)>;
+    void onPeerLost(PeerLostHandler fn) { onPeerLost_ = std::move(fn); }
+    // Whether a peer of `device` has been heard and not forgotten since.
+    bool deviceOnline(const PeerAddress& device) const;
+    // The device behind `peer` (empty when unknown).
+    PeerAddress deviceOf(const PeerAddress& peer) const;
+
     // ---- discovery ------------------------------------------------------
     // Mounts every TesserAPI peer reported by peerSeen() under `parent`, an
     // object of this endpoint's API, as a remote node named after the peer
     // (docs/DESIGN.md section 14.1). `mirrorIntervalMs` > 0 also mirrors it.
+    // Each call adds a parent (again for the same one: a new interval).
     void mountPeers(Object& parent, uint32_t mirrorIntervalMs = 0);
     // A peer announced itself as a TesserAPI node (from NowTP discovery
     // metadata, ...): `name` is its advertised name, `schemaHash` the hash
@@ -177,6 +193,7 @@ public:
 
     Stats stats() const;
     size_t pendingCalls() const;
+    TransportKind kind() const { return kind_; }
     uint32_t now() const { return clock_ ? clock_() : 0; }
     // The default call timeout (Options::timeoutMs).
     uint32_t timeoutMs() const { return options_.timeoutMs; }
@@ -224,6 +241,14 @@ private:
         ResponseHandler done;
         const void* owner;
         BroadcastHandler each;  // a broadcast call: replies from any peer
+        uint32_t sentMs;
+    };
+    // Peers heard from, with their device when known (bounded).
+    struct Known {
+        PeerAddress peer;
+        PeerAddress device;
+        bool online;
+        uint32_t heardMs;
     };
 
     bool sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope, ResponseHandler done,
@@ -236,7 +261,11 @@ private:
     Subscriber* subscriberFor(const PeerAddress& peer, bool create);
     void dropPeer(const PeerAddress& peer);
     void applySeen(const Seen& seen);
+    void mount(Object& parent, uint32_t mirrorMs, const Seen& seen, const PeerAddress& device);
     void markOnline(const PeerAddress& peer, bool online);
+    // Under mutex_.
+    Known* knownLocked(const PeerAddress& peer);
+    Known& learnLocked(const PeerAddress& peer, uint32_t now);
     void checkAdvertisement(uint32_t now);
     void handleFile(JsonObjectConst envelope, const Incoming& msg, const Client& client);
     void dropFiles(const PeerAddress* peer, uint32_t now);
@@ -248,6 +277,7 @@ private:
     Options options_;
     std::function<void()> onQueued_;
     NotificationHandler onNotification_;
+    PeerLostHandler onPeerLost_;
     std::function<bool(const PeerAddress&)> trust_;
     std::atomic<Access> peerAccess_{Access::Public};
 
@@ -258,14 +288,14 @@ private:
     std::vector<Seen> seenPeers_;         // peerSeen() → process()
     // Schema hashes peers advertised, for remote nodes created later.
     std::vector<std::pair<PeerAddress, uint32_t>> advertised_;  // guarded by mutex_
-    Object* mountParent_ = nullptr;
-    uint32_t mountMirrorMs_ = 0;
+    std::vector<std::pair<Object*, uint32_t>> mounts_;  // mountPeers(): parent, mirror interval
     Mutex subscribersMutex_;              // taken before the API lock, never after
     std::vector<PeerSubscriber*> subscribers_;
     std::vector<RemoteNode*> remotes_;  // guarded by mutex_
     std::vector<PeerFiles> files_;      // used in process() only
     std::vector<std::pair<PeerAddress, std::shared_ptr<ClientInbox>>> clients_;  // guarded by mutex_
     std::vector<std::pair<PeerAddress, std::string>> tokens_;  // from "auth", oldest first; guarded by mutex_
+    std::vector<Known> known_;  // guarded by mutex_
     uint32_t nextId_ = 1;
     Stats stats_;
     // autoAdvertise()
@@ -276,6 +306,13 @@ private:
     uint32_t advertiseDebounceMs_ = 1000;
     bool revisionPending_ = false;
 };
+
+// Calls `lost` when a device is gone from every endpoint in `endpoints` that
+// heard it (a peer without a known device: when that peer is), so a node
+// reached over UDP and NowTP isn't taken as lost while one of them still
+// works. Takes the endpoints' onPeerLost(). A device lost on two endpoints
+// at once may be reported twice.
+void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLostHandler lost);
 
 // Builds a request envelope; `id` 0 leaves the "id" out. `bodyJson` is
 // inserted verbatim when not empty.

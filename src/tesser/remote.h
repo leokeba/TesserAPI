@@ -22,11 +22,37 @@ struct Subscription;
 // the remote's answer comes back as a deferred reply. A gateway uses it to
 // serve ESP-NOW nodes over HTTP.
 //
+// A node can have several routes to its device, one per endpoint that
+// reaches it (UDP and NowTP, say): requests go by the first online one in
+// the route order (docs/DESIGN.md section 14.3).
+//
 // Created with Object::remote(); lives as long as the tree. Either may be
-// destroyed first: a destroyed endpoint detaches its remote nodes, which then
-// answer "no endpoint".
+// destroyed first: a destroyed endpoint detaches its routes, and a node left
+// without one answers "no endpoint".
 class RemoteNode : public Annotated<RemoteNode> {
 public:
+    // A way to reach the device.
+    struct Route {
+        DatagramEndpoint* endpoint = nullptr;
+        PeerAddress peer;
+        bool online = true;
+        uint32_t heardMs = 0;  // when a message last came this way (endpoint clock; 0: never)
+        uint32_t rttMs = 0;    // smoothed round trip of the calls made this way (0: none yet)
+        TransportKind kind() const;
+    };
+    // See onStateChange().
+    using StateHandler = std::function<void(RemoteNode& node)>;
+    // A streamed set that failed: `path` below the node, the status, and the
+    // remote's error body (null when it didn't answer).
+    using StreamErrorHandler = std::function<void(const std::string& path, Status status, JsonVariantConst body)>;
+
+    struct StreamStats {
+        uint32_t queued = 0;  // sets accepted
+        uint32_t merged = 0;  // sets merged into one still queued
+        uint32_t sent = 0;    // requests sent, resends included
+        uint32_t failed = 0;  // sets dropped: error reply, peer offline, out of attempts
+    };
+
     RemoteNode(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath);
     // Same, owning a copy of its name (nodes mounted at run time).
     RemoteNode(std::string name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath);
@@ -43,19 +69,61 @@ public:
     // is renewed every `refreshMs` in case the remote node restarted.
     RemoteNode& mirror(uint32_t intervalMs = 500, uint32_t refreshMs = 30000);
 
-    DatagramEndpoint* endpoint() const { return endpoint_; }
-    const PeerAddress& peer() const { return peer_; }
+    // Asks an offline route every `ms` (default 5000; 0: never) whether the
+    // device answers again, with a get at depth 0: a device that doesn't
+    // advertise (a declared address on another subnet) comes back that way.
+    RemoteNode& probe(uint32_t ms) {
+        probeMs_ = ms;
+        return *this;
+    }
+
+    // ---- routes ---------------------------------------------------------
+    // Another way to reach the device (no effect if the node has it).
+    // mountPeers() adds the routes of a device announced on several
+    // endpoints.
+    void addRoute(DatagramEndpoint& endpoint, const PeerAddress& peer);
+    bool hasRoute(const DatagramEndpoint* endpoint, const PeerAddress& peer) const;
+    // Every route, in the order they are tried.
+    std::vector<Route> routes() const;
+    // The route requests use: the first online one in the order, or the
+    // first one when none is online. False without any.
+    bool route(Route& out) const;
+    // The order routes are tried in, by transport; routes of a transport the
+    // list doesn't name come after, in the order they were added. Empty:
+    // the default order. Takes effect at once.
+    RemoteNode& routeOrder(std::vector<TransportKind> order);
+    std::vector<TransportKind> routeOrder() const;
+    // The order of nodes without their own (initially empty: routes in the
+    // order they were added). Any task.
+    static void setDefaultRouteOrder(std::vector<TransportKind> order);
+    static std::vector<TransportKind> defaultRouteOrder();
+    // Called, from an endpoint's process() and without the API lock, when a
+    // node is created or gets a route, and when its online state or route in
+    // use changes. One for every node.
+    static void onStateChange(StateHandler fn);
+    // The remote node under `parent` mounted for `device`, or null. Under
+    // the API lock.
+    static RemoteNode* byDevice(const Object& parent, const PeerAddress& device);
+
+    // The active route's endpoint and address (null and empty without one).
+    DatagramEndpoint* endpoint() const;
+    PeerAddress peer() const;
     const std::string& remotePath() const { return remotePath_; }
     uint32_t timeoutMs() const { return timeoutMs_; }
     bool mirrored() const { return mirror_; }
     bool hasCopy() const;
 
-    // Whether the peer is reachable, as far as the endpoint knows: false
-    // once it is lost (DatagramEndpoint::forgetPeer()), true again when it
-    // is heard from. Shown in the schema; a change marks the node changed,
-    // so subscribers of its parent hear about it.
+    // Whether the device is reachable, as far as the endpoints know: false
+    // once every route is lost (DatagramEndpoint::forgetPeer()), true again
+    // when one is heard from. Shown in the schema; a change marks the node
+    // changed, so subscribers of its parent hear about it.
     bool online() const { return online_.load(); }
+    // Sets every route's state (tests, applications that know better).
     void setOnline(bool online);
+    // One route's state; called by its endpoint.
+    void setRouteOnline(const DatagramEndpoint* endpoint, const PeerAddress& peer, bool online, uint32_t nowMs);
+    // A call on a route got its reply after `rttMs`; called by its endpoint.
+    void routeRoundTrip(const DatagramEndpoint* endpoint, const PeerAddress& peer, uint32_t rttMs);
     // The schema hash the peer advertises (0: unknown), shown in the schema
     // so clients can cache the remote's schema under it.
     uint32_t advertisedSchema() const { return advertisedSchema_.load(); }
@@ -63,8 +131,31 @@ public:
     // The device a mounted peer is (its MAC; empty when unknown), so that a
     // parent mounts each device once, whatever the transport
     // (docs/DESIGN.md section 14.1). Set by DatagramEndpoint::mountPeers().
-    const PeerAddress& device() const { return device_; }
-    void setDevice(const PeerAddress& device) { device_ = device; }
+    PeerAddress device() const;
+    void setDevice(const PeerAddress& device);
+
+    // ---- streamed sets ----------------------------------------------------
+    // Writes `bodyJson` to `path` below this node without waiting, for state
+    // that changes fast (docs/DESIGN.md section 14.3). At most one streamed
+    // set per node is in flight, so they are applied in the order they were
+    // made, whatever the route; the others wait in a queue, where a set to
+    // a path already queued is merged into it (objects merge, anything else
+    // replaces). Streams converge on the latest state: they don't replay
+    // every set. Ok: queued. Timeout: the node is offline. Busy: the queue
+    // is full. BadRequest: `bodyJson` isn't JSON. Any task, under the API
+    // lock or not.
+    Status stream(std::string_view path, std::string_view bodyJson);
+    // Sets that may wait (default 8).
+    RemoteNode& streamLimit(size_t entries) {
+        streamLimit_ = entries;
+        return *this;
+    }
+    // Called, in an endpoint's process() and without the API lock, for each
+    // streamed set that is dropped.
+    void onStreamError(StreamErrorHandler fn);
+    StreamStats streamStats() const;
+    // Sets queued or in flight.
+    size_t streaming() const;
 
     // The mirrored copy (objects below `depth` levels as {}), or null.
     // Virtual like forward(): keeps the remote code out of applications
@@ -94,10 +185,10 @@ public:
     // Upstream subscriptions currently held (tests, diagnostics).
     size_t upstreamCount() const;
 
-    // Called by the endpoint, from process(), and when it is destroyed.
-    void tick(uint32_t nowMs);
-    void detach() { endpoint_ = nullptr; }
-    bool handleNotification(const PeerAddress& from, JsonObjectConst envelope);
+    // Called by an endpoint, from its process(), and when it is destroyed.
+    void tick(const DatagramEndpoint& by, uint32_t nowMs);
+    void detach(const DatagramEndpoint* endpoint);
+    bool handleNotification(const DatagramEndpoint& by, const PeerAddress& from, JsonObjectConst envelope);
 
 private:
     // One subscription to the remote node, shared by local subscribers.
@@ -110,6 +201,15 @@ private:
         uint32_t interval = 0;
         uint32_t lastSubscribeMs = 0;
     };
+    struct RouteSlot {
+        Route route;
+        uint32_t added;  // tie-break: routes of the same rank keep this order
+    };
+    struct Pending {
+        std::string path;  // below the node
+        JsonDocument body;
+        uint8_t attempts = 0;
+    };
 
     bool localPath(std::string& out);
     Upstream* findUpstream(std::string_view rest);
@@ -117,18 +217,37 @@ private:
     bool sendUpstream(const std::string& rest, uint32_t interval, bool renew);
     void upstreamReply(const std::string& rest, Status status, JsonVariantConst body);
     bool relayChange(std::string_view rest, JsonVariantConst patch);
+    // Under routesMutex_.
+    int activeLocked() const;
+    void updateOnlineLocked();
+    void rerouted(const Route& from, uint32_t nowMs);
+    void pump();
+    static void requeue(std::vector<Pending>& queue, Pending p);
+    void streamDone(Status s, JsonVariantConst body);
+    uint32_t streamTimeoutMs() const;
 
-    DatagramEndpoint* endpoint_;
-    PeerAddress peer_;
-    PeerAddress device_;
     std::string remotePath_;
     uint32_t timeoutMs_ = 0;
+
+    mutable Mutex routesMutex_;  // a leaf: nothing is called while it is held
+    std::vector<RouteSlot> routes_;
+    std::vector<TransportKind> order_;
+    bool hasOrder_ = false;
+    uint32_t nextRoute_ = 0;
+    PeerAddress device_;
+    // The route tick() last saw in use, to notice a switch.
+    DatagramEndpoint* lastEndpoint_ = nullptr;
+    PeerAddress lastPeer_;
+    bool lastOnline_ = true;
+    std::atomic<bool> announce_{false};
+    uint32_t probeMs_ = 5000;
+    uint32_t lastProbeMs_ = 0;  // mounted, or a route added: tick() tells onStateChange()
 
     bool mirror_ = false;
     uint32_t mirrorIntervalMs_ = 500;
     uint32_t refreshMs_ = 30000;
     uint32_t lastSubscribeMs_ = 0;
-    bool subscribing_ = false;
+    std::atomic<bool> subscribing_{false};
     bool subscribedOnce_ = false;
     mutable Mutex mutex_;
     JsonDocument copy_;
@@ -139,6 +258,15 @@ private:
     std::atomic<bool> online_{true};
     std::atomic<uint32_t> advertisedSchema_{0};
     std::string ownedName_;
+
+    // Streamed sets, guarded by streamMutex_ (a leaf like routesMutex_).
+    mutable Mutex streamMutex_;
+    std::vector<Pending> queue_;
+    Pending flying_;
+    bool inFlight_ = false;
+    size_t streamLimit_ = 8;
+    StreamStats streamStats_;
+    StreamErrorHandler onStreamError_;
 };
 
 }  // namespace tesser

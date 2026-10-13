@@ -98,7 +98,7 @@ DatagramEndpoint::~DatagramEndpoint() {
     {
         MutexGuard guard(mutex_);
         calls_.clear();
-        for (RemoteNode* r : remotes_) r->detach();
+        for (RemoteNode* r : remotes_) r->detach(this);
         remotes_.clear();
     }
     files_.clear();
@@ -122,9 +122,13 @@ Subscriber* DatagramEndpoint::subscriberFor(const PeerAddress& peer, bool create
 }
 
 void DatagramEndpoint::dropPeer(const PeerAddress& peer) {
-    expire(0, true, &peer);
+    // Offline first: a remote node whose call fails below goes by another
+    // route at once.
     markOnline(peer, false);
+    expire(0, true, &peer);
     dropFiles(&peer, 0);
+    bool wasHeard = false;
+    PeerAddress device;
     {
         MutexGuard guard(mutex_);
         for (size_t i = 0; i < tokens_.size(); i++) {
@@ -133,14 +137,82 @@ void DatagramEndpoint::dropPeer(const PeerAddress& peer) {
                 break;
             }
         }
+        if (Known* k = knownLocked(peer)) {
+            wasHeard = k->online;
+            k->online = false;
+            device = k->device;
+        }
     }
-    MutexGuard guard(subscribersMutex_);
-    for (size_t i = 0; i < subscribers_.size(); i++) {
-        if (subscribers_[i]->peer != peer) continue;
-        if (api_) api_->dropSubscriber(subscribers_[i]);
-        delete subscribers_[i];
-        subscribers_.erase(subscribers_.begin() + static_cast<std::ptrdiff_t>(i));
-        break;
+    {
+        MutexGuard guard(subscribersMutex_);
+        for (size_t i = 0; i < subscribers_.size(); i++) {
+            if (subscribers_[i]->peer != peer) continue;
+            if (api_) api_->dropSubscriber(subscribers_[i]);
+            delete subscribers_[i];
+            subscribers_.erase(subscribers_.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
+    if (wasHeard && onPeerLost_) onPeerLost_(peer, device);
+}
+
+DatagramEndpoint::Known* DatagramEndpoint::knownLocked(const PeerAddress& peer) {
+    for (Known& k : known_) {
+        if (k.peer == peer) return &k;
+    }
+    return nullptr;
+}
+
+// Remembers a peer heard from; past 32, the one silent longest is forgotten.
+DatagramEndpoint::Known& DatagramEndpoint::learnLocked(const PeerAddress& peer, uint32_t now) {
+    if (Known* k = knownLocked(peer)) {
+        k->online = true;
+        k->heardMs = now;
+        return *k;
+    }
+    if (known_.size() >= 32) {
+        size_t oldest = 0;
+        for (size_t i = 1; i < known_.size(); i++) {
+            bool older = known_[i].online == known_[oldest].online
+                             ? static_cast<int32_t>(known_[i].heardMs - known_[oldest].heardMs) < 0
+                             : !known_[i].online;
+            if (older) oldest = i;
+        }
+        known_.erase(known_.begin() + static_cast<std::ptrdiff_t>(oldest));
+    }
+    // A NowTP address is the device's MAC.
+    known_.push_back(Known{peer, kind_ == TransportKind::NowTP ? peer : PeerAddress(), true, now});
+    return known_.back();
+}
+
+bool DatagramEndpoint::deviceOnline(const PeerAddress& device) const {
+    if (!device.length) return false;
+    MutexGuard guard(mutex_);
+    for (const Known& k : known_) {
+        if (k.online && k.device == device) return true;
+    }
+    return false;
+}
+
+PeerAddress DatagramEndpoint::deviceOf(const PeerAddress& peer) const {
+    MutexGuard guard(mutex_);
+    for (const Known& k : known_) {
+        if (k.peer == peer) return k.device;
+    }
+    return kind_ == TransportKind::NowTP ? peer : PeerAddress();
+}
+
+void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLostHandler lost) {
+    auto shared = std::make_shared<std::vector<DatagramEndpoint*>>(std::move(endpoints));
+    for (DatagramEndpoint* ep : *shared) {
+        ep->onPeerLost([shared, lost](const PeerAddress& peer, const PeerAddress& device) {
+            if (device.length) {
+                for (DatagramEndpoint* other : *shared) {
+                    if (other->deviceOnline(device)) return;
+                }
+            }
+            if (lost) lost(peer, device);
+        });
     }
 }
 
@@ -202,7 +274,7 @@ bool DatagramEndpoint::process() {
         MutexGuard guard(mutex_);
         remotes = remotes_;
     }
-    for (RemoteNode* r : remotes) r->tick(now);
+    for (RemoteNode* r : remotes) r->tick(*this, now);
     dropFiles(nullptr, now);
     checkAdvertisement(now);
     return worked || pendingCalls() != before;
@@ -306,6 +378,8 @@ void DatagramEndpoint::handle(Incoming& msg) {
         uint32_t id = env["id"].as<uint32_t>();
         ResponseHandler done;
         BroadcastHandler each;  // a broadcast call stays open for more replies
+        uint32_t sentMs = 0;
+        std::vector<RemoteNode*> remotes;
         {
             MutexGuard guard(mutex_);
             stats_.responses++;
@@ -317,11 +391,18 @@ void DatagramEndpoint::handle(Incoming& msg) {
                 }
                 if (calls_[i].to == msg.from) {
                     done = std::move(calls_[i].done);
+                    sentMs = calls_[i].sentMs;
+                    remotes = remotes_;
                     calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(i));
                     break;
                 }
             }
             if (!done && !each) stats_.unmatched++;
+        }
+        if (done) {
+            // The round trip, for the routes through this peer.
+            uint32_t rtt = (clock_ ? clock_() : 0) - sentMs;
+            for (RemoteNode* r : remotes) r->routeRoundTrip(this, msg.from, rtt);
         }
         Status s = Status::Internal;
         parseStatus(env["status"].as<const char*>(), s);
@@ -341,7 +422,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
         // Remote nodes take what concerns their mirror; the application's
         // handler and clients of the peer still see everything.
         for (RemoteNode* r : remotes) {
-            if (r->handleNotification(msg.from, env)) break;
+            if (r->handleNotification(*this, msg.from, env)) break;
         }
         std::vector<std::shared_ptr<ClientInbox>> inboxes;
         {
@@ -369,6 +450,11 @@ void DatagramEndpoint::handle(Incoming& msg) {
     req.client.transport = kind_;
     memcpy(req.client.address, msg.from.bytes, msg.from.length < 16 ? msg.from.length : 16);
     req.client.addressLength = msg.from.length < 16 ? msg.from.length : 16;
+    PeerAddress device = deviceOf(msg.from);
+    if (device.length == 6) {
+        memcpy(req.client.device, device.bytes, 6);
+        req.client.deviceLength = 6;
+    }
     // A trusted peer is admin; any other is where the token check puts its
     // token, like an HTTP request's, and at least at setPeerAccess().
     if (trust_ && trust_(msg.from)) {
@@ -530,8 +616,8 @@ bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, const std
     {
         MutexGuard guard(mutex_);
         if (calls_.size() >= options_.maxCalls) return false;
-        calls_.push_back(
-            CallSlot{id, to, now + (timeoutMs ? timeoutMs : options_.timeoutMs), std::move(done), owner, nullptr});
+        calls_.push_back(CallSlot{id, to, now + (timeoutMs ? timeoutMs : options_.timeoutMs), std::move(done), owner,
+                                  nullptr, now});
     }
     if (send_ && send_(to, envelope, Delivery::Reliable)) return true;
     MutexGuard guard(mutex_);
@@ -617,7 +703,7 @@ bool DatagramEndpoint::broadcast(const PeerAddress& to, Op op, std::string_view 
         id = nextId_++;
         if (nextId_ == 0) nextId_ = 1;
         calls_.push_back(CallSlot{id, to, now + (windowMs ? windowMs : options_.timeoutMs), nullptr, owner,
-                                  std::move(onReply)});
+                                  std::move(onReply), now});
     }
     if (send_ && send_(to, buildRequestEnvelope(id, op, path, Query(), bodyJson), Delivery::BestEffort)) {
         return true;
@@ -645,9 +731,20 @@ void DatagramEndpoint::cancelCalls(const void* owner) {
 
 void DatagramEndpoint::addRemote(RemoteNode* remote) {
     MutexGuard guard(mutex_);
+    for (RemoteNode* r : remotes_) {
+        if (r == remote) return;
+    }
     remotes_.push_back(remote);
+}
+
+void DatagramEndpoint::routeAdded(RemoteNode* remote, const PeerAddress& peer) {
+    MutexGuard guard(mutex_);
     for (auto& a : advertised_) {
-        if (a.first == remote->peer()) remote->setAdvertisedSchema(a.second);
+        if (a.first == peer) remote->setAdvertisedSchema(a.second);
+    }
+    // What this endpoint knows of the peer holds for the new route too.
+    if (Known* k = knownLocked(peer)) {
+        remote->setRouteOnline(this, peer, k->online, k->online ? k->heardMs : 0);
     }
 }
 
@@ -686,8 +783,13 @@ void DatagramEndpoint::forgetPeer(const PeerAddress& peer) {
 
 void DatagramEndpoint::mountPeers(Object& parent, uint32_t mirrorIntervalMs) {
     MutexGuard guard(mutex_);
-    mountParent_ = &parent;
-    mountMirrorMs_ = mirrorIntervalMs;
+    for (auto& m : mounts_) {
+        if (m.first == &parent) {
+            m.second = mirrorIntervalMs;
+            return;
+        }
+    }
+    mounts_.emplace_back(&parent, mirrorIntervalMs);
 }
 
 void DatagramEndpoint::peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash,
@@ -708,10 +810,10 @@ void DatagramEndpoint::peerSeen(const PeerAddress& peer, std::string_view name, 
 }
 
 void DatagramEndpoint::markOnline(const PeerAddress& peer, bool online) {
+    uint32_t now = clock_ ? clock_() : 0;
     MutexGuard guard(mutex_);
-    for (RemoteNode* r : remotes_) {
-        if (r->peer() == peer) r->setOnline(online);
-    }
+    if (online) learnLocked(peer, now);
+    for (RemoteNode* r : remotes_) r->setRouteOnline(this, peer, online, now);
 }
 
 namespace {
@@ -733,14 +835,20 @@ std::string nodeName(std::string_view advertised) {
 }  // namespace
 
 void DatagramEndpoint::applySeen(const Seen& seen) {
-    Object* parent;
-    uint32_t mirrorMs;
+    std::vector<std::pair<Object*, uint32_t>> mounts;
+    // The device: a NowTP address is its MAC; other links advertise it.
+    const PeerAddress& device = seen.device.length || kind_ != TransportKind::NowTP ? seen.device : seen.peer;
+    std::vector<RemoteNode*> routed;  // nodes with a route through the peer
     {
         MutexGuard guard(mutex_);
+        uint32_t now = clock_ ? clock_() : 0;
+        Known& k = learnLocked(seen.peer, now);
+        if (device.length) k.device = device;
         for (RemoteNode* r : remotes_) {
-            if (r->peer() != seen.peer) continue;
-            r->setOnline(true);
+            if (!r->hasRoute(this, seen.peer)) continue;
+            r->setRouteOnline(this, seen.peer, true, now);
             r->setAdvertisedSchema(seen.schemaHash);
+            routed.push_back(r);
         }
         bool found = false;
         for (auto& a : advertised_) {
@@ -750,21 +858,33 @@ void DatagramEndpoint::applySeen(const Seen& seen) {
             }
         }
         if (!found) advertised_.emplace_back(seen.peer, seen.schemaHash);
-        parent = mountParent_;
-        mirrorMs = mountMirrorMs_;
+        mounts = mounts_;
     }
-    if (!parent || !api_) return;
-
-    // The device: a NowTP address is its MAC; other links advertise it.
-    const PeerAddress& device = seen.device.length || kind_ != TransportKind::NowTP ? seen.device : seen.peer;
+    if (!api_) return;
     MutexGuard apiGuard(api_->mutex());
-    // A parent mounts each peer once, and each device once whatever the
-    // transport: the first to announce it mounts it.
+    // A node declared with this address learns the device it reaches.
+    if (device.length) {
+        for (RemoteNode* r : routed) {
+            if (!r->device().length) r->setDevice(device);
+        }
+    }
+    for (auto& m : mounts) mount(*m.first, m.second, seen, device);
+}
+
+// Under the API lock.
+void DatagramEndpoint::mount(Object& parentRef, uint32_t mirrorMs, const Seen& seen, const PeerAddress& device) {
+    Object* parent = &parentRef;
+    // A parent mounts each device once: the first transport to announce it
+    // mounts it, and the others add their routes to that node.
     for (const Node* c = parent->first(); c; c = c->next()) {
         if (c->type() != NodeType::Remote) continue;
-        auto* r = static_cast<const RemoteNode*>(c);
-        if (r->endpoint() == this && r->peer() == seen.peer) return;
-        if (device.length && r->device() == device) return;
+        auto* r = const_cast<RemoteNode*>(static_cast<const RemoteNode*>(c));
+        if (r->hasRoute(this, seen.peer)) return;
+        if (device.length && r->device() == device) {
+            r->addRoute(*this, seen.peer);
+            r->setAdvertisedSchema(seen.schemaHash);
+            return;
+        }
     }
     // Named after the peer; when that is taken or empty, the last three bytes
     // of its device's address (or its own) are added.

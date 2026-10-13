@@ -43,6 +43,9 @@ struct Query {
 
 enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket, Udp };
 
+// "local" / "serial" / "http" / "nowtp" / "websocket" / "udp".
+const char* toString(TransportKind kind);
+
 // Access levels, ordered (docs/DESIGN.md section 13): a client has one, and a
 // node may require one to be read or written.
 enum class Access : uint8_t { Public, User, Admin };
@@ -56,6 +59,10 @@ struct Client {
     TransportKind transport = TransportKind::Local;
     uint8_t address[16] = {};  // IPv4/IPv6 or MAC, transport-defined
     uint8_t addressLength = 0;
+    // The client's device (its Wi-Fi station MAC) when the transport knows
+    // it: a NowTP address, or the "id" a UDP peer advertises.
+    uint8_t device[6] = {};
+    uint8_t deviceLength = 0;
     bool authenticated = false;
     // Set by transports that know the client's level (token checks); an
     // authenticated client without one has full access.

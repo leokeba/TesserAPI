@@ -889,7 +889,7 @@ nowApi.remote(api, "kitchen", kitchenMac);              // or api.remote("kitche
 nowApi.remote(api, "light", kitchenMac, "/lamp").mirror(200);
 ```
 
-- **Forwarding:** get and set on `/kitchen/...` are forwarded with the path rewritten, and complete through a deferred reply (`maxPending` applies). Error paths in the remote's reply are mapped back under the local path (`/kitchen/nope`). A silent node answers `timeout` after the node's `timeout()` (default: the endpoint's 3 s). Transports that can't wait get `not_allowed`.
+- **Forwarding:** get and set on `/kitchen/...` are forwarded with the path rewritten, and complete through a deferred reply (`maxPending` applies). Error paths in the remote's reply are mapped back under the local path (`/kitchen/nope`). A silent node answers `timeout` after the node's `timeout()` (default: the endpoint's 3 s). A node known to be offline (§14.1) isn't sent to: get, set and a subscription that needs the remote fail at once with `timeout` and `peer offline`, without taking a pending slot. Transports that can't wait get `not_allowed`.
 - **File transfers** to a file node below a remote node (`PUT /api/peers/lamp/sys/firmware`) are relayed to the remote as `upload` and `download` envelopes (§10.1.1), one at a time, in the remote's chunks, whatever the client's transport.
   - **Message clients** (serial, Bluetooth, WebSocket, NowTP) send their envelopes to the gateway as to any node. Each reply is deferred until the remote's comes (`maxPending` applies; transports that can't wait get `not_allowed`), so the gateway's task never waits for the remote. `received` counts the bytes the remote has. The opening reply's `chunk` is the smaller of the gateway's and the remote's, so each envelope takes one round trip; a larger one is split. Downloads come in the remote's chunks as it sent them, base64 included: the client's `length` is passed on, capped at the gateway's own chunk.
   - **HTTP** moves raw bytes, and its requests don't say whether the path is a file. A `GET` (value view), `PUT` or `POST` below a remote node therefore first asks the remote for the path's schema, at depth 0: one round trip (about 20 ms over NowTP). A file node is relayed; anything else is forwarded as usual, and an unreachable remote is an error at once. The relay runs in the httpd task, which waits for each chunk's reply, so the body is read only as fast as the remote takes it, and the client's upload progress follows the remote. Meanwhile the server, WebSocket connections included, serves nothing else: measured between two ESP32 devkits over NowTP, a relayed upload runs at about 32 KB/s (downloads 37 KB/s), so a 1 MB image holds the server for about half a minute. A user interface that must stay live while it updates a remote node uploads over WebSocket envelopes instead (about 21 KB/s, one round trip from the browser per chunk), whose relay never holds the task.
@@ -925,20 +925,21 @@ nowApi.mountPeers(api.object("peers"));   // also mounts the peers already disco
 nowApi.advertise();                       // on every node, once its tree is complete; kept current after that
 ```
 
-- **Mounting:** each peer that advertises TesserAPI on the transport's port becomes a remote node under the parent, named after its advertised name (NowTP: its discovery name). Characters a name can't hold become `-`. If the name is empty or taken, the last three bytes of the device's MAC (or, without one, of its address) are appended (`tesser-lamp-75f303`). `mountPeers(parent, intervalMs)` also mirrors them. A peer already mounted under the parent isn't mounted again. Remote nodes of the peer elsewhere in the tree (declared ones) don't prevent it, but they share its online state and schema hash, including remote nodes declared after the announcement.
-- **One node per device:** a parent mounts each device once, whatever the transport. A NowTP peer is its MAC; a UDP peer advertises its Wi-Fi station MAC (§10.7), the address NowTP uses. The first transport to announce a device mounts it, and the others' announcements of it are ignored under that parent: the node follows its first transport (its online state, its address). That keeps a `*` fan-out (§6.5) from reaching a device twice. To have both, mount each transport's peers under a parent of its own. (A node that runs ESP-NOW from its soft-AP interface is reached from its AP MAC, so it would be mounted twice.)
-- **Nodes are never removed.** A lost peer stays mounted and shows offline; it comes back online as soon as it is heard from or announces itself again.
-- **Remote node stub:** the parent's schema shows each remote node's state. `"online": false` appears while the peer is lost, and `"schema"` is the hash the peer advertises, so a client can cache the peer's own schema under it:
+- **Mounting:** each peer that advertises TesserAPI on the transport's port becomes a remote node under the parent, named after its advertised name (NowTP: its discovery name). Characters a name can't hold become `-`. If the name is empty or taken, the last three bytes of the device's MAC (or, without one, of its address) are appended (`tesser-lamp-75f303`). `mountPeers(parent, intervalMs)` also mirrors them; each call adds a parent, so one endpoint can mount its peers in several places (calling it again for a parent only changes the interval). A peer already mounted under the parent isn't mounted again. Remote nodes of the peer elsewhere in the tree (declared ones) don't prevent it, but they share its online state and schema hash, including remote nodes declared after the announcement.
+- **One node per device:** a parent mounts each device once, whatever the transport. A NowTP peer is its MAC; a UDP peer advertises its Wi-Fi station MAC (§10.7), the address NowTP uses. The first transport to announce a device mounts it; another transport's announcement of the same device adds a route to that node (§14.3), so requests can go either way. That keeps a `*` fan-out (§6.5) from reaching a device twice. (A node that runs ESP-NOW from its soft-AP interface is reached from its AP MAC, so it would be mounted twice.)
+- **Declared devices:** a node declared with an address (`peers.remote("far-lamp", udp.endpoint(), udpAddress(10, 0, 2, 7, 8484))`, for a device on another subnet whose advertisements don't arrive) is the same device as a mounted one: when that address advertises, the node takes the device's MAC, and the device's other transports add their routes to it rather than mounting it again. `RemoteNode::byDevice(parent, mac)` finds the node of a device (under the API lock).
+- **Nodes are never removed.** A lost peer stays mounted and shows offline; it comes back online as soon as it is heard from or announces itself again. A node also probes each offline route every 5 s (`probe(ms)`, 0 to stop) with a get at depth 0, so a device that doesn't advertise comes back when it answers.
+- **Remote node stub:** the parent's schema shows each remote node's state. `"online": false` appears while the peer is lost, `"route"` names the transport in use when the node has several (§14.3), `"schema"` is the hash the peer advertises, so a client can cache the peer's own schema under it, and `"id"` is the device's MAC (12 hex digits) when known, so a client can refer to a node by device rather than by name. None of these is part of the hash (§7):
 
   ```json
   GET /peers?view=schema&depth=1
   {"type": "object", "children": {
-     "tesser-lamp": {"type": "remote", "schema": "1a2b3c4d"},
-     "heliostat-3": {"type": "remote", "online": false, "schema": "99f0e1aa"}}}
+     "tesser-lamp": {"type": "remote", "route": "udp", "schema": "1a2b3c4d", "id": "10521c75f37c"},
+     "heliostat-3": {"type": "remote", "online": false, "schema": "99f0e1aa", "id": "8cbfea8ff250"}}}
   ```
 
-- **Watching the list:** mounting a peer, a change of its online state and a new advertised hash all mark the remote node changed. Only the mount changes the gateway's own schema hash (§7). A subscriber of the parent (depth 1) gets `{"heliostat-3": null}` for an unmirrored node, which is its cue to re-read the parent's schema.
-- **Generic core:** `DatagramEndpoint::mountPeers()` and `peerSeen(address, name, schemaHash, device)` do the work, host-tested with the in-memory link. The NowTP adapter only parses advertisements and forwards peer events; `UdpLink` reads its own (§10.7). Online state comes from the endpoint: `forgetPeer()` marks a peer's remote nodes offline, and any message from the peer marks them online.
+- **Watching the list:** mounting a peer, a change of its online state or route and a new advertised hash all mark the remote node changed. Only the mount changes the gateway's own schema hash (§7). A subscriber of the parent (depth 1) gets `{"heliostat-3": null}` for an unmirrored node, which is its cue to re-read the parent's schema.
+- **Generic core:** `DatagramEndpoint::mountPeers()` and `peerSeen(address, name, schemaHash, device)` do the work, host-tested with the in-memory link. The NowTP adapter only parses advertisements and forwards peer events; `UdpLink` reads its own (§10.7). Online state comes from the endpoint: `forgetPeer()` marks the peer's routes offline, and any message from the peer marks them online; a node is online while one of its routes is.
 
 ### 14.2 ApiClient
 
@@ -960,6 +961,54 @@ client.process();                                   // from the UI loop: runs th
 - **`LocalClient`** goes through `Api::handle()` like a transport, as a `Subscriber`, so subscriptions, deferred actions, queued mode and remote nodes behave as they do for remote clients. Its requests count as authenticated, with `admin` access, unless `setAuthenticated(false)` (`public`). `setAccess(level)` makes its requests and subscriptions act at that level, like an HTTP client whose token has it (authenticated unless `public`): a bridge to an outside protocol such as MQTT uses `Access::User` so that its clients can't reach admin settings, and its notifications leave out what a user can't read. Destroying it drops its subscriptions.
 - **`PeerClient`** sends through a `DatagramEndpoint` and gets the notifications its peer sends to that endpoint. These are per peer, not per client: two clients of the same peer on one endpoint both see both clients' notifications. Destroying it unsubscribes what it subscribed to.
 - **Bodies** are JSON text in, `JsonVariantConst` out. A response that arrives after its client is gone is dropped.
+
+### 14.3 Routes and streamed sets
+
+A device can be reachable several ways, over Ethernet (UDP) and ESP-NOW (NowTP) say. Its remote node then holds one route per way, and a stream of writes to it keeps its order whichever way it goes:
+
+```cpp
+tesser::RemoteNode::setDefaultRouteOrder({tesser::TransportKind::Udp, tesser::TransportKind::NowTP});
+udp.mountPeers(api.object("peers"));
+nowApi.mountPeers(api.object("peers"));          // the same devices: routes, not new nodes
+
+tesser::RemoteNode* node = tesser::RemoteNode::byDevice(peers, mac);
+node->stream("/outputs", "{\"3\":{\"on\":true,\"frequency\":440,\"duty\":78}}");   // never waits
+```
+
+- **Routes:** a route is an endpoint and the device's address on it, with its own online state, the time it was last heard (`heardMs`) and the smoothed round trip of the calls made on it (`rttMs`). `mountPeers()` on several endpoints under one parent gives a device's node one route per endpoint (§14.1); `addRoute(endpoint, address)` adds one by hand. `routes()` lists them in the order they are tried, and `route(r)` gives the one in use.
+- **Order:** requests go by the first online route in the order; with none online, by the first. The order is a list of transports: `RemoteNode::setDefaultRouteOrder()` for every node, `node.routeOrder()` for one (an empty list falls back to the default). Routes of a transport the list doesn't name come after, in the order they were added; with no order at all, the first transport to announce the device is preferred. A new order takes effect at once. `toString(TransportKind)` names the transports (`"udp"`, `"nowtp"`, ...).
+- **Failover:** a route goes offline when its endpoint forgets the peer: over UDP when a message isn't acknowledged within `sendTimeoutMs` (3 s), or the device says goodbye or restarts; over NowTP when discovery reports it lost. Requests then take the next route, and come back to the preferred one as soon as it is heard again: an advertisement, any message, or the probe of §14.1. Calls in flight on a lost route fail with `timeout` (forwarded requests aren't sent again: a set may have been applied); streamed sets go again on the next route (below).
+- **Subscriptions follow:** on a switch, the mirror and forwarded subscriptions subscribe again on the new route, at once; when the switch is back to a preferred route while the other still works, the old subscriptions are dropped. Notifications are taken from the route in use only, so an event isn't delivered twice.
+- **State:** `online()` is true while one route is. The schema stub shows `"route"` when there are several (§14.1). `RemoteNode::onStateChange(fn)`, one hook for every node, runs in an endpoint's `process()`, without the API lock, when a node is created or gets a route and when its online state or route in use changes, so an application can apply stored settings to a device when it first appears and report failovers.
+- **Streamed sets:** `node.stream(path, bodyJson)` writes below the node without waiting, from any task, under the API lock or not. It returns at once: `ok` (queued), `timeout` (the node is offline), `busy` (the queue is full), `bad_request` (not JSON).
+  - **In order:** at most one streamed set per node is in flight; the others wait in a queue of `streamLimit()` sets (8). So they are applied in the order they were made, over UDP and NowTP, which don't keep order, and across a route switch, without anything new on the receiving side.
+  - **Merged:** a set to a path that is already queued is merged into the queued one, as a patch (§6.3): objects merge, anything else replaces. `{"3":{...}}` and then `{"5":{...}}` to `/outputs` go as one patch, and the newest value of each key wins. A set to a path above or below a queued one isn't merged across it. Streams converge on the latest state: they don't replay every set. A note on and its note off made while a set is in flight go as the note off alone, so a note shorter than a round trip (or than a retransmission, during a loss) never sounds. Streams are for state: two action calls merge into one.
+  - **Again:** a set whose reply doesn't come within twice the node's timeout (longer than the link takes to give up, so it can't still arrive later), or that the device answers `busy`, goes again, with the sets queued for its path merged on top, at most three times; on the next route if its route was lost.
+  - **Dropped:** a set the device refuses (an error reply) is dropped; so is everything queued once the node is offline, or a set out of attempts. `onStreamError(fn)` hears of each (`path`, status, the device's error body), in an endpoint's `process()`. `streamStats()` counts sets queued, merged, sent and failed; `streaming()` those queued or in flight.
+  - **Cost:** a set in flight takes one of the endpoint's calls (`Options::maxCalls`, 8): raise it to the number of nodes streamed to at once. A set that finds no call free, or no room on the link, waits for the endpoint's next `process()`. Streams don't take the API's pending slots. A lost datagram holds a node's queue until the link sends it again (100 ms over UDP); meanwhile the queue keeps only the latest state.
+- **Generic core:** routes and streams live in `RemoteNode`, host-tested with UDP and NowTP links that lose datagrams.
+
+### 14.4 Driving a node: the writer and its loss
+
+A node whose outputs another node drives (a master playing MIDI to its slaves) needs to know who writes, and when that writer is gone, to undo what it did.
+
+```cpp
+api.object("outputs").value("3", out3, [&](const Output& o) {
+    const tesser::Client* c = api.currentClient();   // who is writing, during the request
+    owner3 = c ? tesser::PeerAddress::fromBytes(c->device, c->deviceLength) : tesser::PeerAddress();
+    out3 = o;
+});
+tesser::watchDevices({&udp.endpoint(), &nowApi.endpoint()}, [&](const tesser::PeerAddress& peer,
+                                                               const tesser::PeerAddress& device) {
+    tesser::Lock lock(api);
+    releaseOutputsOf(device);                         // gone from every transport
+});
+```
+
+- **The writer:** `Api::currentClient()` is the client of the request being handled (null outside one), for setters, actions and validators. Besides its transport and address, `Client::device` holds the MAC of the device it is, when the transport knows it: a NowTP address, or the `id` a UDP peer advertises (§10.7).
+- **Peer lost:** `DatagramEndpoint::onPeerLost(fn(peer, device))` runs in `process()`, without the API lock, when a peer the endpoint had heard from is forgotten: a failed delivery, a goodbye, a restart (UDP's new nonce), silence, `stop()`. `device` is its MAC when known. A peer is reported once, until it is heard again. `deviceOnline(mac)` says whether the endpoint has heard the device since it last lost it, and `deviceOf(address)` gives a peer's device.
+- **Across transports:** a master reached over UDP and NowTP that fails over from one to the other is still there. `tesser::watchDevices(endpoints, fn)` takes the endpoints' `onPeerLost()` and calls `fn` only once the device is gone from all of them (a peer without a known device: when that peer is). A device lost on two endpoints at the same moment may be reported twice.
+- **Silence needs advertisements:** a quiet client sends nothing, so silence only counts for peers that advertise: the master calls `UdpLink::advertise()` (with `setDeviceId()`, for the device to be known over UDP), or is in NowTP discovery. Goodbyes, restarts and failed deliveries are noticed either way.
 
 ## 15. Memory budget
 
@@ -1038,6 +1087,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
    - `test/e2e_serial.py`, `test/e2e_http.py`, `test/e2e_ws.py`
    - `test/e2e_nowtp.py` and `test/e2e_gateway.py`, on two boards
    - `test/e2e_udp.py`, on two boards and the machine running it, over `test/udp_client.py`, a Python implementation of the UDP link
+   - `test/e2e_routes.py`, on two boards that reach each other over UDP and NowTP: streamed sets in order while one board's UDP goes off and on (§14.3)
    - `test/e2e_persist.py`, which reboots the board through the serial port
 4. **Transport conformance:** `test/conformance.py` sends the same request vectors through serial, HTTP, WebSocket and NowTP (both directions), and every transport must give the same results.
 5. **CI:** host tests, plus ESP-IDF 5.1 / 5.4 / 5.5 / latest × ESP32 / ESP32-C3 (test firmware and examples), plus Arduino-ESP32 3.x × ESP32 / ESP32-C3 (example sketches).
@@ -1059,6 +1109,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 11 | File transfers over the message transports (serial, Bluetooth, WebSocket, NowTP) | done |
 | 12 | File transfers relayed through gateways, for TesserKIT's fleet updates | done |
 | 13 | UDP transport: LAN discovery and broadcast writes, for TesserKIT's sequencer; tokens and a least level for datagram peers | done |
+| 14 | Routes over several transports with failover, streamed sets in order, the writer's device and peer loss on the receiving side, for a master driving other nodes | done |
 
 ## 19. Decisions on former open questions
 

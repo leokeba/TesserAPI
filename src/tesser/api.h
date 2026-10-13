@@ -61,6 +61,10 @@ class Storage;
 class FileTransfer;
 class RemoteNode;
 class TransferHolder;
+class Api;
+namespace detail {
+void handleNested(Api& api, const Request& request, Reply& reply);
+}
 
 // Decides whether a client may perform an operation on a node. Consulted for
 // the target of every request, and for every node a patch touches.
@@ -98,6 +102,12 @@ public:
     void handle(const Request& request, Reply& reply);
 
     Mutex& mutex() { return mutex_; }
+
+    // The client whose request is being handled, for setters, actions and
+    // validators that want to know who writes (its transport, address and
+    // device); null outside a request. Valid under the API lock, until the
+    // handler returns.
+    const Client* currentClient() const { return current_; }
 
     // Deferred calls in flight.
     int pending() const { return pending_.load(); }
@@ -248,6 +258,8 @@ private:
     mutable Mutex queueMutex_;  // never held with the API lock
     std::vector<QueuedRequest*> queue_;  // a vector: an empty deque allocates
     Api* nextApi_ = nullptr;  // registry used by EventNode
+    const Client* current_ = nullptr;  // under mutex_: see currentClient()
+    friend void detail::handleNested(Api&, const Request&, Reply&);
 };
 
 // Holds the API lock: use it when another task changes bound state while
