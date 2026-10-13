@@ -5,6 +5,7 @@
 
 #if defined(ESP_PLATFORM)
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
 #include "tesser/api.h"
@@ -33,6 +34,15 @@ void logv(char level, const char* fmt, va_list ap) {
 }
 
 }  // namespace
+
+bool stationMac(uint8_t mac[6]) {
+#if defined(ESP_PLATFORM)
+    return esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK;
+#else
+    (void)mac;
+    return false;
+#endif
+}
 
 uint32_t millis32() {
 #if defined(ESP_PLATFORM)

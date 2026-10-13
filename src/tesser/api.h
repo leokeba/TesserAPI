@@ -103,6 +103,15 @@ public:
 
     Mutex& mutex() { return mutex_; }
 
+    // The device this API runs on (docs/DESIGN.md section 14.1), shown as
+    // "id" at the root of the schema (not hashed) and in the HTTP server's
+    // mDNS record: the station MAC on target, or what setDeviceId() set
+    // (a node reached by its soft-AP MAC, tests). False when unknown.
+    void setDeviceId(const uint8_t mac[6]);
+    bool deviceId(uint8_t mac[6]) const;
+    // "c8f09ef4a67c"; empty when unknown.
+    std::string deviceIdHex() const;
+
     // The client whose request is being handled, for setters, actions and
     // validators that want to know who writes (its transport, address and
     // device); null outside a request. Valid under the API lock, until the
@@ -259,6 +268,8 @@ private:
     std::vector<QueuedRequest*> queue_;  // a vector: an empty deque allocates
     Api* nextApi_ = nullptr;  // registry used by EventNode
     const Client* current_ = nullptr;  // under mutex_: see currentClient()
+    uint8_t deviceId_[6] = {};
+    bool hasDeviceId_ = false;
     friend void detail::handleNested(Api&, const Request&, Reply&);
 };
 

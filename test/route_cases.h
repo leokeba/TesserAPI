@@ -592,4 +592,18 @@ TEST(route_per_interface) {
     CHECK_EQ(active(), "udp/ethernet");
 }
 
+TEST(route_own_device_id) {
+    // A node shows its own device at the root of its schema, as its stub
+    // does on a gateway, outside the hash.
+    cases::Device dev;
+    uint32_t hash = dev.api.schemaHash();
+    CHECK_EQ(cases::get(dev.api, "/", cases::schema(0)).body, "{\"type\":\"object\"}");  // unknown off target
+    PeerAddress mac = datagram_cases::addr(0x7c);
+    dev.api.setDeviceId(mac.bytes);
+    CHECK_EQ(dev.api.deviceIdHex(), "10521c75f37c");
+    CHECK_EQ(cases::get(dev.api, "/", cases::schema(0)).body, "{\"type\":\"object\",\"id\":\"10521c75f37c\"}");
+    CHECK(cases::get(dev.api, "/lamp", cases::schema(0)).body.find("\"id\"") == std::string::npos);
+    CHECK_EQ(dev.api.schemaHash(), hash);
+}
+
 }  // namespace route_cases

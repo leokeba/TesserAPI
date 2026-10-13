@@ -545,9 +545,14 @@ esp_err_t HttpServer::advertise(const char* instance, const char* hostname) {
     if (hostname && (err = mdns_hostname_set(hostname)) != ESP_OK) return err;
     if (instance) mdns_instance_name_set(instance);
     std::string api = base_.empty() ? std::string("/") : base_;
-    mdns_txt_item_t txt[2] = {{"api", api.c_str()}, {"ws", wsUri_ ? wsUri_ : ""}};
+    std::string id = api_.deviceIdHex();  // the device, as remote stubs show it
+    mdns_txt_item_t txt[3];
+    size_t n = 0;
+    txt[n++] = {"api", api.c_str()};
+    if (wsUri_) txt[n++] = {"ws", wsUri_};
+    if (!id.empty()) txt[n++] = {"id", id.c_str()};
     if (mdns_service_exists("_tesser", "_tcp", nullptr)) mdns_service_remove("_tesser", "_tcp");
-    return mdns_service_add(instance, "_tesser", "_tcp", port_, txt, wsUri_ ? 2 : 1);  // the TXT is copied
+    return mdns_service_add(instance, "_tesser", "_tcp", port_, txt, n);  // the TXT is copied
 #else
     (void)instance;
     (void)hostname;

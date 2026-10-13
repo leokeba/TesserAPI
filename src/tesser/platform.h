@@ -94,6 +94,10 @@ private:
 // Milliseconds since boot (wraps after ~49 days).
 uint32_t millis32();
 
+// The chip's Wi-Fi station MAC, the device id UDP advertises and NowTP
+// addresses (false off target).
+bool stationMac(uint8_t mac[6]);
+
 void logWarning(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void logError(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 

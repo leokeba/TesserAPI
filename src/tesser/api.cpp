@@ -55,6 +55,31 @@ const char* toString(TransportKind kind) {
     return "local";
 }
 
+void Api::setDeviceId(const uint8_t mac[6]) {
+    MutexGuard guard(mutex_);
+    memcpy(deviceId_, mac, 6);
+    hasDeviceId_ = true;
+}
+
+bool Api::deviceId(uint8_t mac[6]) const {
+    {
+        MutexGuard guard(mutex_);
+        if (hasDeviceId_) {
+            memcpy(mac, deviceId_, 6);
+            return true;
+        }
+    }
+    return stationMac(mac);
+}
+
+std::string Api::deviceIdHex() const {
+    uint8_t mac[6];
+    if (!deviceId(mac)) return std::string();
+    char hex[13];
+    snprintf(hex, sizeof(hex), "%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return hex;
+}
+
 bool parseTransportKind(std::string_view s, TransportKind& out) {
     static const TransportKind all[] = {TransportKind::Local,     TransportKind::Serial, TransportKind::Http,
                                         TransportKind::NowTP,     TransportKind::WebSocket, TransportKind::Udp};
@@ -627,6 +652,14 @@ private:
 #endif
         w.beginObject();
         schemaAttributes(w, n);
+        if (&n == &api_ && !hashing_) {
+            // The device, as remote stubs elsewhere show it (§14.1); not hashed.
+            std::string id = api_.deviceIdHex();
+            if (!id.empty()) {
+                w.key("id");
+                w.string(id);
+            }
+        }
         if (n.type() == NodeType::Object && depth > 0) {
             w.key("children");
             renderChildren(w, static_cast<const Object&>(n), depth, f, View::Schema);
