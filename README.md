@@ -1,8 +1,8 @@
 # TesserAPI
 
-Describe your ESP32 firmware's state and operations **once**, as a tree of values and actions. Serve it as JSON over HTTP, over ESP-NOW (with [NowTP](https://github.com/leokeba/NowTP)), or over serial, from Arduino or ESP-IDF.
+Describe your ESP32 firmware's state and operations **once**, as a tree of values and actions. Serve it as JSON over HTTP, over ESP-NOW (with [NowTP](https://github.com/leokeba/NowTP)), over UDP on a LAN, or over serial, from Arduino or ESP-IDF.
 
-> **Status: early development.** The design is in [docs/DESIGN.md](docs/DESIGN.md). Everything in the design works and is tested on hardware: the core (tree, get/set/patch, shapes, schema, lists), subscriptions and events, persistence, access control, the serial, HTTP, WebSocket, NowTP and Bluetooth LE transports, and gateways that mount other nodes. The API will change before 1.0.
+> **Status: early development.** The design is in [docs/DESIGN.md](docs/DESIGN.md). Everything in the design works and is tested on hardware: the core (tree, get/set/patch, shapes, schema, lists), subscriptions and events, persistence, access control, the serial, HTTP, WebSocket, NowTP, UDP and Bluetooth LE transports, and gateways that mount other nodes. The API will change before 1.0.
 
 ```cpp
 #include <TesserAPI.h>
@@ -23,7 +23,7 @@ Every field declared this way is readable, writable (when bound to a variable or
 
 ## Querying the tree
 
-Every subtree is addressable. These examples use HTTP; the same requests work over the [message envelope](docs/DESIGN.md#101-message-envelope-nowtp-serial-websocket) on NowTP and serial.
+Every subtree is addressable. These examples use HTTP; the same requests work over the [message envelope](docs/DESIGN.md#101-message-envelope-nowtp-udp-serial-websocket) on NowTP, UDP and serial.
 
 | Request | Result |
 |---|---|
@@ -39,7 +39,7 @@ Every subtree is addressable. These examples use HTTP; the same requests work ov
 
 ## Live updates
 
-Message transports (serial, WebSocket, NowTP, Bluetooth) can subscribe to any subtree, and get sparse change notifications and events. Plain HTTP can too, with a long `GET /api/<path>?sub` that streams one notification per line:
+Message transports (serial, WebSocket, NowTP, UDP, Bluetooth) can subscribe to any subtree, and get sparse change notifications and events. Plain HTTP can too, with a long `GET /api/<path>?sub` that streams one notification per line:
 
 ```cpp
 auto& button = api.object("button");
@@ -75,7 +75,7 @@ api.file("firmware").maxSize(0x1E0000).accept(".bin").upload([](tesser::FileRequ
 api.file("backup").text([] { return api.persistedState(); }, restoreBackup);   // GET downloads, PUT uploads
 ```
 
-Over HTTP, a file node streams raw bytes both ways, outside the request body limit. Over serial, Bluetooth, WebSocket and NowTP, the client moves it in base64 chunks with `upload` and `download` envelopes, each giving its offset, so a chunk can be sent again after a lost reply. File nodes work in list elements too, so a directory can be a keyed list with a `content` file per entry, and uploads carry the client's file name (`?filename=` or `"filename"`).
+Over HTTP, a file node streams raw bytes both ways, outside the request body limit. Over serial, Bluetooth, WebSocket, NowTP and UDP, the client moves it in base64 chunks with `upload` and `download` envelopes, each giving its offset, so a chunk can be sent again after a lost reply. File nodes work in list elements too, so a directory can be a keyed list with a `content` file per entry, and uploads carry the client's file name (`?filename=` or `"filename"`).
 
 ## Gateway
 
@@ -124,6 +124,7 @@ api.mount("right", rightMotor);
 | Serial (`LineTransport`, `StreamTransport`, `UartTransport`) | one JSON envelope per line | done |
 | HTTP (`HttpServer`, on `esp_http_server`, also usable under PsychicHttp) | REST mapping, streamed chunked responses, streamed subscriptions (`?sub`), CORS, mDNS announcement | done |
 | NowTP (`NowTpTransport`, ESP-NOW) | one JSON envelope per message, reliable unicast; also a client for other nodes | done |
+| UDP (`UdpTransport`, lwIP sockets: Ethernet or Wi-Fi) | one JSON envelope per message, fragmented and reliable when unicast; discovery, and broadcast writes every node applies at once; also a client | done |
 | WebSocket (`HttpServer::enableWebSocket`) | JSON envelope, subscriptions | done |
 | Bluetooth LE (`BleTransport`, `<tesser/transports/ble_transport.h>`; Arduino, ESP-IDF with NimBLE) | serial lines over the Nordic UART Service | done |
 

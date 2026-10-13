@@ -41,7 +41,7 @@ struct Query {
     bool snapshot = true;   // reply with the current state (false: with null)
 };
 
-enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket };
+enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket, Udp };
 
 // Access levels, ordered (docs/DESIGN.md section 13): a client has one, and a
 // node may require one to be read or written.
@@ -65,11 +65,11 @@ struct Client {
 };
 
 // How a message to a client should be delivered, for transports that offer
-// a choice (NowTP).
+// a choice (NowTP, UDP).
 enum class Delivery : uint8_t {
     Reliable,    // retransmitted until acknowledged (requests, responses, events)
     LatestOnly,  // a newer message supersedes older ones
-    BestEffort,  // broadcast
+    BestEffort,  // sent once: broadcast
 };
 
 // A client that can receive notifications: one per persistent connection

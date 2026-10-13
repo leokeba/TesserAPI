@@ -60,6 +60,11 @@ public:
     // so clients can cache the remote's schema under it.
     uint32_t advertisedSchema() const { return advertisedSchema_.load(); }
     void setAdvertisedSchema(uint32_t hash);
+    // The device a mounted peer is (its MAC; empty when unknown), so that a
+    // parent mounts each device once, whatever the transport
+    // (docs/DESIGN.md section 14.1). Set by DatagramEndpoint::mountPeers().
+    const PeerAddress& device() const { return device_; }
+    void setDevice(const PeerAddress& device) { device_ = device; }
 
     // The mirrored copy (objects below `depth` levels as {}), or null.
     // Virtual like forward(): keeps the remote code out of applications
@@ -115,6 +120,7 @@ private:
 
     DatagramEndpoint* endpoint_;
     PeerAddress peer_;
+    PeerAddress device_;
     std::string remotePath_;
     uint32_t timeoutMs_ = 0;
 

@@ -1,4 +1,4 @@
-// Wi-Fi, HTTP and NowTP for the on-target test firmware.
+// Wi-Fi, HTTP, NowTP and UDP for the on-target test firmware.
 //
 // Exposes under /net: ip, mac, channel, discovered peers, NowTP endpoint
 // counters, and the action "remote", which relays a request to another board
@@ -32,7 +32,9 @@ char g_mac[18] = "";
 nowtp::EspNowTransport* g_now;
 tesser::NowTpTransport* g_nowApi;
 tesser::HttpServer* g_http;
+tesser::UdpTransport* g_udp;
 tesser::Api* g_api;
+bool g_udpEnabled = false;
 
 void onEvent(void*, esp_event_base_t base, int32_t id, void* data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -191,11 +193,83 @@ void describeNet(tesser::Object& net) {
     });
 }
 
+// /net/udp: the UDP transport's state and controls (test/e2e_udp.py).
+void describeUdp(tesser::Object& net) {
+    auto& udp = net.object("udp");
+    udp.value("port", [] { return g_udp->port(); });
+    // Switched at run time, from any transport, UDP included.
+    udp.value(
+        "enabled", [] { return g_udp->running(); },
+        [](bool on) {
+            if (on && !g_udp->running()) {
+                g_udpEnabled = g_udp->begin();
+            } else if (!on) {
+                g_udp->end();
+                g_udpEnabled = false;
+            }
+        });
+    udp.value(
+        "peerAccess", [] { return std::string(tesser::toString(g_udp->endpoint().peerAccess())); },
+        [](const std::string& s) {
+            tesser::Access a;
+            if (tesser::parseAccess(s, a)) g_udp->setPeerAccess(a);
+        });
+    auto& stats = udp.object("stats");
+    stats.value("sent", [] { return g_udp->link().stats().sent; });
+    stats.value("received", [] { return g_udp->link().stats().received; });
+    stats.value("retransmits", [] { return g_udp->link().stats().retransmits; });
+    stats.value("failed", [] { return g_udp->link().stats().failed; });
+    stats.value("duplicates", [] { return g_udp->link().stats().duplicates; });
+    stats.value("dropped", [] { return g_udp->link().stats().dropped; });
+    stats.value("requests", [] { return g_udp->endpoint().stats().requests; });
+    // {path, value, to}: one broadcast write; `to` empty or absent is every
+    // network. With "replies": true, waits 300 ms and lists who answered.
+    udp.action("broadcast", [](tesser::Call& call) {
+        JsonVariantConst a = call.arg();
+        const char* path = a["path"] | "";
+        const char* toText = a["to"] | "";
+        tesser::PeerAddress to;
+        if (!*path || (*toText && !tesser::parseUdpAddress(toText, g_udp->port(), to))) {
+            call.fail(tesser::Status::InvalidValue, "expected {path, value, to}");
+            return;
+        }
+        std::string body;
+        serializeJson(a["value"], body);
+        if (!(a["replies"] | false)) {
+            if (!g_udp->broadcastSet(to, path, body)) call.fail(tesser::Status::Busy, "not sent");
+            else call.reply(true);
+            return;
+        }
+        tesser::Pending pending = call.defer();
+        if (!pending) return;
+        auto replies = std::make_shared<std::string>("[");
+        bool sent = g_udp->endpoint().broadcast(
+            to, tesser::Op::Set, path, body,
+            [pending, replies](const tesser::PeerAddress& from, tesser::Status s, JsonVariantConst) mutable {
+                if (from.length == 0) {
+                    *replies += "]";
+                    std::string r = *replies;
+                    pending.replyWith([&](tesser::JsonWriter& w) { w.raw(r); });
+                    return;
+                }
+                if (replies->size() > 1) *replies += ",";
+                *replies += "{\"from\":\"" + tesser::formatUdpAddress(from) + "\",\"status\":\"" +
+                            tesser::toString(s) + "\"}";
+            },
+            300);
+        if (!sent) pending.fail(tesser::Status::Busy, "not sent");
+    });
+}
+
 }  // namespace
 
 // Brings up Wi-Fi (when test/secrets.h exists), NowTP and HTTP, and adds /net.
 void startNetwork(tesser::Api& api) {
     g_api = &api;
+    // Tokens over the message transports ("auth": UDP, NowTP, Bluetooth).
+    api.authenticate([](std::string_view token) {
+        return token == "test-token" ? tesser::Access::Admin : tesser::Access::Public;
+    });
     g_events = xEventGroupCreate();
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -248,4 +322,14 @@ void startNetwork(tesser::Api& api) {
         // <name>.local, and a _tesser._tcp service for TesserUI's bridge.
         printf("MDNS %d\n", int(g_http->advertise(name, name)));
     }
+
+    // UDP on the LAN: LAN peers are mounted under /lan (/peers holds the
+    // NowTP ones, and would take each board once).
+    g_udp = new tesser::UdpTransport(&api);
+    g_udp->setName(name);
+    describeUdp(api.object("net"));
+    g_udp->mountPeers(api.object("lan").doc("TesserAPI boards on the LAN, mounted as they advertise"));
+    g_udpEnabled = wifi && g_udp->begin();
+    printf("UDP %s port=%u advertise=%d\n", g_udpEnabled ? "started" : "off", unsigned(g_udp->port()),
+           int(g_udp->advertise()));
 }

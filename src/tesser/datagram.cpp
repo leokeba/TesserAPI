@@ -19,8 +19,10 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
     StringSink sink(out);
     JsonWriter w(sink);
     w.beginObject();
-    w.key("id");
-    w.uinteger(id);
+    if (id) {
+        w.key("id");
+        w.uinteger(id);
+    }
     w.key("op");
     w.string(toString(op));
     w.key("path");
@@ -123,6 +125,15 @@ void DatagramEndpoint::dropPeer(const PeerAddress& peer) {
     expire(0, true, &peer);
     markOnline(peer, false);
     dropFiles(&peer, 0);
+    {
+        MutexGuard guard(mutex_);
+        for (size_t i = 0; i < tokens_.size(); i++) {
+            if (tokens_[i].first == peer) {
+                tokens_.erase(tokens_.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+        }
+    }
     MutexGuard guard(subscribersMutex_);
     for (size_t i = 0; i < subscribers_.size(); i++) {
         if (subscribers_[i]->peer != peer) continue;
@@ -133,12 +144,13 @@ void DatagramEndpoint::dropPeer(const PeerAddress& peer) {
     }
 }
 
-void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t len, bool reliable) {
+void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t len, bool reliable,
+                               bool broadcast) {
     bool queued = false;
     {
         MutexGuard guard(mutex_);
         if (queue_.size() < options_.queueLimit) {
-            queue_.push_back(Incoming{from, std::string(data, len), reliable});
+            queue_.push_back(Incoming{from, std::string(data, len), reliable, broadcast});
             queued = true;
         } else {
             stats_.dropped++;
@@ -149,7 +161,7 @@ void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t
         return;
     }
     // Full: answer requests with "busy" so clients needn't wait for a timeout.
-    Incoming msg{from, std::string(data, len), reliable};
+    Incoming msg{from, std::string(data, len), reliable, broadcast};
     reject(msg, Status::Busy, "request queue full");
 }
 
@@ -233,6 +245,8 @@ void DatagramEndpoint::reject(const Incoming& msg, Status status, const char* me
         return;
     }
     if (!doc["op"].is<const char*>()) return;
+    // A broadcast request without an id is never answered.
+    if (msg.broadcast && doc["id"].isNull()) return;
     EnvelopeId id;
     JsonVariantConst idv = doc["id"];
     if (!idv.isNull()) {
@@ -291,23 +305,28 @@ void DatagramEndpoint::handle(Incoming& msg) {
     if (env["status"].is<const char*>()) {
         uint32_t id = env["id"].as<uint32_t>();
         ResponseHandler done;
+        BroadcastHandler each;  // a broadcast call stays open for more replies
         {
             MutexGuard guard(mutex_);
             stats_.responses++;
             for (size_t i = 0; i < calls_.size(); i++) {
-                if (calls_[i].id == id && calls_[i].to == msg.from) {
+                if (calls_[i].id != id) continue;
+                if (calls_[i].each) {
+                    each = calls_[i].each;
+                    break;
+                }
+                if (calls_[i].to == msg.from) {
                     done = std::move(calls_[i].done);
                     calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(i));
                     break;
                 }
             }
-            if (!done) stats_.unmatched++;
+            if (!done && !each) stats_.unmatched++;
         }
-        if (done) {
-            Status s = Status::Internal;
-            parseStatus(env["status"].as<const char*>(), s);
-            done(s, env["body"]);
-        }
+        Status s = Status::Internal;
+        parseStatus(env["status"].as<const char*>(), s);
+        if (done) done(s, env["body"]);
+        if (each) each(msg.from, s, env["body"]);
         return;
     }
 
@@ -350,12 +369,12 @@ void DatagramEndpoint::handle(Incoming& msg) {
     req.client.transport = kind_;
     memcpy(req.client.address, msg.from.bytes, msg.from.length < 16 ? msg.from.length : 16);
     req.client.addressLength = msg.from.length < 16 ? msg.from.length : 16;
-    // A trusted peer is admin; any other is where the token check puts a
-    // client without a token, like an HTTP request without one.
+    // A trusted peer is admin; any other is where the token check puts its
+    // token, like an HTTP request's, and at least at setPeerAccess().
     if (trust_ && trust_(msg.from)) {
         req.client.authenticated = true;
     } else {
-        req.client.access = api_->tokenAccess(std::string_view());
+        req.client.access = levelOf(msg.from);
         req.client.authenticated = req.client.access != Access::Public;
     }
     if (FileSession::handles(env)) {
@@ -364,21 +383,29 @@ void DatagramEndpoint::handle(Incoming& msg) {
     }
     EnvelopeId id;
     const char* message = nullptr;
-    Status s = requestFromEnvelope(env, req, id, message);
+    bool auth = op == "auth";
+    Status s = auth ? envelopeId(env, id, message) : requestFromEnvelope(env, req, id, message);
     if (s == Status::Ok && nesting(env) > envelopeNesting(api_->config().maxDepth)) {
         s = Status::BadRequest;
         message = "envelope nested too deeply";
     }
     PeerAddress to = msg.from;
     SendFn send = send_;
-    EnvelopeReply reply(id, api_->config().maxResponse, [send, to](const std::string& m) {
-        if (send) send(to, m, Delivery::Reliable);
+    // A broadcast request without an id is never answered.
+    bool silent = msg.broadcast && id.length == 0;
+    EnvelopeReply reply(id, api_->config().maxResponse, [send, to, silent](const std::string& m) {
+        if (send && !silent) send(to, m, Delivery::Reliable);
     });
     if (s != Status::Ok) {
         writeError(reply, s, std::string_view(), message);
         return;
     }
-    if ((req.op == Op::Set || req.op == Op::Subscribe) && options_.requireReliableSet && !msg.reliable) {
+    if (auth) {
+        handleAuth(env, msg, reply);
+        return;
+    }
+    bool reliable = msg.reliable || (req.op == Op::Set && msg.broadcast && options_.broadcastSet);
+    if ((req.op == Op::Set || req.op == Op::Subscribe) && options_.requireReliableSet && !reliable) {
         writeError(reply, Status::NotAllowed, req.path, "set and sub requests must be sent reliably");
         return;
     }
@@ -386,6 +413,66 @@ void DatagramEndpoint::handle(Incoming& msg) {
         req.subscriber = subscriberFor(msg.from, req.op == Op::Subscribe);
     }
     api_->handle(req, reply);
+}
+
+Access DatagramEndpoint::levelOf(const PeerAddress& peer) {
+    std::string token;
+    {
+        MutexGuard guard(mutex_);
+        for (auto& t : tokens_) {
+            if (t.first == peer) token = t.second;
+        }
+    }
+    Access level = api_->tokenAccess(token);
+    Access least = peerAccess_.load();
+    return level > least ? level : least;
+}
+
+// {"op":"auth","token":"..."} sets the peer's token until the next one or
+// until the peer is forgotten; an empty or missing token signs out. As on a
+// line (docs/DESIGN.md section 10.4), the reply gives the level, and a lower
+// one drops the peer's subscriptions and file transfer.
+void DatagramEndpoint::handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply) {
+    JsonVariantConst token = envelope["token"];
+    if (!token.isNull() && !token.is<const char*>()) {
+        writeError(reply, Status::BadRequest, std::string_view(), "token must be a string");
+        return;
+    }
+    bool trusted = trust_ && trust_(msg.from);
+    Access before = trusted ? Access::Admin : levelOf(msg.from);
+    {
+        MutexGuard guard(mutex_);
+        for (size_t i = 0; i < tokens_.size(); i++) {
+            if (tokens_[i].first == msg.from) {
+                tokens_.erase(tokens_.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+        }
+        JsonString t = token.as<JsonString>();
+        if (t.size()) {
+            if (tokens_.size() >= options_.maxTokens && !tokens_.empty()) tokens_.erase(tokens_.begin());
+            if (options_.maxTokens) tokens_.emplace_back(msg.from, std::string(t.c_str(), t.size()));
+        }
+    }
+    Access after = trusted ? Access::Admin : levelOf(msg.from);
+    if (after < before) {
+        // Subscriptions and a transfer keep the level they were opened at.
+        {
+            MutexGuard guard(subscribersMutex_);
+            for (PeerSubscriber* sub : subscribers_) {
+                if (sub->peer == msg.from) api_->dropSubscriber(sub);
+            }
+        }
+        for (size_t i = 0; i < files_.size(); i++) {
+            if (files_[i].peer == msg.from) {
+                files_.erase(files_.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+        }
+    }
+    std::string body = std::string("{\"access\":\"") + toString(after) + "\"}";
+    reply.begin(Status::Ok).write(body.data(), body.size());
+    reply.end();
 }
 
 // "upload" and "download" (docs/DESIGN.md section 10.1.1): each peer has a
@@ -396,8 +483,9 @@ void DatagramEndpoint::handleFile(JsonObjectConst envelope, const Incoming& msg,
     Status s = envelopeId(envelope, id, message);
     PeerAddress to = msg.from;
     SendFn send = send_;
-    EnvelopeReply reply(id, api_->config().maxResponse, [send, to](const std::string& m) {
-        if (send) send(to, m, Delivery::Reliable);
+    bool silent = msg.broadcast && id.length == 0;
+    EnvelopeReply reply(id, api_->config().maxResponse, [send, to, silent](const std::string& m) {
+        if (send && !silent) send(to, m, Delivery::Reliable);
     });
     if (s != Status::Ok) {
         writeError(reply, s, std::string_view(), message);
@@ -443,7 +531,7 @@ bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, const std
         MutexGuard guard(mutex_);
         if (calls_.size() >= options_.maxCalls) return false;
         calls_.push_back(
-            CallSlot{id, to, now + (timeoutMs ? timeoutMs : options_.timeoutMs), std::move(done), owner});
+            CallSlot{id, to, now + (timeoutMs ? timeoutMs : options_.timeoutMs), std::move(done), owner, nullptr});
     }
     if (send_ && send_(to, envelope, Delivery::Reliable)) return true;
     MutexGuard guard(mutex_);
@@ -516,6 +604,34 @@ bool DatagramEndpoint::requestFields(const PeerAddress& to, std::string_view fie
     return sendRequest(to, id, text, std::move(done), timeoutMs, owner);
 }
 
+bool DatagramEndpoint::broadcast(const PeerAddress& to, Op op, std::string_view path, std::string_view bodyJson,
+                                 BroadcastHandler onReply, uint32_t windowMs, const void* owner) {
+    if (!onReply) {
+        return send_ && send_(to, buildRequestEnvelope(0, op, path, Query(), bodyJson), Delivery::BestEffort);
+    }
+    uint32_t id;
+    uint32_t now = clock_ ? clock_() : 0;
+    {
+        MutexGuard guard(mutex_);
+        if (calls_.size() >= options_.maxCalls) return false;
+        id = nextId_++;
+        if (nextId_ == 0) nextId_ = 1;
+        calls_.push_back(CallSlot{id, to, now + (windowMs ? windowMs : options_.timeoutMs), nullptr, owner,
+                                  std::move(onReply)});
+    }
+    if (send_ && send_(to, buildRequestEnvelope(id, op, path, Query(), bodyJson), Delivery::BestEffort)) {
+        return true;
+    }
+    MutexGuard guard(mutex_);
+    for (size_t i = 0; i < calls_.size(); i++) {
+        if (calls_[i].id == id) {
+            calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
+    return false;
+}
+
 void DatagramEndpoint::cancelCalls(const void* owner) {
     MutexGuard guard(mutex_);
     for (size_t i = 0; i < calls_.size();) {
@@ -574,17 +690,19 @@ void DatagramEndpoint::mountPeers(Object& parent, uint32_t mirrorIntervalMs) {
     mountMirrorMs_ = mirrorIntervalMs;
 }
 
-void DatagramEndpoint::peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash) {
+void DatagramEndpoint::peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash,
+                                const PeerAddress& device) {
     {
         MutexGuard guard(mutex_);
         for (Seen& s : seenPeers_) {
             if (s.peer == peer) {  // coalesce repeated announcements
                 s.name.assign(name.data(), name.size());
                 s.schemaHash = schemaHash;
+                s.device = device;
                 return;
             }
         }
-        seenPeers_.push_back(Seen{peer, std::string(name), schemaHash});
+        seenPeers_.push_back(Seen{peer, std::string(name), schemaHash, device});
     }
     if (onQueued_) onQueued_();
 }
@@ -637,44 +755,54 @@ void DatagramEndpoint::applySeen(const Seen& seen) {
     }
     if (!parent || !api_) return;
 
+    // The device: a NowTP address is its MAC; other links advertise it.
+    const PeerAddress& device = seen.device.length || kind_ != TransportKind::NowTP ? seen.device : seen.peer;
     MutexGuard apiGuard(api_->mutex());
+    // A parent mounts each peer once, and each device once whatever the
+    // transport: the first to announce it mounts it.
     for (const Node* c = parent->first(); c; c = c->next()) {
-        if (c->type() == NodeType::Remote && static_cast<const RemoteNode*>(c)->peer() == seen.peer) return;
+        if (c->type() != NodeType::Remote) continue;
+        auto* r = static_cast<const RemoteNode*>(c);
+        if (r->endpoint() == this && r->peer() == seen.peer) return;
+        if (device.length && r->device() == device) return;
     }
     // Named after the peer; when that is taken or empty, the last three bytes
-    // of its address are added.
+    // of its device's address (or its own) are added.
     std::string name = nodeName(seen.name);
     if (name.empty() || parent->child(name)) {
         char suffix[8] = "";
-        const uint8_t* b = seen.peer.bytes;
-        uint8_t n = seen.peer.length;
+        const uint8_t* b = device.length ? device.bytes : seen.peer.bytes;
+        uint8_t n = device.length ? device.length : seen.peer.length;
         if (n >= 3) snprintf(suffix, sizeof(suffix), "%02x%02x%02x", b[n - 3], b[n - 2], b[n - 1]);
         name = name.empty() ? std::string(suffix) : name + "-" + suffix;
     }
     if (name.empty() || parent->child(name)) return;
     RemoteNode& node = parent->add(new RemoteNode(std::move(name), *this, seen.peer, "/"));
+    node.setDevice(device);
     if (mirrorMs) node.mirror(mirrorMs);
     node.changed();  // subscribers of the parent see the new key
 }
 
 void DatagramEndpoint::expire(uint32_t now, bool all, const PeerAddress* peer) {
-    std::vector<ResponseHandler> expired;
+    std::vector<CallSlot> expired;
     {
         MutexGuard guard(mutex_);
         for (size_t i = 0; i < calls_.size();) {
             bool match = peer ? calls_[i].to == *peer
                               : (all || static_cast<int32_t>(now - calls_[i].deadline) >= 0);
             if (match) {
-                expired.push_back(std::move(calls_[i].done));
+                // A broadcast call's window closing is its normal end.
+                if (!calls_[i].each) stats_.timeouts++;
+                expired.push_back(std::move(calls_[i]));
                 calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(i));
-                stats_.timeouts++;
             } else {
                 i++;
             }
         }
     }
-    for (auto& done : expired) {
-        if (done) done(Status::Timeout, JsonVariantConst());
+    for (auto& call : expired) {
+        if (call.done) call.done(Status::Timeout, JsonVariantConst());
+        if (call.each) call.each(PeerAddress(), Status::Timeout, JsonVariantConst());
     }
 }
 

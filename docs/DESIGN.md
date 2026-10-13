@@ -524,7 +524,7 @@ The error body is the same on every transport:
 
 ## 10. Transports
 
-### 10.1 Message envelope (NowTP, serial, WebSocket)
+### 10.1 Message envelope (NowTP, UDP, serial, WebSocket)
 
 These transports are message-based and two-way, so they share one JSON envelope.
 
@@ -539,14 +539,14 @@ These transports are message-based and two-way, so they share one JSON envelope.
 ```
 
 - **`id`:** any JSON scalar, echoed verbatim. It may be omitted, in which case the response also has no `id`.
-- **`op`:** `get`, `set`, `sub` or `unsub`; `upload` and `download` for file nodes (§10.1.1); on serial and Bluetooth lines also `auth` (§10.4). The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `changes`, `events`, `snapshot` and `body` map one-to-one onto `Request`.
+- **`op`:** `get`, `set`, `sub` or `unsub`; `upload` and `download` for file nodes (§10.1.1); on serial and Bluetooth lines, NowTP and UDP also `auth` (§10.4, §13.1). The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `changes`, `events`, `snapshot` and `body` map one-to-one onto `Request`.
 - **Unknown envelope keys** are ignored, for forward compatibility.
 - **Response:** the response is written as a stream: `{"id":…,"status":"…","body":` followed by the body and then `}`.
   - **Buffered** (NowTP, and every deferred or queued reply): the envelope is sent whole, up to `maxResponse`. A larger body is replaced with a `too_large` error.
   - **Streamed** (serial and WebSocket, for replies sent while the request is handled): `EnvelopeReply::stream()` sends the envelope in 1 KB pieces as it is rendered, so its size isn't limited and memory stays bounded. An error found before the first piece is out still replaces the reply. After that, a failed piece stops the rendering, and the transport ends the message as it can.
 - **Framing** is the transport's job:
   - Serial: one envelope per line (`\n`). Non-JSON lines from the log are ignored by clients.
-  - NowTP: one envelope per message.
+  - NowTP and UDP: one envelope per message.
   - WebSocket: one per text frame.
 
 #### 10.1.1 File transfers
@@ -625,12 +625,12 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 - **Files:** `upload` envelopes, like `set`, must arrive reliably. Each peer has a file session, dropped when the peer is lost or after `transferIdleMs` without a request.
 - **Notifications** use reliable mode, like responses (§11 explains why not latest-only). `sub` requests, like `set`, must arrive reliably.
 - **Client identity:** the MAC address. NowTP's "peer lost" discovery event drops that client's subscriptions.
-- **Security:** ESP-NOW frames aren't authenticated. Writes over NowTP should be restricted with an allowlist of MACs or encrypted peers (§13).
+- **Security:** ESP-NOW frames aren't authenticated. Writes over NowTP should be restricted with an allowlist of MACs or encrypted peers (§13). A peer may also present a token with `auth`, as over UDP (§10.7).
 - **Threading:** NowTP runs its receive callbacks while holding its own lock, so the adapter never handles a request there. It copies each message into a bounded queue (default 8, then `busy`), and a worker task (or `poll()`) handles it under the API lock. The lock order is therefore always API, then NowTP, and replies sent from any API context can't deadlock.
 - **Client:** the same endpoint sends requests to other nodes (`get`, `set`, or `endpoint().request()`) and matches responses by `id`, with a timeout per call (default 3 s) and at most 8 calls in flight. Handlers run in the worker task. `peerLost(mac)` fails a lost peer's calls at once.
 - **Discovery:** `advertise()` puts `{"tesser": <port>, "schema": "<schemaHash>"}` into NowTP discovery metadata, and `parseAdvertisement()` reads it, so clients can tell TesserAPI nodes apart and keep a cached schema while its hash (`Api::schemaHash()`, FNV-1a of the full schema) is unchanged. `peerEvent()` takes NowTP's peer events, and `mountPeers()` mounts the TesserAPI peers it reports (§14.1).
 - **Re-advertising:** after the first `advertise()`, the advertisement follows the tree. A global schema revision (`schemaRevision()`) counts the changes that can alter a schema hash: a node added (a peer mounted, too) or a modifier. Temporary objects (list elements and prototypes), value changes and remote nodes' state (online, advertised hash) don't count. Once the revision has stayed unchanged for 1 s, the worker recomputes `schemaHash()` and updates the metadata if the hash differs, so a gateway that mounts a burst of peers re-advertises once. The logic is `DatagramEndpoint::autoAdvertise()`, host-tested with the in-memory link.
-- **Generic core:** all of this lives in `tesser::DatagramEndpoint`, which is platform-independent and host-tested with an in-memory link. Another datagram transport (UDP, LoRa, ...) only needs a send function and a call to `receive()`.
+- **Generic core:** all of this lives in `tesser::DatagramEndpoint`, which is platform-independent and host-tested with an in-memory link. Another datagram transport (UDP, §10.7; LoRa, ...) only needs a send function and a call to `receive()`.
 - **Optional:** the adapter is compiled only when NowTP is available. The core never includes NowTP.
 
 ### 10.4 Serial
@@ -696,6 +696,62 @@ The serial lines of §10.4 over the **Nordic UART Service**, so browsers (Web Bl
 - **Flash:** NimBLE adds about 400 KB (an ESP-IDF example is 510 KB). Bluedroid on Arduino's ESP32 makes a sketch about 1.7 MB: it needs a larger app partition than the default 1.25 MB (`huge_app`).
 - **ESP-IDF component:** `bt` is a private requirement; the transport compiles to nothing without `CONFIG_BT_NIMBLE_ENABLED`.
 
+### 10.7 UDP
+
+```cpp
+tesser::UdpTransport udp(&api);
+udp.begin();                              // port 8484 on every interface, once the network is up
+udp.advertise();                          // name and schema hash, every 5 s
+udp.mountPeers(api.object("peers"));      // the LAN's TesserAPI nodes, as remote nodes (§14.1)
+udp.setPeerAccess(tesser::Access::User);  // anyone on the LAN, short of admin nodes
+udp.broadcastSet(tesser::PeerAddress(), "/sequencer/play", "true");   // every node at once
+```
+
+The §10.1 envelopes between nodes and clients on a LAN, Ethernet or Wi-Fi, through the same `DatagramEndpoint` as NowTP: serving, client calls, remote nodes and forwarding, forwarded subscriptions, file transfers, `*` fan-out (§6.5) and discovered peers all work as over NowTP. Two things are new: broadcast writes, and a least level for peers with tokens sent in `auth` envelopes.
+
+- **Addresses:** IPv4 and port, a 6-byte `PeerAddress`: the address bytes in order, then the port, most significant byte first. `udpAddress(192, 168, 1, 59, 8484)`, `parseUdpAddress("192.168.1.59:8484", defaultPort, out)` and `formatUdpAddress(a)` convert. A request's `Client::address` holds the same 6 bytes. An empty `PeerAddress` means every local network (below).
+- **Datagrams:** each starts with a 20-byte header, multi-byte fields little-endian:
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 1 | Magic `0x54` (`T`) |
+  | 1 | 1 | Version (1) × 16 + type: 0 data, 1 acknowledgement, 2 advertisement |
+  | 2 | 1 | Flags. Data: `0x1` reliable, `0x2` ack-request, `0x4` broadcast. Advertisement: `0x1` query, `0x2` goodbye |
+  | 3 | 1 | Data: fragment index. Acknowledgement: 0 complete, 1 partial, 2 rejected |
+  | 4 | 4 | Sender's nonce: random, new at each `begin()` |
+  | 8 | 4 | Message id: per nonce, one more per message. An acknowledgement repeats the acknowledged message's |
+  | 12 | 1 | Data: fragment count, 1 to 64 |
+  | 13 | 1 | Reserved, 0 |
+  | 14 | 2 | Data: fragment size `S` |
+  | 16 | 4 | Data: message length |
+
+  A message (one envelope, at most `maxMessage`, 16 KB) is cut into fragments of `S` bytes (`fragmentSize`, 1400), the last one 1 to `S`; fragment `i` is at offset `i × S`. A datagram is at most 1420 bytes, under the 1472 bytes of UDP payload an Ethernet frame holds, since ESP-IDF's lwIP doesn't reassemble IP fragments by default (`CONFIG_LWIP_IP4_REASSEMBLY`). UDP's checksum covers the rest. A partial acknowledgement carries the fragments received as a 64-bit mask (bit `i`: fragment `i`). An advertisement carries `{"name": "...", "schema": "<8 hex digits>", "id": "<MAC, 12 hex digits>"}`, or nothing (a bare query, a goodbye).
+- **Reliable delivery** (`Delivery::Reliable`: requests, replies, notifications), modelled on NowTP's (its PROTOCOL.md):
+  1. The sender sends every fragment, with ack-request on the last.
+  2. The receiver answers an ack-request with complete or partial, and sends complete unasked when the message completes.
+  3. On partial, the sender sends the missing fragments again at once. Without an answer it sends what is unacknowledged again after `ackTimeoutMs` (100 ms), doubling up to 1 s.
+  4. After `sendTimeoutMs` (3 s) the message fails, and the peer is forgotten (`forgetPeer()`): its pending calls fail, its subscriptions and file transfer are dropped, its remote nodes show offline until it is heard from. A client that left without unsubscribing goes this way, at its next notification.
+  - **Repeats:** a receiver remembers, per peer and nonce, the 64 message ids behind the newest it completed; a repeat is acknowledged, not delivered, and an older id counts as a repeat. So a request whose acknowledgement was lost runs once.
+  - **Order:** not guaranteed, as over NowTP.
+  - **Bounds:** 16 reliable messages waiting for acknowledgement (`maxOutgoing`; then the send fails, and a notification is marked missed), 32 KB of messages being reassembled (`reassemblyBytes`; the oldest is evicted), 16 peers remembered (`maxPeers`).
+  - **Restarts:** a peer heard with a new nonce has restarted, and is forgotten as above, so a client that restarts leaves no subscriptions behind. A node's own broadcasts, when the stack loops them back, carry its own nonce and are ignored.
+- **Broadcast writes:** `broadcastSet(to, path, bodyJson)` sends one set request to every node behind `to`, a broadcast address (`192.168.1.255:8484`, any directed broadcast), or the empty address for every local network: the transport sends it to the broadcast address of each interface that is up (Ethernet, the station, the soft-AP: address | ~netmask). 255.255.255.255 would leave by the default interface only.
+  - **Once:** a broadcast is sent `broadcastCopies` times (2), with the same id; receivers apply the first copy that arrives and drop the others as repeats, so an action runs once.
+  - **No replies:** the request has no `id`, and a broadcast request without one is never answered, errors included.
+  - **The sender** doesn't apply it (its own copy is ignored): a node that should act too acts locally.
+  - **Set only:** `DatagramEndpoint::Options::broadcastSet`, on for UDP, lets a set that arrived by broadcast through; `sub` and `upload` must still arrive reliably.
+  - **Access:** the request is at its sender's level, like any request from that address (below).
+  - **Replies, when wanted:** `endpoint().broadcast(to, op, path, body, onReply, windowMs)` gives the request an id. Every node answers it by reliable unicast, `onReply(from, status, body)` runs for each reply in the window (default: the call timeout), and once more with an empty address and `Status::Timeout` when it closes.
+  - **Timing:** on Ethernet the nodes get the datagram within a millisecond or so of each other. On Wi-Fi, the access point holds group frames until its next DTIM beacon (about 240 ms later on the test network) and sends them once, without retries: the stations get them together, but late, and some are lost. Measured between two ESP32 devkits through a home access point: one copy lost 8% of broadcasts at 4 per second and 45% at 10 per second; with two copies, 140 of 140 arrived at either rate, each applied once. Broadcasts from a Mac to the same access point were lost in bursts that two copies didn't always cover.
+- **Discovery** (§14.1): after `advertise()`, an advertisement goes to every local network every `advertiseMs` (5 s), and at once when the schema hash changes (after the 1 s quiet period of §10.3). `begin()` and `mountPeers()` broadcast a query, which advertising nodes answer by unicast, so a node finds the others at once; a node that advertises sends its own advertisement with the query. `end()` broadcasts a goodbye: peers show it offline at once. A peer that advertised and is then silent for `peerTimeoutMs` (15 s) is lost. The name is `setName()`'s, by default `tesser-<last two MAC bytes>`; the `id` is the Wi-Fi station MAC, the address NowTP knows it by, so a gateway reaching a node both ways mounts it once (§14.1). Queries and goodbyes go `broadcastCopies` times too.
+- **Access:** datagrams carry no proof of origin, and anyone on a LAN can use any address. A peer is `admin` if the endpoint's `trust(fn)` accepts it; otherwise its level is the higher of `setPeerAccess(level)` (default `public`) and the token check's level for its token. It presents a token with an `auth` envelope, as on a Bluetooth line (§10.4): the reply gives the level, and a lower level drops its subscriptions and file transfer. The token is kept per address (the last 8 peers, `maxTokens`) until the next `auth`, or until the peer is forgotten (a restart, a failed delivery, a goodbye, `end()`). Tokens travel in clear: use UDP on a LAN you trust.
+- **Runtime control:** `begin(port)` and `end()` at any time, `end()` then `begin(newPort)` to move. `end()` says goodbye, closes the socket and forgets every peer (remote nodes show offline, calls fail). It is safe from a request handler, one that came over UDP included: it doesn't wait for the worker task, which finishes the request at hand, ticks once more and exits, or carries on if `begin()` comes first. Destroy the transport after `end()`, outside the API lock: the destructor waits for the tasks. `running()` and `port()` describe it.
+- **Threading:** a receive task (4 KB of stack, one priority above the worker) reads the socket and runs the link: fragments, acknowledgements, advertisements. It never takes the API lock, and hands complete messages to the endpoint's queue (16 deep). A worker task (6 KB by default) handles requests and client callbacks, retransmits and advertises, waking at least every 20 ms. Without tasks (`begin(port, false)`), `poll()` from `loop()` does both. lwIP's receive mailbox per socket is small (`CONFIG_LWIP_UDP_RECVMBOX_SIZE`, 6), which is why receiving has its own task.
+- **Sending:** `sendto` under a mutex, so `end()` never closes the socket under a send. Wi-Fi refuses bursts with `ENOMEM` while its buffers are full: the datagram is tried again, up to 20 times, a tick apart.
+- **Measured** (two ESP32 devkits and a Mac on a home Wi-Fi network): a GET from the Mac in 19–23 ms median; file transfers in envelopes at 90–100 KB/s up and 115–130 KB/s down; a GET through a gateway (HTTP, then UDP: the file probe of §14, then the request) in 120 ms median, against 52 ms for the gateway's own GET; relayed HTTP file transfers at 40–44 KB/s up and 30–51 KB/s down.
+- **Generic core:** `tesser::UdpLink`, platform-independent and host-tested over an in-memory network that loses datagrams. It takes a send function, `packet()` calls and `tick()`, so an application's own service can be tested the same way. `UdpTransport` is the socket around it: lwIP sockets and `esp_netif`, the same code on ESP-IDF (5.1 and later) and Arduino-ESP32 3.x.
+- **Not covered:** IPv6, multicast groups, encryption.
+
 ## 11. Change tracking and subscriptions
 
 **Tracking changes:**
@@ -708,7 +764,7 @@ The serial lines of §10.4 over the **Nordic UART Service**, so browsers (Web Bl
 
 **Delivering:** `Api::poll()` sends pending change notifications. Call it from `loop()`, or let `api.startTask(periodMs)` (ESP, default 20 ms) do it. It does nothing while nobody is subscribed.
 
-**Subscribing** (message transports: serial, NowTP, WebSocket, Bluetooth; over plain HTTP, a streamed GET, §10.2; another HTTP `sub` answers `not_allowed`):
+**Subscribing** (message transports: serial, NowTP, UDP, WebSocket, Bluetooth; over plain HTTP, a streamed GET, §10.2; another HTTP `sub` answers `not_allowed`):
 
 ```json
 → {"id": 3, "op": "sub", "path": "/sensors", "keys": "temperature,humidity", "interval": 500}
@@ -791,7 +847,7 @@ api.authenticate([](std::string_view token) { return users.check(token); });   /
 - A transport that only knows "authenticated" (`Client::authenticated`, below) gives an authenticated client `admin` and any other `public`. That is the case of trusted NowTP peers, and of serial lines unless they are unauthenticated (below). A `LocalClient` is `admin` by default; `setAccess(level)` gives it any level (§14.2).
 - HTTP and WebSocket clients present a token. The transport's own token (`HttpServer::setToken`) gives `admin`. Any other token, or none (an empty token), goes to the API's token check, `api.authenticate(fn)`, whose answer is the client's level; without a check, `public`. A WebSocket connection's level is decided once, from its handshake.
 - Unauthenticated lines (Bluetooth) present a token with an `auth` envelope (§10.4), checked the same way for every request; until then, the empty token.
-- Untrusted NowTP peers carry no token: they get the empty token's level, as an HTTP request without one does. That is `public` unless the check opens the device to anyone.
+- Untrusted NowTP and UDP peers present a token with an `auth` envelope (§10.4), held per peer address until the next one or until the peer is forgotten (§10.7); until then, the empty token, as an HTTP request without one: `public` unless the check opens the device to anyone. Their level is at least the endpoint's `setPeerAccess(level)` (default `public`), so a LAN can let anyone use a device short of its admin nodes.
 - **Gateways:** a gateway checks levels of its own clients before forwarding. The remote node sees the gateway as its client (a trusted peer is `admin`), not the browser behind it.
 
 ### 13.2 Authorizer and authentication
@@ -805,7 +861,8 @@ api.authenticate([](std::string_view token) { return users.check(token); });   /
 |---|---|
 | HTTP | `HttpServer::setToken(token)` is set and the request carries `Authorization: Bearer <token>` or `?token=<token>` (`admin`), or the API's token check gives its token a level above `public` (§13.1) |
 | WebSocket | Same checks, on the handshake |
-| NowTP | The sender is in `NowTpTransport::trustPeers({...})`, or `DatagramEndpoint::trust(fn)` accepts it (`admin`), or the API's token check gives the empty token a level above `public`. ESP-NOW frames carry no proof of origin, so trust is in MAC addresses; combine it with encrypted NowTP peers when that matters. |
+| NowTP | The sender is in `NowTpTransport::trustPeers({...})`, or `DatagramEndpoint::trust(fn)` accepts it (`admin`), or its level is above `public`: the token check's for its token (`auth`, or the empty one), or `setPeerAccess()`. ESP-NOW frames carry no proof of origin, so trust is in MAC addresses; combine it with encrypted NowTP peers when that matters. |
+| UDP | As NowTP: `trust(fn)` on the endpoint, a token sent with `auth`, or `setPeerAccess()`. Trust is in IP addresses, which anyone on the LAN can use. |
 | Serial | Always (physical access), unless `LineTransport::setAuthenticated(false)`: then as Bluetooth LE |
 | Bluetooth LE | When the API's token check gives the line's token (`auth`, §10.4), or the empty one, a level above `public`; always with `BleTransport::setAuthenticated(true)` |
 
@@ -815,12 +872,14 @@ api.authenticate([](std::string_view token) { return users.check(token); });   /
 
 ## 14. Remote trees and the client
 
-**Client.** `DatagramEndpoint` (and `NowTpTransport` on top of it) sends requests to other nodes and matches responses by `id`:
+**Client.** `DatagramEndpoint` (and `NowTpTransport` and `UdpTransport` on top of it) sends requests to other nodes and matches responses by `id`, and broadcasts them where the link can (UDP, §10.7):
 
 ```cpp
 nowApi.get(mac, "/lamp", [](tesser::Status s, JsonVariantConst body) { ... });
 nowApi.endpoint().request(addr, tesser::Op::Subscribe, "/sensors", "", done, query);
 nowApi.endpoint().onNotification([](const tesser::PeerAddress& from, JsonObjectConst msg) { ... });
+udp.endpoint().broadcast(tesser::PeerAddress(), tesser::Op::Set, "/lamp/on", "true",
+                         [](const tesser::PeerAddress& from, tesser::Status s, JsonVariantConst body) { ... }, 300);
 ```
 
 **Remote mount (gateway).** A remote node grafts another node's tree into the local one:
@@ -866,7 +925,8 @@ nowApi.mountPeers(api.object("peers"));   // also mounts the peers already disco
 nowApi.advertise();                       // on every node, once its tree is complete; kept current after that
 ```
 
-- **Mounting:** each peer that advertises TesserAPI on the transport's port becomes a remote node under the parent, named after its NowTP discovery name. Characters a name can't hold become `-`. If the name is empty or taken, the last three address bytes are appended (`tesser-lamp-75f303`). `mountPeers(parent, intervalMs)` also mirrors them. A peer already mounted under the parent isn't mounted again. Remote nodes of the peer elsewhere in the tree (declared ones) don't prevent it, but they share its online state and schema hash, including remote nodes declared after the announcement.
+- **Mounting:** each peer that advertises TesserAPI on the transport's port becomes a remote node under the parent, named after its advertised name (NowTP: its discovery name). Characters a name can't hold become `-`. If the name is empty or taken, the last three bytes of the device's MAC (or, without one, of its address) are appended (`tesser-lamp-75f303`). `mountPeers(parent, intervalMs)` also mirrors them. A peer already mounted under the parent isn't mounted again. Remote nodes of the peer elsewhere in the tree (declared ones) don't prevent it, but they share its online state and schema hash, including remote nodes declared after the announcement.
+- **One node per device:** a parent mounts each device once, whatever the transport. A NowTP peer is its MAC; a UDP peer advertises its Wi-Fi station MAC (§10.7), the address NowTP uses. The first transport to announce a device mounts it, and the others' announcements of it are ignored under that parent: the node follows its first transport (its online state, its address). That keeps a `*` fan-out (§6.5) from reaching a device twice. To have both, mount each transport's peers under a parent of its own. (A node that runs ESP-NOW from its soft-AP interface is reached from its AP MAC, so it would be mounted twice.)
 - **Nodes are never removed.** A lost peer stays mounted and shows offline; it comes back online as soon as it is heard from or announces itself again.
 - **Remote node stub:** the parent's schema shows each remote node's state. `"online": false` appears while the peer is lost, and `"schema"` is the hash the peer advertises, so a client can cache the peer's own schema under it:
 
@@ -878,7 +938,7 @@ nowApi.advertise();                       // on every node, once its tree is com
   ```
 
 - **Watching the list:** mounting a peer, a change of its online state and a new advertised hash all mark the remote node changed. Only the mount changes the gateway's own schema hash (§7). A subscriber of the parent (depth 1) gets `{"heliostat-3": null}` for an unmirrored node, which is its cue to re-read the parent's schema.
-- **Generic core:** `DatagramEndpoint::mountPeers()` and `peerSeen(address, name, schemaHash)` do the work, host-tested with the in-memory link. The NowTP adapter only parses advertisements and forwards peer events. Online state comes from the endpoint: `forgetPeer()` marks a peer's remote nodes offline, and any message from the peer marks them online.
+- **Generic core:** `DatagramEndpoint::mountPeers()` and `peerSeen(address, name, schemaHash, device)` do the work, host-tested with the in-memory link. The NowTP adapter only parses advertisements and forwards peer events; `UdpLink` reads its own (§10.7). Online state comes from the endpoint: `forgetPeer()` marks a peer's remote nodes offline, and any message from the peer marks them online.
 
 ### 14.2 ApiClient
 
@@ -930,14 +990,16 @@ Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware
 | Serial round trip at 115200 baud | 13 ms (mostly wire time) |
 | HTTP GET over Wi-Fi, new TCP connection each time | 55–85 ms median |
 | NowTP request and response between two boards | 13–14 ms median, fragmented 1.5 KB responses included |
+| UDP request and response, Mac to board over Wi-Fi | 19–23 ms median; a 4 KB schema (three datagrams) included |
+| GET through a gateway over UDP (HTTP, then UDP to the remote node) | 120 ms median, the gateway's own GET 52 ms |
 | GET through a gateway (HTTP, then NowTP to the remote node) | 85 ms median |
-| File transfer in envelopes (§10.1.1), 12–20 KB in the device's chunks | serial at 115200 baud: 8 KB/s each way (the wire's limit with base64); WebSocket: 60 KB/s up, 52 KB/s down; NowTP: 15 KB/s up, 20 KB/s down, each chunk relayed by an HTTP call to the other board |
+| File transfer in envelopes (§10.1.1), 12–20 KB in the device's chunks | serial at 115200 baud: 8 KB/s each way (the wire's limit with base64); WebSocket: 60 KB/s up, 52 KB/s down; NowTP: 15 KB/s up, 20 KB/s down, each chunk relayed by an HTTP call to the other board; UDP from a Mac: 90–100 KB/s up, 115–130 KB/s down |
 | UART task stack during file transfers | 2.6 KB free, 290 B less than requests alone |
 
 **Flash:** `examples/idf/http_api` against its `FOOTPRINT_BASELINE` build (the same app on bare `esp_http_server`):
 - **Total:** 45.5 KB for the core, the HTTP transport and ArduinoJson. With `TESSER_NO_SCHEMA`, `TESSER_NO_MESSAGES` and `TESSER_NO_DESCRIPTIONS` it is 43.8 KB.
 - **Against the target:** the 40 KB target was set before subscriptions, events, lists and authorization joined the core. 34.6 KB was measured for core + HTTP at phase 2.
-- **Linked only when used:** remote nodes (and the datagram client), persistence, WebSocket and NowTP. Remote forwarding is virtual and persistence is a hook installed by `persistence()`, so applications that don't use them don't link them.
+- **Linked only when used:** remote nodes (and the datagram client), persistence, WebSocket, NowTP and UDP. Remote forwarding is virtual and persistence is a hook installed by `persistence()`, so applications that don't use them don't link them.
 
 **No leaks:** running the whole host test suite a second time on the chip moves the heap by exactly the two nodes the duplicate-name test deliberately leaves unlinked.
 
@@ -964,15 +1026,18 @@ The layout follows NowTP:
 
 The Bluetooth transport (§10.6) is a header that `TesserAPI.h` doesn't include, so that only the firmware using it compiles a BLE stack. On ESP-IDF, its source compiles to nothing unless NimBLE is enabled.
 
+The UDP transport (§10.7) needs only lwIP and `esp_netif`, which every ESP-IDF and Arduino-ESP32 3.x build has: it is always compiled, and linked when used. On ESP-IDF `esp_netif` is a private requirement.
+
 Optional transports (NowTP) compile only when their dependency is present: `__has_include(<NowTP.h>)` on Arduino and PlatformIO. On ESP-IDF, the component looks for a `nowtp` component among the build components and links it, since requirements are resolved before that list is known.
 
 ## 17. Testing
 
-1. **Host tests** (CMake + ctest, ASan and UBSan, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror` on the library). They cover the core, the envelope codec and the line transport, and run against NowTP's simulated network for the NowTP adapter.
+1. **Host tests** (CMake + ctest, ASan and UBSan, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror` on the library). They cover the core, the envelope codec, the line transport, and the datagram endpoint and UDP link over in-memory networks (losses, repeats, broadcasts and discovery included).
 2. **On-target tests** (`test/hardware`, ESP-IDF): the same core cases on the chip, plus heap and stack measurements.
 3. **End-to-end on hardware:** `test/hardware` serves a demo API over UART, HTTP and WebSocket (with Wi-Fi credentials from the gitignored `test/secrets.h`), and NowTP. It drives subscriptions, events, access control, persistence and the gateway:
    - `test/e2e_serial.py`, `test/e2e_http.py`, `test/e2e_ws.py`
    - `test/e2e_nowtp.py` and `test/e2e_gateway.py`, on two boards
+   - `test/e2e_udp.py`, on two boards and the machine running it, over `test/udp_client.py`, a Python implementation of the UDP link
    - `test/e2e_persist.py`, which reboots the board through the serial port
 4. **Transport conformance:** `test/conformance.py` sends the same request vectors through serial, HTTP, WebSocket and NowTP (both directions), and every transport must give the same results.
 5. **CI:** host tests, plus ESP-IDF 5.1 / 5.4 / 5.5 / latest × ESP32 / ESP32-C3 (test firmware and examples), plus Arduino-ESP32 3.x × ESP32 / ESP32-C3 (example sketches).
@@ -993,6 +1058,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 10 | Streamed subscriptions over plain HTTP, for TesserUI on HTTPS pages | done |
 | 11 | File transfers over the message transports (serial, Bluetooth, WebSocket, NowTP) | done |
 | 12 | File transfers relayed through gateways, for TesserKIT's fleet updates | done |
+| 13 | UDP transport: LAN discovery and broadcast writes, for TesserKIT's sequencer; tokens and a least level for datagram peers | done |
 
 ## 19. Decisions on former open questions
 

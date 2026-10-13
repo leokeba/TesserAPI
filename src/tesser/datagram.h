@@ -4,8 +4,9 @@
 #include <stdint.h>
 #include <string.h>
 
-#include <memory>
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -51,12 +52,16 @@ public:
     using SendFn = std::function<bool(const PeerAddress& to, const std::string& message, Delivery delivery)>;
     using ClockFn = std::function<uint32_t()>;
     using ResponseHandler = std::function<void(Status status, JsonVariantConst body)>;
+    // A reply to a broadcast request; see broadcast().
+    using BroadcastHandler = std::function<void(const PeerAddress& from, Status status, JsonVariantConst body)>;
 
     struct Options {
         size_t queueLimit = 8;           // incoming messages waiting for process()
         bool requireReliableSet = true;  // reject set requests that didn't arrive reliably
+        bool broadcastSet = false;       // but apply set requests that arrived by broadcast
         uint32_t timeoutMs = 3000;       // default client call timeout
         size_t maxCalls = 8;             // client calls in flight
+        size_t maxTokens = 8;            // peers holding a token ("auth"); the oldest is forgotten
     };
 
     struct Stats {
@@ -74,7 +79,9 @@ public:
     ~DatagramEndpoint();
 
     // Any task. `reliable`: the link guaranteed delivery (so it was unicast).
-    void receive(const PeerAddress& from, const char* data, size_t len, bool reliable);
+    // `broadcast`: the message was sent to every node; a request without an
+    // "id" that came this way gets no reply.
+    void receive(const PeerAddress& from, const char* data, size_t len, bool reliable, bool broadcast = false);
 
     // Handles queued messages and expires client calls. Returns true if it did
     // anything.
@@ -102,6 +109,15 @@ public:
     // without the braces (`"op":"download","path":"/sys/backup"`).
     bool requestFields(const PeerAddress& to, std::string_view fields, ResponseHandler done, uint32_t timeoutMs = 0,
                        const void* owner = nullptr);
+    // Sends a request once, unreliably, to every node behind `to` (a
+    // broadcast address of the link: Delivery::BestEffort). Without
+    // `onReply` the request has no "id", and no node answers. With it, each
+    // reply that comes within `windowMs` (default: the call timeout) is
+    // passed to `onReply` in process(), and `onReply` is called once more
+    // with an empty address and Status::Timeout when the window closes.
+    // Returns false (without calling `onReply`) if it couldn't be sent.
+    bool broadcast(const PeerAddress& to, Op op, std::string_view path, std::string_view bodyJson,
+                   BroadcastHandler onReply = nullptr, uint32_t windowMs = 0, const void* owner = nullptr);
     // Drops (without calling) the pending calls tagged with `owner`.
     void cancelCalls(const void* owner);
 
@@ -114,9 +130,15 @@ public:
 
     // Requests from peers for which `fn` returns true count as authenticated
     // (see Api::authorize()), with full access. Other peers get the level the
-    // API's token check gives the empty token (Api::tokenAccess("")):
-    // public, unless the check opens the device to anyone.
+    // API's token check gives their token (Api::tokenAccess()): the one they
+    // sent with {"op":"auth","token":"..."} (docs/DESIGN.md section 10.1),
+    // or the empty one, which is public unless the check opens the device to
+    // anyone; at least setPeerAccess()'s.
     void trust(std::function<bool(const PeerAddress&)> fn) { trust_ = std::move(fn); }
+    // The least level of a peer that isn't trusted (default public): User
+    // lets anyone on the link use the device, short of admin nodes.
+    void setPeerAccess(Access level) { peerAccess_ = level; }
+    Access peerAccess() const { return peerAccess_.load(); }
 
     // Notifications ("change" / "event" envelopes) from nodes this one
     // subscribed to, all of them, including those a mirrored RemoteNode
@@ -137,9 +159,12 @@ public:
     void mountPeers(Object& parent, uint32_t mirrorIntervalMs = 0);
     // A peer announced itself as a TesserAPI node (from NowTP discovery
     // metadata, ...): `name` is its advertised name, `schemaHash` the hash
-    // it advertises. Marks its remote nodes online and mounts it if needed.
-    // Safe from any task; takes effect in the next process().
-    void peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash);
+    // it advertises, `device` the device's MAC when the link's address isn't
+    // it (UDP); NowTP addresses are MACs. Marks its remote nodes online and
+    // mounts it if needed. Safe from any task; takes effect in the next
+    // process().
+    void peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash,
+                  const PeerAddress& device = PeerAddress());
 
     // Keeps an advertisement current: once the API's tree has changed (a
     // peer mounted, a node added, a remote node's state, see
@@ -162,6 +187,7 @@ private:
         PeerAddress from;
         std::string text;
         bool reliable;
+        bool broadcast;
     };
     class PeerSubscriber : public Subscriber {
     public:
@@ -181,6 +207,7 @@ private:
         PeerAddress peer;
         std::string name;
         uint32_t schemaHash;
+        PeerAddress device;
     };
 
     // A peer's file transfers, dropped once idle for Config::transferIdleMs.
@@ -196,11 +223,14 @@ private:
         uint32_t deadline;
         ResponseHandler done;
         const void* owner;
+        BroadcastHandler each;  // a broadcast call: replies from any peer
     };
 
     bool sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope, ResponseHandler done,
                      uint32_t timeoutMs, const void* owner);
     void handle(Incoming& msg);
+    void handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply);
+    Access levelOf(const PeerAddress& peer);
     void reject(const Incoming& msg, Status status, const char* message);
     void expire(uint32_t now, bool all, const PeerAddress* peer);
     Subscriber* subscriberFor(const PeerAddress& peer, bool create);
@@ -219,6 +249,7 @@ private:
     std::function<void()> onQueued_;
     NotificationHandler onNotification_;
     std::function<bool(const PeerAddress&)> trust_;
+    std::atomic<Access> peerAccess_{Access::Public};
 
     mutable Mutex mutex_;
     std::vector<Incoming> queue_;  // a vector: an empty deque allocates
@@ -234,6 +265,7 @@ private:
     std::vector<RemoteNode*> remotes_;  // guarded by mutex_
     std::vector<PeerFiles> files_;      // used in process() only
     std::vector<std::pair<PeerAddress, std::shared_ptr<ClientInbox>>> clients_;  // guarded by mutex_
+    std::vector<std::pair<PeerAddress, std::string>> tokens_;  // from "auth", oldest first; guarded by mutex_
     uint32_t nextId_ = 1;
     Stats stats_;
     // autoAdvertise()
@@ -245,7 +277,8 @@ private:
     bool revisionPending_ = false;
 };
 
-// Builds a request envelope. `bodyJson` is inserted verbatim when not empty.
+// Builds a request envelope; `id` 0 leaves the "id" out. `bodyJson` is
+// inserted verbatim when not empty.
 std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, const Query& query,
                                  std::string_view bodyJson);
 

@@ -11,6 +11,7 @@ set(TESSER_CORE_SRCS
     src/tesser/envelope.cpp
     src/tesser/line_transport.cpp
     src/tesser/datagram.cpp
+    src/tesser/udp_link.cpp
     src/tesser/subscription.cpp
     src/tesser/persistence.cpp
     src/tesser/storage.cpp
@@ -27,7 +28,8 @@ if(ESP_PLATFORM)
     endif()
     set(TESSER_SRCS ${TESSER_CORE_SRCS}
         src/tesser/transports/uart_transport.cpp
-        src/tesser/transports/http_server.cpp)
+        src/tesser/transports/http_server.cpp
+        src/tesser/transports/udp_transport.cpp)
     set(TESSER_REQS ${TESSER_UART_REQ} esp_http_server)
     # The NowTP transport is built when a NowTP component is part of the build.
     idf_build_get_property(TESSER_BUILD_COMPONENTS BUILD_COMPONENTS)
@@ -56,7 +58,7 @@ if(ESP_PLATFORM)
         SRCS ${TESSER_SRCS}
         INCLUDE_DIRS "src"
         REQUIRES ${TESSER_REQS}
-        PRIV_REQUIRES log esp_timer lwip nvs_flash bt)
+        PRIV_REQUIRES log esp_timer lwip esp_netif nvs_flash bt)
     if(TESSER_NOWTP)
         # Requirements are resolved before the component list is known, so
         # NowTP is linked here rather than listed in REQUIRES.
