@@ -2,6 +2,8 @@
 
 #include <stdio.h>
 
+#include <algorithm>
+
 #include "tesser/api.h"
 #include "tesser/call.h"
 #include "tesser/detail/lazy_patch.h"
@@ -73,6 +75,93 @@ bool passes(const Subscription& sub, JsonString key) {
 }
 
 int depthOf(const Subscription& sub) { return sub.depth < 0 ? 255 : sub.depth; }
+
+// ---- upstream specs ------------------------------------------------------------
+
+using Spec = RemoteNode::Spec;
+
+std::vector<std::string> listItems(std::string_view list) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos <= list.size()) {
+        size_t comma = list.find(',', pos);
+        if (comma == std::string_view::npos) comma = list.size();
+        std::string_view item = list.substr(pos, comma - pos);
+        while (!item.empty() && item.front() == ' ') item.remove_prefix(1);
+        while (!item.empty() && item.back() == ' ') item.remove_suffix(1);
+        if (!item.empty()) out.emplace_back(item);
+        pos = comma + 1;
+    }
+    return out;
+}
+
+std::string joinSorted(std::vector<std::string> items) {
+    std::sort(items.begin(), items.end());
+    items.erase(std::unique(items.begin(), items.end()), items.end());
+    std::string s;
+    for (const std::string& i : items) {
+        if (!s.empty()) s += ',';
+        s += i;
+    }
+    return s;
+}
+
+Spec specOf(const Subscription& sub) {
+    Spec s;
+    std::vector<std::string> keys = listItems(sub.keys);
+    s.keys = joinSorted(keys);
+    if (keys.empty()) s.exclude = joinSorted(listItems(sub.exclude));
+    s.depth = sub.depth < 0 ? -1 : sub.depth;
+    return s;
+}
+
+// Everything any of `specs` needs: the deepest depth; the keys of all when
+// all have keys, else every child but those all of them leave out.
+Spec unionOf(const std::vector<Spec>& specs) {
+    Spec u;
+    if (specs.empty()) return u;
+    bool unlimited = false, allKeyed = true, anyUnkeyed = false;
+    int depth = 0;
+    std::vector<std::string> keys, exclude;
+    for (const Spec& s : specs) {
+        if (s.depth < 0) {
+            unlimited = true;
+        } else if (s.depth > depth) {
+            depth = s.depth;
+        }
+        std::vector<std::string> k = listItems(s.keys);
+        if (!k.empty()) {
+            keys.insert(keys.end(), k.begin(), k.end());
+            continue;
+        }
+        allKeyed = false;
+        std::vector<std::string> e = listItems(s.exclude);
+        if (!anyUnkeyed) {
+            exclude = e;
+            anyUnkeyed = true;
+        } else {
+            std::vector<std::string> both;
+            for (const std::string& x : exclude) {
+                if (std::find(e.begin(), e.end(), x) != e.end()) both.push_back(x);
+            }
+            exclude = both;
+        }
+    }
+    u.depth = unlimited ? -1 : depth;
+    if (allKeyed) {
+        u.keys = joinSorted(keys);
+    } else {
+        std::vector<std::string> left;
+        for (const std::string& x : exclude) {
+            if (std::find(keys.begin(), keys.end(), x) == keys.end()) left.push_back(x);
+        }
+        u.exclude = joinSorted(left);
+    }
+    return u;
+}
+
+// `have` holds everything `need` asks for.
+bool covers(const Spec& have, const Spec& need) { return unionOf({have, need}) == have; }
 
 // A subscription's snapshot, cut from the shared copy: keys and exclude at the
 // top level, then depth, as for a get.
@@ -1017,12 +1106,14 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
     sub.forwarded = true;
     sub.snapshot = req.query.snapshot;
 
-    bool start = false;
+    bool start = false, renew = false;
     uint32_t interval = 0;
+    // What the upstream subscription must hold once this one joins.
+    Spec want = wanted(sub.path, &sub);
     {
         MutexGuard guard(mutex_);
         Upstream* u = findUpstream(rest);
-        if (u && u->ready) {
+        if (u && u->ready && covers(u->copySpec, specOf(sub))) {
             // Shared: the snapshot comes from the copy, right away.
             JsonWriter w(reply.begin(Status::Ok));
             if (sub.snapshot) {
@@ -1053,16 +1144,67 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
             // An events-only subscriber doesn't pace the others' changes.
             u->interval = sub.changes ? req.query.interval : 0;
         }
+        // A copy that doesn't hold what this one needs: subscribed again,
+        // wider; this one waits for that snapshot.
+        u->spec = want;
         interval = u->interval;
         if (!u->subscribing) {
             u->subscribing = true;
             u->lastSubscribeMs = route.endpoint->now();
             start = true;
+            renew = u->ready;
         }
     }
     std::string r(rest);
     api.addSubscription(std::move(sub));  // waiting for the upstream snapshot
-    if (start && !sendUpstream(r, interval, false)) upstreamReply(r, Status::Busy, JsonVariantConst());
+    if (start && !sendUpstream(r, interval, renew)) upstreamReply(r, Status::Busy, JsonVariantConst());
+}
+
+RemoteNode::Spec RemoteNode::wanted(const std::string& local, const Subscription* extra) {
+    std::vector<Spec> specs;
+    if (extra) specs.push_back(specOf(*extra));
+    if (Api* api = api_) {
+        api->forwardedSubscriptions(this, [&](Subscription& sub) {
+            if (sub.path == local) specs.push_back(specOf(sub));
+            return true;
+        });
+    }
+    return unionOf(specs);
+}
+
+void RemoteNode::narrowed(std::string_view localPath) {
+    if (localPath.size() < localPath_.size()) return;
+    std::string rest(localPath.substr(localPath_.size()));
+    Spec want = wanted(std::string(localPath), nullptr);
+    uint32_t interval;
+    {
+        MutexGuard guard(mutex_);
+        Upstream* u = findUpstream(rest);
+        if (!u || u->spec == want) return;
+        u->spec = want;
+        // In flight: its reply sees the new spec and asks again.
+        if (u->subscribing || !u->ready) return;
+        u->subscribing = true;
+        interval = u->interval;
+    }
+    if (!sendUpstream(rest, interval, true)) {
+        MutexGuard guard(mutex_);
+        if (Upstream* u = findUpstream(rest)) u->subscribing = false;
+    }
+}
+
+bool RemoteNode::upstreamSpec(std::string_view localPath, std::string& keys, std::string& exclude, int& depth) const {
+    if (localPath.size() < localPath_.size()) return false;
+    std::string_view rest = localPath.substr(localPath_.size());
+    MutexGuard guard(mutex_);
+    for (const auto& u : upstreams_) {
+        if (u->rest != rest) continue;
+        keys = u->sent.keys;
+        exclude = u->sent.exclude;
+        depth = u->sent.depth;
+        return true;
+    }
+    return false;
 }
 
 bool RemoteNode::sendUpstream(const std::string& rest, uint32_t interval, bool renew) {
@@ -1074,8 +1216,21 @@ bool RemoteNode::sendUpstream(const std::string& rest, uint32_t interval, bool r
             r.peer, Op::Unsubscribe, path, std::string_view(), [](Status, JsonVariantConst) {}, Query(), timeoutMs_,
             this);
     }
+    Spec spec;
+    {
+        MutexGuard guard(mutex_);
+        if (Upstream* u = findUpstream(rest)) {
+            u->sent = u->spec;
+            spec = u->spec;
+        }
+    }
+    // Only what the local subscribers need (keys, depth): a whole tree
+    // would cost the remote, the link and this node's heap.
     Query q;
     q.interval = interval;
+    q.keys = spec.keys;
+    q.exclude = spec.exclude;
+    q.depth = spec.depth;
     return r.endpoint->request(
         r.peer, Op::Subscribe, path, std::string_view(),
         [this, rest](Status s, JsonVariantConst body) { upstreamReply(rest, s, body); }, q, timeoutMs_, this);
@@ -1084,71 +1239,98 @@ bool RemoteNode::sendUpstream(const std::string& rest, uint32_t interval, bool r
 void RemoteNode::upstreamReply(const std::string& rest, Status s, JsonVariantConst body) {
     Api* api = api_;
     if (!api) return;
-    // Lock order: the API, then this node.
-    MutexGuard apiGuard(api->mutex());
-    MutexGuard guard(mutex_);
-    Upstream* u = findUpstream(rest);
-    if (!u) {
-        // Released while subscribing: drop the subscription it made.
-        Route r;
-        if (s == Status::Ok && route(r)) {
-            r.endpoint->request(
-                r.peer, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {},
-                Query(), timeoutMs_, this);
+    bool again = false;
+    uint32_t interval = 0;
+    {
+        // Lock order: the API, then this node.
+        MutexGuard apiGuard(api->mutex());
+        MutexGuard guard(mutex_);
+        Upstream* u = findUpstream(rest);
+        if (!u) {
+            // Released while subscribing: drop the subscription it made.
+            Route r;
+            if (s == Status::Ok && route(r)) {
+                r.endpoint->request(
+                    r.peer, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {},
+                    Query(), timeoutMs_, this);
+            }
+            return;
         }
-        return;
-    }
-    u->subscribing = false;
-    bool wasReady = u->ready;
-    bool changedCopy = false;
-    if (s == Status::Ok) {
-        // Compared in place: two serialized copies of a large state could
-        // exhaust a fragmented heap.
-        changedCopy = !wasReady || u->copy.as<JsonVariantConst>() != body;
-        u->copy.set(body);
-        u->ready = true;
-        u->stale = false;
-    } else if (wasReady) {
-        u->stale = true;  // keep the copy and the subscribers; retry soon
-    }
+        u->subscribing = false;
+        bool wasReady = u->ready;
+        bool changedCopy = false;
+        bool reshaped = false;  // the copy now holds more or less, not newer state
+        if (s == Status::Ok) {
+            reshaped = wasReady && u->copySpec != u->sent;
+            // Compared in place: two serialized copies of a large state could
+            // exhaust a fragmented heap.
+            changedCopy = !wasReady || (!reshaped && u->copy.as<JsonVariantConst>() != body);
+            u->copy.set(body);
+            u->copySpec = u->sent;
+            u->ready = true;
+            u->stale = false;
+        } else if (wasReady) {
+            u->stale = true;  // keep the copy and the subscribers; retry soon
+        }
 
-    std::string localPath = localPath_ + rest;
-    std::string remoteBase = remotePath_ == "/" ? std::string() : remotePath_;
-    std::string localBase = localPath_;
-    bool anyLeft = false;
-    JsonVariantConst copy = u->copy.as<JsonVariantConst>();
-    api->forwardedSubscriptions(this, [&](Subscription& sub) {
-        if (sub.path != localPath) return true;
-        if (sub.waiting) {
-            if (s == Status::Ok) {
-                JsonWriter w(sub.waiting->begin(Status::Ok));
-                if (sub.snapshot) {
-                    writeSnapshot(w, copy, sub);
-                } else {
-                    w.null();
+        std::string localPath = localPath_ + rest;
+        std::string remoteBase = remotePath_ == "/" ? std::string() : remotePath_;
+        std::string localBase = localPath_;
+        bool anyLeft = false, stillWaiting = false;
+        JsonVariantConst copy = u->copy.as<JsonVariantConst>();
+        api->forwardedSubscriptions(this, [&](Subscription& sub) {
+            if (sub.path != localPath) return true;
+            if (sub.waiting) {
+                if (s == Status::Ok && !covers(u->copySpec, specOf(sub))) {
+                    // Joined while a narrower request was in flight: next one.
+                    stillWaiting = true;
+                    anyLeft = true;
+                    return true;
                 }
-                detail::finishBody(*sub.waiting, w, sub.path);
-            } else {
-                writeMapped(*sub.waiting, s, body, localBase, remoteBase);
+                if (s == Status::Ok) {
+                    JsonWriter w(sub.waiting->begin(Status::Ok));
+                    if (sub.snapshot) {
+                        writeSnapshot(w, copy, sub);
+                    } else {
+                        w.null();
+                    }
+                    detail::finishBody(*sub.waiting, w, sub.path);
+                } else {
+                    writeMapped(*sub.waiting, s, body, localBase, remoteBase);
+                }
+                sub.waiting->release();
+                sub.waiting = nullptr;
+                api->pendingDone();
+                if (s != Status::Ok) return false;
+            } else if (s == Status::Ok && wasReady && changedCopy && sub.changes) {
+                // Renewed after the remote changed without telling us (it
+                // restarted, or notifications were lost): send the whole state.
+                notifyChange(sub, [&](JsonWriter& w) { writeSnapshot(w, copy, sub); });
             }
-            sub.waiting->release();
-            sub.waiting = nullptr;
-            api->pendingDone();
-            if (s != Status::Ok) return false;
-        } else if (s == Status::Ok && wasReady && changedCopy && sub.changes) {
-            // Renewed after the remote changed without telling us (it
-            // restarted, or notifications were lost): send the whole state.
-            notifyChange(sub, [&](JsonWriter& w) { writeSnapshot(w, copy, sub); });
+            anyLeft = true;
+            return true;
+        });
+        if (!anyLeft && !u->ready) {
+            for (size_t i = 0; i < upstreams_.size(); i++) {
+                if (upstreams_[i].get() == u) {
+                    upstreams_.erase(upstreams_.begin() + static_cast<std::ptrdiff_t>(i));
+                    break;
+                }
+            }
+            return;
         }
-        anyLeft = true;
-        return true;
-    });
-    if (!anyLeft && !u->ready) {
-        for (size_t i = 0; i < upstreams_.size(); i++) {
-            if (upstreams_[i].get() == u) {
-                upstreams_.erase(upstreams_.begin() + static_cast<std::ptrdiff_t>(i));
-                break;
-            }
+        // The subscribers' needs changed while it was in flight.
+        if (s == Status::Ok && (stillWaiting || u->spec != u->sent)) {
+            u->subscribing = true;
+            interval = u->interval;
+            again = true;
+        }
+    }
+    if (again && !sendUpstream(rest, interval, true)) {
+        MutexGuard guard(mutex_);
+        if (Upstream* u = findUpstream(rest)) {
+            u->subscribing = false;
+            u->stale = true;  // tick() tries again
         }
     }
 }

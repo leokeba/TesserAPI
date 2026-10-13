@@ -232,6 +232,12 @@ public:
     // The last local subscription to `localPath` is gone. Called by the API,
     // under its lock.
     virtual void released(std::string_view localPath);
+    // One of several local subscriptions to `localPath` is gone: the
+    // upstream one may narrow. Called by the API, under its lock.
+    virtual void narrowed(std::string_view localPath);
+    // What the upstream subscription to `localPath` asks the remote for
+    // (keys, exclude, depth; tests, diagnostics): false without one.
+    bool upstreamSpec(std::string_view localPath, std::string& keys, std::string& exclude, int& depth) const;
     // Upstream subscriptions currently held (tests, diagnostics).
     size_t upstreamCount() const;
 
@@ -239,6 +245,16 @@ public:
     void tick(const DatagramEndpoint& by, uint32_t nowMs);
     void detach(const DatagramEndpoint* endpoint);
     bool handleNotification(const DatagramEndpoint& by, const PeerAddress& from, JsonObjectConst envelope);
+
+    // What an upstream subscription asks for: the union of what its local
+    // subscribers need (docs/DESIGN.md section 14).
+    struct Spec {
+        std::string keys;     // sorted, comma-separated; empty: every child
+        std::string exclude;  // likewise, with no keys
+        int depth = -1;       // -1: unlimited
+        bool operator==(const Spec& o) const { return keys == o.keys && exclude == o.exclude && depth == o.depth; }
+        bool operator!=(const Spec& o) const { return !(*this == o); }
+    };
 
 private:
     // One subscription to the remote node, shared by local subscribers.
@@ -250,7 +266,12 @@ private:
         bool stale = false;  // a renewal failed: retry soon
         uint32_t interval = 0;
         uint32_t lastSubscribeMs = 0;
+        Spec spec;      // what the subscribers need now
+        Spec sent;      // what the request in flight (or the last) asked for
+        Spec copySpec;  // what `copy` holds
     };
+    // The union of `local`'s subscribers' needs, plus `extra`'s.
+    Spec wanted(const std::string& local, const Subscription* extra);
     struct RouteSlot {
         Route route;
         uint32_t added;  // tie-break: routes of the same rank keep this order

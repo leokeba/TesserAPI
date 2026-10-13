@@ -47,6 +47,38 @@ struct Rig {
     }
 };
 
+// A reply that can wait (the remote's snapshot), as transports' can.
+struct WaitReply : tesser::Reply {
+    std::shared_ptr<std::string> out = std::make_shared<std::string>();
+    std::string buf;
+    tesser::StringSink sink{buf};
+    tesser::Sink& begin(Status) override {
+        buf.clear();
+        return sink;
+    }
+    void end() override { *out = buf; }
+    tesser::Reply* detach() override {
+        auto* r = new WaitReply();
+        r->out = out;
+        return r;
+    }
+    void release() override { delete this; }
+};
+
+// Subscribes `sub` through a reply that can wait; the body once it came.
+inline std::string subscribeWaiting(Rig& r, tesser::Subscriber* sub, const char* path, tesser::Query q = tesser::Query()) {
+    tesser::Request req;
+    req.op = tesser::Op::Subscribe;
+    req.path = path;
+    req.query = q;
+    req.subscriber = sub;
+    WaitReply reply;
+    std::shared_ptr<std::string> out = reply.out;
+    r.gateway.handle(req, reply);
+    r.net.run();
+    return *out;
+}
+
 TEST(remote_forwarding) {
     Rig r;
     CHECK_EQ(r.ask("{\"id\":1,\"op\":\"get\",\"path\":\"/kitchen/lamp\",\"keys\":\"on\"}"),
@@ -138,6 +170,56 @@ TEST(remote_mirror) {
     CHECK_EQ(r.gatewayEnd.stats().timeouts, 0u);
 }
 
+TEST(remote_upstream_follows_subscribers) {
+    // The upstream subscription asks for what its local subscribers need:
+    // their keys and depth together, wider as one needing more joins,
+    // narrower again as it leaves.
+    Rig r;
+    auto spec = [&](const char* path) {
+        std::string keys, exclude;
+        int depth = 0;
+        if (!r.kitchen.upstreamSpec(path, keys, exclude, depth)) return std::string("none");
+        return keys + "|" + exclude + "|" + std::to_string(depth);
+    };
+    subscription_cases::FakeSubscriber a, b, c;
+    tesser::Query q = cases::keys("on");
+    q.depth = 1;
+    CHECK_EQ(subscribeWaiting(r, &a, "/kitchen/lamp", q), "{\"on\":false}");
+    CHECK_EQ(spec("/kitchen/lamp"), "on||1");
+    CHECK_EQ(subscribeWaiting(r, &b, "/kitchen/lamp", cases::keys("brightness,on")), "{\"on\":false,\"brightness\":128}");
+    CHECK_EQ(spec("/kitchen/lamp"), "brightness,on||-1");
+    tesser::Query all;
+    all.exclude = "label";
+    CHECK_EQ(subscribeWaiting(r, &c, "/kitchen/lamp", all), "{\"on\":false,\"brightness\":128}");
+    CHECK_EQ(spec("/kitchen/lamp"), "|label|-1");  // every key but label: b's and a's are in it
+    CHECK_EQ(r.device.api.subscriptionCount(), 1u);
+    // Changes still reach each through its own filter.
+    cases::set(r.device.api, "/lamp/brightness", "50");
+    r.device.api.poll(1000);
+    r.net.run();
+    CHECK_EQ(a.messages.size(), 0u);
+    CHECK_EQ(b.last(), "{\"op\":\"change\",\"path\":\"/kitchen/lamp\",\"body\":{\"brightness\":50}}");
+    CHECK_EQ(c.last(), b.last());
+    // The wide ones leave: narrower again, and nobody is told anything.
+    size_t before = a.messages.size();
+    r.gateway.dropSubscriber(&c);
+    r.net.run();
+    CHECK_EQ(spec("/kitchen/lamp"), "brightness,on||-1");
+    r.gateway.dropSubscriber(&b);
+    r.net.run();
+    CHECK_EQ(spec("/kitchen/lamp"), "on||1");
+    CHECK_EQ(a.messages.size(), before);
+    CHECK_EQ(r.device.api.subscriptionCount(), 1u);
+    cases::set(r.device.api, "/lamp/on", "true");
+    r.device.api.poll(2000);
+    r.net.run();
+    CHECK_EQ(a.last(), "{\"op\":\"change\",\"path\":\"/kitchen/lamp\",\"body\":{\"on\":true}}");
+    r.gateway.dropSubscriber(&a);
+    r.net.run();
+    CHECK_EQ(spec("/kitchen/lamp"), "none");
+    CHECK_EQ(r.device.api.subscriptionCount(), 0u);
+}
+
 // Arrays in a mirrored copy are values: whole at any depth, like local ones.
 TEST(remote_mirror_arrays_whole) {
     Rig r;
@@ -158,12 +240,20 @@ TEST(remote_forwarded_subscriptions) {
              "{\"id\":1,\"status\":\"ok\",\"body\":{\"on\":false}}");
     CHECK_EQ(r.device.api.subscriptionCount(), 1u);
     CHECK_EQ(r.kitchen.upstreamCount(), 1u);
-    // Later ones share it, and get their snapshot from its copy at once.
+    // Later ones share it; one that needs more (every key) waits while it
+    // is renewed wider. The serial client hears nothing of that.
+    r.lines.out.clear();
     subscription_cases::FakeSubscriber local;
-    CHECK_EQ(subscription_cases::subscribe(r.gateway, &local, "/kitchen/lamp").body,
-             "{\"on\":false,\"brightness\":128,\"label\":\"desk\"}");
+    CHECK_EQ(subscribeWaiting(r, &local, "/kitchen/lamp"), "{\"on\":false,\"brightness\":128,\"label\":\"desk\"}");
     CHECK_EQ(r.device.api.subscriptionCount(), 1u);
     CHECK_EQ(r.gateway.subscriptionCount(), 2u);
+    CHECK_EQ(r.lines.out.size(), 0u);
+    // One that needs no more gets its snapshot from the copy at once.
+    subscription_cases::FakeSubscriber third;
+    CHECK_EQ(subscription_cases::subscribe(r.gateway, &third, "/kitchen/lamp", cases::keys("label")).body,
+             "{\"label\":\"desk\"}");
+    r.gateway.dropSubscriber(&third);
+    r.net.run();
 
     // Changes are relayed through each subscriber's own filter.
     r.lines.out.clear();

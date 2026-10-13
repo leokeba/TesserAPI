@@ -217,7 +217,12 @@ void Api::subscriptionsRemoved(std::vector<Subscription>& gone, bool clientGone)
         if (!g.forwarded) continue;
         bool used = false;
         for (const Subscription& s : subs_) used = used || (s.node == g.node && s.path == g.path);
-        if (!used) static_cast<RemoteNode*>(g.node)->released(g.path);
+        if (used) {
+            // The others may need less: the upstream subscription narrows.
+            static_cast<RemoteNode*>(g.node)->narrowed(g.path);
+        } else {
+            static_cast<RemoteNode*>(g.node)->released(g.path);
+        }
     }
 }
 
