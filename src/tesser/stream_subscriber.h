@@ -32,8 +32,9 @@ public:
     // Subscribes for `request` (its op and subscriber are replaced). Ok: the
     // stream is open, and the snapshot, if any, went out as the first line.
     // Otherwise the error was written to `error` and nothing was sent.
-    // Subscriptions that would wait (below a remote node) are not_allowed.
-    // Once per stream.
+    // Below a remote node it waits for the remote's snapshot, up to
+    // Config::deferTimeoutMs (then timeout), as a forwarded get does: call
+    // it without the API lock. Once per stream.
     Status open(Request request, Reply& error);
 
     bool notify(const std::string& message, Delivery delivery) override;

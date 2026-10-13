@@ -1,11 +1,15 @@
 // Remote nodes: a gateway forwarding to a device over an in-memory link.
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include "core_cases.h"
 #include "datagram_cases.h"
 #include "subscription_cases.h"
+#include "tesser/stream_subscriber.h"
 
 namespace remote_cases {
 
@@ -218,6 +222,58 @@ TEST(remote_upstream_follows_subscribers) {
     r.net.run();
     CHECK_EQ(spec("/kitchen/lamp"), "none");
     CHECK_EQ(r.device.api.subscriptionCount(), 0u);
+}
+
+TEST(remote_streamed_subscription_waits) {
+    // An HTTP streamed subscription below a remote node waits for the
+    // remote's snapshot, as a forwarded get does, then streams.
+    Rig r;
+    std::vector<std::string> lines;
+    tesser::StreamSubscriber stream(r.gateway, [&](const std::string& piece) {
+        lines.push_back(piece);
+        return true;
+    });
+    // The remote answers from another task while open() waits; it starts
+    // once the request is out, so the two never share the network at once.
+    auto answer = [&] {
+        return std::thread([&] {
+            while (r.gatewayEnd.pendingCalls() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            for (int i = 0; i < 5; i++) r.net.run();
+        });
+    };
+    tesser::Request req;
+    req.path = "/kitchen/lamp";
+    req.query.keys = "on";
+    tesser::StringReply error;
+    std::thread remote = answer();
+    Status s = stream.open(req, error);
+    remote.join();
+    CHECK_EQ(s, Status::Ok);
+    CHECK_EQ(lines.size(), 1u);
+    if (!lines.empty()) CHECK_EQ(lines[0], "{\"op\":\"change\",\"path\":\"/kitchen/lamp\",\"body\":{\"on\":false}}\n");
+    cases::set(r.device.api, "/lamp/on", "true");
+    r.device.api.poll(1000);
+    r.net.run();
+    CHECK_EQ(lines.back(), "{\"op\":\"change\",\"path\":\"/kitchen/lamp\",\"body\":{\"on\":true}}\n");
+
+    // A remote that doesn't answer: timeout, nothing streamed, nothing left.
+    r.gateway.config().deferTimeoutMs = 50;
+    r.net.dropAll = true;
+    std::vector<std::string> none;
+    tesser::StreamSubscriber silent(r.gateway, [&](const std::string& piece) {
+        none.push_back(piece);
+        return true;
+    });
+    tesser::Request other;
+    other.path = "/kitchen/sensors";
+    tesser::StringReply timedOut;
+    size_t subs = r.gateway.subscriptionCount();
+    CHECK_EQ(silent.open(other, timedOut), Status::Timeout);
+    CHECK_EQ(timedOut.status, Status::Timeout);
+    CHECK(none.empty());
+    CHECK_EQ(r.gateway.subscriptionCount(), subs);
+    CHECK_EQ(r.gateway.pending(), 0);
 }
 
 // Arrays in a mirrored copy are values: whole at any depth, like local ones.
