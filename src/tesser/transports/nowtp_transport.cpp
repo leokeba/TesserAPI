@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <type_traits>
+#include <utility>
+
 #include "esp_timer.h"
 #include "tesser/api.h"
 
@@ -13,6 +16,25 @@ namespace tesser {
 namespace {
 
 uint32_t nowMs() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
+
+// NowTP 8320a40 and later let a handler take a reassembled message's
+// malloc'd buffer (Message::buffer); older ones only lend `data`.
+template <class M, class = void>
+struct HasBuffer : std::false_type {};
+template <class M>
+struct HasBuffer<M, decltype(void(std::declval<const M&>().buffer))> : std::true_type {};
+
+template <class M>
+uint8_t* takeBuffer(const M& m) {
+    if constexpr (HasBuffer<M>::value) {
+        uint8_t* b = m.buffer;
+        m.buffer = nullptr;
+        return b;
+    } else {
+        (void)m;
+        return nullptr;
+    }
+}
 
 }  // namespace
 
@@ -46,7 +68,13 @@ bool NowTpTransport::begin(bool runTask, uint32_t stackSize, UBaseType_t priorit
         ownHook_ = true;
     }
     now_.listen(port_, [this](const nowtp::Message& m) {
-        endpoint_.receive(address(m.src), reinterpret_cast<const char*>(m.data), m.len, m.reliable);
+        // A reassembled message is kept as NowTP built it: a large reply
+        // isn't on a short heap twice. A single frame's data is copied.
+        if (uint8_t* buffer = takeBuffer(m)) {
+            endpoint_.receiveOwned(address(m.src), buffer, m.len, m.reliable);
+        } else {
+            endpoint_.receive(address(m.src), reinterpret_cast<const char*>(m.data), m.len, m.reliable);
+        }
     });
     return true;
 }
