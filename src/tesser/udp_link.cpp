@@ -191,7 +191,7 @@ void UdpLink::stop() {
         outgoing_.clear();
         partials_.clear();
     }
-    for (const PeerAddress& p : peers) endpoint_.forgetPeer(p);
+    for (const PeerAddress& p : peers) endpoint_.forgetPeer(p, PeerLoss::Stopped);
 }
 
 void UdpLink::setName(std::string_view name) {
@@ -577,14 +577,14 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
         }
     }
     // A peer that restarted lost its calls and subscriptions: forget them.
-    if (restarted) endpoint_.forgetPeer(from);
+    if (restarted) endpoint_.forgetPeer(from, PeerLoss::Restarted);
     for (Inbound& in : inbound) endpoint_.receive(in.from, in.data.data(), in.data.size(), in.reliable, in.broadcast);
     if (announced) endpoint_.peerSeen(from, name, hash, device);
-    if (bye) endpoint_.forgetPeer(from);
+    if (bye) endpoint_.forgetPeer(from, PeerLoss::Goodbye);
 }
 
 bool UdpLink::tick() {
-    std::vector<PeerAddress> lost;
+    std::vector<std::pair<PeerAddress, PeerLoss>> lost;
     {
         MutexGuard guard(mutex_);
         uint32_t t = now();
@@ -595,7 +595,7 @@ bool UdpLink::tick() {
                     // Unreachable: what else waits for it fails with it.
                     stats_.failed++;
                     PeerAddress to = o.to;
-                    lost.push_back(to);
+                    lost.emplace_back(to, PeerLoss::Failed);
                     for (size_t j = 0; j < outgoing_.size();) {
                         if (outgoing_[j].to == to) {
                             outgoing_.erase(outgoing_.begin() + static_cast<std::ptrdiff_t>(j));
@@ -626,13 +626,13 @@ bool UdpLink::tick() {
             for (Peer& p : peers_) {
                 if (p.advertised && t - p.heardMs >= options_.peerTimeoutMs) {
                     p.advertised = false;
-                    lost.push_back(p.address);
+                    lost.emplace_back(p.address, PeerLoss::Silent);
                 }
             }
             if (advertising_ && t - advertisedMs_ >= options_.advertiseMs) sendAdvert(PeerAddress(), 0);
         }
     }
-    for (const PeerAddress& p : lost) endpoint_.forgetPeer(p);
+    for (const auto& p : lost) endpoint_.forgetPeer(p.first, p.second);
     return endpoint_.process() || !lost.empty();
 }
 

@@ -333,14 +333,23 @@ TEST(route_peer_lost_on_the_device) {
     CHECK(r.devUdp.endpoint().deviceOnline(r.masterMac));
 
     tesser::watchDevices({&r.devUdp.endpoint(), &r.devNow},
-                         [&](const PeerAddress&, const PeerAddress& device) { lost.push_back(hex(device.bytes, 6)); });
+                         [&](const PeerAddress&, const PeerAddress& device, tesser::PeerLoss reason) {
+                             lost.push_back(hex(device.bytes, 6) + " " + tesser::toString(reason));
+                         });
+    // The master restarts without a goodbye (a power blip): back at once,
+    // and still on NowTP, but whatever it turned on went with its previous
+    // run.
+    r.gwUdp.start(0x7777);
+    r.run();
+    CHECK((lost == std::vector<std::string>{"10521c75f301 restarted"}));
+    lost.clear();
     r.gwUdp.stop();
     r.run();
     CHECK(lost.empty());
     // Gone from NowTP too: now it is lost.
     r.devNow.forgetPeer(r.masterMac);
     r.devNow.process();
-    CHECK((lost == std::vector<std::string>{"10521c75f301"}));
+    CHECK((lost == std::vector<std::string>{"10521c75f301 lost"}));
     // A peer forgotten again isn't reported twice.
     r.devNow.forgetPeer(r.masterMac);
     r.devNow.process();
@@ -456,6 +465,49 @@ TEST(route_tokens) {
     CHECK_EQ(r.level, 7);
     CHECK_EQ(n.streamStats().failed, 2u);
     RemoteNode::onAccess(nullptr);
+}
+
+TEST(route_probe_backoff) {
+    // An offline route is probed 5 s after it is lost, then ever less often,
+    // up to once a minute; a route lost again starts over.
+    datagram_cases::Net net;
+    tesser::Api gw;
+    int probes = 0;
+    DatagramEndpoint ep(
+        &gw, TransportKind::NowTP,
+        [&](const PeerAddress&, const std::string& m, tesser::Delivery) {
+            if (m.find("\"op\":\"get\"") != std::string::npos) probes++;
+            return true;
+        },
+        net.clockFn());
+    RemoteNode& ghost = gw.remote("ghost", ep, datagram_cases::addr(9));
+    ep.forgetPeer(datagram_cases::addr(9));
+    ep.process();
+    CHECK(!ghost.online());
+    auto until = [&](uint32_t ms) {
+        while (net.clock < 1000 + ms) {
+            net.clock += 100;
+            ep.process();
+        }
+    };
+    std::vector<int> counts;
+    for (uint32_t t : {4900u, 5100u, 15100u, 35100u, 75100u, 135100u, 195100u}) {
+        until(t);
+        counts.push_back(probes);
+    }
+    CHECK((counts == std::vector<int>{0, 1, 2, 3, 4, 5, 6}));
+    // Heard again, then lost: 5 s again.
+    ep.peerSeen(datagram_cases::addr(9), "ghost", 1);
+    ep.process();
+    CHECK(ghost.online());
+    ep.forgetPeer(datagram_cases::addr(9));
+    ep.process();
+    uint32_t lostAt = net.clock;
+    while (net.clock < lostAt + 5100) {
+        net.clock += 100;
+        ep.process();
+    }
+    CHECK_EQ(probes, 7);
 }
 
 }  // namespace route_cases

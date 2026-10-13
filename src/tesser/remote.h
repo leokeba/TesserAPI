@@ -69,11 +69,14 @@ public:
     // is renewed every `refreshMs` in case the remote node restarted.
     RemoteNode& mirror(uint32_t intervalMs = 500, uint32_t refreshMs = 30000);
 
-    // Asks an offline route every `ms` (default 5000; 0: never) whether the
-    // device answers again, with a get at depth 0: a device that doesn't
-    // advertise (a declared address on another subnet) comes back that way.
+    // Asks offline routes whether the device answers again, with a get at
+    // depth 0: a device that doesn't advertise (a declared address on
+    // another subnet) comes back that way. The first probe goes `ms` after
+    // the route is lost (default 5000; 0: never), and the wait doubles after
+    // each one, up to a minute, so a device that is gone costs little.
     RemoteNode& probe(uint32_t ms) {
         probeMs_ = ms;
+        probeWaitMs_ = ms;
         return *this;
     }
 
@@ -260,7 +263,9 @@ private:
     bool lastOnline_ = true;
     std::atomic<bool> announce_{false};
     uint32_t probeMs_ = 5000;
-    uint32_t lastProbeMs_ = 0;  // mounted, or a route added: tick() tells onStateChange()
+    uint32_t probeWaitMs_ = 5000;  // until the next probe; doubles up to kMaxProbeMs
+    uint32_t lastProbeMs_ = 0;
+    static constexpr uint32_t kMaxProbeMs = 60000;  // mounted, or a route added: tick() tells onStateChange()
 
     bool mirror_ = false;
     uint32_t mirrorIntervalMs_ = 500;

@@ -459,7 +459,10 @@ void RemoteNode::setRouteOnline(const DatagramEndpoint* endpoint, const PeerAddr
     MutexGuard guard(routesMutex_);
     for (RouteSlot& r : routes_) {
         if (r.route.endpoint != endpoint || r.route.peer != peer) continue;
-        if (r.route.online && !online) lastProbeMs_ = nowMs;  // the first probe waits probeMs
+        if (r.route.online && !online) {
+            lastProbeMs_ = nowMs;  // the first probe waits probeMs
+            probeWaitMs_ = probeMs_;
+        }
         r.route.online = online;
         if (online && nowMs) r.route.heardMs = nowMs;
     }
@@ -610,11 +613,15 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
     std::vector<Route> probes;
     {
         MutexGuard guard(routesMutex_);
-        if (probeMs_ && nowMs - lastProbeMs_ >= probeMs_) {
+        if (probeMs_ && nowMs - lastProbeMs_ >= (probeWaitMs_ ? probeWaitMs_ : probeMs_)) {
             for (const RouteSlot& r : routes_) {
                 if (!r.route.online) probes.push_back(r.route);
             }
-            if (!probes.empty()) lastProbeMs_ = nowMs;
+            if (!probes.empty()) {
+                lastProbeMs_ = nowMs;
+                uint32_t base = probeWaitMs_ ? probeWaitMs_ : probeMs_;
+                probeWaitMs_ = base >= kMaxProbeMs / 2 ? kMaxProbeMs : base * 2;
+            }
         }
     }
     for (const Route& r : probes) {

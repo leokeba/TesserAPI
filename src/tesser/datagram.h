@@ -47,6 +47,18 @@ struct PeerAddress {
 // call from the link's own callback even while the link holds its locks.
 // process() does the work: it handles requests under the API lock and runs
 // client callbacks. Call it from a worker task or from loop().
+// Why an endpoint forgot a peer.
+enum class PeerLoss : uint8_t {
+    Lost,       // the link said so (NowTP's peer lost), or forgetPeer() without a reason
+    Failed,     // a reliable message wasn't acknowledged in time
+    Goodbye,    // it said it was leaving
+    Restarted,  // it came back with a new session: whatever it held is gone
+    Silent,     // an advertising peer went quiet
+    Stopped,    // this side's link stopped
+};
+// "lost" / "failed" / "goodbye" / "restarted" / "silent" / "stopped".
+const char* toString(PeerLoss reason);
+
 class DatagramEndpoint {
 public:
     using SendFn = std::function<bool(const PeerAddress& to, const std::string& message, Delivery delivery)>;
@@ -151,8 +163,8 @@ public:
     // The peer is gone (e.g. NowTP reported it lost): its pending calls get
     // Status::Timeout, its subscriptions and file transfer are dropped and
     // its remote nodes show it offline. Safe from any task, including link callbacks: the
-    // work happens in the next process().
-    void forgetPeer(const PeerAddress& peer);
+    // work happens in the next process(). `reason` goes to onPeerLost().
+    void forgetPeer(const PeerAddress& peer, PeerLoss reason = PeerLoss::Lost);
 
     // ---- credentials (client side) ---------------------------------------
     // Presents `token` to `peer` with an "auth" envelope (docs/DESIGN.md
@@ -172,13 +184,20 @@ public:
     void onAuth(AuthHandler fn) { onAuth_ = std::move(fn); }
 
     // ---- peers ------------------------------------------------------------
-    // A peer this endpoint had heard from was forgotten (a failed delivery,
-    // a goodbye, a restart, silence, the link stopped): `device` is its MAC
-    // when known (a NowTP address; the "id" a UDP peer advertises), else
-    // empty. Runs in process(), without the API lock. A node that a client
-    // drives undoes what it did here (docs/DESIGN.md section 14.4).
+    // A peer this endpoint had heard from was forgotten, for `reason`:
+    // `device` is its MAC when known (a NowTP address; the "id" a UDP peer
+    // advertises), else empty. Runs in process(), without the API lock. A
+    // node that a client drives undoes what it did here (docs/DESIGN.md
+    // section 14.4); a restarted peer is reported though it is back at once.
+    using PeerLossHandler =
+        std::function<void(const PeerAddress& peer, const PeerAddress& device, PeerLoss reason)>;
     using PeerLostHandler = std::function<void(const PeerAddress& peer, const PeerAddress& device)>;
-    void onPeerLost(PeerLostHandler fn) { onPeerLost_ = std::move(fn); }
+    void onPeerLost(PeerLossHandler fn) { onPeerLost_ = std::move(fn); }
+    void onPeerLost(PeerLostHandler fn) {
+        if (!fn) return onPeerLost(PeerLossHandler());
+        onPeerLost(PeerLossHandler(
+            [fn](const PeerAddress& peer, const PeerAddress& device, PeerLoss) { fn(peer, device); }));
+    }
     // Whether a peer of `device` has been heard and not forgotten since.
     bool deviceOnline(const PeerAddress& device) const;
     // The device behind `peer` (empty when unknown).
@@ -291,7 +310,7 @@ private:
     void reject(const Incoming& msg, Status status, const char* message);
     void expire(uint32_t now, bool all, const PeerAddress* peer);
     Subscriber* subscriberFor(const PeerAddress& peer, bool create);
-    void dropPeer(const PeerAddress& peer);
+    void dropPeer(const PeerAddress& peer, PeerLoss reason);
     void applySeen(const Seen& seen);
     void mount(Object& parent, uint32_t mirrorMs, const Seen& seen, const PeerAddress& device);
     void markOnline(const PeerAddress& peer, bool online);
@@ -309,7 +328,7 @@ private:
     Options options_;
     std::function<void()> onQueued_;
     NotificationHandler onNotification_;
-    PeerLostHandler onPeerLost_;
+    PeerLossHandler onPeerLost_;
     AuthHandler onAuth_;
     std::function<bool(const PeerAddress&)> trust_;
     std::atomic<Access> peerAccess_{Access::Public};
@@ -317,7 +336,7 @@ private:
     mutable Mutex mutex_;
     std::vector<Incoming> queue_;  // a vector: an empty deque allocates
     std::vector<CallSlot> calls_;
-    std::vector<PeerAddress> lostPeers_;  // forgetPeer() → process()
+    std::vector<std::pair<PeerAddress, PeerLoss>> lostPeers_;  // forgetPeer() → process()
     std::vector<Seen> seenPeers_;         // peerSeen() → process()
     // Schema hashes peers advertised, for remote nodes created later.
     std::vector<std::pair<PeerAddress, uint32_t>> advertised_;  // guarded by mutex_
@@ -344,8 +363,11 @@ private:
 // Calls `lost` when a device is gone from every endpoint in `endpoints` that
 // heard it (a peer without a known device: when that peer is), so a node
 // reached over UDP and NowTP isn't taken as lost while one of them still
-// works. Takes the endpoints' onPeerLost(). A device lost on two endpoints
-// at once may be reported twice.
+// works; and when it restarted (PeerLoss::Restarted), since whatever it
+// held went with its previous run, though it is back at once. Takes the
+// endpoints' onPeerLost(). A device lost on two endpoints at once may be
+// reported twice.
+void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLossHandler lost);
 void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLostHandler lost);
 
 // Builds a request envelope; `id` 0 leaves the "id" out. `bodyJson` is

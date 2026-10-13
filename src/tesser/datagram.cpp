@@ -121,7 +121,19 @@ Subscriber* DatagramEndpoint::subscriberFor(const PeerAddress& peer, bool create
     return s;
 }
 
-void DatagramEndpoint::dropPeer(const PeerAddress& peer) {
+const char* toString(PeerLoss reason) {
+    switch (reason) {
+        case PeerLoss::Lost: return "lost";
+        case PeerLoss::Failed: return "failed";
+        case PeerLoss::Goodbye: return "goodbye";
+        case PeerLoss::Restarted: return "restarted";
+        case PeerLoss::Silent: return "silent";
+        case PeerLoss::Stopped: return "stopped";
+    }
+    return "lost";
+}
+
+void DatagramEndpoint::dropPeer(const PeerAddress& peer, PeerLoss reason) {
     // Offline first: a remote node whose call fails below goes by another
     // route at once.
     markOnline(peer, false);
@@ -159,7 +171,7 @@ void DatagramEndpoint::dropPeer(const PeerAddress& peer) {
             break;
         }
     }
-    if (wasHeard && onPeerLost_) onPeerLost_(peer, device);
+    if (wasHeard && onPeerLost_) onPeerLost_(peer, device, reason);
 }
 
 DatagramEndpoint::Known* DatagramEndpoint::knownLocked(const PeerAddress& peer) {
@@ -208,18 +220,27 @@ PeerAddress DatagramEndpoint::deviceOf(const PeerAddress& peer) const {
     return kind_ == TransportKind::NowTP ? peer : PeerAddress();
 }
 
-void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLostHandler lost) {
+void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLossHandler lost) {
     auto shared = std::make_shared<std::vector<DatagramEndpoint*>>(std::move(endpoints));
     for (DatagramEndpoint* ep : *shared) {
-        ep->onPeerLost([shared, lost](const PeerAddress& peer, const PeerAddress& device) {
-            if (device.length) {
-                for (DatagramEndpoint* other : *shared) {
-                    if (other->deviceOnline(device)) return;
+        ep->onPeerLost(DatagramEndpoint::PeerLossHandler(
+            [shared, lost](const PeerAddress& peer, const PeerAddress& device, PeerLoss reason) {
+                // A restart lost the device's state even though it is back.
+                if (device.length && reason != PeerLoss::Restarted) {
+                    for (DatagramEndpoint* other : *shared) {
+                        if (other->deviceOnline(device)) return;
+                    }
                 }
-            }
-            if (lost) lost(peer, device);
-        });
+                if (lost) lost(peer, device, reason);
+            }));
     }
+}
+
+void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLostHandler lost) {
+    watchDevices(std::move(endpoints),
+                 DatagramEndpoint::PeerLossHandler([lost](const PeerAddress& peer, const PeerAddress& device, PeerLoss) {
+                     if (lost) lost(peer, device);
+                 }));
 }
 
 void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t len, bool reliable,
@@ -245,15 +266,15 @@ void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t
 
 bool DatagramEndpoint::process() {
     bool worked = false;
-    std::vector<PeerAddress> lost;
+    std::vector<std::pair<PeerAddress, PeerLoss>> lost;
     std::vector<Seen> seen;
     {
         MutexGuard guard(mutex_);
         lost.swap(lostPeers_);
         seen.swap(seenPeers_);
     }
-    for (const PeerAddress& p : lost) {
-        dropPeer(p);
+    for (const auto& p : lost) {
+        dropPeer(p.first, p.second);
         worked = true;
     }
     for (const Seen& s : seen) {
@@ -934,10 +955,10 @@ void DatagramEndpoint::removeClient(const ClientInbox* inbox) {
     }
 }
 
-void DatagramEndpoint::forgetPeer(const PeerAddress& peer) {
+void DatagramEndpoint::forgetPeer(const PeerAddress& peer, PeerLoss reason) {
     {
         MutexGuard guard(mutex_);
-        lostPeers_.push_back(peer);
+        lostPeers_.emplace_back(peer, reason);
     }
     if (onQueued_) onQueued_();
 }
