@@ -380,4 +380,78 @@ TEST(route_declared_device) {
     CHECK(onlyDeclared);
 }
 
+TEST(route_tokens) {
+    // The device lets admins write /out; the master holds a token for it.
+    Defaults d;
+    Rig r;
+    r.dev.object("out").writeAccess(tesser::Access::Admin);
+    r.dev.authenticate([](std::string_view t) {
+        return t == "good" ? tesser::Access::Admin : t == "user" ? tesser::Access::User : tesser::Access::Public;
+    });
+    RemoteNode& n = r.node();
+    std::vector<std::string> errors, answers;
+    n.onStreamError([&](const std::string&, Status s, JsonVariantConst) { errors.push_back(tesser::toString(s)); });
+    RemoteNode::onAccess([&](RemoteNode& node, Status s, tesser::Access level) {
+        RemoteNode::Route cur;
+        node.route(cur);
+        answers.push_back(std::string(tesser::toString(cur.kind())) + " " + tesser::toString(s) + " " +
+                          tesser::toString(level));
+    });
+    auto write = [&](int v) {
+        char body[24];
+        snprintf(body, sizeof(body), "{\"level\":%d}", v);
+        CHECK_EQ(n.stream("/out", body), Status::Ok);
+        r.run();
+    };
+    write(1);
+    CHECK_EQ(r.level, 0);
+    CHECK((errors == std::vector<std::string>{"unauthorized"}));
+
+    // Presented before the next request, which waits for its answer.
+    n.setToken("good");
+    write(2);
+    CHECK_EQ(r.level, 2);
+    CHECK((answers == std::vector<std::string>{"udp ok admin"}));
+    CHECK(n.access() == tesser::Access::Admin);
+    // On every route.
+    n.routeOrder({TransportKind::NowTP});
+    write(3);
+    CHECK_EQ(r.level, 3);
+    CHECK_EQ(answers.size(), 2u);
+    CHECK(n.access() == tesser::Access::Admin);
+    n.routeOrder({});
+
+    // The device restarts (a new nonce): presented again.
+    r.devUdp.stop();
+    r.devUdp.start(0x4321);
+    r.run();
+    write(4);
+    CHECK_EQ(r.level, 4);
+    CHECK_EQ(answers.size(), 3u);
+    // The device forgets the token unseen: "unauthorized", presented again,
+    // and the set goes once more.
+    r.devUdp.endpoint().forgetPeer(ip(1));
+    r.run();
+    write(5);
+    CHECK_EQ(r.level, 5);
+    CHECK_EQ(answers.size(), 4u);
+    CHECK_EQ(errors.size(), 1u);
+
+    // A token the device refuses: reported, and the set fails after one
+    // more try.
+    n.setToken("stale");
+    write(6);
+    CHECK_EQ(r.level, 5);
+    CHECK((answers.back() == "udp ok public"));
+    CHECK_EQ(answers.size(), 6u);  // presented, refused; presented again for the retry
+    CHECK_EQ(errors.size(), 2u);
+    CHECK(n.access() == tesser::Access::Public);
+    // A fresh one works at once.
+    n.setToken("good");
+    write(7);
+    CHECK_EQ(r.level, 7);
+    CHECK_EQ(n.streamStats().failed, 2u);
+    RemoteNode::onAccess(nullptr);
+}
+
 }  // namespace route_cases

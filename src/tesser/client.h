@@ -139,6 +139,10 @@ public:
     bool request(Op op, std::string_view path, std::string_view bodyJson, ResponseHandler done,
                  const Query& query = Query()) override;
     const PeerAddress& peer() const { return peer_; }
+    // Presents `token` to the peer before requests (see
+    // DatagramEndpoint::setPeerToken()): for every client of the peer on
+    // this endpoint.
+    void setToken(std::string_view token) { endpoint_.setPeerToken(peer_, token); }
 
 private:
     DatagramEndpoint& endpoint_;

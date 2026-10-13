@@ -154,6 +154,23 @@ public:
     // work happens in the next process().
     void forgetPeer(const PeerAddress& peer);
 
+    // ---- credentials (client side) ---------------------------------------
+    // Presents `token` to `peer` with an "auth" envelope (docs/DESIGN.md
+    // section 13.3) before the next request to it; requests wait for the
+    // answer, since datagrams may arrive out of order. Presented again
+    // whenever the peer may have forgotten it: after forgetPeer() (a
+    // restart, a goodbye, a failed delivery, the link stopped) and after an
+    // "unauthorized" reply, whose request is then sent once more. An empty
+    // token stops presenting one (the peer keeps it until it forgets us).
+    void setPeerToken(const PeerAddress& peer, std::string_view token);
+    // The level the peer last granted our token (public if none yet).
+    Access grantedAccess(const PeerAddress& peer) const;
+    // Called, in process() and without the API lock, with each answer to a
+    // token: Status::Ok and the level granted (public: the token wasn't
+    // accepted), or the error (timeout: the peer didn't answer).
+    using AuthHandler = std::function<void(const PeerAddress& peer, Status status, Access level)>;
+    void onAuth(AuthHandler fn) { onAuth_ = std::move(fn); }
+
     // ---- peers ------------------------------------------------------------
     // A peer this endpoint had heard from was forgotten (a failed delivery,
     // a goodbye, a restart, silence, the link stopped): `device` is its MAC
@@ -242,6 +259,17 @@ private:
         const void* owner;
         BroadcastHandler each;  // a broadcast call: replies from any peer
         uint32_t sentMs;
+        std::string text;      // to a peer with a token: kept to send it again after "unauthorized"
+        bool held = false;     // waiting for the token's answer before it is sent
+        bool retried = false;  // sent again once already
+    };
+    // A token presented to a peer (setPeerToken()).
+    struct PeerAuth {
+        PeerAddress peer;
+        std::string token;
+        enum State : uint8_t { Idle, Pending, Done } state = Idle;
+        Access level = Access::Public;
+        bool renew = false;  // changed while presented: present the new one when the answer comes
     };
     // Peers heard from, with their device when known (bounded).
     struct Known {
@@ -252,7 +280,11 @@ private:
     };
 
     bool sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope, ResponseHandler done,
-                     uint32_t timeoutMs, const void* owner);
+                     uint32_t timeoutMs, const void* owner, bool internal = false);
+    uint32_t nextCallId();
+    PeerAuth* authLocked(const PeerAddress& peer);
+    void sendAuth(const PeerAddress& peer, const std::string& token);
+    void authDone(const PeerAddress& peer, Status status, JsonVariantConst body);
     void handle(Incoming& msg);
     void handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply);
     Access levelOf(const PeerAddress& peer);
@@ -278,6 +310,7 @@ private:
     std::function<void()> onQueued_;
     NotificationHandler onNotification_;
     PeerLostHandler onPeerLost_;
+    AuthHandler onAuth_;
     std::function<bool(const PeerAddress&)> trust_;
     std::atomic<Access> peerAccess_{Access::Public};
 
@@ -296,6 +329,7 @@ private:
     std::vector<std::pair<PeerAddress, std::shared_ptr<ClientInbox>>> clients_;  // guarded by mutex_
     std::vector<std::pair<PeerAddress, std::string>> tokens_;  // from "auth", oldest first; guarded by mutex_
     std::vector<Known> known_;  // guarded by mutex_
+    std::vector<PeerAuth> auths_;  // guarded by mutex_
     uint32_t nextId_ = 1;
     Stats stats_;
     // autoAdvertise()

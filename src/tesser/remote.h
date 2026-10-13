@@ -134,6 +134,24 @@ public:
     PeerAddress device() const;
     void setDevice(const PeerAddress& device);
 
+    // ---- credentials --------------------------------------------------------
+    // A token the device's token check accepts (docs/DESIGN.md section
+    // 13.3), presented on every route before requests, and again whenever
+    // the device may have forgotten it. Empty: none. Any task.
+    void setToken(std::string_view token);
+    std::string token() const;
+    // The level the device granted the token on the route in use (public
+    // until it answers).
+    Access access() const;
+    // Called, in an endpoint's process() and without the API lock, with
+    // every answer to a node's token: Status::Ok and the level granted
+    // (public: refused, time to get a new one), or the error. One for every
+    // node.
+    using AccessHandler = std::function<void(RemoteNode& node, Status status, Access level)>;
+    static void onAccess(AccessHandler fn);
+    // Called by an endpoint.
+    void tokenAnswered(Status status, Access level);
+
     // ---- streamed sets ----------------------------------------------------
     // Writes `bodyJson` to `path` below this node without waiting, for state
     // that changes fast (docs/DESIGN.md section 14.3). At most one streamed
@@ -235,6 +253,7 @@ private:
     bool hasOrder_ = false;
     uint32_t nextRoute_ = 0;
     PeerAddress device_;
+    std::string token_;
     // The route tick() last saw in use, to notice a switch.
     DatagramEndpoint* lastEndpoint_ = nullptr;
     PeerAddress lastPeer_;

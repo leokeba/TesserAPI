@@ -870,6 +870,24 @@ api.authenticate([](std::string_view token) { return users.check(token); });   /
 - Hiding nodes from the schema is not access control: the authorizer runs on every access.
 - TLS is the application's choice of server.
 
+### 13.3 Tokens as a client
+
+A node that writes to other nodes' protected paths over NowTP or UDP presents a token to each of them, as a browser does over HTTP:
+
+```cpp
+node->setToken(token);          // a remote node (§14): every route, kept across failovers
+peerClient.setToken(token);     // a PeerClient
+udp.endpoint().setPeerToken(address, token);
+tesser::RemoteNode::onAccess([](tesser::RemoteNode& node, tesser::Status s, tesser::Access level) {
+    if (s == tesser::Status::Ok && level == tesser::Access::Public) refreshToken(node);   // refused
+});
+```
+
+- **Presented first:** before the next request to the peer, the endpoint sends `{"op":"auth","token":"..."}` (§10.7). Requests to the peer wait for its answer, since datagrams may overtake each other; then they go, whatever the answer.
+- **Again when forgotten:** the peer forgets a token when it forgets the client (a restart, a failed delivery, a goodbye, §10.7), and the client notices most of these: whenever the client's endpoint forgets the peer (a new nonce, a goodbye, a failed delivery, NowTP's peer lost, `stop()`), the token is presented again before the next request. A peer that forgot it unseen answers `unauthorized`: the token is presented again and that request sent once more; a second `unauthorized` is the request's answer.
+- **The answer:** the level the peer grants, from its token check: `grantedAccess(address)`, `node.access()`. `DatagramEndpoint::onAuth(fn(address, status, level))` and `RemoteNode::onAccess(fn(node, status, level))` hear every answer, in `process()` without the API lock: `public` means refused, the cue to get a new token (TesserKIT logs in to the node's own `/sys/auth/login` with an account stored on the master). Changing the token presents the new one before the next request; an empty one stops presenting (the peer keeps the old one until it forgets the client).
+- **Tokens travel in clear**, as over HTTP without TLS.
+
 ## 14. Remote trees and the client
 
 **Client.** `DatagramEndpoint` (and `NowTpTransport` and `UdpTransport` on top of it) sends requests to other nodes and matches responses by `id`, and broadcasts them where the link can (UDP, §10.7):
@@ -1110,6 +1128,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 12 | File transfers relayed through gateways, for TesserKIT's fleet updates | done |
 | 13 | UDP transport: LAN discovery and broadcast writes, for TesserKIT's sequencer; tokens and a least level for datagram peers | done |
 | 14 | Routes over several transports with failover, streamed sets in order, the writer's device and peer loss on the receiving side, for a master driving other nodes | done |
+| 15 | Tokens presented as a client over NowTP and UDP, for TesserKIT's masters | done |
 
 ## 19. Decisions on former open questions
 

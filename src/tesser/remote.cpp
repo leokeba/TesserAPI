@@ -198,6 +198,10 @@ RemoteNode::StateHandler& sharedStateHandler() {
     static RemoteNode::StateHandler fn;
     return fn;
 }
+RemoteNode::AccessHandler& sharedAccessHandler() {
+    static RemoteNode::AccessHandler fn;
+    return fn;
+}
 
 constexpr uint8_t kStreamAttempts = 3;  // a streamed set that timed out is sent twice more
 
@@ -274,7 +278,43 @@ void RemoteNode::addRoute(DatagramEndpoint& endpoint, const PeerAddress& peer) {
     }
     if (!registered) endpoint.addRemote(this);
     endpoint.routeAdded(this, peer);
+    std::string token = this->token();
+    if (!token.empty()) endpoint.setPeerToken(peer, token);
     announce_ = true;
+}
+
+void RemoteNode::setToken(std::string_view token) {
+    std::vector<RouteSlot> routes;
+    {
+        MutexGuard guard(routesMutex_);
+        token_.assign(token.data(), token.size());
+        routes = routes_;
+    }
+    for (const RouteSlot& r : routes) r.route.endpoint->setPeerToken(r.route.peer, token);
+}
+
+std::string RemoteNode::token() const {
+    MutexGuard guard(routesMutex_);
+    return token_;
+}
+
+Access RemoteNode::access() const {
+    Route r;
+    return route(r) ? r.endpoint->grantedAccess(r.peer) : Access::Public;
+}
+
+void RemoteNode::onAccess(AccessHandler fn) {
+    MutexGuard guard(sharedMutex());
+    sharedAccessHandler() = std::move(fn);
+}
+
+void RemoteNode::tokenAnswered(Status status, Access level) {
+    AccessHandler fn;
+    {
+        MutexGuard guard(sharedMutex());
+        fn = sharedAccessHandler();
+    }
+    if (fn) fn(*this, status, level);
 }
 
 bool RemoteNode::hasRoute(const DatagramEndpoint* endpoint, const PeerAddress& peer) const {

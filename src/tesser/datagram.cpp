@@ -137,6 +137,12 @@ void DatagramEndpoint::dropPeer(const PeerAddress& peer) {
                 break;
             }
         }
+        if (PeerAuth* a = authLocked(peer)) {
+            // It no longer knows our token.
+            a->state = PeerAuth::Idle;
+            a->level = Access::Public;
+            a->renew = false;
+        }
         if (Known* k = knownLocked(peer)) {
             wasHeard = k->online;
             k->online = false;
@@ -376,6 +382,10 @@ void DatagramEndpoint::handle(Incoming& msg) {
     // Response to one of our calls.
     if (env["status"].is<const char*>()) {
         uint32_t id = env["id"].as<uint32_t>();
+        Status s = Status::Internal;
+        parseStatus(env["status"].as<const char*>(), s);
+        bool reauth = false, again = false;
+        std::string token;
         ResponseHandler done;
         BroadcastHandler each;  // a broadcast call stays open for more replies
         uint32_t sentMs = 0;
@@ -390,6 +400,21 @@ void DatagramEndpoint::handle(Incoming& msg) {
                     break;
                 }
                 if (calls_[i].to == msg.from) {
+                    if (calls_[i].held) break;  // not sent yet: a stray reply
+                    PeerAuth* a = authLocked(msg.from);
+                    if (s == Status::Unauthorized && a && !calls_[i].retried && !calls_[i].text.empty()) {
+                        // The peer may have forgotten our token (it restarted
+                        // unseen, or dropped it): present it again, then this.
+                        calls_[i].retried = true;
+                        calls_[i].held = true;
+                        again = true;
+                        if (a->state != PeerAuth::Pending) {
+                            a->state = PeerAuth::Pending;
+                            reauth = true;
+                            token = a->token;
+                        }
+                        break;
+                    }
                     done = std::move(calls_[i].done);
                     sentMs = calls_[i].sentMs;
                     remotes = remotes_;
@@ -397,15 +422,15 @@ void DatagramEndpoint::handle(Incoming& msg) {
                     break;
                 }
             }
-            if (!done && !each) stats_.unmatched++;
+            if (!done && !each && !again) stats_.unmatched++;
         }
+        if (reauth) sendAuth(msg.from, token);
+        if (again) return;
         if (done) {
             // The round trip, for the routes through this peer.
             uint32_t rtt = (clock_ ? clock_() : 0) - sentMs;
             for (RemoteNode* r : remotes) r->routeRoundTrip(this, msg.from, rtt);
         }
-        Status s = Status::Internal;
-        parseStatus(env["status"].as<const char*>(), s);
         if (done) done(s, env["body"]);
         if (each) each(msg.from, s, env["body"]);
         return;
@@ -611,14 +636,32 @@ void DatagramEndpoint::dropFiles(const PeerAddress* peer, uint32_t now) {
 }
 
 bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope,
-                                   ResponseHandler done, uint32_t timeoutMs, const void* owner) {
+                                   ResponseHandler done, uint32_t timeoutMs, const void* owner, bool internal) {
     uint32_t now = clock_ ? clock_() : 0;
+    bool hold = false, startAuth = false;
+    std::string token;
     {
         MutexGuard guard(mutex_);
-        if (calls_.size() >= options_.maxCalls) return false;
-        calls_.push_back(CallSlot{id, to, now + (timeoutMs ? timeoutMs : options_.timeoutMs), std::move(done), owner,
-                                  nullptr, now});
+        // A token's own "auth" doesn't count: it would hold up what waits for it.
+        if (!internal && calls_.size() >= options_.maxCalls) return false;
+        CallSlot slot{id, to, now + (timeoutMs ? timeoutMs : options_.timeoutMs), std::move(done), owner, nullptr, now,
+                      std::string(), false, false};
+        if (PeerAuth* a = internal ? nullptr : authLocked(to)) {
+            slot.text = envelope;
+            if (a->state != PeerAuth::Done) {
+                // Datagrams may overtake each other: wait for the token's answer.
+                slot.held = hold = true;
+                if (a->state == PeerAuth::Idle) {
+                    a->state = PeerAuth::Pending;
+                    startAuth = true;
+                    token = a->token;
+                }
+            }
+        }
+        calls_.push_back(std::move(slot));
     }
+    if (startAuth) sendAuth(to, token);
+    if (hold) return true;
     if (send_ && send_(to, envelope, Delivery::Reliable)) return true;
     MutexGuard guard(mutex_);
     for (size_t i = 0; i < calls_.size(); i++) {
@@ -628,6 +671,124 @@ bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, const std
         }
     }
     return false;
+}
+
+uint32_t DatagramEndpoint::nextCallId() {
+    MutexGuard guard(mutex_);
+    uint32_t id = nextId_++;
+    if (nextId_ == 0) nextId_ = 1;
+    return id;
+}
+
+// ---- credentials ---------------------------------------------------------------
+
+DatagramEndpoint::PeerAuth* DatagramEndpoint::authLocked(const PeerAddress& peer) {
+    for (PeerAuth& a : auths_) {
+        if (a.peer == peer) return &a;
+    }
+    return nullptr;
+}
+
+void DatagramEndpoint::setPeerToken(const PeerAddress& peer, std::string_view token) {
+    std::vector<std::string> release;
+    {
+        MutexGuard guard(mutex_);
+        PeerAuth* a = authLocked(peer);
+        if (token.empty()) {
+            if (!a) return;
+            // Nothing to wait for any more.
+            for (CallSlot& c : calls_) {
+                if (c.held && c.to == peer) {
+                    c.held = false;
+                    release.push_back(c.text);
+                }
+            }
+            auths_.erase(auths_.begin() + (a - auths_.data()));
+        } else if (!a) {
+            PeerAuth n;
+            n.peer = peer;
+            n.token.assign(token.data(), token.size());
+            auths_.push_back(std::move(n));
+        } else if (a->token != token) {
+            a->token.assign(token.data(), token.size());
+            a->level = Access::Public;
+            if (a->state == PeerAuth::Done) a->state = PeerAuth::Idle;
+            if (a->state == PeerAuth::Pending) a->renew = true;  // the answer will be the old token's
+        }
+    }
+    for (const std::string& t : release) {
+        if (send_) send_(peer, t, Delivery::Reliable);
+    }
+}
+
+Access DatagramEndpoint::grantedAccess(const PeerAddress& peer) const {
+    MutexGuard guard(mutex_);
+    for (const PeerAuth& a : auths_) {
+        if (a.peer == peer) return a.state == PeerAuth::Done ? a.level : Access::Public;
+    }
+    return Access::Public;
+}
+
+void DatagramEndpoint::sendAuth(const PeerAddress& peer, const std::string& token) {
+    std::string text;
+    {
+        StringSink sink(text);
+        JsonWriter w(sink);
+        w.beginObject();
+        w.key("id");
+        w.uinteger(0);  // replaced below
+        w.key("op");
+        w.string("auth");
+        w.key("token");
+        w.string(token);
+        w.endObject();
+    }
+    uint32_t id = nextCallId();
+    text.replace(0, 7, "{\"id\":" + std::to_string(id));
+    PeerAddress to = peer;
+    if (!sendRequest(
+            peer, id, text, [this, to](Status s, JsonVariantConst body) { authDone(to, s, body); }, 0, this, true)) {
+        authDone(peer, Status::Busy, JsonVariantConst());
+    }
+}
+
+// The token's answer: what waited for it goes now, whatever it was (a
+// refused request comes back "unauthorized").
+void DatagramEndpoint::authDone(const PeerAddress& peer, Status status, JsonVariantConst body) {
+    Access level = Access::Public;
+    if (status == Status::Ok) parseAccess(body["access"] | "", level);
+    std::vector<std::string> release;
+    std::string renewed;
+    std::vector<RemoteNode*> remotes;
+    {
+        MutexGuard guard(mutex_);
+        PeerAuth* a = authLocked(peer);
+        if (a && a->renew) {
+            // The token changed meanwhile: present the new one first.
+            a->renew = false;
+            renewed = a->token;
+        } else {
+            if (a) {
+                a->state = status == Status::Ok ? PeerAuth::Done : PeerAuth::Idle;
+                a->level = level;
+            }
+            for (CallSlot& c : calls_) {
+                if (c.held && c.to == peer) {
+                    c.held = false;
+                    release.push_back(c.text);
+                }
+            }
+            remotes = remotes_;
+        }
+    }
+    if (!renewed.empty()) return sendAuth(peer, renewed);
+    for (const std::string& t : release) {
+        if (send_) send_(peer, t, Delivery::Reliable);
+    }
+    if (onAuth_) onAuth_(peer, status, level);
+    for (RemoteNode* r : remotes) {
+        if (r->hasRoute(this, peer)) r->tokenAnswered(status, level);
+    }
 }
 
 bool DatagramEndpoint::request(const PeerAddress& to, Op op, std::string_view path, std::string_view bodyJson,
@@ -703,7 +864,7 @@ bool DatagramEndpoint::broadcast(const PeerAddress& to, Op op, std::string_view 
         id = nextId_++;
         if (nextId_ == 0) nextId_ = 1;
         calls_.push_back(CallSlot{id, to, now + (windowMs ? windowMs : options_.timeoutMs), nullptr, owner,
-                                  std::move(onReply), now});
+                                  std::move(onReply), now, std::string(), false, false});
     }
     if (send_ && send_(to, buildRequestEnvelope(id, op, path, Query(), bodyJson), Delivery::BestEffort)) {
         return true;
