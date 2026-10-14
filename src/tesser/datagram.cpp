@@ -301,6 +301,16 @@ void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::Pe
                  }));
 }
 
+void DatagramEndpoint::ownReplies(EnvelopeReply& reply, const PeerAddress& to, bool silent) {
+    if (!ownedSend_) return;
+    OwnedSendFn fn = ownedSend_;
+    reply.sendOwned(
+        [fn, to, silent](Bytes& m) {
+            if (!silent) fn(to, std::move(m), Delivery::Reliable);
+        },
+        ownedSlack_);
+}
+
 uintptr_t budgetKey(const PeerAddress& p) {
     uint32_t h = 2166136261u;
     for (uint8_t i = 0; i < p.length; i++) h = (h ^ p.bytes[i]) * 16777619u;
@@ -794,6 +804,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
     EnvelopeReply reply(id, replyLimit(), [send, to, silent](std::string& m) {
         if (send && !silent) send(to, std::move(m), Delivery::Reliable);
     });
+    ownReplies(reply, to, silent);
     if (s == Status::Ok && auth) s = checkStrict(env, {"v", "id", "op", "token"}, message, &reason);
     if (s != Status::Ok) {
         writeError(reply, s, reason, std::string_view(), message);
@@ -886,6 +897,7 @@ void DatagramEndpoint::handleFile(JsonObjectConst envelope, const Incoming& msg,
     EnvelopeReply reply(id, replyLimit(), [send, to, silent](std::string& m) {
         if (send && !silent) send(to, std::move(m), Delivery::Reliable);
     });
+    ownReplies(reply, to, silent);
     if (s != Status::Ok) {
         writeError(reply, s, std::string_view(), message);
         return;

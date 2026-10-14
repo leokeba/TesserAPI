@@ -9,6 +9,7 @@
 
 #include <ArduinoJson.h>
 
+#include "tesser/bytes.h"
 #include "tesser/json_writer.h"
 #include "tesser/request.h"
 
@@ -82,6 +83,12 @@ public:
     // drain() (the core calls it without the API lock) or the destructor;
     // beyond the window they go at once.
     void stream(Fragment fragment, size_t chunk = 1024, size_t window = 4096);
+    // Buffers the envelope in a malloc()ed buffer instead, `slack` bytes
+    // spare at its end, and hands it whole to `send`, which takes it: for a
+    // link that sends from it without a copy (NowTP's sendBuffer(),
+    // docs/DESIGN.md section 15). Kept by a detached copy.
+    using SendOwned = std::function<void(Bytes& message)>;
+    void sendOwned(SendOwned send, size_t slack);
 
     Sink& begin(Status status) override;
     void end() override;
@@ -110,6 +117,9 @@ private:
     size_t limit_;
     Send send_;
     std::string buf_;
+    SendOwned owned_;
+    size_t slack_ = 0;
+    Bytes bytes_;  // with owned_: the envelope
     LimitedSink sink_{*this};
     bool detached_ = false;
     bool lowMemory_ = false;

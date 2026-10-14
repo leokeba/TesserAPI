@@ -15,12 +15,14 @@
 #include <ArduinoJson.h>
 
 #include "tesser/budget.h"
+#include "tesser/bytes.h"
 #include "tesser/platform.h"
 #include "tesser/request.h"
 
 namespace tesser {
 
 class Api;
+class EnvelopeReply;
 class FileSession;
 class Object;
 class RemoteNode;
@@ -128,6 +130,16 @@ public:
     // Handles queued messages and expires client calls. Returns true if it did
     // anything.
     bool process();
+
+    // A link that sends from a malloc()ed buffer it takes over (NowTP's
+    // sendBuffer()): replies are built in one, `slack` bytes spare at its
+    // end, and handed over whole rather than copied (docs/DESIGN.md
+    // section 15). `fn` takes the buffer in every case. Before begin().
+    using OwnedSendFn = std::function<bool(const PeerAddress& to, Bytes message, Delivery delivery)>;
+    void setOwnedSend(OwnedSendFn fn, size_t slack) {
+        ownedSend_ = std::move(fn);
+        ownedSlack_ = slack;
+    }
 
     // Called (from receive()'s context) whenever something is queued, so an
     // adapter can wake its worker.
@@ -400,6 +412,8 @@ private:
     void reject(const PeerAddress& from, std::string_view text, bool broadcast, Status status, Reason reason,
                 const char* message);
     static Options checked(Options o);
+    // Replies to `to` hand their buffer to ownedSend_, when there is one.
+    void ownReplies(EnvelopeReply& reply, const PeerAddress& to, bool silent);
     // Holds `len` bytes from `from` in incoming_ (`heap`: about to be
     // allocated); empty, with a busy reply to a request, when refused.
     Reservation hold(const PeerAddress& from, std::string_view text, bool broadcast, bool heap);
@@ -422,6 +436,8 @@ private:
     TransportKind kind_;
     ByteBudget incoming_;  // queued messages (Options::queueBytes)
     SendFn send_;
+    OwnedSendFn ownedSend_;
+    size_t ownedSlack_ = 0;
     ClockFn clock_;
     Options options_;
     std::function<void()> onQueued_;

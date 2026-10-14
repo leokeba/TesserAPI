@@ -1,6 +1,7 @@
 #include "tesser/platform.h"
 
 #include "tesser/budget.h"
+#include "tesser/bytes.h"
 #include "tesser/sink.h"
 
 #include <stdarg.h>
@@ -249,6 +250,20 @@ bool growFor(std::string& s, size_t need) {
     }
     s.reserve(capacity);
     return true;  // released: the heap shows the buffer now
+}
+
+bool growFor(Bytes& b, size_t need) {
+    if (need <= b.capacity()) return true;
+    size_t grown = b.capacity() + b.capacity() / 2;
+    size_t capacity = need > grown ? need : grown;
+    Reservation growth;
+    if (capacity > 256) {
+        // realloc() may need the new block while the old one is held.
+        growth = memoryBudget().reserve(capacity, 0, false);
+        if (!growth) return false;
+        if (capacity > 1024 && largestFreeBlock() < capacity + 1024) return false;
+    }
+    return b.reserve(capacity);
 }
 
 bool stationMac(uint8_t mac[6]) {

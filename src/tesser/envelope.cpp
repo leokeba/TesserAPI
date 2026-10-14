@@ -214,6 +214,15 @@ bool EnvelopeReply::LimitedSink::write(const char* data, size_t len) {
         r_.buf_.append(data, len);
         return r_.buf_.size() <= r_.window_ || r_.sendPieces(false);
     }
+    if (r_.owned_) {
+        size_t size = r_.bytes_.size();
+        if (r_.limit_ && size + len + 1 > r_.limit_) return false;  // keep room for '}'
+        if (!growFor(r_.bytes_, size + len + 1)) {
+            r_.lowMemory_ = true;
+            return false;
+        }
+        return r_.bytes_.append(data, len);
+    }
     if (r_.limit_ && r_.buf_.size() + len + 1 > r_.limit_) return false;  // keep room for '}'
     // Buffered whole: on a fragmented heap, refuse rather than abort.
     if (!growFor(r_.buf_, r_.buf_.size() + len + 1)) {
@@ -235,6 +244,11 @@ EnvelopeReply::~EnvelopeReply() {
         // release what it holds for it (a line's output, a WebSocket message).
         fragment_(nullptr, 0, false, true);
     }
+}
+
+void EnvelopeReply::sendOwned(SendOwned send, size_t slack) {
+    owned_ = std::move(send);
+    slack_ = slack;
 }
 
 void EnvelopeReply::stream(Fragment fragment, size_t chunk, size_t window) {
@@ -295,6 +309,12 @@ Sink& EnvelopeReply::begin(Status status) {
     buf_ += "\"status\":\"";
     buf_ += toString(status);
     buf_ += "\",\"body\":";
+    if (owned_ && !fragment_) {
+        // The head moves to the owned buffer: the body is written there.
+        bytes_.clear();
+        if (!growFor(bytes_, buf_.size() + 1) || !bytes_.append(buf_)) lowMemory_ = true;
+        buf_.clear();
+    }
     return sink_;
 }
 
@@ -306,6 +326,17 @@ void EnvelopeReply::end() {
         ended_ = true;
         return;
     }
+    if (owned_) {
+        // The envelope, with the slack the link wants after it (without it,
+        // if the heap can't: the link then grows it itself).
+        buf_.clear();
+        growFor(bytes_, bytes_.size() + slack_);
+        if (bytes_.append("}", 1) || (growFor(bytes_, bytes_.size() + 1) && bytes_.append("}", 1))) {
+            owned_(bytes_);
+        }
+        bytes_.reset();
+        return;
+    }
     if (send_) send_(buf_);
     buf_.clear();
     buf_.shrink_to_fit();
@@ -314,6 +345,7 @@ void EnvelopeReply::end() {
 bool EnvelopeReply::rollback() {
     if (flushed_) return false;
     buf_.clear();
+    bytes_.clear();
     failed_ = false;
     ended_ = false;
     return true;
@@ -321,6 +353,8 @@ bool EnvelopeReply::rollback() {
 
 Reply* EnvelopeReply::detach() {
     auto* r = new EnvelopeReply(id_, limit_, send_);
+    r->owned_ = owned_;
+    r->slack_ = slack_;
     r->detached_ = true;
     return r;
 }

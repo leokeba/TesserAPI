@@ -116,6 +116,9 @@ private:
     };
 
     static void taskEntry(void* arg);
+    nowtp::CompletionHandler completion(const PeerAddress& to, uint32_t callId);
+    template <class T>
+    void installOwnedSend(T& now);
 
     std::shared_ptr<Reports> reports_ = std::make_shared<Reports>();
     nowtp::EspNowTransport& now_;

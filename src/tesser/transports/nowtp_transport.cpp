@@ -36,7 +36,65 @@ uint8_t* takeBuffer(const M& m) {
     }
 }
 
+// NowTP ce6b645 and later send from a malloc()ed buffer they take over
+// (sendBuffer()); older ones only copy.
+template <class T, class = void>
+struct HasSendBuffer : std::false_type {};
+template <class T>
+struct HasSendBuffer<T, decltype(void(std::declval<T&>().sendBuffer(
+                            std::declval<const nowtp::Mac&>(), uint8_t(0), static_cast<uint8_t*>(nullptr), size_t(0),
+                            size_t(0), std::declval<const nowtp::SendOptions&>(), nowtp::CompletionHandler())))>
+    : std::true_type {};
+
+// Room NowTP wants after the payload to send it in place (its
+// kSendOverhead: 21 bytes as of ce6b645); less, and it reallocates.
+constexpr size_t kSendSlack = 32;
+
 }  // namespace
+
+nowtp::CompletionHandler NowTpTransport::completion(const PeerAddress& to, uint32_t callId) {
+    // A delivery that fails later (docs/DESIGN.md section 10.3): the
+    // endpoint fails its calls at once rather than letting them time out.
+    // Runs in NowTP's task: it only queues.
+    return [reports = reports_, to, callId](nowtp::Status s) {
+        SendFailure f;
+        if (s == nowtp::Status::SendFailed || s == nowtp::Status::Timeout) {
+            f = SendFailure::Undelivered;
+        } else if (s == nowtp::Status::Rejected) {
+            f = SendFailure::Rejected;
+        } else if (s == nowtp::Status::AuthFailed) {
+            f = SendFailure::AuthFailed;
+        } else {
+            return;  // delivered, superseded, cancelled
+        }
+        MutexGuard guard(reports->mutex);
+        if (reports->endpoint) reports->endpoint->sendFailed(to, callId, f);
+    };
+}
+
+template <class T>
+void NowTpTransport::installOwnedSend(T& now) {
+    if constexpr (HasSendBuffer<T>::value) {
+        // Replies are built in the buffer NowTP sends from: on a short
+        // heap, a large one isn't held twice (docs/DESIGN.md section 15).
+        endpoint_.setOwnedSend(
+            [this, &now](const PeerAddress& to, Bytes message, Delivery delivery) {
+                if (!message.data()) return false;
+                nowtp::Mac mac = nowtp::Mac::from(to.bytes);
+                nowtp::SendOptions opts;
+                opts.reliable = delivery == Delivery::Reliable && !mac.isBroadcast();
+                opts.latestOnly = delivery == Delivery::LatestOnly;
+                nowtp::CompletionHandler done;
+                if (opts.reliable) done = completion(to, 0);
+                size_t len = message.size(), capacity = message.capacity();
+                auto* buffer = reinterpret_cast<uint8_t*>(message.release());
+                return now.sendBuffer(mac, port_, buffer, len, capacity, opts, std::move(done)) == nowtp::Status::Ok;
+            },
+            kSendSlack);
+    } else {
+        (void)now;
+    }
+}
 
 NowTpTransport::NowTpTransport(Api* api, nowtp::EspNowTransport& now, uint8_t port,
                                DatagramEndpoint::Options options)
@@ -50,25 +108,7 @@ NowTpTransport::NowTpTransport(Api* api, nowtp::EspNowTransport& now, uint8_t po
               opts.reliable = delivery == Delivery::Reliable && !mac.isBroadcast();
               opts.latestOnly = delivery == Delivery::LatestOnly;
               nowtp::CompletionHandler done;
-              if (opts.reliable) {
-                  // A delivery that fails later (docs/DESIGN.md section 10.3):
-                  // the endpoint fails its calls at once rather than letting
-                  // them time out. Runs in NowTP's task: it only queues.
-                  done = [reports = reports_, to, id = DatagramEndpoint::callIdOf(message)](nowtp::Status s) {
-                      SendFailure f;
-                      if (s == nowtp::Status::SendFailed || s == nowtp::Status::Timeout) {
-                          f = SendFailure::Undelivered;
-                      } else if (s == nowtp::Status::Rejected) {
-                          f = SendFailure::Rejected;
-                      } else if (s == nowtp::Status::AuthFailed) {
-                          f = SendFailure::AuthFailed;
-                      } else {
-                          return;  // delivered, superseded, cancelled
-                      }
-                      MutexGuard guard(reports->mutex);
-                      if (reports->endpoint) reports->endpoint->sendFailed(to, id, f);
-                  };
-              }
+              if (opts.reliable) done = completion(to, DatagramEndpoint::callIdOf(message));
               // QueueFull (per destination) is a full buffer, not a failure:
               // false here, and the sender tries again or answers busy.
               return now_.send(mac, port_, message.data(), message.size(), opts, std::move(done)) ==
@@ -76,6 +116,7 @@ NowTpTransport::NowTpTransport(Api* api, nowtp::EspNowTransport& now, uint8_t po
           },
           &nowMs, options) {
     reports_->endpoint = &endpoint_;
+    installOwnedSend(now_);
 }
 
 NowTpTransport::~NowTpTransport() {

@@ -195,4 +195,39 @@ TEST(budget_queued_requests) {
     CHECK_EQ(d.api.queuedRequests(), 0u);
 }
 
+TEST(budget_owned_reply_buffers) {
+    // A link that sends from a buffer it takes over gets replies built in
+    // one, with its slack: the reply isn't copied on its way out.
+    cases::Device d;
+    tesser::Pending saved;
+    d.api.action("later", [&](tesser::Call& call) { saved = call.defer(); });
+    datagram_cases::Net net;
+    tesser::DatagramEndpoint ep(&d.api, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(2)),
+                                net.clockFn());
+    std::vector<size_t> spare;
+    std::string got;
+    ep.setOwnedSend(
+        [&](const tesser::PeerAddress&, tesser::Bytes m, tesser::Delivery) {
+            spare.push_back(m.capacity() - m.size());
+            got.assign(m.data(), m.size());
+            return true;
+        },
+        32);
+    std::string req = "{\"id\":1,\"op\":\"get\",\"path\":\"/lamp\"}";
+    ep.receive(datagram_cases::addr(1), req.data(), req.size(), true);
+    ep.process();
+    CHECK_EQ(got, "{\"id\":1,\"status\":\"ok\",\"body\":{\"on\":false,\"brightness\":128,\"label\":\"desk\"}}");
+    CHECK(net.frames.empty());  // not through the copying send
+    CHECK(!spare.empty() && spare.back() >= 32u);
+    // A deferred reply too, completed later.
+    got.clear();
+    req = "{\"id\":2,\"op\":\"set\",\"path\":\"/later\"}";
+    ep.receive(datagram_cases::addr(1), req.data(), req.size(), true);
+    ep.process();
+    CHECK(got.empty());
+    saved.reply(7);
+    CHECK_EQ(got, "{\"id\":2,\"status\":\"ok\",\"body\":7}");
+    CHECK(spare.back() >= 32u);
+}
+
 }  // namespace budget_cases
