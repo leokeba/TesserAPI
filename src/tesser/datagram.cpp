@@ -151,6 +151,7 @@ const char* toString(PeerLoss reason) {
         case PeerLoss::Restarted: return "restarted";
         case PeerLoss::Silent: return "silent";
         case PeerLoss::Stopped: return "stopped";
+        case PeerLoss::AuthFailed: return "auth_failed";
     }
     return "lost";
 }
@@ -159,7 +160,10 @@ void DatagramEndpoint::dropPeer(const PeerAddress& peer, PeerLoss reason) {
     // Offline first: a remote node whose call fails below goes by another
     // route at once.
     markOnline(peer, false);
-    expire(0, true, &peer);
+    expire(0, true, &peer,
+           reason == PeerLoss::Failed       ? Reason::SendFailed
+           : reason == PeerLoss::AuthFailed ? Reason::AuthFailed
+                                            : Reason::None);
     dropFiles(&peer, 0);
     bool wasHeard = false;
     PeerAddress device;
@@ -177,10 +181,23 @@ void DatagramEndpoint::dropPeer(const PeerAddress& peer, PeerLoss reason) {
             a->level = Access::Public;
             a->renew = false;
         }
-        if (Known* k = knownLocked(peer)) {
+        Known* k = knownLocked(peer);
+        if (!k && reason == PeerLoss::AuthFailed) {
+            // Never heard (its frames don't authenticate either): known now,
+            // so the failure is reported once.
+            k = &learnLocked(peer, clock_ ? clock_() : 0);
+            k->online = false;
+        }
+        if (k) {
             wasHeard = k->online;
             k->online = false;
             device = k->device;
+            // A wrong key is reported once, heard or not, until the peer is
+            // heard again.
+            if (reason == PeerLoss::AuthFailed) {
+                wasHeard = !k->authFailed;
+                k->authFailed = true;
+            }
         }
     }
     {
@@ -208,6 +225,7 @@ DatagramEndpoint::Known& DatagramEndpoint::learnLocked(const PeerAddress& peer, 
     if (Known* k = knownLocked(peer)) {
         k->online = true;
         k->heardMs = now;
+        k->authFailed = false;
         return *k;
     }
     if (known_.size() >= 32) {
@@ -221,7 +239,7 @@ DatagramEndpoint::Known& DatagramEndpoint::learnLocked(const PeerAddress& peer, 
         known_.erase(known_.begin() + static_cast<std::ptrdiff_t>(oldest));
     }
     // A NowTP address is the device's MAC.
-    known_.push_back(Known{peer, kind_ == TransportKind::NowTP ? peer : PeerAddress(), true, now});
+    known_.push_back(Known{peer, kind_ == TransportKind::NowTP ? peer : PeerAddress(), true, now, false});
     return known_.back();
 }
 
@@ -321,13 +339,24 @@ bool DatagramEndpoint::process() {
     bool worked = false;
     std::vector<std::pair<PeerAddress, PeerLoss>> lost;
     std::vector<Seen> seen;
+    std::vector<Failure> failures;
     {
         MutexGuard guard(mutex_);
         lost.swap(lostPeers_);
         seen.swap(seenPeers_);
+        failures.swap(failures_);
     }
     for (const auto& p : lost) {
         dropPeer(p.first, p.second);
+        worked = true;
+    }
+    for (const Failure& f : failures) {
+        if (f.failure == SendFailure::Rejected) {
+            failCall(f.callId, Status::Internal, Reason::Rejected,
+                     "the remote node refused the message (no listener on the port, or too large)");
+        } else {
+            dropPeer(f.peer, f.failure == SendFailure::AuthFailed ? PeerLoss::AuthFailed : PeerLoss::Failed);
+        }
         worked = true;
     }
     for (const Seen& s : seen) {
@@ -1156,6 +1185,47 @@ void DatagramEndpoint::removeClient(const ClientInbox* inbox) {
     }
 }
 
+void DatagramEndpoint::sendFailed(const PeerAddress& peer, uint32_t callId, SendFailure failure) {
+    {
+        MutexGuard guard(mutex_);
+        failures_.push_back(Failure{peer, callId, failure});
+    }
+    if (onQueued_) onQueued_();
+}
+
+uint32_t DatagramEndpoint::callIdOf(std::string_view m) {
+    // Our requests start {"id":N,"op": (buildRequestEnvelope(), "auth",
+    // file envelopes); replies have a "status" after the id instead.
+    if (m.compare(0, 6, "{\"id\":") != 0) return 0;
+    uint32_t id = 0;
+    size_t i = 6;
+    while (i < m.size() && m[i] >= '0' && m[i] <= '9' && i < 16) id = id * 10 + uint32_t(m[i++] - '0');
+    return m.compare(i, 6, ",\"op\":") == 0 ? id : 0;
+}
+
+void DatagramEndpoint::failCall(uint32_t id, Status status, Reason reason, const char* message) {
+    if (!id) return;
+    CallSlot call;
+    bool found = false;
+    {
+        MutexGuard guard(mutex_);
+        for (size_t i = 0; i < calls_.size(); i++) {
+            if (calls_[i].id != id || calls_[i].each) continue;
+            call = std::move(calls_[i]);
+            calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(i));
+            found = true;
+            break;
+        }
+    }
+    if (!found || !call.done) return;
+    JsonDocument body;
+    body["error"] = toString(status);
+    body["reason"] = toString(reason);
+    body["path"] = "/";
+    body["message"] = message;
+    call.done(status, body.as<JsonVariantConst>());
+}
+
 void DatagramEndpoint::forgetPeer(const PeerAddress& peer, PeerLoss reason) {
     {
         MutexGuard guard(mutex_);
@@ -1290,7 +1360,7 @@ void DatagramEndpoint::mount(Object& parentRef, uint32_t mirrorMs, const Seen& s
     node.changed();  // subscribers of the parent see the new key
 }
 
-void DatagramEndpoint::expire(uint32_t now, bool all, const PeerAddress* peer) {
+void DatagramEndpoint::expire(uint32_t now, bool all, const PeerAddress* peer, Reason reason) {
     std::vector<CallSlot> expired;
     {
         MutexGuard guard(mutex_);
@@ -1307,8 +1377,18 @@ void DatagramEndpoint::expire(uint32_t now, bool all, const PeerAddress* peer) {
             }
         }
     }
+    // Why, when the link said so: a gateway passes it on (docs/DESIGN.md
+    // section 10.1.2).
+    JsonDocument body;
+    if (reason != Reason::None) {
+        body["error"] = toString(Status::Timeout);
+        body["reason"] = toString(reason);
+        body["path"] = "/";
+        body["message"] = reason == Reason::AuthFailed ? "the remote node holds another pairing key"
+                                                       : "the link couldn't deliver to the remote node";
+    }
     for (auto& call : expired) {
-        if (call.done) call.done(Status::Timeout, JsonVariantConst());
+        if (call.done) call.done(Status::Timeout, body.as<JsonVariantConst>());
         if (call.each) call.each(PeerAddress(), Status::Timeout, JsonVariantConst());
     }
 }

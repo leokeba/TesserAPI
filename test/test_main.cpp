@@ -23,5 +23,6 @@
 #include "memory_cases.h"
 #include "ceiling_cases.h"
 #include "protocol_cases.h"
+#include "link_failure_cases.h"
 
 int main(int argc, char** argv) { return check::run(argc > 1 ? argv[1] : nullptr) ? 1 : 0; }

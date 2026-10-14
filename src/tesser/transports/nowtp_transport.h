@@ -14,6 +14,7 @@
 #include <NowTP.h>
 #include <string.h>
 
+#include <memory>
 #include <vector>
 
 #include "freertos/FreeRTOS.h"
@@ -97,8 +98,16 @@ public:
     static PeerAddress address(const nowtp::Mac& mac) { return PeerAddress::fromBytes(mac.bytes, 6); }
 
 private:
+    // What NowTP's completion handlers report to, cleared before the
+    // transport goes: they can run after it, in NowTP's task.
+    struct Reports {
+        Mutex mutex;
+        DatagramEndpoint* endpoint = nullptr;
+    };
+
     static void taskEntry(void* arg);
 
+    std::shared_ptr<Reports> reports_ = std::make_shared<Reports>();
     nowtp::EspNowTransport& now_;
     uint8_t port_;
     DatagramEndpoint endpoint_;

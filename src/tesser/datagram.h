@@ -56,6 +56,14 @@ enum class PeerLoss : uint8_t {
     Restarted,  // it came back with a new session: whatever it held is gone
     Silent,     // an advertising peer went quiet
     Stopped,    // this side's link stopped
+    AuthFailed, // the link couldn't authenticate with it: it holds another pairing key (NowTP), or none
+};
+
+// A message a link accepted but couldn't deliver (DatagramEndpoint::sendFailed()).
+enum class SendFailure : uint8_t {
+    Undelivered,  // not acknowledged after the link's retries: the peer is unreachable
+    Rejected,     // the peer refused it: no listener on the port, or too large
+    AuthFailed,   // the peer holds another pairing key, or none
 };
 // "lost" / "failed" / "goodbye" / "restarted" / "silent" / "stopped".
 const char* toString(PeerLoss reason);
@@ -181,6 +189,19 @@ public:
     // its remote nodes show it offline. Safe from any task, including link callbacks: the
     // work happens in the next process(). `reason` goes to onPeerLost().
     void forgetPeer(const PeerAddress& peer, PeerLoss reason = PeerLoss::Lost);
+
+    // ---- link failures ----------------------------------------------------
+    // The link couldn't deliver a message it had accepted (its completion
+    // callback): `callId` is callIdOf() the message, 0 for one that isn't a
+    // request of ours. Undelivered and AuthFailed forget the peer at once,
+    // as forgetPeer() (PeerLoss::Failed, PeerLoss::AuthFailed), failing its
+    // calls with reason send_failed or auth_failed instead of letting them
+    // time out; Rejected fails that call alone (Status::Internal, reason
+    // rejected). Safe from any task, including link callbacks: the work
+    // happens in the next process(). docs/DESIGN.md section 10.3.
+    void sendFailed(const PeerAddress& peer, uint32_t callId, SendFailure failure);
+    // The call id of a request this endpoint sent ({"id":N,"op":...}), or 0.
+    static uint32_t callIdOf(std::string_view message);
 
     // ---- credentials (client side) ---------------------------------------
     // Presents `token` to `peer` with an "auth" envelope (docs/DESIGN.md
@@ -339,6 +360,12 @@ private:
         PeerAddress device;
         bool online;
         uint32_t heardMs;
+        bool authFailed = false;  // reported as such; cleared when heard
+    };
+    struct Failure {
+        PeerAddress peer;
+        uint32_t callId;
+        SendFailure failure;
     };
 
     bool sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope, ResponseHandler done,
@@ -353,7 +380,9 @@ private:
     void handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply);
     Access levelOf(const PeerAddress& peer);
     void reject(const Incoming& msg, Status status, Reason reason, const char* message);
-    void expire(uint32_t now, bool all, const PeerAddress* peer);
+    // `reason`: why the calls of a forgotten peer fail (None: a plain timeout).
+    void expire(uint32_t now, bool all, const PeerAddress* peer, Reason reason = Reason::None);
+    void failCall(uint32_t id, Status status, Reason reason, const char* message);
     Subscriber* subscriberFor(const PeerAddress& peer, bool create);
     void dropPeer(const PeerAddress& peer, PeerLoss reason);
     void applySeen(const Seen& seen);
@@ -383,6 +412,7 @@ private:
     std::vector<Incoming> queue_;  // a vector: an empty deque allocates
     std::vector<CallSlot> calls_;
     std::vector<std::pair<PeerAddress, PeerLoss>> lostPeers_;  // forgetPeer() → process()
+    std::vector<Failure> failures_;                            // sendFailed() → process()
     std::vector<Seen> seenPeers_;         // peerSeen() → process()
     // Schema hashes peers advertised, for remote nodes created later.
     std::vector<Advertised> advertised_;  // guarded by mutex_

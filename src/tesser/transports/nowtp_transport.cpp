@@ -49,11 +49,42 @@ NowTpTransport::NowTpTransport(Api* api, nowtp::EspNowTransport& now, uint8_t po
               nowtp::SendOptions opts;
               opts.reliable = delivery == Delivery::Reliable && !mac.isBroadcast();
               opts.latestOnly = delivery == Delivery::LatestOnly;
-              return now_.send(mac, port_, message.data(), message.size(), opts) == nowtp::Status::Ok;
+              nowtp::CompletionHandler done;
+              if (opts.reliable) {
+                  // A delivery that fails later (docs/DESIGN.md section 10.3):
+                  // the endpoint fails its calls at once rather than letting
+                  // them time out. Runs in NowTP's task: it only queues.
+                  done = [reports = reports_, to, id = DatagramEndpoint::callIdOf(message)](nowtp::Status s) {
+                      SendFailure f;
+                      if (s == nowtp::Status::SendFailed || s == nowtp::Status::Timeout) {
+                          f = SendFailure::Undelivered;
+                      } else if (s == nowtp::Status::Rejected) {
+                          f = SendFailure::Rejected;
+                      } else if (s == nowtp::Status::AuthFailed) {
+                          f = SendFailure::AuthFailed;
+                      } else {
+                          return;  // delivered, superseded, cancelled
+                      }
+                      MutexGuard guard(reports->mutex);
+                      if (reports->endpoint) reports->endpoint->sendFailed(to, id, f);
+                  };
+              }
+              // QueueFull (per destination) is a full buffer, not a failure:
+              // false here, and the sender tries again or answers busy.
+              return now_.send(mac, port_, message.data(), message.size(), opts, std::move(done)) ==
+                     nowtp::Status::Ok;
           },
-          &nowMs, options) {}
+          &nowMs, options) {
+    reports_->endpoint = &endpoint_;
+}
 
-NowTpTransport::~NowTpTransport() { end(); }
+NowTpTransport::~NowTpTransport() {
+    {
+        MutexGuard guard(reports_->mutex);
+        reports_->endpoint = nullptr;
+    }
+    end();
+}
 
 bool NowTpTransport::begin(bool runTask, uint32_t stackSize, UBaseType_t priority) {
     if (running_) return false;

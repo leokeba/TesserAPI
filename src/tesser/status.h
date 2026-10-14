@@ -38,6 +38,9 @@ enum class Reason : uint8_t {
     NotAuthorized,      // unauthorized: the client's level or the authorizer refuses it
     CeilingUnsupported, // unauthorized: a remote node too old to limit a gateway's client (only admins reach it)
     UnknownOption,      // bad_request: a strict request ("v") named an option this node doesn't know
+    SendFailed,         // timeout: the link couldn't deliver to the remote node, now offline
+    AuthFailed,         // timeout: the remote node holds another pairing key (NowTP), or none
+    Rejected,           // internal: the remote node refused the message (no listener on the port, too large)
 };
 
 // Wire name: "low_memory", ...; "" for None.
