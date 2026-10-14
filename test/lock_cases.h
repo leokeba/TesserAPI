@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core_cases.h"
+#include "subscription_cases.h"
 
 namespace lock_cases {
 
@@ -139,6 +140,40 @@ TEST(lock_notification_waits_for_the_line) {
         CHECK(!deserializeJson(doc, out.substr(0, nl)));
         CHECK_EQ(out.substr(nl + 1), "{\"op\":\"change\",\"path\":\"/x\",\"body\":5}\n");
     }
+}
+
+TEST(lock_events_of_two_apis) {
+    // An event's first emit() finds its API without taking another's lock:
+    // each thread holds its own API and emits its own event, at once.
+#if defined(TESSER_LOCK_CHECK)
+    tesser::setLockOrderHandler(&countViolation);
+    g_violations = 0;
+#endif
+    Api a, b;
+    tesser::EventNode& ea = a.object("x").event("ping");
+    tesser::EventNode& eb = b.object("y").event("pong");
+    subscription_cases::FakeSubscriber sa, sb;
+    subscription_cases::subscribe(a, &sa, "/");
+    subscription_cases::subscribe(b, &sb, "/");
+    std::atomic<int> ready{0};
+    auto run = [&ready](Api& api, tesser::EventNode& ev) {
+        tesser::Lock lock(api);
+        ready++;
+        while (ready < 2) std::this_thread::yield();
+        ev.emit(1);
+    };
+    std::thread ta(run, std::ref(a), std::ref(ea));
+    std::thread tb(run, std::ref(b), std::ref(eb));
+    ta.join();
+    tb.join();
+    CHECK_EQ(sa.last(), "{\"op\":\"event\",\"path\":\"/x/ping\",\"body\":1}");
+    CHECK_EQ(sb.last(), "{\"op\":\"event\",\"path\":\"/y/pong\",\"body\":1}");
+#if defined(TESSER_LOCK_CHECK)
+    CHECK_EQ(g_violations.load(), 0);
+    tesser::setLockOrderHandler(nullptr);
+#endif
+    a.dropSubscriber(&sa);
+    b.dropSubscriber(&sb);
 }
 
 TEST(lock_background_work) {

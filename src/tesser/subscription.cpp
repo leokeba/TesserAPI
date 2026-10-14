@@ -148,11 +148,13 @@ Api::~Api() {
 }
 
 Api* Api::owner(const Node& node, std::string& path) {
+    // Without any API's lock: trees only grow, by appends published whole
+    // (Node::next_), so a walk sees a consistent tree. A caller holding its
+    // own API's lock (an event's first emit()) mustn't take another's.
     MutexGuard guard(apisMutex());
     for (Api* a = g_apis.load(); a; a = a->nextApi_) {
         path.clear();
         if (&node == a) return a;
-        MutexGuard apiGuard(a->mutex_);
         if (findPath(*a, &node, path)) return a;
     }
     path.clear();

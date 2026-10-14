@@ -350,10 +350,12 @@ void Object::link(Node* node) {
     // Children of a temporary object are temporary too.
     node->flags_ |= kLinked | (flags_ & kTemporary);
     node->touch();
+    // Published complete: readers that walk the tree without the lock see
+    // the node whole or not at all.
     if (last_) {
-        last_->next_ = node;
+        last_->next_.store(node, std::memory_order_release);
     } else {
-        first_ = node;
+        first_.store(node, std::memory_order_release);
     }
     last_ = node;
 }

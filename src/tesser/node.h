@@ -117,7 +117,7 @@ public:
 
     const char* name() const { return name_; }
     NodeType type() const { return type_; }
-    Node* next() const { return next_; }
+    Node* next() const { return next_.load(std::memory_order_acquire); }
     const NodeMeta* meta() const { return meta_; }
     bool persisted() const { return flags_ & kPersist; }
     bool watched() const { return flags_ & kWatch; }
@@ -164,7 +164,9 @@ protected:
     Check checkRange(double v) const;
 
     const char* name_;
-    Node* next_ = nullptr;
+    // Siblings are only ever appended, published with a release store, so a
+    // tree can be walked without its API's lock (Api::owner()).
+    std::atomic<Node*> next_{nullptr};
     NodeMeta* meta_ = nullptr;
     NodeType type_;
     uint8_t flags_ = 0;
@@ -1250,7 +1252,7 @@ public:
         return *this;
     }
 
-    Node* first() const { return first_; }
+    Node* first() const { return first_.load(std::memory_order_acquire); }
     Node* child(std::string_view name) const;
     size_t childCount() const;
 
@@ -1265,7 +1267,7 @@ protected:
     void link(Node* node);
 
 private:
-    Node* first_ = nullptr;
+    std::atomic<Node*> first_{nullptr};  // see Node::next_
     Node* last_ = nullptr;
 };
 
