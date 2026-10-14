@@ -432,7 +432,7 @@ private:
     std::function<bool(const PeerAddress&)> trust_;
     std::atomic<Access> peerAccess_{Access::Public};
 
-    mutable Mutex mutex_;
+    mutable Mutex mutex_{kRankEndpoint, "endpoint"};
     std::vector<Incoming> queue_;  // a vector: an empty deque allocates
     std::vector<CallSlot> calls_;
     std::vector<std::pair<PeerAddress, PeerLoss>> lostPeers_;  // forgetPeer() → process()
@@ -441,7 +441,7 @@ private:
     // Schema hashes peers advertised, for remote nodes created later.
     std::vector<Advertised> advertised_;  // guarded by mutex_
     std::vector<std::pair<Object*, uint32_t>> mounts_;  // mountPeers(): parent, mirror interval
-    Mutex subscribersMutex_;              // taken before the API lock, never after
+    Mutex subscribersMutex_{kRankSubscribers, "endpoint subscribers"};  // taken before the API lock, never after
     std::vector<PeerSubscriber*> subscribers_;
     std::vector<RemoteNode*> remotes_;  // guarded by mutex_
     std::vector<PeerFiles> files_;      // used in process() only

@@ -9,10 +9,7 @@ LineTransport::LineTransport(Api& api, Output output) : api_(api), output_(std::
 
 LineTransport::~LineTransport() { api_.dropSubscriber(this); }
 
-bool LineTransport::notify(const std::string& message, Delivery) {
-    send(message);
-    return true;
-}
+bool LineTransport::notify(const std::string& message, Delivery) { return send(message, true); }
 
 void LineTransport::feed(const char* data, size_t len) {
     for (size_t i = 0; i < len; i++) feed(data[i]);
@@ -24,7 +21,7 @@ void LineTransport::feed(char c) {
             discarding_ = false;
             overflows_++;
             EnvelopeId noId;
-            EnvelopeReply reply(noId, 0, [this](const std::string& m) { send(m); });
+            EnvelopeReply reply(noId, 0, [this](const std::string& m) { send(m, false); });
             writeError(reply, Status::TooLarge, std::string_view(), "line too long");
         } else {
             handleLine();
@@ -77,7 +74,7 @@ void LineTransport::handleLine() {
             return;
         }
     }
-    EnvelopeReply reply(id, api_.config().maxResponse, [this](const std::string& m) { send(m); });
+    EnvelopeReply reply(id, api_.config().maxResponse, [this](const std::string& m) { send(m, false); });
     reply.stream([this](const char* data, size_t len, bool first, bool final) { return sendPiece(data, len, first, final); });
     if (s != Status::Ok) {
         writeError(reply, s, reason, std::string_view(), message);
@@ -99,7 +96,7 @@ Access LineTransport::level() const { return authenticated_ ? Access::Admin : ap
 // {"op":"auth","token":"..."} sets the line's token until the next one or
 // reset(); an empty or missing token signs out. The reply gives the level.
 void LineTransport::handleAuth(JsonObjectConst envelope, const EnvelopeId& id) {
-    EnvelopeReply reply(id, 0, [this](const std::string& m) { send(m); });
+    EnvelopeReply reply(id, 0, [this](const std::string& m) { send(m, false); });
     const char* message = nullptr;
     Reason reason = Reason::None;
     if (checkStrict(envelope, {"v", "id", "op", "token"}, message, &reason) != Status::Ok) {
@@ -135,23 +132,42 @@ void LineTransport::reset() {
     files_.reset();
 }
 
-// A streamed response line. The output lock is held from the first piece to
-// the last, so nothing else lands in the middle of the line.
+// A streamed response line: from its first piece to its last, the line is
+// its own (streaming_), so nothing lands in the middle of it, and its pieces
+// are written without any lock: a slow line (Bluetooth waits for room)
+// holds up no other task.
 bool LineTransport::sendPiece(const char* data, size_t len, bool first, bool final) {
-    if (first) outputMutex_.lock();
+    if (first) {
+        MutexGuard guard(outputMutex_);
+        streaming_ = true;
+    }
     if (output_ && len) output_(data, len);
     if (final) {
+        MutexGuard guard(outputMutex_);
         if (output_) output_("\n", 1);
-        outputMutex_.unlock();
+        streaming_ = false;
+        // What came meanwhile, in order.
+        if (output_ && !waiting_.empty()) output_(waiting_.data(), waiting_.size());
+        waiting_.clear();
+        waiting_.shrink_to_fit();
     }
     return true;
 }
 
-void LineTransport::send(const std::string& message) {
-    if (!output_) return;
+bool LineTransport::send(const std::string& message, bool mayDrop) {
+    if (!output_) return true;
     MutexGuard guard(outputMutex_);
+    if (streaming_) {
+        // A notification beyond 2 KB waiting is dropped (its subscriber is
+        // told "overflow" next); a deferred reply always waits.
+        if (mayDrop && waiting_.size() + message.size() > 2048) return false;
+        waiting_ += message;
+        waiting_ += '\n';
+        return true;
+    }
     output_(message.data(), message.size());
     output_("\n", 1);
+    return true;
 }
 
 }  // namespace tesser

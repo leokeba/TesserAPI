@@ -275,7 +275,7 @@ private:
     bool atDefault(const Node& n) const;
 
     Config config_;
-    mutable Mutex mutex_;
+    mutable Mutex mutex_{kRankApi, "api"};
     std::atomic<int> pending_{0};
     std::vector<Subscription> subs_;
     struct Transfer {
@@ -299,7 +299,7 @@ private:
     // Set by persistence(): poll() reaches the persistence code through it,
     // so applications that don't persist don't link it.
     void (*persistHook_)(Api& api, uint32_t nowMs) = nullptr;
-    mutable Mutex queueMutex_;  // never held with the API lock
+    mutable Mutex queueMutex_{kRankLeaf, "api queue"};  // never held with the API lock
     std::vector<QueuedRequest*> queue_;  // a vector: an empty deque allocates
     Api* nextApi_ = nullptr;  // registry used by EventNode
     const Client* current_ = nullptr;  // under mutex_: see currentClient()

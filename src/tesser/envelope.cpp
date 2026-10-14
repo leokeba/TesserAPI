@@ -202,8 +202,17 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
 bool EnvelopeReply::LimitedSink::write(const char* data, size_t len) {
     if (r_.fragment_) {
         if (r_.failed_) return false;
+        // On a short heap, or past the window (no drain() came: a deep list,
+        // say), whole pieces go now, under the lock.
+        if (!growFor(r_.buf_, r_.buf_.size() + len)) {
+            if (!r_.sendPieces(false)) return false;
+            if (!growFor(r_.buf_, r_.buf_.size() + len)) {
+                r_.lowMemory_ = true;
+                return false;
+            }
+        }
         r_.buf_.append(data, len);
-        return r_.buf_.size() < r_.chunk_ || r_.flush();
+        return r_.buf_.size() <= r_.window_ || r_.sendPieces(false);
     }
     if (r_.limit_ && r_.buf_.size() + len + 1 > r_.limit_) return false;  // keep room for '}'
     // Buffered whole: on a fragmented heap, refuse rather than abort.
@@ -219,27 +228,64 @@ EnvelopeReply::EnvelopeReply(const EnvelopeId& id, size_t limit, Send send)
     : id_(id), limit_(limit), send_(std::move(send)) {}
 
 EnvelopeReply::~EnvelopeReply() {
-    // A streamed envelope cut short still ends, so the transport can release
-    // what it holds for it (a line's output lock, a WebSocket message).
-    if (flushed_) fragment_(nullptr, 0, false, true);
+    if (ended_) {
+        sendPieces(true);  // nobody drained it
+    } else if (flushed_) {
+        // A streamed envelope cut short still ends, so the transport can
+        // release what it holds for it (a line's output, a WebSocket message).
+        fragment_(nullptr, 0, false, true);
+    }
 }
 
-void EnvelopeReply::stream(Fragment fragment, size_t chunk) {
+void EnvelopeReply::stream(Fragment fragment, size_t chunk, size_t window) {
     fragment_ = std::move(fragment);
     chunk_ = chunk ? chunk : 1;
+    window_ = window > chunk_ ? window : chunk_;
 }
 
-bool EnvelopeReply::flush() {
-    bool first = !flushed_;
-    flushed_ = true;
-    if (!fragment_(buf_.data(), buf_.size(), first, false)) failed_ = true;
+bool EnvelopeReply::sendPieces(bool final) {
+    size_t at = 0;
+    // Whole pieces; the tail waits for more, unless this is the end.
+    while (!failed_ && at < buf_.size() && (final || buf_.size() - at >= chunk_)) {
+        size_t n = buf_.size() - at < chunk_ ? buf_.size() - at : chunk_;
+        bool last = final && at + n == buf_.size();
+        if (!fragment_(buf_.data() + at, n, !flushed_, last)) failed_ = true;
+        flushed_ = !last;  // a piece is out: the end is owed, until the last
+        at += n;
+    }
+    if (!final) {
+        if (failed_) {
+            buf_.clear();
+        } else {
+            buf_.erase(0, at);
+        }
+        return !failed_;
+    }
     buf_.clear();
+    // The end on its own: after a failed piece, or when every byte went
+    // out with earlier drains.
+    if (flushed_) fragment_(nullptr, 0, false, true);
+    flushed_ = false;
+    ended_ = false;
+    buf_.shrink_to_fit();
     return !failed_;
+}
+
+bool EnvelopeReply::wantsDrain() const { return fragment_ && !failed_ && (ended_ || buf_.size() >= chunk_); }
+
+void EnvelopeReply::drain() {
+    if (!fragment_) return;
+    if (ended_) {
+        sendPieces(true);
+    } else if (!failed_ && buf_.size() >= chunk_) {
+        sendPieces(false);
+    }
 }
 
 Sink& EnvelopeReply::begin(Status status) {
     buf_.clear();
     lowMemory_ = false;
+    ended_ = false;
     buf_ += '{';
     if (id_.length) {
         buf_ += "\"id\":";
@@ -255,16 +301,12 @@ Sink& EnvelopeReply::begin(Status status) {
 void EnvelopeReply::end() {
     buf_ += '}';
     if (fragment_) {
-        bool first = !flushed_;
-        flushed_ = false;  // the final piece goes out here
-        if (failed_) {
-            if (!first) fragment_(nullptr, 0, false, true);
-        } else {
-            fragment_(buf_.data(), buf_.size(), first, true);
-        }
-    } else if (send_) {
-        send_(buf_);
+        // The final pieces go with drain() or the destructor: not under the
+        // API lock (docs/DESIGN.md section 9).
+        ended_ = true;
+        return;
     }
+    if (send_) send_(buf_);
     buf_.clear();
     buf_.shrink_to_fit();
 }
@@ -273,6 +315,7 @@ bool EnvelopeReply::rollback() {
     if (flushed_) return false;
     buf_.clear();
     failed_ = false;
+    ended_ = false;
     return true;
 }
 

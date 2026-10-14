@@ -120,12 +120,13 @@ TEST(stream_send_failure) {
 }
 
 TEST(stream_unfinished_reply_still_ends) {
-    // A reply destroyed between pieces (never ended) owes a final piece.
+    // A reply destroyed between pieces (never ended) owes a final piece once
+    // one went out (here, past a window as small as a piece).
     Pieces p;
     {
         EnvelopeId id;
         EnvelopeReply reply(id, 0, nullptr);
-        reply.stream(p.fn(), 8);
+        reply.stream(p.fn(), 8, 8);
         tesser::Sink& sink = reply.begin(Status::Ok);
         sink.write("[1,2,3,4,5,6]", 13);
     }

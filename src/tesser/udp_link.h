@@ -208,7 +208,7 @@ private:
     DatagramEndpoint endpoint_;
     Api* api_;
 
-    mutable Mutex mutex_;  // everything below; never held while calling the endpoint
+    mutable Mutex mutex_{kRankLeaf, "udp link"};  // everything below; never held while calling the endpoint
     std::atomic<bool> running_{false};
     uint32_t nonce_ = 0;
     uint32_t nextId_ = 0;

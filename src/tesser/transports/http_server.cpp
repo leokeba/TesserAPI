@@ -10,6 +10,7 @@
 #include <atomic>
 #include <memory>
 
+#include "esp_idf_version.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -149,13 +150,23 @@ bool flagParam(const char* query, const char* key, bool& bad) {
     return on;
 }
 
+}  // namespace
+
 // Shared between a parked HTTP handler and the deferred reply that completes
-// it. Whoever lets go last frees it.
-struct DeferredState {
+// it. Whoever lets go last frees it. With async handlers, the handler doesn't
+// park: the request is answered later, from the httpd task.
+struct HttpServer::DeferredState {
     SemaphoreHandle_t done = xSemaphoreCreateBinary();
     std::atomic<int> refs{2};
     Status status = Status::Internal;
     std::string body;
+    // Async (docs/DESIGN.md section 10.2): set before asyncReady.
+    httpd_req_t* async = nullptr;
+    HttpServer* server = nullptr;
+    uint32_t deadlineMs = 0;
+    std::string path;
+    std::atomic<bool> asyncReady{false};
+    std::atomic<bool> answered{false};
 
     void unref() {
         if (refs.fetch_sub(1) == 1) {
@@ -165,8 +176,11 @@ struct DeferredState {
     }
 };
 
+namespace {
+
 class DeferredHttpReply : public Reply {
 public:
+    using DeferredState = HttpServer::DeferredState;
     DeferredHttpReply(DeferredState* st, size_t limit) : st_(st), sink_(st->body, limit, true) {}
     Sink& begin(Status s) override {
         st_->status = s;
@@ -175,7 +189,15 @@ public:
         return sink_;
     }
     bool outOfMemory() const override { return sink_.lowMemory; }
-    void end() override { xSemaphoreGive(st_->done); }
+    void end() override {
+        // Async: the server answers, from its own task. Else the parked
+        // handler does, or serve() finds it done (see serve()).
+        if (st_->asyncReady.load()) {
+            st_->server->answerAsync(st_, false);
+        } else {
+            xSemaphoreGive(st_->done);
+        }
+    }
     bool rollback() override {
         st_->body.clear();
         return true;
@@ -192,35 +214,51 @@ private:
 
 }  // namespace
 
-// Streams the body in kChunk pieces. Responses that fit in one chunk go out
-// with a Content-Length; larger ones switch to chunked encoding.
+// Streams the body: what is written waits, up to a window, for drain(),
+// which the core calls without the API lock (docs/DESIGN.md section 9);
+// beyond the window it goes at once. A response that fits the window when it
+// ends goes out whole with a Content-Length; a larger one is chunked.
 class HttpReply : public Reply {
 public:
-    // The chunk buffer lives on the heap: the httpd task's stack is precious.
-    HttpReply(HttpServer& server, httpd_req_t* req) : server_(server), req_(req), buf_(new char[kChunk]) {}
+    using DeferredState = HttpServer::DeferredState;
+    static constexpr size_t kWindow = 4096;
+
+    HttpReply(HttpServer& server, httpd_req_t* req) : server_(server), req_(req) {}
+    ~HttpReply() override {
+        if (ended_) finish();  // nobody drained it
+    }
 
     Sink& begin(Status s) override {
         status_ = s;
-        used_ = 0;
+        pending_.clear();
         chunked_ = false;
+        ended_ = false;
         return sink_;
     }
 
     void end() override {
-        if (failed_) return;
-        if (!chunked_) {
-            sendHeaders();
-            httpd_resp_send(req_, buf_.get(), static_cast<ssize_t>(used_));
-        } else {
-            flush();
-            httpd_resp_send_chunk(req_, nullptr, 0);
+        // Under the API lock (in a request): sent by drain(), without it.
+        if (server_.api().mutex().heldByMe()) {
+            ended_ = true;
+            return;
         }
+        finish();
     }
 
     bool rollback() override {
         if (chunked_) return false;
-        used_ = 0;
+        pending_.clear();
+        ended_ = false;
         return true;
+    }
+
+    bool wantsDrain() const override { return !failed_ && (ended_ || pending_.size() >= kChunk); }
+    void drain() override {
+        if (ended_) {
+            finish();
+        } else if (!failed_ && pending_.size() >= kChunk) {
+            sendChunk();
+        }
     }
 
     Reply* detach() override {
@@ -259,42 +297,49 @@ private:
         server_.addCorsHeaders(req_);
     }
 
-    bool flush() {
-        if (used_ == 0) return true;
-        if (httpd_resp_send_chunk(req_, buf_.get(), static_cast<ssize_t>(used_)) != ESP_OK) {
+    void finish() {
+        ended_ = false;
+        if (failed_) return;
+        if (!chunked_) {
+            sendHeaders();
+            httpd_resp_send(req_, pending_.data(), static_cast<ssize_t>(pending_.size()));
+        } else {
+            sendChunk();
+            httpd_resp_send_chunk(req_, nullptr, 0);
+        }
+        pending_.clear();
+        pending_.shrink_to_fit();
+    }
+
+    bool sendChunk() {
+        if (!chunked_) {
+            chunked_ = true;
+            sendHeaders();
+        }
+        if (pending_.empty()) return true;
+        if (httpd_resp_send_chunk(req_, pending_.data(), static_cast<ssize_t>(pending_.size())) != ESP_OK) {
             failed_ = true;
             return false;
         }
-        used_ = 0;
+        pending_.clear();
         return true;
     }
 
     bool append(const char* data, size_t len) {
         if (failed_) return false;
-        while (len) {
-            if (used_ == kChunk) {
-                if (!chunked_) {
-                    chunked_ = true;
-                    sendHeaders();
-                }
-                if (!flush()) return false;
-            }
-            size_t n = len < kChunk - used_ ? len : kChunk - used_;
-            memcpy(buf_.get() + used_, data, n);
-            used_ += n;
-            data += n;
-            len -= n;
-        }
-        return true;
+        // On a short heap, what is pending goes first.
+        if (!growFor(pending_, pending_.size() + len) && (!sendChunk() || !growFor(pending_, len))) return false;
+        pending_.append(data, len);
+        return pending_.size() <= kWindow || sendChunk();
     }
 
     HttpServer& server_;
     httpd_req_t* req_;
     ChunkSink sink_{*this};
-    std::unique_ptr<char[]> buf_;
-    size_t used_ = 0;
+    std::string pending_;
     Status status_ = Status::Ok;
     bool chunked_ = false;
+    bool ended_ = false;  // end() came under the API lock: drain() finishes
     bool failed_ = false;
     DeferredState* deferred_ = nullptr;
 };
@@ -680,6 +725,18 @@ void HttpServer::end() {
         esp_timer_delete(keepAliveTimer_);
         keepAliveTimer_ = nullptr;
     }
+    if (asyncTimer_) {
+        esp_timer_stop(asyncTimer_);
+        esp_timer_delete(asyncTimer_);
+        asyncTimer_ = nullptr;
+    }
+    // Async requests still waiting: answered as timed out.
+    std::vector<DeferredState*> waiting;
+    {
+        MutexGuard guard(asyncMutex_);
+        waiting = async_;
+    }
+    for (DeferredState* st : waiting) answerAsync(st, true);
     // Streams outlive the server object until their sockets close: orphaned
     // here, freed by freeStream().
     std::vector<Stream*> streams;
@@ -841,11 +898,17 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
         return ESP_OK;
     }
     if (!sub && (request.op == Op::Set || request.query.view == View::Value)) {
-        FileTransfer file(api_, FileTransfer::Remotes::Wait);
+        std::unique_ptr<FileTransfer> owned(new FileTransfer(api_, FileTransfer::Remotes::Wait));
+        FileTransfer& file = *owned;
         FileTransfer::Open o = request.op == Op::Set
                                    ? file.openUpload(path, request.client, req->content_len, reply, filename)
                                    : file.openDownload(path, request.client, reply);
-        if (o == FileTransfer::Open::Ok) return request.op == Op::Set ? receiveFile(req, file, reply) : sendFile(req, file);
+        if (o == FileTransfer::Open::Ok) {
+            // Relayed to a remote node, it waits for each chunk's reply: off
+            // the httpd task (docs/DESIGN.md section 14).
+            if (file.relay() && relayAsync(req, owned, request.op == Op::Set)) return ESP_OK;
+            return request.op == Op::Set ? receiveFile(req, file, reply) : sendFile(req, file);
+        }
         if (o == FileTransfer::Open::Failed) {
             if (request.op != Op::Set || req->content_len == 0) return ESP_OK;
             return req->content_len <= kDrainLimit && drain(req, req->content_len) ? ESP_OK : ESP_FAIL;
@@ -888,6 +951,23 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
     api_.handle(request, reply);
 
     if (DeferredState* st = reply.deferred()) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+        // The httpd task doesn't wait: the request turns async, answered
+        // when the reply comes (or deferTimeoutMs passes), and the server
+        // goes on serving everyone else (docs/DESIGN.md section 10.2).
+        httpd_req_t* async = nullptr;
+        if (httpd_req_async_handler_begin(req, &async) == ESP_OK) {
+            st->async = async;
+            st->server = this;
+            st->deadlineMs = millis32() + cfg.deferTimeoutMs;
+            st->path = path;
+            watchAsync(st);
+            st->asyncReady = true;
+            // It may have ended before asyncReady: then it gave `done`.
+            if (xSemaphoreTake(st->done, 0) == pdTRUE) answerAsync(st, false);
+            return ESP_OK;
+        }
+#endif
         if (xSemaphoreTake(st->done, pdMS_TO_TICKS(cfg.deferTimeoutMs)) == pdTRUE) {
             reply.sendWhole(st->status, st->body);
         } else {
@@ -989,6 +1069,118 @@ void HttpServer::freeStream(void* ctx) {
         }
     }
     delete stream;  // drops its subscription
+}
+
+// ---- relayed transfers ---------------------------------------------------------
+
+namespace {
+struct RelayJob {
+    HttpServer* server;
+    httpd_req_t* req;  // async
+    std::unique_ptr<FileTransfer> file;
+    bool upload;
+};
+}  // namespace
+
+bool HttpServer::relayAsync(httpd_req_t* req, std::unique_ptr<FileTransfer>& file, bool upload) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+    httpd_req_t* async = nullptr;
+    if (httpd_req_async_handler_begin(req, &async) != ESP_OK) return false;
+    auto* job = new RelayJob{this, async, std::move(file), upload};
+    if (xTaskCreate(&HttpServer::relayTask, "tesser_relay", 4096, job, 5, nullptr) == pdPASS) return true;
+    // No task: done here after all, as without async handlers.
+    file = std::move(job->file);
+    httpd_req_async_handler_complete(async);
+    delete job;
+    return false;
+#else
+    (void)req;
+    (void)file;
+    (void)upload;
+    return false;
+#endif
+}
+
+void HttpServer::relayTask(void* arg) {
+    auto* job = static_cast<RelayJob*>(arg);
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+    esp_err_t err;
+    {
+        HttpReply reply(*job->server, job->req);
+        err = job->upload ? job->server->receiveFile(job->req, *job->file, reply)
+                          : job->server->sendFile(job->req, *job->file);
+    }
+    job->file.reset();
+    // A failure means the connection can't carry on: closed, as httpd closes
+    // it when a handler fails.
+    if (err != ESP_OK) httpd_sess_trigger_close(job->req->handle, httpd_req_to_sockfd(job->req));
+    httpd_req_async_handler_complete(job->req);
+#endif
+    delete job;
+    vTaskDelete(nullptr);
+}
+
+// ---- async deferred replies ---------------------------------------------------
+
+void HttpServer::watchAsync(DeferredState* st) {
+    MutexGuard guard(asyncMutex_);
+    async_.push_back(st);  // holds serve()'s reference until answered
+    if (!asyncTimer_) {
+        esp_timer_create_args_t args = {};
+        args.callback = &HttpServer::onAsyncTimer;
+        args.arg = this;
+        args.name = "tesser_async";
+        if (esp_timer_create(&args, &asyncTimer_) != ESP_OK) asyncTimer_ = nullptr;
+    }
+    if (asyncTimer_ && !esp_timer_is_active(asyncTimer_)) esp_timer_start_periodic(asyncTimer_, 500 * 1000);
+}
+
+// Once, by the reply or the timeout: the answer is written by the httpd task,
+// like every other write, and the request completed.
+void HttpServer::answerAsync(DeferredState* st, bool timedOut) {
+    if (st->answered.exchange(true)) return;
+    {
+        MutexGuard guard(asyncMutex_);
+        for (size_t i = 0; i < async_.size(); i++) {
+            if (async_[i] != st) continue;
+            async_.erase(async_.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
+    if (timedOut) {
+        StringReply r;
+        writeError(r, Status::Timeout, Reason::NoAnswer, st->path, "deferred call timed out");
+        st->status = r.status;
+        st->body = std::move(r.body);
+    }
+    auto work = [](void* arg) {
+        auto* s = static_cast<DeferredState*>(arg);
+        httpd_resp_set_status(s->async, statusLine(s->status));
+        httpd_resp_set_type(s->async, "application/json");
+        s->server->addCorsHeaders(s->async);
+        httpd_resp_send(s->async, s->body.data(), static_cast<ssize_t>(s->body.size()));
+        httpd_req_async_handler_complete(s->async);
+        s->unref();
+    };
+    if (!server_ || httpd_queue_work(server_, work, st) != ESP_OK) {
+        // The server is going: complete it here.
+        httpd_req_async_handler_complete(st->async);
+        st->unref();
+    }
+}
+
+void HttpServer::onAsyncTimer(void* arg) {
+    auto* self = static_cast<HttpServer*>(arg);
+    std::vector<DeferredState*> expired;
+    uint32_t now = millis32();
+    {
+        MutexGuard guard(self->asyncMutex_);
+        for (DeferredState* st : self->async_) {
+            if (static_cast<int32_t>(now - st->deadlineMs) >= 0) expired.push_back(st);
+        }
+        if (self->async_.size() == expired.size()) esp_timer_stop(self->asyncTimer_);
+    }
+    for (DeferredState* st : expired) self->answerAsync(st, true);
 }
 
 void HttpServer::onKeepAlive(void* arg) {

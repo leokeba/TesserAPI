@@ -55,13 +55,20 @@ private:
     void handleLine();
     void handleAuth(JsonObjectConst envelope, const EnvelopeId& id);
     Access level() const;
-    void send(const std::string& message);
+    // A whole message (a notification, `mayDrop`, or a deferred reply):
+    // waits in `waiting_` while a reply streams. False if dropped.
+    bool send(const std::string& message, bool mayDrop);
     bool sendPiece(const char* data, size_t len, bool first, bool final);
 
     Api& api_;
     Output output_;
     std::string line_;
-    Mutex outputMutex_;
+    // Held only briefly: a streamed reply sets streaming_ and writes its
+    // pieces without it (and without the API lock, docs/DESIGN.md section
+    // 9); whole messages wait in waiting_ meanwhile, written after its end.
+    Mutex outputMutex_{kRankLeaf, "line output"};
+    bool streaming_ = false;
+    std::string waiting_;
     bool discarding_ = false;
     bool authenticated_ = true;
     std::string token_;  // from the last "auth" envelope

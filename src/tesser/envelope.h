@@ -78,8 +78,10 @@ public:
     // Streams the envelope through `fragment` in pieces of `chunk` bytes
     // instead of buffering it whole, with no size limit. Errors can replace
     // the body until the first piece is out. A detached copy (deferred
-    // reply) is buffered as usual.
-    void stream(Fragment fragment, size_t chunk = 1024);
+    // reply) is buffered as usual. Pieces wait, up to `window` bytes, for
+    // drain() (the core calls it without the API lock) or the destructor;
+    // beyond the window they go at once.
+    void stream(Fragment fragment, size_t chunk = 1024, size_t window = 4096);
 
     Sink& begin(Status status) override;
     void end() override;
@@ -87,6 +89,8 @@ public:
     Reply* detach() override;
     void release() override;
     bool outOfMemory() const override { return lowMemory_; }
+    bool wantsDrain() const override;
+    void drain() override;
 
 private:
     class LimitedSink : public Sink {
@@ -98,7 +102,9 @@ private:
         EnvelopeReply& r_;
     };
 
-    bool flush();
+    // Sends what is buffered in pieces; with `final`, the last one ends the
+    // envelope.
+    bool sendPieces(bool final);
 
     EnvelopeId id_;
     size_t limit_;
@@ -109,6 +115,8 @@ private:
     bool lowMemory_ = false;
     Fragment fragment_;
     size_t chunk_ = 0;
+    size_t window_ = 0;
+    bool ended_ = false;     // end() was called: the final piece is owed
     bool flushed_ = false;   // a piece is out: no rollback, a final piece is owed
     bool failed_ = false;    // a piece couldn't be sent
 };

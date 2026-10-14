@@ -691,10 +691,23 @@ private:
                     if (!f.exclude.empty() && listContains(f.exclude, c->name())) continue;
                     w.key(c->name());
                     renderAny(w, *c, depth - 1, Filter(), view);
+                    yieldPoint();
                 }
             }
         }
         w.endObject();
+    }
+
+    // Between an object's children: a streamed reply's pending pieces go out
+    // without the API lock (docs/DESIGN.md section 9), so a slow line holds
+    // up nobody else. Gets only (a subscription's snapshot must stay one
+    // with its start), and never below a list element, whose nodes the
+    // application's data backs. What a reply renders after the lock came
+    // back may be newer than what it rendered before.
+    void yieldPoint() {
+        if (req_.op != Op::Get || !temps_.empty() || inList_ || !reply_.wantsDrain()) return;
+        MutexRelease release(api_.mutex());
+        if (release.released()) reply_.drain();
     }
 
     // Out of line, like schemaAttributes, so renders without a shape don't
@@ -737,7 +750,9 @@ private:
         }
         if (n.type() == NodeType::List && depth > 0) {
             w.key("items");
+            inList_++;
             renderSchema(w, *static_cast<const ListNode&>(n).prototype(), depth, Filter());
+            inList_--;
         }
         w.endObject();
     }
@@ -1447,6 +1462,7 @@ private:
     bool partial_ = false;
     bool filling_ = false;  // validating or filling an action's object argument
     bool hashing_ = false;  // rendering a schema for view=hash
+    int inList_ = 0;        // rendering a list's prototype: no yieldPoint()
     std::vector<std::unique_ptr<Node>> temps_;  // list and array elements on the request path
     std::vector<Node*> containers_;             // lists and arrays the path went through
     struct KeyRef {
@@ -1522,11 +1538,16 @@ void Api::releaseTransfer(std::string_view path) {
 }
 
 void Api::handleNow(const Request& request, Reply& reply) {
-    MutexGuard guard(mutex_);
-    const Client* outer = current_;
-    current_ = &request.client;
-    Handler(*this, request, reply).run();
-    current_ = outer;
+    {
+        MutexGuard guard(mutex_);
+        const Client* outer = current_;
+        current_ = &request.client;
+        Handler(*this, request, reply).run();
+        current_ = outer;
+    }
+    // What a streamed reply still holds goes out without the lock, unless
+    // the caller holds it (docs/DESIGN.md section 9).
+    if (reply.wantsDrain() && !mutex_.heldByMe()) reply.drain();
 }
 
 void detail::handleNested(Api& api, const Request& request, Reply& reply) {

@@ -4,8 +4,10 @@
 #include "tesser/sink.h"
 
 #include <stdarg.h>
+#include <stdlib.h>
 
 #include <atomic>
+#include <vector>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -18,6 +20,9 @@
 #include "tesser/api.h"
 #else
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #endif
 
 namespace tesser {
@@ -71,6 +76,150 @@ bool heapAbove(size_t bytes) {
     if (!floor) return true;
     size_t free = freeHeap();
     return free >= floor && free - floor >= bytes;
+}
+
+namespace {
+void defaultLockOrder(const char* held, const char* taking) {
+    logError("lock order: taking %s while holding %s", taking ? taking : "?", held ? held : "?");
+#if !defined(ESP_PLATFORM)
+    abort();
+#endif
+}
+std::atomic<LockOrderHandler> g_lockOrder{&defaultLockOrder};
+}  // namespace
+
+void setLockOrderHandler(LockOrderHandler fn) { g_lockOrder = fn ? fn : &defaultLockOrder; }
+
+#if !defined(ESP_PLATFORM)
+namespace {
+// The ranked mutexes this thread holds, innermost last.
+thread_local std::vector<std::pair<uint8_t, const char*>> t_held;
+}  // namespace
+
+void Mutex::checkOrder() {
+#if defined(TESSER_LOCK_CHECK)
+    if (!rank_) return;
+    for (const auto& h : t_held) {
+        if (h.first >= rank_) g_lockOrder.load()(h.second, name_);
+    }
+#endif
+}
+
+void Mutex::locked() {
+    if (heldByMe()) {
+        depth_++;
+        return;
+    }
+    owner_ = std::this_thread::get_id();
+    depth_ = 1;
+#if defined(TESSER_LOCK_CHECK)
+    if (rank_) t_held.emplace_back(rank_, name_);
+#endif
+}
+
+void Mutex::unlocking() {
+    if (--depth_ > 0) return;
+    owner_ = std::thread::id();
+#if defined(TESSER_LOCK_CHECK)
+    if (!rank_) return;
+    for (size_t i = t_held.size(); i-- > 0;) {
+        if (t_held[i].second == name_ && t_held[i].first == rank_) {
+            t_held.erase(t_held.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
+#endif
+}
+#endif
+
+// ---- background task ------------------------------------------------------------
+
+namespace {
+constexpr size_t kBackgroundJobs = 8;
+std::atomic<uint32_t> g_backgroundStack{6144};
+
+#if defined(ESP_PLATFORM)
+struct Background {
+    Mutex mutex{kRankLeaf, "background"};
+    std::vector<std::function<void()>> jobs;
+    TaskHandle_t task = nullptr;
+};
+
+void backgroundLoop(void* arg) {
+    auto* b = static_cast<Background*>(arg);
+    for (;;) {
+        std::function<void()> job;
+        {
+            MutexGuard guard(b->mutex);
+            if (!b->jobs.empty()) {
+                job = std::move(b->jobs.front());
+                b->jobs.erase(b->jobs.begin());
+            }
+        }
+        if (job) {
+            job();
+        } else {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
+    }
+}
+#else
+struct Background {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<std::function<void()>> jobs;
+    bool started = false;
+};
+
+void backgroundLoop(Background* b) {
+    for (;;) {
+        std::function<void()> job;
+        {
+            std::unique_lock<std::mutex> lock(b->mutex);
+            b->cv.wait(lock, [b] { return !b->jobs.empty(); });
+            job = std::move(b->jobs.front());
+            b->jobs.erase(b->jobs.begin());
+        }
+        if (job) job();
+    }
+}
+#endif
+
+Background& backgroundState() {
+    static Background* b = new Background();  // never destroyed: its task runs on
+    return *b;
+}
+}  // namespace
+
+void setBackgroundStack(uint32_t bytes) { g_backgroundStack = bytes; }
+
+bool background(std::function<void()> work) {
+    if (!work) return false;
+    Background& b = backgroundState();
+#if defined(ESP_PLATFORM)
+    {
+        MutexGuard guard(b.mutex);
+        if (b.jobs.size() >= kBackgroundJobs) return false;
+        if (!b.task && xTaskCreate(&backgroundLoop, "tesser_bg", g_backgroundStack.load(), &b, 4, &b.task) != pdPASS) {
+            b.task = nullptr;
+            return false;
+        }
+        b.jobs.push_back(std::move(work));
+    }
+    xTaskNotifyGive(b.task);
+#else
+    {
+        std::lock_guard<std::mutex> lock(b.mutex);
+        if (b.jobs.size() >= kBackgroundJobs) return false;
+        if (!b.started) {
+            std::thread(&backgroundLoop, &b).detach();
+            b.started = true;
+        }
+        b.jobs.push_back(std::move(work));
+    }
+    b.cv.notify_one();
+#endif
+    return true;
 }
 
 size_t largestFreeBlock() {

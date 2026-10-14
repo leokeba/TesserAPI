@@ -317,7 +317,7 @@ private:
     std::string remotePath_;
     uint32_t timeoutMs_ = 0;
 
-    mutable Mutex routesMutex_;  // a leaf: nothing is called while it is held
+    mutable Mutex routesMutex_{kRankLeaf, "remote routes"};  // a leaf: nothing is called while it is held
     std::vector<RouteSlot> routes_;
     std::vector<RouteKind> order_;
     bool hasOrder_ = false;
@@ -341,7 +341,7 @@ private:
     uint32_t lastSubscribeMs_ = 0;
     std::atomic<bool> subscribing_{false};
     bool subscribedOnce_ = false;
-    mutable Mutex mutex_;
+    mutable Mutex mutex_{kRankRemote, "remote"};  // after the API lock
     JsonDocument copy_;
     bool hasCopy_ = false;
     Api* api_ = nullptr;
@@ -353,7 +353,7 @@ private:
     std::string ownedName_;
 
     // Streamed sets, guarded by streamMutex_ (a leaf like routesMutex_).
-    mutable Mutex streamMutex_;
+    mutable Mutex streamMutex_{kRankLeaf, "remote stream"};
     std::vector<Pending> queue_;
     Pending flying_;
     bool inFlight_ = false;

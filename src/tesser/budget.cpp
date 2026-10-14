@@ -10,7 +10,7 @@ namespace {
 // chain, and the heap, at once. A leaf: nothing is called while it is held
 // but the heap probes.
 Mutex& accountant() {
-    static Mutex m;  // constructed on first use (budgets are often globals)
+    static Mutex m(kRankAccountant, "accountant");  // constructed on first use (budgets are often globals)
     return m;
 }
 

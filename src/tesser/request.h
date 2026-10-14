@@ -159,6 +159,12 @@ public:
     // The last write failed because the heap couldn't hold the reply: the
     // core answers "busy" rather than "too_large".
     virtual bool outOfMemory() const { return false; }
+    // A streamed reply keeps what is written, up to a window, rather than
+    // send it under the API lock (docs/DESIGN.md section 9): the core calls
+    // drain() where it may let go of the lock, and once the request is done.
+    // wantsDrain(): something is waiting to be sent.
+    virtual bool wantsDrain() const { return false; }
+    virtual void drain() {}
 };
 
 // Reply that captures status and body into memory: handy for tests and for

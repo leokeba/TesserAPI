@@ -95,6 +95,10 @@ public:
     };
     WorkStats workStats() const;
 
+    // Used by deferred replies.
+    struct DeferredState;
+    void answerAsync(DeferredState* st, bool timedOut);
+
 private:
     class WsClient;
     class Stream;
@@ -118,6 +122,11 @@ private:
     bool streamSend(Stream* stream, const std::string& piece);
     static void freeStream(void* ctx);
     static void onKeepAlive(void* arg);
+    void watchAsync(DeferredState* st);
+    // Hands a relayed transfer to its own task; false: do it here.
+    bool relayAsync(httpd_req_t* req, std::unique_ptr<FileTransfer>& file, bool upload);
+    static void relayTask(void* arg);
+    static void onAsyncTimer(void* arg);
 
     Api& api_;
     ByteBudget queued_{"httpd queue", 16384, 8192};
@@ -133,11 +142,16 @@ private:
     mutable Mutex wsMutex_;
     std::vector<WsClient*> wsClients_;
     bool wsAuthWarned_ = false;
-    mutable Mutex streamsMutex_;  // never held while taking the API lock
+    mutable Mutex streamsMutex_{kRankLeaf, "http streams"};  // never held while taking the API lock
     std::vector<Stream*> streams_;
     uint8_t maxStreams_ = 2;
     uint32_t keepAliveMs_ = 15000;
     struct esp_timer* keepAliveTimer_ = nullptr;
+    // Async deferred replies waiting for their answer (docs/DESIGN.md
+    // section 10.2), each holding its handler's reference.
+    mutable Mutex asyncMutex_{kRankLeaf, "http async"};
+    std::vector<DeferredState*> async_;
+    struct esp_timer* asyncTimer_ = nullptr;
     friend class HttpReply;
 };
 
