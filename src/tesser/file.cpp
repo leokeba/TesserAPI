@@ -7,6 +7,7 @@
 #include "tesser/api.h"
 #include "tesser/budget.h"
 #include "tesser/call.h"
+#include "tesser/datagram.h"
 #include "tesser/envelope.h"
 #include "tesser/remote.h"
 
@@ -193,6 +194,7 @@ struct Waited {
     Signal signal;
     Status status = Status::Timeout;
     JsonDocument body;
+    std::vector<uint8_t> data;  // a download's chunk, decoded
 };
 
 Status waitFor(FileRelay& relay, const std::function<void(FileRelay::Done)>& start, JsonDocument& body) {
@@ -212,6 +214,47 @@ Status waitFor(FileRelay& relay, const std::function<void(FileRelay::Done)>& sta
         }
     }
     body = std::move(w->body);
+    return w->status;
+}
+
+// A download's chunk at `offset`, waited for: its body in `body`, its data
+// decoded in `data`, within the byte accountant (busy, low_memory if not).
+Status waitForChunk(FileRelay& relay, uint64_t offset, JsonDocument& body, std::vector<uint8_t>& data) {
+    auto w = std::make_shared<Waited>();
+    relay.download(offset, 0, [w](Status s, JsonVariantConst b, std::string_view text) {
+        w->status = s;
+        w->body.set(b);
+        if (s == Status::Ok) {
+            size_t n = text.size() / 4 * 3;
+            Reservation room = memoryBudget().reserve(n, 0, true);
+            if (!room) {
+                w->status = Status::Busy;
+                w->body.clear();
+                w->body["error"] = "busy";
+                w->body["reason"] = "low_memory";
+                w->body["message"] = "not enough memory for the chunk";
+            } else {
+                w->data.reserve(n);
+                room.settle();
+                if (!detail::base64Decode(text, w->data)) {
+                    w->status = Status::Internal;
+                    w->body.clear();
+                    w->body["error"] = "internal";
+                    w->body["message"] = "bad download reply";
+                }
+            }
+        }
+        w->signal.give();
+    });
+    for (int round = 0; !w->signal.take(relay.patienceMs()); round++) {
+        if (round > 0 || !relay.busy()) {
+            if (w->signal.take(100)) break;
+            body.clear();
+            return Status::Timeout;
+        }
+    }
+    body = std::move(w->body);
+    data = std::move(w->data);
     return w->status;
 }
 
@@ -252,11 +295,9 @@ FileTransfer::Open FileTransfer::openRelay(Op op, uint64_t size, std::string_vie
         if (s == Status::Ok && relay_->finished()) serializeJson(body, relayReply_);  // size 0
         filename_.assign(filename.data(), filename.size());
     } else {
-        s = waitFor(*relay_, [this](FileRelay::Done d) { relay_->download(0, 0, std::move(d)); }, body);
-        if (s == Status::Ok && !takeChunk(body.as<JsonVariantConst>())) {
-            body.clear();
-            s = Status::Internal;
-        }
+        std::vector<uint8_t> data;
+        s = waitForChunk(*relay_, 0, body, data);
+        if (s == Status::Ok) takeChunk(body.as<JsonVariantConst>(), std::move(data));
         if (s == Status::Ok) {
             relaySize_ = body["size"].is<int64_t>() ? body["size"].as<int64_t>() : -1;
             filename_ = body["filename"] | "";
@@ -272,20 +313,19 @@ FileTransfer::Open FileTransfer::openRelay(Op op, uint64_t size, std::string_vie
     return Open::Ok;
 }
 
-bool FileTransfer::takeChunk(JsonVariantConst body) {
-    JsonString data = body["data"].as<JsonString>();
-    if (!detail::base64Decode(std::string_view(data.c_str() ? data.c_str() : "", data.size()), relayBuf_)) return false;
+void FileTransfer::takeChunk(JsonVariantConst body, std::vector<uint8_t> data) {
+    relayBuf_ = std::move(data);
     relayAt_ = 0;
     relayPosition_ = body["offset"].as<uint64_t>() + relayBuf_.size();
     relayEnd_ = body["end"] == true;
-    return true;
 }
 
 bool FileTransfer::fetchRelay() {
     JsonDocument body;
-    uint64_t at = relayPosition_;
-    Status s = waitFor(*relay_, [&](FileRelay::Done d) { relay_->download(at, 0, std::move(d)); }, body);
-    return s == Status::Ok && takeChunk(body.as<JsonVariantConst>());
+    std::vector<uint8_t> data;
+    if (waitForChunk(*relay_, relayPosition_, body, data) != Status::Ok) return false;
+    takeChunk(body.as<JsonVariantConst>(), std::move(data));
+    return true;
 }
 
 bool FileTransfer::flushRelay(Reply& reply, bool all) {
@@ -528,9 +568,9 @@ struct FileSession::State {
     int64_t size = -1;
     uint64_t position = 0;     // bytes sent: where the next chunk starts
     uint64_t lastOffset = 0;   // where the last chunk started
-    std::vector<uint8_t> chunk;  // the last chunk, kept to send it again
+    std::vector<uint8_t> chunk;  // read from lastOffset on: the last chunk, kept to send it again, and any read ahead
     bool sent = false;           // a chunk is out
-    bool end = false;            // it was the last
+    bool end = false;            // the file has no more to read
 };
 
 FileSession::FileSession(Api& api) : api_(api) {}
@@ -554,7 +594,7 @@ bool FileSession::busy() const {
     return !relay || relay->open();
 }
 
-void FileSession::handle(JsonObjectConst envelope, const Client& from, Reply& reply) {
+void FileSession::handle(JsonObjectConst envelope, const Client& from, Reply& reply, std::string_view raw) {
     // "upload@user": a gateway's client (docs/DESIGN.md section 13.1).
     std::string_view op;
     Access ceiling = Access::Admin;
@@ -563,8 +603,27 @@ void FileSession::handle(JsonObjectConst envelope, const Client& from, Reply& re
     client.cap(ceiling);
     const char* message = nullptr;
     Reason reason = Reason::None;
-    if (checkStrict(envelope, {"v", "id", "op", "path", "offset", "size", "filename", "data", "length"}, message,
-                    &reason) != Status::Ok) {
+    Status strict = checkStrict(envelope, {"v", "id", "op", "path", "offset", "size", "filename", "data", "length"},
+                                message, &reason);
+    // Parsed without its data (uploadFilter()), it may have lost members:
+    // a strict envelope's keys are checked in its text.
+    JsonVariantConst v = envelope["v"];
+    if (strict == Status::Ok && !raw.empty() && v.is<uint8_t>() && v.as<uint8_t>() >= 2) {
+        bool known = true;
+        jsonKeys(raw, [&known](std::string_view k) {
+            for (const char* ok : {"v", "id", "op", "path", "offset", "size", "filename", "data", "length"}) {
+                if (k == ok) return true;
+            }
+            known = false;
+            return false;
+        });
+        if (!known) {
+            strict = Status::BadRequest;
+            message = "an option this node doesn't know (the request is strict: \"v\")";
+            reason = Reason::UnknownOption;
+        }
+    }
+    if (strict != Status::Ok) {
         writeError(reply, Status::BadRequest, reason, std::string_view(), message);
         return;
     }
@@ -584,17 +643,38 @@ void FileSession::handle(JsonObjectConst envelope, const Client& from, Reply& re
     }
     uint64_t offset = off.as<uint64_t>();
     if (op == "upload") {
-        upload(envelope, path, offset, client, reply);
+        upload(envelope, raw, path, offset, client, reply);
     } else {
         download(envelope, path, offset, client, reply);
     }
 }
 
-void FileSession::upload(JsonObjectConst envelope, std::string_view path, uint64_t offset, const Client& client,
-                         Reply& reply) {
+void FileSession::upload(JsonObjectConst envelope, std::string_view raw, std::string_view path, uint64_t offset,
+                         const Client& client, Reply& reply) {
     std::vector<uint8_t> data;
     JsonVariantConst d = envelope["data"];
-    if (!d.isNull() && (!d.is<const char*>() || !detail::base64Decode(text(d), data))) {
+    // Left out of the parsed envelope: read from its text, a JSON string
+    // (base64 has no escapes).
+    std::string_view rawData;
+    bool fromRaw = d.isNull() && !raw.empty() && jsonMember(raw, "data", rawData);
+    // The decoded bytes, only with room for them (docs/DESIGN.md section 15).
+    size_t encoded = fromRaw ? rawData.size() : d.is<const char*>() ? text(d).size() : 0;
+    if (encoded > 256) {
+        Reservation room = memoryBudget().reserve(encoded / 4 * 3, 0, true);
+        if (!room) {
+            writeError(reply, Status::Busy, Reason::LowMemory, path, "not enough memory for the chunk");
+            return;
+        }
+        data.reserve(encoded / 4 * 3);
+    }
+    bool bad = false;
+    if (fromRaw) {
+        bad = rawData.size() < 2 || rawData.front() != '"' || rawData.back() != '"' ||
+              !detail::base64Decode(rawData.substr(1, rawData.size() - 2), data);
+    } else if (!d.isNull()) {
+        bad = !d.is<const char*>() || !detail::base64Decode(text(d), data);
+    }
+    if (bad) {
         writeError(reply, Status::BadRequest, path, "data must be base64");
         return;
     }
@@ -698,45 +778,61 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
         return;
     }
     State& s = *state_;
-    if (!opening && s.sent && offset == s.lastOffset) {
-        // The last chunk again: its reply was lost.
-    } else if (offset != s.position) {
+    // s.chunk holds what was read from lastOffset on: the bytes up to
+    // position went out with the last chunk; the rest (that chunk asked
+    // again for less: a gateway short of memory, docs/DESIGN.md section 14)
+    // go first with the next.
+    bool again = !opening && s.sent && offset == s.lastOffset;
+    if (!again && offset != s.position) {
         char message[64];
         snprintf(message, sizeof(message), "offset must be %llu", static_cast<unsigned long long>(s.position));
         writeError(reply, Status::BadRequest, path, message);
         return;
-    } else if (s.end) {
-        s.chunk.clear();  // past the end: nothing more
-        s.lastOffset = s.position;
-    } else {
-        // The next chunk: read until it is full or the file ends.
-        s.chunk.resize(length);
-        size_t got = 0;
-        while (got < length) {
-            int n = s.transfer.read(s.chunk.data() + got, length - got);
-            if (n < 0) {
-                bool expired = s.transfer.expired();
-                state_.reset();
-                writeError(reply, expired ? Status::Timeout : Status::Internal, expired ? Reason::Idle : Reason::None, path,
-                           expired ? "the transfer was idle too long" : "read failed");
+    }
+    if (!again) {
+        size_t sent = static_cast<size_t>(s.position - s.lastOffset);
+        // Room for the chunk before anything changes: refused, it is asked
+        // for again.
+        if (!s.end && s.chunk.capacity() < length) {
+            Reservation room = memoryBudget().reserve(length, 0, true);
+            if (!room) {
+                writeError(reply, Status::Busy, Reason::LowMemory, path, "not enough memory for the chunk");
                 return;
             }
-            if (n == 0) {
-                s.end = true;
-                break;
-            }
-            got += static_cast<size_t>(n);
+            s.chunk.reserve(length);
         }
-        s.chunk.resize(got);
+        s.chunk.erase(s.chunk.begin(), s.chunk.begin() + static_cast<std::ptrdiff_t>(sent));
         s.lastOffset = s.position;
-        s.position += got;
-        if (s.size >= 0 && s.position >= static_cast<uint64_t>(s.size)) s.end = true;
-        if (s.end) s.transfer.cancel();  // releases the path; the chunk stays
+        // Then the file, until the chunk is full or the file ends.
+        size_t got = s.chunk.size();
+        if (!s.end && got < length) {
+            s.chunk.resize(length);
+            while (got < length) {
+                int n = s.transfer.read(s.chunk.data() + got, length - got);
+                if (n < 0) {
+                    bool expired = s.transfer.expired();
+                    state_.reset();
+                    writeError(reply, expired ? Status::Timeout : Status::Internal, expired ? Reason::Idle : Reason::None,
+                               path, expired ? "the transfer was idle too long" : "read failed");
+                    return;
+                }
+                if (n == 0) {
+                    s.end = true;
+                    break;
+                }
+                got += static_cast<size_t>(n);
+            }
+            s.chunk.resize(got);
+            if (s.size >= 0 && s.lastOffset + got >= static_cast<uint64_t>(s.size)) s.end = true;
+            if (s.end) s.transfer.cancel();  // releases the path; the chunk stays
+        }
         s.sent = true;
     }
-    std::string data = "\"";
-    detail::base64Encode(s.chunk.data(), s.chunk.size(), data);
-    data += '"';
+    size_t n = s.chunk.size() < length ? s.chunk.size() : length;
+    s.position = s.lastOffset + n;
+    bool last = s.end && n == s.chunk.size();
+    // The data is encoded straight into the reply: no copy of the chunk is
+    // held as text (docs/DESIGN.md section 15).
     JsonWriter w(reply.begin(Status::Ok));
     w.beginObject();
     if (opening) {
@@ -754,9 +850,9 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
     w.key("offset");
     w.uinteger(s.lastOffset);
     w.key("data");
-    w.raw(data);
+    w.base64(s.chunk.data(), n);
     w.key("end");
-    w.boolean(s.end);
+    w.boolean(last);
     w.endObject();
     detail::finishBody(reply, w, path);
 }
@@ -851,22 +947,25 @@ void FileSession::relayUpload(bool opening, uint64_t size, std::string_view file
     }
 }
 
-void FileSession::relayDownload(bool opening, uint64_t offset, size_t length, size_t max, Reply& reply) {
-    std::shared_ptr<FileRelay> relay = state_->transfer.relay();
-    const std::string& path = state_->path;
-    if (!opening && !relayReady(*relay, reply, path, false)) return;
-    Reply* detached = deferFor(api_, reply, path);
-    if (!detached) return;
-    Api* api = &api_;
-    relay->download(offset, length, [relay, detached, api, max, path](Status s, JsonVariantConst body) {
+namespace {
+
+// One relayed download chunk, written to `detached` when the peer's reply
+// comes. A reply this node has no memory to hold is asked for again, half as
+// long: the peer sends the start of the same chunk (docs/DESIGN.md section
+// 14).
+void relayChunk(std::shared_ptr<FileRelay> relay, Reply* detached, Api* api, size_t max, std::string path,
+                uint64_t offset, size_t length) {
+    relay->download(offset, length, [=](Status s, JsonVariantConst body, std::string_view data) {
         if (s != Status::Ok || !body.is<JsonObjectConst>()) {
             relay->writeReply(*detached, s, body);
         } else {
-            // The peer's chunk as it came, base64 and all; only its largest
-            // chunk is capped at ours.
+            // The peer's chunk as it came, base64 and all, straight from its
+            // reply's text; only its largest chunk is capped at ours.
             JsonWriter w(detached->begin(Status::Ok));
             w.beginObject();
+            bool wrote = false;  // `data`, where the peer had it: after "offset"
             for (JsonPairConst kv : body.as<JsonObjectConst>()) {
+                if (kv.key() == "data") continue;
                 w.key(std::string_view(kv.key().c_str(), kv.key().size()));
                 if (kv.key() == "chunk") {
                     size_t c = kv.value().as<size_t>();
@@ -874,13 +973,41 @@ void FileSession::relayDownload(bool opening, uint64_t offset, size_t length, si
                 } else {
                     w.variant(kv.value());
                 }
+                if (kv.key() == "offset") {
+                    w.key("data");
+                    w.string(data);
+                    wrote = true;
+                }
+            }
+            if (!wrote) {
+                w.key("data");
+                w.string(data);
             }
             w.endObject();
+            size_t got = data.size() / 4 * 3;
+            if (!w.ok() && detached->outOfMemory() && got > FileRelay::kMinPart && detached->rollback()) {
+                size_t half = got / 2 / 3 * 3;
+                relayChunk(relay, detached, api, max, path, offset, half > FileRelay::kMinPart ? half : FileRelay::kMinPart);
+                return;
+            }
             detail::finishBody(*detached, w, path);
         }
         detached->release();
         api->pendingDone();
     });
+}
+
+}  // namespace
+
+void FileSession::relayDownload(bool opening, uint64_t offset, size_t length, size_t max, Reply& reply) {
+    // The relay's parts are at most our upload chunk (RemoteFile::download()).
+    if (max > uploadChunk(api_.config())) max = uploadChunk(api_.config());
+    std::shared_ptr<FileRelay> relay = state_->transfer.relay();
+    const std::string& path = state_->path;
+    if (!opening && !relayReady(*relay, reply, path, false)) return;
+    Reply* detached = deferFor(api_, reply, path);
+    if (!detached) return;
+    relayChunk(relay, detached, &api_, max, path, offset, length);
 }
 
 }  // namespace tesser

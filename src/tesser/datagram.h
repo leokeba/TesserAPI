@@ -170,6 +170,26 @@ public:
     // without the braces (`"op":"download","path":"/sys/backup"`).
     bool requestFields(const PeerAddress& to, std::string_view fields, ResponseHandler done, uint32_t timeoutMs = 0,
                        const void* owner = nullptr);
+    // Where a Builder writes an envelope: the link's own buffer when it
+    // takes one over (setOwnedSend()), else a string.
+    class EnvelopeOut {
+    public:
+        virtual ~EnvelopeOut() = default;
+        // Room for `bytes` in all; false if the heap can't give it.
+        virtual bool reserve(size_t bytes) = 0;
+        virtual void append(const char* data, size_t len) = 0;
+        void append(std::string_view s) { append(s.data(), s.size()); }
+    };
+    // Sends the envelope `build` writes for the call's id into `out`, which
+    // it builds again rather than have it kept, should it go again (to a peer
+    // with a token, after "unauthorized"); over a link that takes buffers
+    // (NowTP), it is built in the one the link sends from. So a large one (a
+    // relayed file chunk) is never held twice (docs/DESIGN.md section 15).
+    // False from `build` (no memory for it): not sent, false. With `raw`,
+    // an "ok" reply's body goes to it unparsed, as for requestRaw().
+    using Builder = std::function<bool(uint32_t id, EnvelopeOut& out)>;
+    bool requestBuilt(const PeerAddress& to, Builder build, ResponseHandler done, uint32_t timeoutMs = 0,
+                      const void* owner = nullptr, RawHandler raw = nullptr);
     // Sends a request once, unreliably, to every node behind `to` (a
     // broadcast address of the link: Delivery::BestEffort). Without
     // `onReply` the request has no "id", and no node answers. With it, each
@@ -373,6 +393,7 @@ private:
         uint32_t sentMs;
         RawHandler raw;        // requestRaw(): an "ok" reply's body, unparsed
         std::string text;      // to a peer with a token: kept to send it again after "unauthorized"
+        std::shared_ptr<Builder> rebuild;  // or how to make it again (requestBuilt())
         bool held = false;     // waiting for the token's answer before it is sent
         bool retried = false;  // sent again once already
     };
@@ -398,8 +419,17 @@ private:
         SendFailure failure;
     };
 
+    // A held call to send once its token is answered: built then.
+    struct Held {
+        uint32_t id;
+        std::string text;
+        std::shared_ptr<Builder> rebuild;
+    };
     bool sendRequest(const PeerAddress& to, uint32_t id, std::string envelope, ResponseHandler done,
-                     uint32_t timeoutMs, const void* owner, bool internal = false, RawHandler raw = nullptr);
+                     uint32_t timeoutMs, const void* owner, bool internal = false, RawHandler raw = nullptr,
+                     std::shared_ptr<Builder> rebuild = nullptr, Bytes owned = Bytes());
+    // A held call's text, built again from its builder.
+    static std::string rebuilt(const Builder& build, uint32_t id);
     bool takeRaw(const Incoming& msg);
     uint32_t nextCallId();
     PeerAuth* authLocked(const PeerAddress& peer);
@@ -423,6 +453,7 @@ private:
     void failCall(uint32_t id, Status status, Reason reason, const char* message);
     Subscriber* subscriberFor(const PeerAddress& peer, bool create);
     void dropPeer(const PeerAddress& peer, PeerLoss reason);
+    void unreachable(const PeerAddress& peer);
     void applySeen(const Seen& seen);
     void mount(Object& parent, uint32_t mirrorMs, const Seen& seen, const PeerAddress& device);
     void markOnline(const PeerAddress& peer, bool online);
@@ -493,6 +524,9 @@ uintptr_t budgetKey(const PeerAddress& peer);
 // The text of member `key` of a JSON object (`json` must be valid JSON):
 // false if it has none.
 bool jsonMember(std::string_view json, std::string_view key, std::string_view& out);
+// Calls `each` with every top-level member's key of a JSON object, until it
+// returns false; false if the text isn't an object.
+bool jsonKeys(std::string_view json, const std::function<bool(std::string_view key)>& each);
 
 // Builds a request envelope; `id` 0 leaves the "id" out. `bodyJson` is
 // inserted verbatim when not empty.

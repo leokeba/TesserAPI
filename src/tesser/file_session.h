@@ -36,7 +36,9 @@ public:
     static bool handles(JsonObjectConst envelope);
     // Handles one, from `client`, replying through `reply`. The node's
     // handler runs under the API lock, the transfer itself outside it.
-    void handle(JsonObjectConst envelope, const Client& client, Reply& reply);
+    // `raw`: the envelope's text, which an upload's "data" is read from
+    // when the parsed envelope left it out (uploadFilter()).
+    void handle(JsonObjectConst envelope, const Client& client, Reply& reply, std::string_view raw = {});
     // Ends the transfer in progress: the client is gone or its level fell.
     // An unfinished upload is aborted.
     void reset();
@@ -50,7 +52,8 @@ public:
 
 private:
     struct State;
-    void upload(JsonObjectConst envelope, std::string_view path, uint64_t offset, const Client& client,
+    void upload(JsonObjectConst envelope, std::string_view raw, std::string_view path, uint64_t offset,
+                const Client& client,
                 Reply& reply);
     void download(JsonObjectConst envelope, std::string_view path, uint64_t offset, const Client& client,
                   Reply& reply);

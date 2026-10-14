@@ -1,7 +1,12 @@
 #include "tesser/line_transport.h"
 
+#include <string.h>
+
 #include "tesser/api.h"
+#include "tesser/budget.h"
 #include "tesser/call.h"
+#include "tesser/datagram.h"
+#include "tesser/sink.h"
 
 namespace tesser {
 
@@ -15,24 +20,67 @@ void LineTransport::feed(const char* data, size_t len) {
     for (size_t i = 0; i < len; i++) feed(data[i]);
 }
 
+namespace {
+
+// What a line discarded keeps of its start: room for its id.
+constexpr size_t kKept = 64;
+
+// Room for one more byte: grown by half again, within the byte accountant
+// and the largest block. Unlike growFor(), no room for a copy of the line:
+// nothing copies it on (docs/DESIGN.md section 15).
+bool growLine(std::string& s) {
+    if (s.size() < s.capacity()) return true;
+    size_t capacity = s.capacity() + s.capacity() / 2;
+    if (capacity < 64) capacity = 64;
+    Reservation room;
+    if (capacity > 256) {
+        room = memoryBudget().reserve(capacity, 0, true);
+        if (!room) return false;
+    }
+    s.reserve(capacity);
+    return true;
+}
+
+}  // namespace
+
 void LineTransport::feed(char c) {
     if (c == '\n') {
         if (discarding_) {
             discarding_ = false;
             overflows_++;
-            EnvelopeId noId;
-            EnvelopeReply reply(noId, 0, [this](const std::string& m) { send(m, false); });
-            writeError(reply, Status::TooLarge, std::string_view(), "line too long");
+            // The line's start was kept: its id, so the client hears which
+            // request failed rather than waiting it out.
+            EnvelopeId id;
+            size_t brace = line_.find('{');
+            std::string_view raw;
+            if (brace != std::string::npos &&
+                jsonMember(std::string_view(line_).substr(brace), "id", raw) && raw.size() <= EnvelopeId::kMax) {
+                memcpy(id.json, raw.data(), raw.size());
+                id.length = raw.size();
+            }
+            EnvelopeReply reply(id, 0, [this](const std::string& m) { send(m, false); });
+            if (starved_)
+                writeError(reply, Status::Busy, Reason::LowMemory, std::string_view(), "not enough memory for the line");
+            else
+                writeError(reply, Status::TooLarge, std::string_view(), "line too long");
+            starved_ = false;
         } else {
             handleLine();
         }
         line_.clear();
+        // An upload line takes a few KB: give them back between lines, so
+        // the reply to the next one (a download) finds them.
+        if (line_.capacity() > 512) line_.shrink_to_fit();
         return;
     }
     if (discarding_) return;
-    if (line_.size() >= api_.config().maxRequestBody + 256) {
+    if (line_.size() >= api_.config().maxRequestBody + 256 || !growLine(line_)) {
+        // Too long, or the heap can't hold it: the rest of the line goes,
+        // and its end gets an error (busy when it was the heap). Its start
+        // is kept for the id.
+        starved_ = line_.size() < api_.config().maxRequestBody + 256;
         discarding_ = true;
-        line_.clear();
+        if (line_.size() > kKept) line_.resize(kKept);
         line_.shrink_to_fit();
         return;
     }
@@ -75,7 +123,10 @@ void LineTransport::handleLine() {
         }
     }
     EnvelopeReply reply(id, api_.config().maxResponse, [this](const std::string& m) { send(m, false); });
-    reply.stream([this](const char* data, size_t len, bool first, bool final) { return sendPiece(data, len, first, final); });
+    // A short window: a serial line drains slowly, and what waits for it
+    // is heap the next request may need.
+    reply.stream([this](const char* data, size_t len, bool first, bool final) { return sendPiece(data, len, first, final); },
+                 512, 1024);
     if (s != Status::Ok) {
         writeError(reply, s, reason, std::string_view(), message);
         return;
@@ -84,7 +135,7 @@ void LineTransport::handleLine() {
     req.client.access = level();
     req.client.authenticated = req.client.access != Access::Public;
     if (file) {
-        files_.handle(doc.as<JsonObjectConst>(), req.client, reply);
+        files_.handle(doc.as<JsonObjectConst>(), req.client, reply, text);
         return;
     }
     req.subscriber = this;
@@ -127,7 +178,8 @@ void LineTransport::handleAuth(JsonObjectConst envelope, const EnvelopeId& id) {
 void LineTransport::reset() {
     api_.dropSubscriber(this);
     line_.clear();
-    discarding_ = false;
+    line_.shrink_to_fit();
+    discarding_ = starved_ = false;
     token_.clear();
     files_.reset();
 }
@@ -160,7 +212,9 @@ bool LineTransport::send(const std::string& message, bool mayDrop) {
     if (streaming_) {
         // A notification beyond 2 KB waiting is dropped (its subscriber is
         // told "overflow" next); a deferred reply always waits.
-        if (mayDrop && waiting_.size() + message.size() > 2048) return false;
+        if (mayDrop && (waiting_.size() + message.size() > 2048 ||
+                        !growFor(waiting_, waiting_.size() + message.size() + 1)))
+            return false;
         waiting_ += message;
         waiting_ += '\n';
         return true;

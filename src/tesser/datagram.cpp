@@ -174,6 +174,27 @@ const char* toString(PeerLoss reason) {
     return "lost";
 }
 
+// A message to `peer` wasn't delivered (NowTP's SendFailed or Timeout): its
+// calls fail at once and its routes go offline, so a remote node takes
+// another; but what it holds here as a client (subscriptions, a file
+// transfer, its token) stays, as one lost frame on a busy link isn't the
+// peer gone (docs/DESIGN.md section 10.3).
+void DatagramEndpoint::unreachable(const PeerAddress& peer) {
+    markOnline(peer, false);
+    expire(0, true, &peer, Reason::SendFailed);
+    bool wasHeard = false;
+    PeerAddress device;
+    {
+        MutexGuard guard(mutex_);
+        if (Known* k = knownLocked(peer)) {
+            wasHeard = k->online;
+            k->online = false;
+            device = k->device;
+        }
+    }
+    if (wasHeard && onPeerLost_) onPeerLost_(peer, device, PeerLoss::Failed);
+}
+
 void DatagramEndpoint::dropPeer(const PeerAddress& peer, PeerLoss reason) {
     // Offline first: a remote node whose call fails below goes by another
     // route at once.
@@ -413,8 +434,10 @@ bool DatagramEndpoint::process() {
         if (f.failure == SendFailure::Rejected) {
             failCall(f.callId, Status::Internal, Reason::Rejected,
                      "the remote node refused the message (no listener on the port, or too large)");
+        } else if (f.failure == SendFailure::AuthFailed) {
+            dropPeer(f.peer, PeerLoss::AuthFailed);
         } else {
-            dropPeer(f.peer, f.failure == SendFailure::AuthFailed ? PeerLoss::AuthFailed : PeerLoss::Failed);
+            unreachable(f.peer);
         }
         worked = true;
     }
@@ -599,6 +622,29 @@ size_t skipValue(std::string_view s, size_t i) {
 
 }  // namespace
 
+// Each key of the JSON object `json` (valid JSON) to `each`, in order, until
+// it returns false; false if `json` isn't an object.
+bool jsonKeys(std::string_view json, const std::function<bool(std::string_view key)>& each) {
+    size_t i = skipSpace(json, 0);
+    if (i >= json.size() || json[i] != '{') return false;
+    i = skipSpace(json, i + 1);
+    if (i < json.size() && json[i] == '}') return true;
+    for (;;) {
+        if (i >= json.size() || json[i] != '"') return false;
+        size_t end = skipString(json, i);
+        if (end == kNone) return false;
+        if (!each(json.substr(i + 1, end - i - 2))) return true;
+        i = skipSpace(json, end);
+        if (i >= json.size() || json[i] != ':') return false;
+        size_t valueEnd = skipValue(json, skipSpace(json, i + 1));
+        if (valueEnd == kNone) return false;
+        i = skipSpace(json, valueEnd);
+        if (i < json.size() && json[i] == '}') return true;
+        if (i >= json.size() || json[i] != ',') return false;
+        i = skipSpace(json, i + 1);
+    }
+}
+
 // The text of member `key` of the JSON object `json` (valid JSON).
 bool jsonMember(std::string_view json, std::string_view key, std::string_view& out) {
     size_t i = skipSpace(json, 0);
@@ -677,7 +723,8 @@ void DatagramEndpoint::handle(Incoming& msg) {
     std::string_view text = msg.view();
     Reservation parsing;  // the document, about as large as the text
     if (text.size() > 1024) {
-        parsing = memoryBudget().reserve(2 * text.size(), 0, false);
+        // An upload's document leaves its data out: small.
+        parsing = memoryBudget().reserve(isUploadEnvelope(text) ? 512 : 2 * text.size(), 0, false);
         if (!parsing) {
             {
                 MutexGuard guard(mutex_);
@@ -690,8 +737,12 @@ void DatagramEndpoint::handle(Incoming& msg) {
     // Responses and notifications nest as deep as the peer wrote them;
     // requests are held to the same limit as on other transports below.
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, text.data(), text.size(),
-                                               DeserializationOption::NestingLimit(kWrittenNesting));
+    // An upload's data is read from the text, not copied into the document.
+    DeserializationError err =
+        isUploadEnvelope(text)
+            ? deserializeJson(doc, text.data(), text.size(), DeserializationOption::Filter(uploadFilter()),
+                              DeserializationOption::NestingLimit(kWrittenNesting))
+            : deserializeJson(doc, text.data(), text.size(), DeserializationOption::NestingLimit(kWrittenNesting));
     if (err || !doc.is<JsonObjectConst>()) {
         MutexGuard guard(mutex_);
         stats_.dropped++;
@@ -722,7 +773,8 @@ void DatagramEndpoint::handle(Incoming& msg) {
                 if (calls_[i].to == msg.from) {
                     if (calls_[i].held) break;  // not sent yet: a stray reply
                     PeerAuth* a = authLocked(msg.from);
-                    if (s == Status::Unauthorized && a && !calls_[i].retried && !calls_[i].text.empty()) {
+                    if (s == Status::Unauthorized && a && !calls_[i].retried &&
+                        (!calls_[i].text.empty() || calls_[i].rebuild)) {
                         // The peer may have forgotten our token (it restarted
                         // unseen, or dropped it): present it again, then this.
                         calls_[i].retried = true;
@@ -943,7 +995,7 @@ void DatagramEndpoint::handleFile(JsonObjectConst envelope, const Incoming& msg,
         files = &files_.back();
     }
     files->usedMs = now;
-    files->session->handle(envelope, client, reply);
+    files->session->handle(envelope, client, reply, msg.view());
 }
 
 // Drops the sessions of `peer`, or, without one, those with nothing open
@@ -962,9 +1014,63 @@ void DatagramEndpoint::dropFiles(const PeerAddress* peer, uint32_t now) {
     }
 }
 
+namespace {
+class StringOut : public DatagramEndpoint::EnvelopeOut {
+public:
+    explicit StringOut(std::string& s) : s_(s) {}
+    bool reserve(size_t bytes) override {
+        s_.reserve(bytes);
+        return true;
+    }
+    void append(const char* data, size_t len) override { s_.append(data, len); }
+
+private:
+    std::string& s_;
+};
+
+// With `slack` spare after the envelope, for the link (NowTP's trailer).
+class BytesOut : public DatagramEndpoint::EnvelopeOut {
+public:
+    BytesOut(Bytes& b, size_t slack) : b_(b), slack_(slack) {}
+    bool reserve(size_t bytes) override { return b_.reserve(bytes + slack_); }
+    void append(const char* data, size_t len) override {
+        if (!b_.append(data, len) && b_.reserve(b_.size() + len + slack_)) b_.append(data, len);
+    }
+
+private:
+    Bytes& b_;
+    size_t slack_;
+};
+}  // namespace
+
+std::string DatagramEndpoint::rebuilt(const Builder& build, uint32_t id) {
+    std::string text;
+    StringOut out(text);
+    if (!build(id, out)) text.clear();
+    return text;
+}
+
+bool DatagramEndpoint::requestBuilt(const PeerAddress& to, Builder build, ResponseHandler done, uint32_t timeoutMs,
+                                    const void* owner, RawHandler raw) {
+    if (!build) return false;
+    uint32_t id = nextCallId();
+    auto keep = std::make_shared<Builder>(std::move(build));
+    if (ownedSend_) {
+        Bytes envelope;
+        BytesOut out(envelope, ownedSlack_);
+        if (!(*keep)(id, out)) return false;
+        return sendRequest(to, id, std::string(), std::move(done), timeoutMs, owner, false, std::move(raw), keep,
+                           std::move(envelope));
+    }
+    std::string envelope;
+    StringOut out(envelope);
+    if (!(*keep)(id, out)) return false;
+    return sendRequest(to, id, std::move(envelope), std::move(done), timeoutMs, owner, false, std::move(raw), keep);
+}
+
 bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, std::string envelope,
                                    ResponseHandler done, uint32_t timeoutMs, const void* owner, bool internal,
-                                   RawHandler raw) {
+                                   RawHandler raw, std::shared_ptr<Builder> rebuild, Bytes owned) {
     uint32_t now = clock_ ? clock_() : 0;
     bool hold = false, startAuth = false;
     std::string token;
@@ -973,9 +1079,14 @@ bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, std::stri
         // A token's own "auth" doesn't count: it would hold up what waits for it.
         if (!internal && calls_.size() >= options_.maxCalls) return false;
         CallSlot slot{id, to, now + (timeoutMs ? timeoutMs : options_.timeoutMs), std::move(done), owner, nullptr, now,
-                      std::move(raw), std::string(), false, false};
+                      std::move(raw), std::string(), nullptr, false, false};
         if (PeerAuth* a = internal ? nullptr : authLocked(to)) {
-            slot.text = envelope;
+            // Kept to go again: its builder, or a copy.
+            if (rebuild) {
+                slot.rebuild = std::move(rebuild);
+            } else {
+                slot.text = envelope;
+            }
             if (a->state != PeerAuth::Done) {
                 // Datagrams may overtake each other: wait for the token's answer.
                 slot.held = hold = true;
@@ -991,7 +1102,11 @@ bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, std::stri
     if (startAuth) sendAuth(to, token);
     if (hold) return true;
     // Taken by the link, not copied (a large envelope on a short heap).
-    if (send_ && send_(to, std::move(envelope), Delivery::Reliable)) return true;
+    if (owned.data()) {
+        if (ownedSend_(to, std::move(owned), Delivery::Reliable)) return true;
+    } else if (send_ && send_(to, std::move(envelope), Delivery::Reliable)) {
+        return true;
+    }
     MutexGuard guard(mutex_);
     for (size_t i = 0; i < calls_.size(); i++) {
         if (calls_[i].id == id) {
@@ -1019,7 +1134,7 @@ DatagramEndpoint::PeerAuth* DatagramEndpoint::authLocked(const PeerAddress& peer
 }
 
 void DatagramEndpoint::setPeerToken(const PeerAddress& peer, std::string_view token) {
-    std::vector<std::string> release;
+    std::vector<Held> release;
     {
         MutexGuard guard(mutex_);
         PeerAuth* a = authLocked(peer);
@@ -1029,7 +1144,7 @@ void DatagramEndpoint::setPeerToken(const PeerAddress& peer, std::string_view to
             for (CallSlot& c : calls_) {
                 if (c.held && c.to == peer) {
                     c.held = false;
-                    release.push_back(c.text);
+                    release.push_back(Held{c.id, c.text, c.rebuild});
                 }
             }
             auths_.erase(auths_.begin() + (a - auths_.data()));
@@ -1045,8 +1160,9 @@ void DatagramEndpoint::setPeerToken(const PeerAddress& peer, std::string_view to
             if (a->state == PeerAuth::Pending) a->renew = true;  // the answer will be the old token's
         }
     }
-    for (const std::string& t : release) {
-        if (send_) send_(peer, t, Delivery::Reliable);
+    for (const Held& h : release) {
+        std::string t = h.rebuild ? rebuilt(*h.rebuild, h.id) : h.text;  // built outside the lock
+        if (send_ && !t.empty()) send_(peer, std::move(t), Delivery::Reliable);
     }
 }
 
@@ -1086,7 +1202,7 @@ void DatagramEndpoint::sendAuth(const PeerAddress& peer, const std::string& toke
 void DatagramEndpoint::authDone(const PeerAddress& peer, Status status, JsonVariantConst body) {
     Access level = Access::Public;
     if (status == Status::Ok) parseAccess(body["access"] | "", level);
-    std::vector<std::string> release;
+    std::vector<Held> release;
     std::string renewed;
     std::vector<RemoteNode*> remotes;
     {
@@ -1104,15 +1220,16 @@ void DatagramEndpoint::authDone(const PeerAddress& peer, Status status, JsonVari
             for (CallSlot& c : calls_) {
                 if (c.held && c.to == peer) {
                     c.held = false;
-                    release.push_back(c.text);
+                    release.push_back(Held{c.id, c.text, c.rebuild});
                 }
             }
             remotes = remotes_;
         }
     }
     if (!renewed.empty()) return sendAuth(peer, renewed);
-    for (const std::string& t : release) {
-        if (send_) send_(peer, t, Delivery::Reliable);
+    for (const Held& h : release) {
+        std::string t = h.rebuild ? rebuilt(*h.rebuild, h.id) : h.text;  // built outside the lock
+        if (send_ && !t.empty()) send_(peer, std::move(t), Delivery::Reliable);
     }
     if (onAuth_) onAuth_(peer, status, level);
     for (RemoteNode* r : remotes) {
@@ -1208,7 +1325,7 @@ bool DatagramEndpoint::broadcast(const PeerAddress& to, Op op, std::string_view 
         id = nextId_++;
         if (nextId_ == 0) nextId_ = 1;
         calls_.push_back(CallSlot{id, to, now + (windowMs ? windowMs : options_.timeoutMs), nullptr, owner,
-                                  std::move(onReply), now, nullptr, std::string(), false, false});
+                                  std::move(onReply), now, nullptr, std::string(), nullptr, false, false});
     }
     if (send_ && send_(to, buildRequestEnvelope(id, op, path, Query(), bodyJson), Delivery::BestEffort)) {
         return true;

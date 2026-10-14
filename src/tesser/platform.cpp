@@ -232,22 +232,28 @@ size_t largestFreeBlock() {
 #endif
 }
 
+// A buffer grows by half again at a time; short of room for that, by just
+// what it needs (a reply nearly its full size: measured on DEVKIT-R1, a 4 KB
+// download chunk's reply was refused for growing to 5.9 KB). The growth stays
+// reserved until the buffer has it.
 bool growFor(std::string& s, size_t need) {
     if (need <= s.capacity()) return true;
     size_t grown = s.capacity() + s.capacity() / 2;
-    size_t capacity = need > grown ? need : grown;
-    // Small buffers (error replies) always go: refusing them would leave the
-    // client with nothing at all.
-    Reservation growth;
-    if (capacity > 256) {
+    Reservation held;
+    auto fits = [&](size_t capacity) {
+        // Small buffers (error replies) always go: refusing them would leave
+        // the client with nothing at all.
+        if (capacity <= 256) return true;
         // The heap as a whole: the growth and a copy further down, and the
         // floor left to everything else, after what other tasks' buffers
         // are about to take (the accountant, docs/DESIGN.md section 15).
-        growth = memoryBudget().reserve(capacity - s.capacity() + need, 0, false);
-        if (!growth) return false;
+        held = Reservation();
+        held = memoryBudget().reserve(capacity - s.capacity() + need, 0, false);
         // One block that size, a copy further down, and headroom.
-        if (capacity > 1024 && largestFreeBlock() < capacity + need + 1024) return false;
-    }
+        return held && (capacity <= 1024 || largestFreeBlock() >= capacity + need + 1024);
+    };
+    size_t capacity = grown > need && fits(grown) ? grown : fits(need) ? need : 0;
+    if (!capacity) return false;
     s.reserve(capacity);
     return true;  // released: the heap shows the buffer now
 }
@@ -255,15 +261,16 @@ bool growFor(std::string& s, size_t need) {
 bool growFor(Bytes& b, size_t need) {
     if (need <= b.capacity()) return true;
     size_t grown = b.capacity() + b.capacity() / 2;
-    size_t capacity = need > grown ? need : grown;
-    Reservation growth;
-    if (capacity > 256) {
+    Reservation held;
+    auto fits = [&](size_t capacity) {
+        if (capacity <= 256) return true;
         // realloc() may need the new block while the old one is held.
-        growth = memoryBudget().reserve(capacity, 0, false);
-        if (!growth) return false;
-        if (capacity > 1024 && largestFreeBlock() < capacity + 1024) return false;
-    }
-    return b.reserve(capacity);
+        held = Reservation();
+        held = memoryBudget().reserve(capacity, 0, false);
+        return held && (capacity <= 1024 || largestFreeBlock() >= capacity + 1024);
+    };
+    size_t capacity = grown > need && fits(grown) ? grown : fits(need) ? need : 0;
+    return capacity && b.reserve(capacity);
 }
 
 bool stationMac(uint8_t mac[6]) {

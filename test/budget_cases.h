@@ -230,4 +230,60 @@ TEST(budget_owned_reply_buffers) {
     CHECK(spare.back() >= 32u);
 }
 
+TEST(budget_owned_request_buffers) {
+    // A request built for a link that takes buffers goes in one, with the
+    // link's slack, and is built again (not kept) should it be resent.
+    datagram_cases::Net net;
+    tesser::DatagramEndpoint ep(nullptr, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(1)),
+                                net.clockFn());
+    std::vector<std::string> sent;
+    size_t spare = 0;
+    ep.setOwnedSend(
+        [&](const tesser::PeerAddress&, tesser::Bytes m, tesser::Delivery) {
+            spare = m.capacity() - m.size();
+            sent.emplace_back(m.data(), m.size());
+            return true;
+        },
+        21);
+    int builds = 0;
+    auto build = [&builds](uint32_t id, tesser::DatagramEndpoint::EnvelopeOut& out) {
+        builds++;
+        std::string text = "{\"id\":" + std::to_string(id) + ",\"op\":\"get\",\"path\":\"/\"}";
+        if (!out.reserve(text.size())) return false;
+        out.append(text);
+        return true;
+    };
+    datagram_cases::Result res;
+    CHECK(ep.requestBuilt(datagram_cases::addr(2), build, datagram_cases::capture(res)));
+    CHECK_EQ(sent.size(), 1u);
+    CHECK(spare >= 21u);
+    CHECK(net.frames.empty());  // not through the copying send
+    CHECK_EQ(builds, 1);
+    // A builder with no room: not sent.
+    CHECK(!ep.requestBuilt(datagram_cases::addr(2), [](uint32_t, tesser::DatagramEndpoint::EnvelopeOut&) { return false; },
+                           datagram_cases::capture(res)));
+    CHECK_EQ(sent.size(), 1u);
+}
+
+TEST(budget_growth_falls_back_to_the_need) {
+    // Short of room to grow by half again, a buffer grows by what it needs.
+    std::string s;
+    s.reserve(2000);
+    tesser::Bytes b;
+    CHECK(b.reserve(2000));
+    {
+        memory_cases::Floor floor(8000, 10500);
+        // By half again: 3000 bytes, and a copy of 2100 for the string.
+        CHECK(tesser::growFor(s, 2100));
+        CHECK(s.capacity() >= 2100 && s.capacity() < 3000);
+        CHECK(tesser::growFor(b, 2100));
+        CHECK_EQ(b.capacity(), 2100u);
+        CHECK(!tesser::growFor(b, 2600));  // the need alone doesn't fit either
+        CHECK_EQ(b.capacity(), 2100u);
+    }
+    CHECK_EQ(tesser::unsettledBytes(), 0u);
+    CHECK(tesser::growFor(b, 2200));  // room again: by half
+    CHECK_EQ(b.capacity(), 3150u);
+}
+
 }  // namespace budget_cases

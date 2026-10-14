@@ -4,6 +4,7 @@
 
 #include "tesser/api.h"
 #include "tesser/call.h"
+#include "tesser/datagram.h"
 #include "tesser/file_session.h"
 
 namespace tesser {
@@ -40,11 +41,26 @@ std::string_view view(JsonVariantConst v) {
 
 }  // namespace
 
+bool isUploadEnvelope(std::string_view text) {
+    std::string_view op;
+    return jsonMember(text, "op", op) && op.compare(0, 7, "\"upload") == 0;
+}
+
+JsonDocument uploadFilter() {
+    JsonDocument filter;
+    for (const char* k : {"v", "id", "op", "path", "offset", "size", "filename", "length"}) filter[k] = true;
+    return filter;
+}
+
 Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth, Request& request, EnvelopeId& id,
                      const char*& message, Reason* reason) {
     id.length = 0;
-    DeserializationError err = deserializeJson(doc, text.data(), text.size(),
-                                               DeserializationOption::NestingLimit(envelopeNesting(maxDepth)));
+    DeserializationError err =
+        isUploadEnvelope(text)
+            ? deserializeJson(doc, text.data(), text.size(), DeserializationOption::Filter(uploadFilter()),
+                              DeserializationOption::NestingLimit(envelopeNesting(maxDepth)))
+            : deserializeJson(doc, text.data(), text.size(),
+                              DeserializationOption::NestingLimit(envelopeNesting(maxDepth)));
     if (err) {
         message = err == DeserializationError::TooDeep ? "envelope nested too deeply" : "malformed JSON";
         return Status::BadRequest;
@@ -381,7 +397,7 @@ void handleEnvelope(Api& api, std::string_view text, const Client& client, const
     EnvelopeReply reply(id, api.config().maxResponse, send);
     if (stream) reply.stream(stream);
     if (file && s == Status::Ok) {
-        files->handle(doc.as<JsonObjectConst>(), client, reply);
+        files->handle(doc.as<JsonObjectConst>(), client, reply, text);
         return;
     }
     if (s != Status::Ok) {

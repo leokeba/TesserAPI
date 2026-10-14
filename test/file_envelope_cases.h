@@ -91,6 +91,24 @@ TEST(file_base64) {
     CHECK(!tesser::detail::base64Decode("====", out));
 }
 
+TEST(file_envelope_download_again_for_less) {
+    // A chunk asked again with a smaller length (a gateway short of memory)
+    // sends its start; the rest, already read, goes first with the next.
+    Fixture f;
+    Line line(f.api);
+    CHECK(line.send("{\"id\":1,\"op\":\"download\",\"path\":\"/sys/config\",\"length\":2}").find("\"data\":\"eyI=\"") !=
+          std::string::npos);
+    CHECK_EQ(line.send("{\"id\":2,\"op\":\"download\",\"path\":\"/sys/config\",\"offset\":2,\"length\":6}"),
+             "{\"id\":2,\"status\":\"ok\",\"body\":{\"offset\":2,\"data\":\"bGV2ZWwi\",\"end\":false}}");
+    CHECK_EQ(line.send("{\"id\":3,\"op\":\"download\",\"path\":\"/sys/config\",\"offset\":2,\"length\":3}"),
+             "{\"id\":3,\"status\":\"ok\",\"body\":{\"offset\":2,\"data\":\"bGV2\",\"end\":false}}");
+    CHECK_EQ(line.send("{\"id\":4,\"op\":\"download\",\"path\":\"/sys/config\",\"offset\":8}"),
+             "{\"id\":4,\"status\":\"bad_request\",\"body\":{\"error\":\"bad_request\",\"path\":\"/sys/config\","
+             "\"message\":\"offset must be 5\"}}");
+    CHECK_EQ(line.send("{\"id\":5,\"op\":\"download\",\"path\":\"/sys/config\",\"offset\":5}"),
+             "{\"id\":5,\"status\":\"ok\",\"body\":{\"offset\":5,\"data\":\"ZWwiOjN9\",\"end\":true}}");
+}
+
 TEST(file_envelope_download) {
     Fixture f;
     Line line(f.api);

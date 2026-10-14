@@ -150,26 +150,70 @@ TEST(relay_envelope_upload) {
     CHECK_EQ(r.gateway.pending(), 0);
 }
 
-TEST(relay_upload_on_a_short_heap) {
-    // A gateway short of memory refuses a chunk (busy, low_memory) rather
-    // than build it anyway and abort; the transfer stays open, and the
-    // client sends the rest again from what the device has.
+TEST(relay_upload_survives_an_undelivered_reply) {
+    // The device's reply to one chunk is lost (NowTP reports it
+    // undelivered): the gateway's transfer stays open on the device, and
+    // the chunk sent again goes on from there (docs/DESIGN.md section 10.3).
     Rig r;
-    std::string first = r.big.substr(0, 1500);
-    {
-        memory_cases::Floor floor(8000, 9000);  // 1 KB above the floor
-        std::string reply = r.ask("{\"id\":1,\"op\":\"upload\",\"path\":\"/dev/big\",\"size\":3000,\"data\":\"" +
-                                  b64(first) + "\"}");
-        CHECK(reply.find("\"status\":\"busy\"") != std::string::npos);
-        CHECK(reply.find("\"reason\":\"low_memory\"") != std::string::npos);
+    CHECK_EQ(r.ask("{\"id\":1,\"op\":\"upload\",\"path\":\"/dev/big\",\"size\":3000}"),
+             "{\"id\":1,\"status\":\"ok\",\"body\":{\"received\":0,\"chunk\":576}}");
+    r.deviceEnd.sendFailed(addr(1), 0, tesser::SendFailure::Undelivered);
+    r.net.run();
+    for (size_t at = 0; at < r.big.size(); at += 576) {
+        std::string reply = r.ask("{\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":" + std::to_string(at) +
+                                  ",\"data\":\"" + b64(r.big.substr(at, 576)) + "\"}");
+        CHECK(reply.find("\"status\":\"ok\"") != std::string::npos);
+        if (reply.find("\"status\":\"ok\"") == std::string::npos) break;
     }
-    CHECK_EQ(r.ask("{\"id\":2,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":0,\"data\":\"" + b64(first) + "\"}"),
-             "{\"id\":2,\"status\":\"ok\",\"body\":{\"received\":1500}}");
-    CHECK_EQ(r.ask("{\"id\":3,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":1500,\"data\":\"" +
+    CHECK_EQ(r.got, r.big);
+}
+
+TEST(relay_upload_on_a_short_heap) {
+    // A gateway short of memory for a part sends it in smaller parts; with
+    // no room even to decode the chunk, it refuses it (busy, low_memory)
+    // rather than build it anyway and abort, and the transfer stays open:
+    // the client sends it again.
+    Rig r;
+    r.device.api.config().maxRequestBody = 4096;  // the chunk would go as one part
+    std::string first = r.big.substr(0, 1500);
+    CHECK_EQ(r.ask("{\"id\":1,\"op\":\"upload\",\"path\":\"/dev/big\",\"size\":3000}").find("\"status\":\"ok\""),
+             8u);
+    std::string reply;
+    auto chunk = [&](size_t free, const std::string& envelope) {
+        // The line comes in whole first; then the heap runs short.
+        r.line.feed(envelope.data(), envelope.size());
+        memory_cases::Floor floor(8000, free);
+        r.lines.out.clear();
+        r.line.feed("\n", 1);
+        r.net.run();
+        return r.lines.out.size() == 1 ? r.lines.out[0] : std::string();
+    };
+    reply = chunk(8500, "{\"id\":2,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":0,\"data\":\"" + b64(first) + "\"}");
+    CHECK_EQ(reply.substr(0, 40), "{\"id\":2,\"status\":\"busy\",\"body\":{\"error\":");
+    CHECK(reply.find("\"reason\":\"low_memory\"") != std::string::npos);
+    // Room to decode it, not for a part of 1500 bytes: two of 750.
+    reply = chunk(9700, "{\"id\":3,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":0,\"data\":\"" + b64(first) + "\"}");
+    CHECK_EQ(reply, "{\"id\":3,\"status\":\"ok\",\"body\":{\"received\":1500}}");
+    CHECK_EQ(r.ask("{\"id\":4,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":1500,\"data\":\"" +
                    b64(r.big.substr(1500)) + "\"}"),
-             "{\"id\":3,\"status\":\"ok\",\"body\":null}");
+             "{\"id\":4,\"status\":\"ok\",\"body\":null}");
     CHECK_EQ(r.got, r.big);
     CHECK_EQ(r.gateway.pending(), 0);
+}
+
+TEST(relay_line_without_room_is_refused) {
+    // A serial line the heap can't hold is read to its end and refused
+    // (busy, low_memory), under its id; the next line is read as usual.
+    Rig r;
+    {
+        memory_cases::Floor floor(8000, 8500);
+        std::string reply = r.ask("{\"id\":1,\"op\":\"upload\",\"path\":\"/dev/big\",\"size\":3000,\"data\":\"" +
+                                  b64(r.big.substr(0, 1500)) + "\"}");
+        CHECK_EQ(reply.substr(0, 40), "{\"id\":1,\"status\":\"busy\",\"body\":{\"error\":");
+        CHECK(reply.find("\"reason\":\"low_memory\"") != std::string::npos);
+    }
+    CHECK_EQ(r.ask("{\"id\":2,\"op\":\"get\",\"path\":\"/dev/big\",\"keys\":\"x\"}").find("\"id\":2"), 1u);
+    CHECK_EQ(r.line.overflows(), 1u);
 }
 
 TEST(relay_reply_without_room_fails_at_once) {
@@ -190,6 +234,34 @@ TEST(relay_reply_without_room_fails_at_once) {
     CHECK_EQ(res.status, Status::Busy);
     CHECK(res.body.find("\"reason\":\"low_memory\"") != std::string::npos);
     CHECK_EQ(client.pendingCalls(), 0u);
+}
+
+TEST(relay_download_on_a_short_heap) {
+    // The device's chunk is relayed from its reply's text: the gateway
+    // parses its other fields alone. A parsed copy of a 4 KB reply took
+    // twice its size more (above 18 KB here, both nodes' buffers counted).
+    Rig r;
+    r.device.api.config().maxResponse = 4096;
+    std::string reply;
+    {
+        memory_cases::Floor floor(8000, 16500);
+        reply = r.ask("{\"id\":1,\"op\":\"download\",\"path\":\"/dev/big\"}");
+    }
+    CHECK_EQ(reply, "{\"id\":1,\"status\":\"ok\",\"body\":{\"size\":3000,\"filename\":\"big\",\"contentType\":"
+                    "\"application/octet-stream\",\"chunk\":2880,\"offset\":0,\"data\":\"" +
+                        b64(r.big.substr(0, 2880)) + "\",\"end\":false}}");
+    // Shorter yet, the parts are halved until they fit, whichever node
+    // refuses them (the device its reply, the gateway its copy), and the
+    // file comes whole.
+    Rig small;
+    small.device.api.config().maxResponse = 4096;
+    {
+        memory_cases::Floor floor(8000, 10000);
+        size_t chunks = 0;
+        CHECK_EQ(small.downloadAll("/dev/big", 100000, &chunks), small.big);
+        CHECK(chunks >= 5);
+    }
+    CHECK_EQ(small.gateway.pending(), 0);
 }
 
 TEST(relay_envelope_download) {

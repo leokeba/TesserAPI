@@ -38,6 +38,9 @@ public:
     void variant(JsonVariantConst v);
     // Pre-serialized JSON, written as one value.
     void raw(std::string_view json);
+    // Bytes as a base64 string (RFC 4648, padded), encoded straight into
+    // the sink: no copy of a file chunk is held as text.
+    void base64(const uint8_t* data, size_t len);
 
     bool ok() const { return ok_; }
     Sink& sink() { return sink_; }

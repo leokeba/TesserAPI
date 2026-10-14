@@ -203,4 +203,27 @@ void JsonWriter::raw(std::string_view json) {
     put(json.data(), json.size());
 }
 
+void JsonWriter::base64(const uint8_t* data, size_t len) {
+    static const char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    beforeValue();
+    put('"');
+    char out[64];  // 48 bytes at a time
+    size_t n = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = uint32_t(data[i]) << 16;
+        if (i + 1 < len) v |= uint32_t(data[i + 1]) << 8;
+        if (i + 2 < len) v |= data[i + 2];
+        out[n++] = kAlphabet[v >> 18 & 63];
+        out[n++] = kAlphabet[v >> 12 & 63];
+        out[n++] = i + 1 < len ? kAlphabet[v >> 6 & 63] : '=';
+        out[n++] = i + 2 < len ? kAlphabet[v & 63] : '=';
+        if (n == sizeof(out)) {
+            put(out, n);
+            n = 0;
+        }
+    }
+    if (n) put(out, n);
+    put('"');
+}
+
 }  // namespace tesser

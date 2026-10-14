@@ -42,6 +42,13 @@ protected:
 class FileRelay {
 public:
     using Done = std::function<void(Status status, JsonVariantConst body)>;
+    // A download's reply: its body without "data", and the data apart (the
+    // base64 text as the peer wrote it, valid during the call), so a chunk
+    // is never copied into a document.
+    using Chunk = std::function<void(Status status, JsonVariantConst body, std::string_view data)>;
+    // The smallest part a relay halves its parts to when memory is short
+    // (512 bytes of base64).
+    static constexpr size_t kMinPart = 384;
     virtual ~FileRelay() = default;
 
     // Claims the peer (Api::claimTransfer()); false, with busy written to
@@ -59,7 +66,7 @@ public:
     virtual void write(std::vector<uint8_t> data, Done done) = 0;
     // Download: the chunk at `offset`, up to `length` bytes (0: the peer's
     // largest). Offset 0 opens the download. `done` gets the peer's reply.
-    virtual void download(uint64_t offset, size_t length, Done done) = 0;
+    virtual void download(uint64_t offset, size_t length, Chunk done) = 0;
     // Ends the transfer here and releases the peer. The peer's side ends
     // when it has been idle for its Config::transferIdleMs, or with the next
     // transfer relayed to it.
@@ -165,7 +172,7 @@ private:
     // next chunk into relayBuf_.
     bool flushRelay(Reply& reply, bool all);
     bool fetchRelay();
-    bool takeChunk(JsonVariantConst body);
+    void takeChunk(JsonVariantConst body, std::vector<uint8_t> data);
     void close();
 
     Api& api_;

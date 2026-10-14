@@ -1503,6 +1503,20 @@ std::string fieldsOf(const std::function<void(JsonWriter&)>& write) {
     return text.substr(1, text.size() - 2);  // the members, without the braces
 }
 
+// An envelope's builder (DatagramEndpoint::requestBuilt()) from its members.
+std::shared_ptr<DatagramEndpoint::Builder> builderOf(std::string fields) {
+    return std::make_shared<DatagramEndpoint::Builder>(
+        [fields = std::move(fields)](uint32_t id, DatagramEndpoint::EnvelopeOut& out) {
+            char head[20];
+            int n = snprintf(head, sizeof(head), "{\"id\":%lu,", static_cast<unsigned long>(id));
+            if (!out.reserve(static_cast<size_t>(n) + fields.size() + 1)) return false;
+            out.append(head, static_cast<size_t>(n));
+            out.append(fields);
+            out.append("}", 1);
+            return true;
+        });
+}
+
 class RemoteFile : public FileRelay, public TransferHolder, public std::enable_shared_from_this<RemoteFile> {
 public:
     RemoteFile(Api& api, RemoteNode& node, std::string remotePath, std::string localBase, std::string remoteBase,
@@ -1544,7 +1558,7 @@ public:
 
     void probe(Done done) override {
         std::string path = remotePath_;
-        call(std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
+        call(builderOf(fieldsOf([&](JsonWriter& w) {
                  w.key("op");
                  w.string(get_);
                  w.key("path");
@@ -1566,7 +1580,7 @@ public:
         }
         std::string path = remotePath_;
         auto self = shared_from_this();
-        call(std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
+        call(builderOf(fieldsOf([&](JsonWriter& w) {
                  w.key("op");
                  w.string(upload_);
                  w.key("path");
@@ -1602,7 +1616,10 @@ public:
             // section 15); else the chunk is refused, for the client to send
             // again.
             size_t need = pending_.size() + data.size();
-            if (need > pending_.capacity()) {
+            if (pending_.empty()) {
+                pending_ = std::move(data);  // taken over, not copied
+                data.clear();
+            } else if (need > pending_.capacity()) {
                 Reservation growth = memoryBudget().reserve(need, 0, true);
                 room = static_cast<bool>(growth);
                 if (room) pending_.reserve(need);
@@ -1613,10 +1630,60 @@ public:
         pump(std::move(done));
     }
 
-    void download(uint64_t offset, size_t length, Done done) override {
+    void download(uint64_t offset, size_t length, Chunk done) override {
+        // A part is at most this node's upload chunk, as a relayed upload's:
+        // the remote's reply is held here whole, and in the remote's own
+        // reply buffer (docs/DESIGN.md section 14).
+        size_t cap = FileSession::uploadChunk(api_.config());
+        {
+            MutexGuard guard(mutex_);
+            if (limit_ && cap > limit_) cap = limit_;
+        }
+        if (!length || length > cap) length = cap;
         std::string path = remotePath_;
         auto self = shared_from_this();
-        call(std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
+        // The reply's fields apart from its data, which stays in the text.
+        auto took = [self, done, offset, length](Status s, JsonVariantConst body, std::string_view data) {
+            if (self->smaller(s, body, length)) {
+                self->download(offset, length, done);  // asked again, for less
+                return;
+            }
+            if (s == Status::Ok) {
+                MutexGuard guard(self->mutex_);
+                if (body["chunk"].is<size_t>()) self->chunk_ = body["chunk"].as<size_t>();
+                // The end: the peer is free again, though the last chunk
+                // can still be asked for again.
+                if (body["end"] == true) {
+                    self->finished_ = true;
+                    self->release();
+                }
+            } else {
+                self->failed(s);
+            }
+            done(s, body, data);
+        };
+        auto raw = std::make_shared<DatagramEndpoint::RawHandler>([took](std::string_view text) {
+            JsonDocument filter;
+            for (const char* k : {"size", "filename", "contentType", "chunk", "offset", "end"}) filter[k] = true;
+            JsonDocument body;
+            std::string_view data;
+            bool bad = deserializeJson(body, text.data(), text.size(), DeserializationOption::Filter(filter)) ||
+                       !body.is<JsonObjectConst>();
+            // A JSON string, without escapes (base64).
+            if (!bad && jsonMember(text, "data", data)) {
+                bad = data.size() < 2 || data.front() != '"' || data.back() != '"';
+                if (!bad) data = data.substr(1, data.size() - 2);
+            }
+            if (bad) {
+                JsonDocument error;
+                error["error"] = "internal";
+                error["message"] = "bad download reply";
+                took(Status::Internal, error.as<JsonVariantConst>(), std::string_view());
+                return;
+            }
+            took(Status::Ok, body.as<JsonVariantConst>(), data);
+        });
+        call(builderOf(fieldsOf([&](JsonWriter& w) {
                  w.key("op");
                  w.string(download_);
                  w.key("path");
@@ -1630,21 +1697,11 @@ public:
                      w.uinteger(length);
                  }
              })),
-             [self, done](Status s, JsonVariantConst body) {
-                 if (s == Status::Ok) {
-                     MutexGuard guard(self->mutex_);
-                     if (body["chunk"].is<size_t>()) self->chunk_ = body["chunk"].as<size_t>();
-                     // The end: the peer is free again, though the last chunk
-                     // can still be asked for again.
-                     if (body["end"] == true) {
-                         self->finished_ = true;
-                         self->release();
-                     }
-                 } else {
-                     self->failed(s);
-                 }
-                 done(s, body);
-             });
+             [took](Status s, JsonVariantConst body) {
+                 JsonString data = body["data"].as<JsonString>();
+                 took(s, body, std::string_view(data.c_str() ? data.c_str() : "", data.size()));
+             },
+             0, raw);
     }
 
     void close() override {
@@ -1707,7 +1764,9 @@ public:
 private:
     // Sends one envelope, again on a timeout while the relay is open and
     // the peer online. An offline peer isn't sent to.
-    void call(std::shared_ptr<const std::string> fields, Done done, int attempt = 0) {
+    // With `raw`, an "ok" reply's body goes to it unparsed instead.
+    void call(std::shared_ptr<DatagramEndpoint::Builder> build, Done done, int attempt = 0,
+              std::shared_ptr<DatagramEndpoint::RawHandler> raw = nullptr) {
         if (!node_.online()) {
             JsonDocument error;
             error["error"] = "timeout";
@@ -1724,20 +1783,29 @@ private:
         }
         DatagramEndpoint* ep = node_.endpoint();
         auto self = shared_from_this();
-        bool sent = ep && ep->requestFields(
-                              node_.peer(), *fields,
-                              [self, fields, done, attempt](Status s, JsonVariantConst body) {
+        noRoom_ = false;
+        DatagramEndpoint::RawHandler rawOk;
+        if (raw) {
+            rawOk = [self, raw](std::string_view body) {
+                self->landed();
+                (*raw)(body);
+            };
+        }
+        bool sent = ep && ep->requestBuilt(
+                              node_.peer(), *build,
+                              [self, build, done, attempt, raw](Status s, JsonVariantConst body) {
                                   if (s == Status::Timeout && attempt + 1 < kAttempts && self->open() &&
                                       self->node_.online()) {
-                                      self->call(fields, done, attempt + 1);
+                                      self->call(build, done, attempt + 1, raw);
                                       return;
                                   }
                                   self->landed();
                                   done(s, body);
                               },
-                              node_.timeoutMs(), &node_);
+                              node_.timeoutMs(), &node_, std::move(rawOk));
         if (!sent) {
             landed();
+            if (noRoom_) return lowMemory(done, false);  // the envelope had no room: its caller decides
             done(Status::Busy, JsonVariantConst());
         }
     }
@@ -1750,7 +1818,7 @@ private:
 
     // Upload: sends the next part of pending_.
     void pump(Done done) {
-        std::shared_ptr<const std::string> fields;
+        std::shared_ptr<DatagramEndpoint::Builder> build;
         uint64_t offset = 0;
         size_t part = 0;
         bool closed, idle;
@@ -1761,10 +1829,8 @@ private:
             if (!closed && !idle) {
                 offset = received_;
                 part = chunk_ ? chunk_ : kFallbackChunk;
+                if (limit_ && part > limit_) part = limit_;
                 if (part > pending_.size()) part = pending_.size();
-                // Built once, at its exact size: the members, then the data
-                // encoded in place. Only with room for it and for the
-                // envelope it is copied into (docs/DESIGN.md section 15).
                 std::string head = fieldsOf([&](JsonWriter& w) {
                     w.key("op");
                     w.string(upload_);
@@ -1773,27 +1839,62 @@ private:
                     w.key("offset");
                     w.uinteger(offset);
                 });
-                static constexpr char kData[] = ",\"data\":\"";
-                size_t size = head.size() + sizeof(kData) - 1 + (part + 2) / 3 * 4 + 1;
-                Reservation room = memoryBudget().reserve(2 * size + 32, 0, false);
-                if (room) {
-                    std::string text;
-                    text.reserve(size);
-                    text += head;
-                    text += kData;
-                    detail::base64Encode(pending_.data(), part, text);
-                    text += '"';
-                    fields = std::make_shared<const std::string>(std::move(text));
-                }
+                // The whole envelope, built once at its exact size, the data
+                // encoded in place from the bytes waiting; built again rather
+                // than kept, should it go again (docs/DESIGN.md section 15).
+                std::weak_ptr<RemoteFile> weak = shared_from_this();
+                build = std::make_shared<DatagramEndpoint::Builder>(
+                    [weak, head, part](uint32_t id, DatagramEndpoint::EnvelopeOut& out) {
+                        auto self = weak.lock();
+                        if (!self) return false;
+                        MutexGuard lock(self->mutex_);
+                        if (self->pending_.size() < part) return false;  // dropped meanwhile
+                        char idHead[20];
+                        int n = snprintf(idHead, sizeof(idHead), "{\"id\":%lu,", static_cast<unsigned long>(id));
+                        static constexpr char kData[] = ",\"data\":\"";
+                        size_t size =
+                            static_cast<size_t>(n) + head.size() + sizeof(kData) - 1 + (part + 2) / 3 * 4 + 2;
+                        Reservation room = memoryBudget().reserve(size + 32, 0, true);
+                        self->noRoom_ = !room || !out.reserve(size);
+                        if (self->noRoom_) return false;
+                        out.append(idHead, static_cast<size_t>(n));
+                        out.append(head);
+                        out.append(kData, sizeof(kData) - 1);
+                        // Encoded 48 bytes at a time into the envelope.
+                        static const char kAlphabet[] =
+                            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                        const uint8_t* d = self->pending_.data();
+                        char buf[64];
+                        size_t k = 0;
+                        for (size_t i = 0; i < part; i += 3) {
+                            uint32_t v = uint32_t(d[i]) << 16;
+                            if (i + 1 < part) v |= uint32_t(d[i + 1]) << 8;
+                            if (i + 2 < part) v |= d[i + 2];
+                            buf[k++] = kAlphabet[v >> 18 & 63];
+                            buf[k++] = kAlphabet[v >> 12 & 63];
+                            buf[k++] = i + 1 < part ? kAlphabet[v >> 6 & 63] : '=';
+                            buf[k++] = i + 2 < part ? kAlphabet[v & 63] : '=';
+                            if (k == sizeof(buf)) {
+                                out.append(buf, k);
+                                k = 0;
+                            }
+                        }
+                        out.append(buf, k);
+                        out.append("\"}", 2);
+                        return true;
+                    });
             }
         }
         if (closed || idle) {
             done(closed ? Status::Busy : Status::Ok, JsonVariantConst());
             return;
         }
-        if (!fields) return lowMemory(done);
         auto self = shared_from_this();
-        call(fields, [self, done, offset, part](Status s, JsonVariantConst body) {
+        call(build, [self, done, offset, part](Status s, JsonVariantConst body) {
+            if (self->smaller(s, body, part)) {
+                self->pump(done);  // the same bytes, in smaller parts
+                return;
+            }
             if (s == Status::Busy) {
                 // The peer (or this node) had no room or no queue: the
                 // transfer stays open, and the client sends the rest again.
@@ -1850,8 +1951,20 @@ private:
 
     // No room to relay what the client sent: dropped, for it to send again
     // from received(); the transfer stays open.
-    void lowMemory(const Done& done) {
-        {
+    // A part refused for memory (busy, low_memory: by the peer, or here)
+    // goes again at half the size, down to kMinPart; the parts stay that
+    // small for the rest of the transfer (docs/DESIGN.md section 14).
+    bool smaller(Status s, JsonVariantConst body, size_t part) {
+        if (s != Status::Busy || body["reason"] != "low_memory" || part <= kMinPart || !open()) return false;
+        MutexGuard guard(mutex_);
+        size_t half = part / 2 / 3 * 3;  // whole base64 groups
+        limit_ = half > kMinPart ? half : kMinPart;
+        return true;
+    }
+
+    // `drop`: the bytes waiting go too, for the client to send again.
+    void lowMemory(const Done& done, bool drop = true) {
+        if (drop) {
             MutexGuard guard(mutex_);
             pending_.clear();
         }
@@ -1887,9 +2000,11 @@ private:
     bool expired_ = false;
     uint32_t activeMs_ = 0;
     size_t chunk_ = 0;
+    size_t limit_ = 0;  // the largest part since one was refused for memory (smaller()), or 0
     uint64_t size_ = 0;
     uint64_t received_ = 0;
     std::vector<uint8_t> pending_;  // upload bytes from received_ on
+    std::atomic<bool> noRoom_{false};  // the last envelope had no room (pump()'s builder)
 };
 
 }  // namespace

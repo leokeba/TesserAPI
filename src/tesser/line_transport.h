@@ -70,6 +70,7 @@ private:
     bool streaming_ = false;
     std::string waiting_;
     bool discarding_ = false;
+    bool starved_ = false;  // discarding_ because the heap couldn't hold the line
     bool authenticated_ = true;
     std::string token_;  // from the last "auth" envelope
     FileSession files_;

@@ -221,7 +221,7 @@ private:
 class HttpReply : public Reply {
 public:
     using DeferredState = HttpServer::DeferredState;
-    static constexpr size_t kWindow = 4096;
+    static constexpr size_t kWindow = 2048;
 
     HttpReply(HttpServer& server, httpd_req_t* req) : server_(server), req_(req) {}
     ~HttpReply() override {
@@ -560,7 +560,17 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
         // The payload is still unread: drop the connection.
         return ESP_FAIL;
     }
+    // Room for the frame first (docs/DESIGN.md section 15): on a short heap
+    // the client hears busy, and the connection goes, the payload unread.
+    Reservation room = memoryBudget().reserve(frame.len + 1, 0, true);
+    if (!room) {
+        EnvelopeId noId;
+        EnvelopeReply reply(noId, 0, [this, fd](const std::string& m) { wsSend(fd, m); });
+        writeError(reply, Status::Busy, Reason::LowMemory, std::string_view(), "not enough memory for the message");
+        return ESP_FAIL;
+    }
     std::string text(frame.len, '\0');
+    room.settle();
     if (frame.len) {
         frame.payload = reinterpret_cast<uint8_t*>(&text[0]);
         if (httpd_ws_recv_frame(req, &frame, frame.len) != ESP_OK) return ESP_FAIL;

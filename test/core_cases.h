@@ -802,6 +802,12 @@ TEST(line_transport_framing) {
     const char* ok = "{\"op\":\"get\",\"path\":\"/lamp/on\"}\n";
     t.feed(ok, strlen(ok));
     CHECK_EQ(lines.out.size(), 2u);
+    // A line with an id is refused under it.
+    lines.out.clear();
+    longLine = "{\"id\":\"big\",\"op\":\"get\",\"path\":\"/" + std::string(400, 'a') + "\"}\n";
+    t.feed(longLine.data(), longLine.size());
+    CHECK_EQ(lines.out.size(), 1u);
+    if (!lines.out.empty()) CHECK_EQ(lines.out[0].substr(0, 33), "{\"id\":\"big\",\"status\":\"too_large\",");
 }
 
 TEST(deferred_replies) {

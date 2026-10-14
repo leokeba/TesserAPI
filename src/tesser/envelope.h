@@ -54,6 +54,13 @@ Status requestFromEnvelope(JsonObjectConst envelope, Request& request, EnvelopeI
 Status checkStrict(JsonObjectConst envelope, std::initializer_list<const char*> known, const char*& message,
                    Reason* reason);
 
+// An "upload" envelope (docs/DESIGN.md section 10.1.1), told from its text
+// alone. Its "data" is left out when it is parsed (uploadFilter()) and read
+// from the text instead (FileSession::handle()'s `raw`), so a chunk isn't
+// copied into the document too (docs/DESIGN.md section 15).
+bool isUploadEnvelope(std::string_view text);
+JsonDocument uploadFilter();
+
 // Reads only the envelope's id, for envelopes that aren't requests ("auth",
 // "upload", "download"). An unusable id is BadRequest with `message`.
 Status envelopeId(JsonObjectConst envelope, EnvelopeId& id, const char*& message);
@@ -82,7 +89,7 @@ public:
     // reply) is buffered as usual. Pieces wait, up to `window` bytes, for
     // drain() (the core calls it without the API lock) or the destructor;
     // beyond the window they go at once.
-    void stream(Fragment fragment, size_t chunk = 1024, size_t window = 4096);
+    void stream(Fragment fragment, size_t chunk = 1024, size_t window = 2048);
     // Buffers the envelope in a malloc()ed buffer instead, `slack` bytes
     // spare at its end, and hands it whole to `send`, which takes it: for a
     // link that sends from it without a copy (NowTP's sendBuffer(),
