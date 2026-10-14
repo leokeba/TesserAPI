@@ -43,7 +43,9 @@ TEST(persist_state_and_roundtrip) {
     MemoryStorage storage;
     {
         Settings s(&storage);
-        CHECK_EQ(s.api.persistedState(), "{}");  // everything at its default
+        // A backup holds every value, defaults included.
+        CHECK_EQ(s.api.persistedState(),
+                 "{\"config\":{\"brightness\":128,\"name\":\"lamp\",\"tuning\":{\"gain\":0.5}},\"calibration\":0}");
         CHECK(!s.api.load());  // nothing stored yet
         cases::set(s.api, "/config", "{\"brightness\":7,\"name\":\"desk\",\"tuning\":{\"gain\":2}}");
         cases::set(s.api, "/on", "true");
@@ -351,7 +353,29 @@ TEST(persist_sparse_defaults) {
              Status::Ok);
     CHECK_EQ(next.brightness, 128);
     CHECK_EQ(storage.records.count("config"), 0u);
-    CHECK_EQ(next.api.persistedState(), "{}");
+}
+
+// A restore gives exactly the backed-up state, whatever changed since:
+// values set back to their defaults included (docs/DESIGN.md section 12).
+TEST(persist_restore_is_exact) {
+    MemoryStorage storage;
+    Settings s(&storage);
+    cases::set(s.api, "/config/brightness", "7");        // A
+    cases::set(s.api, "/config/name", "\"desk\"");        // B
+    std::string backup = s.api.persistedState();
+    cases::set(s.api, "/config/name", "\"attic\"");       // B again
+    cases::set(s.api, "/config/tuning/gain", "2");       // C
+    CHECK(s.api.save());
+    CHECK_EQ(s.api.restore(backup), Status::Ok);
+    CHECK_EQ(s.brightness, 7);
+    CHECK_EQ(std::string(s.name), "desk");
+    CHECK_EQ(s.gain, 0.5);  // C back at its default
+    CHECK_EQ(storage.records["config"], "{\"brightness\":7,\"name\":\"desk\"}");  // still sparse
+    // Undoing a restore with the backup taken just before it.
+    std::string before = s.api.persistedState();
+    cases::set(s.api, "/config/brightness", "128");
+    CHECK_EQ(s.api.restore(before), Status::Ok);
+    CHECK_EQ(s.brightness, 7);
 }
 
 // Stored state from before a version goes through the migration first:
@@ -383,7 +407,9 @@ TEST(persist_migration) {
     // Rewritten under the version, sparse.
     CHECK_EQ(storage.records["@version"], "1");
     CHECK_EQ(storage.records["config"], "{\"name\":\"desk\"}");
-    CHECK_EQ(s.api.persistedState(), "{\"@version\":1,\"config\":{\"name\":\"desk\"},\"calibration\":3}");
+    CHECK_EQ(s.api.persistedState(),
+             "{\"@version\":1,\"config\":{\"brightness\":128,\"name\":\"desk\",\"tuning\":{\"gain\":0.75}},"
+             "\"calibration\":3}");
     // Loaded again: current, no migration.
     seen.clear();
     Settings again;

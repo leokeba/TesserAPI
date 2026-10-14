@@ -280,7 +280,9 @@ std::string Api::persistedState() {
         lp.key(kVersionKey);
         w.uinteger(persistVersion_);
     }
-    writePersisted(*this, persisted(), lp, w, [this](const Node& n) { return atDefault(n); });
+    // Every value, defaults included, unlike the records: a restore must
+    // bring back the backed-up state whatever changed since, defaults too.
+    writePersisted(*this, persisted(), lp, w, [](const Node&) { return false; });
     if (!lp.finish()) out = "{}";
     return out;
 }

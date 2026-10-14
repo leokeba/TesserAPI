@@ -179,8 +179,8 @@ public:
     bool save();
     // The whole persisted state as one JSON document (the records under
     // their names, and "@version" when persistVersion() set one), secrets
-    // included: a backup. Like the records, values at their default are left
-    // out.
+    // included: a backup. Unlike the records, it holds every value, defaults
+    // included, so restoring it gives exactly that state.
     std::string persistedState();
     // Applies a document like persistedState()'s (a backup), leniently like
     // load(): what doesn't fit the tree is skipped and its path added to
