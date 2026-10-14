@@ -43,7 +43,10 @@ jobs:
       fail-fast: false
       matrix:
         core: ["3.3.7"]
-        fqbn: ["esp32:esp32:esp32", "esp32:esp32:esp32c3"]
+        # The examples with Wi-Fi, HTTP and NowTP outgrew the default 1.25 MB
+        # app partition (HttpAndNowTP on the C3 by 5.6 KB): build them as
+        # applications that size would, with a larger one.
+        fqbn: ["esp32:esp32:esp32:PartitionScheme=min_spiffs", "esp32:esp32:esp32c3:PartitionScheme=min_spiffs"]
     steps:
       - uses: actions/checkout@v5
       - uses: arduino/compile-sketches@v1
