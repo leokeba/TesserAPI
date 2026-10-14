@@ -40,8 +40,29 @@ inline Resp request(Api& api, tesser::Op op, const char* path, const char* body 
     return {reply.status, reply.body};
 }
 
+// On target a root schema shows the board's own device id (docs/DESIGN.md
+// section 14.1), which these expectations, written for the host, leave out:
+// it is taken out of a schema root (`at`: where the schema is in the JSON).
+inline std::string withoutOwnId(const std::string& json, const char* at = nullptr) {
+#if defined(ESP_PLATFORM)
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return json;
+    JsonObject root = at ? doc[at].as<JsonObject>() : doc.as<JsonObject>();
+    if (root.isNull() || !root["type"].is<const char*>() || !root["id"].is<const char*>()) return json;
+    root.remove("id");
+    std::string out;
+    serializeJson(doc, out);
+    return out;
+#else
+    (void)at;
+    return json;
+#endif
+}
+
 inline Resp get(Api& api, const char* path, Query q = Query(), const char* shape = nullptr) {
-    return request(api, tesser::Op::Get, path, shape, q);
+    Resp r = request(api, tesser::Op::Get, path, shape, q);
+    if (q.view == tesser::View::Schema) r.body = withoutOwnId(r.body);
+    return r;
 }
 
 inline Resp set(Api& api, const char* path, const char* body) { return request(api, tesser::Op::Set, path, body); }

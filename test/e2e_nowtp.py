@@ -63,10 +63,13 @@ def main():
     check(f'fragmented response ({size} bytes)', status == 'ok' and size > 1000 and
           schema['children']['net']['children']['remote']['type'] == 'action', (status, size))
 
-    # Unknown peer: the client call times out.
+    # Unknown peer: the call fails as soon as NowTP reports the delivery
+    # failed (reason send_failed, DESIGN.md §10.3), else when it times out.
     _, reply = a.call('set', '/net/remote', {}, {'mac': '02:00:00:00:00:01', 'op': 'get', 'path': '/',
                                                  'timeoutMs': 600})
-    check('unknown peer times out', reply['status'] == 'timeout' and 550 <= reply['ms'] <= 900, reply)
+    early = (reply.get('body') or {}).get('reason') == 'send_failed'
+    check('unknown peer fails', reply['status'] == 'timeout' and (early or 550 <= reply['ms']) and reply['ms'] <= 900,
+          reply)
 
     # Latency as measured on board A (request out, response in).
     times = []

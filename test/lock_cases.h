@@ -113,8 +113,9 @@ TEST(lock_notification_waits_for_the_line) {
             // gives up after a second rather than hang if the line held the
             // API lock.)
             std::thread([&] {
-                for (int i = 0; i < 1000 && !w.api.mutex().tryLock(); i++) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                // 10 ms: shorter sleeps busy-wait on ESP-IDF.
+                for (int i = 0; i < 100 && !w.api.mutex().tryLock(); i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
                 if (!w.api.mutex().heldByMe()) {
                     blocked = true;
@@ -159,7 +160,9 @@ TEST(lock_events_of_two_apis) {
     auto run = [&ready](Api& api, tesser::EventNode& ev) {
         tesser::Lock lock(api);
         ready++;
-        while (ready < 2) std::this_thread::yield();
+        // Sleeps, not yields: a yielding thread above the test task's
+        // priority would starve it on target before it starts the other.
+        while (ready < 2) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         ev.emit(1);
     };
     std::thread ta(run, std::ref(a), std::ref(ea));
@@ -188,7 +191,7 @@ TEST(lock_background_work) {
         tesser::Pending p = call.defer();
         CHECK(tesser::background([&api, &release, &lockFree, p]() mutable {
             lockFree = !api.mutex().heldByMe();
-            while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             p.reply(42);
         }));
     });
@@ -199,8 +202,8 @@ TEST(lock_background_work) {
     });
     CHECK_EQ(cases::get(api, "/x").body, "1");  // the API isn't held
     release = true;
-    for (int i = 0; i < 1000 && got.empty(); i++) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    for (int i = 0; i < 300 && got.empty(); i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         c.process();
     }
     CHECK_EQ(got, "ok42");

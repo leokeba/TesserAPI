@@ -47,7 +47,8 @@ struct Rig {
         std::string l = envelope + "\n";
         line.feed(l.data(), l.size());
         net.run();
-        return lines.out.size() == 1 ? lines.out[0] : "<" + std::to_string(lines.out.size()) + " lines>";
+        return lines.out.size() == 1 ? cases::withoutOwnId(lines.out[0], "body")
+                                     : "<" + std::to_string(lines.out.size()) + " lines>";
     }
 };
 
@@ -228,6 +229,9 @@ TEST(remote_upstream_follows_subscribers) {
     CHECK_EQ(r.device.api.subscriptionCount(), 0u);
 }
 
+#if !defined(ESP_PLATFORM)
+// Host only: its helper thread waits in 1 ms sleeps, which ESP-IDF turns into
+// busy waits that starve the test task pinned to the same core.
 TEST(remote_streamed_subscription_waits) {
     // An HTTP streamed subscription below a remote node waits for the
     // remote's snapshot, as a forwarded get does, then streams.
@@ -279,6 +283,7 @@ TEST(remote_streamed_subscription_waits) {
     CHECK_EQ(r.gateway.subscriptionCount(), subs);
     CHECK_EQ(r.gateway.pending(), 0);
 }
+#endif
 
 // Arrays in a mirrored copy are values: whole at any depth, like local ones.
 TEST(remote_mirror_arrays_whole) {
