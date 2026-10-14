@@ -43,8 +43,7 @@ TEST(persist_state_and_roundtrip) {
     MemoryStorage storage;
     {
         Settings s(&storage);
-        CHECK_EQ(s.api.persistedState(),
-                 "{\"config\":{\"brightness\":128,\"name\":\"lamp\",\"tuning\":{\"gain\":0.5}},\"calibration\":0}");
+        CHECK_EQ(s.api.persistedState(), "{}");  // everything at its default
         CHECK(!s.api.load());  // nothing stored yet
         cases::set(s.api, "/config", "{\"brightness\":7,\"name\":\"desk\",\"tuning\":{\"gain\":2}}");
         cases::set(s.api, "/on", "true");
@@ -166,7 +165,7 @@ TEST(persist_restore) {
         CHECK_EQ(skipped[2], "/on");
     }
     // Saved at once, and subscribers hear about it.
-    CHECK_EQ(storage.records["config"], "{\"brightness\":9,\"name\":\"attic\",\"tuning\":{\"gain\":0.5}}");
+    CHECK_EQ(storage.records["config"], "{\"brightness\":9,\"name\":\"attic\"}");  // gain at its default
     s.api.poll(100);
     CHECK_EQ(watcher.last(), "{\"op\":\"change\",\"path\":\"/config\",\"body\":{\"brightness\":9,\"name\":\"attic\"}}");
 
@@ -177,6 +176,7 @@ TEST(persist_restore) {
 TEST(persist_erase) {
     MemoryStorage storage;
     Settings s(&storage);
+    cases::set(s.api, "/config/brightness", "3");
     CHECK(s.api.save());
     CHECK(!storage.records.empty());
     CHECK(storage.erase());
@@ -318,6 +318,114 @@ TEST(persist_generation_wraparound) {
     CHECK_EQ(storage.saves, 3);
     s.api.poll(17000);
     CHECK_EQ(storage.saves, 3);
+}
+
+// Records hold what differs from the defaults (docs/DESIGN.md section 12),
+// so a release that changes a default reaches every device whose user never
+// changed that value.
+TEST(persist_sparse_defaults) {
+    MemoryStorage storage;
+    {
+        Settings s(&storage);
+        cases::set(s.api, "/config/brightness", "7");
+        CHECK(s.api.save());
+        CHECK_EQ(storage.records["config"], "{\"brightness\":7}");
+        CHECK_EQ(storage.records.count("calibration"), 0u);
+        // Back to its default: the record goes.
+        cases::set(s.api, "/config/brightness", "128");
+        CHECK(s.api.save());
+        CHECK_EQ(storage.records.count("config"), 0u);
+        cases::set(s.api, "/config/brightness", "9");
+        CHECK(s.api.save());
+    }
+    // A later release with another default for gain: it applies.
+    Settings next;
+    next.gain = 0.75;
+    next.api.persistence(storage);
+    CHECK(next.api.load());
+    CHECK_EQ(next.brightness, 9);
+    CHECK_EQ(next.gain, 0.75);
+    // An old full backup restores; what equals today's defaults isn't stored.
+    CHECK_EQ(next.api.restore("{\"config\":{\"brightness\":128,\"name\":\"lamp\",\"tuning\":{\"gain\":0.75}},"
+                              "\"calibration\":0}"),
+             Status::Ok);
+    CHECK_EQ(next.brightness, 128);
+    CHECK_EQ(storage.records.count("config"), 0u);
+    CHECK_EQ(next.api.persistedState(), "{}");
+}
+
+// Stored state from before a version goes through the migration first:
+// TesserKIT drops values its devices froze at old defaults.
+TEST(persist_migration) {
+    MemoryStorage storage;
+    storage.records["config"] = "{\"brightness\":128,\"label\":\"desk\",\"tuning\":{\"gain\":0.5}}";
+    storage.records["calibration"] = "3";
+    Settings s;
+    s.gain = 0.75;  // this release's default
+    std::vector<std::string> seen;
+    s.api.persistVersion(1, [&](std::string_view record, uint32_t version, JsonVariant value) {
+        seen.push_back(std::string(record) + "@" + std::to_string(version));
+        if (record != "config") return true;
+        if (value["tuning"]["gain"] == 0.5) value["tuning"].as<JsonObject>().remove("gain");  // the old default
+        if (value["label"].is<const char*>()) {  // renamed
+            value["name"] = value["label"];
+            value.as<JsonObject>().remove("label");
+        }
+        return true;
+    });
+    s.api.persistence(storage);
+    CHECK(s.api.load());
+    CHECK_EQ(seen.size(), 2u);
+    if (seen.size() == 2) CHECK_EQ(seen[0], "config@0");
+    CHECK_EQ(s.gain, 0.75);
+    CHECK_EQ(std::string(s.name), "desk");
+    CHECK_EQ(s.calibration, 3);
+    // Rewritten under the version, sparse.
+    CHECK_EQ(storage.records["@version"], "1");
+    CHECK_EQ(storage.records["config"], "{\"name\":\"desk\"}");
+    CHECK_EQ(s.api.persistedState(), "{\"@version\":1,\"config\":{\"name\":\"desk\"},\"calibration\":3}");
+    // Loaded again: current, no migration.
+    seen.clear();
+    Settings again;
+    again.gain = 0.75;
+    again.api.persistVersion(1, [&](std::string_view, uint32_t, JsonVariant) {
+        seen.push_back("x");
+        return true;
+    });
+    again.api.persistence(storage);
+    CHECK(again.api.load());
+    CHECK(seen.empty());
+    // A backup from before versions is migrated too; one record can be dropped.
+    again.api.persistVersion(1, [&](std::string_view record, uint32_t, JsonVariant) { return record != "calibration"; });
+    CHECK_EQ(again.api.restore("{\"calibration\":8,\"config\":{\"brightness\":5}}"), Status::Ok);
+    CHECK_EQ(again.calibration, 3);
+    CHECK_EQ(again.brightness, 5);
+}
+
+inline size_t g_free = SIZE_MAX;
+inline size_t freeProbe() { return g_free; }
+
+// A record is written in one allocation of its exact size, from the byte
+// budget: on a short heap it waits, still dirty.
+TEST(persist_record_needs_room) {
+    MemoryStorage storage;
+    std::string notes;
+    Settings s;
+    s.api.value("notes", notes).persist();
+    s.api.persistence(storage);
+    notes = std::string(600, 'n');
+    s.api.changed("/notes");
+    size_t floor = tesser::heapFloor();
+    tesser::setHeapFloor(8000);
+    tesser::setFreeHeapProbe(&freeProbe);
+    g_free = 8300;
+    CHECK(!s.api.save());
+    CHECK_EQ(storage.records.count("notes"), 0u);
+    g_free = 20000;
+    CHECK(s.api.save());
+    tesser::setFreeHeapProbe(nullptr);
+    tesser::setHeapFloor(floor);
+    CHECK_EQ(storage.records["notes"].size(), 602u);
 }
 
 }  // namespace persistence_cases

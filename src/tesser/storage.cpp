@@ -39,15 +39,23 @@ bool FileStorage::save(std::string_view key, const std::string& data) {
     bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
     ok = (fclose(f) == 0) && ok;
     if (!ok) {
-        remove(tmp.c_str());
+        ::remove(tmp.c_str());
         return false;
     }
     if (rename(tmp.c_str(), file.c_str()) != 0) {
         // Some VFS drivers refuse to rename over an existing file.
-        remove(file.c_str());
+        ::remove(file.c_str());
         if (rename(tmp.c_str(), file.c_str()) != 0) return false;
     }
     return true;
+}
+
+bool FileStorage::remove(std::string_view key) {
+    std::string file = path(key);
+    FILE* f = fopen(file.c_str(), "rb");
+    if (!f) return true;  // none stored
+    fclose(f);
+    return ::remove(file.c_str()) == 0;
 }
 
 bool FileStorage::erase() {
@@ -60,7 +68,7 @@ bool FileStorage::erase() {
         bool tmp = len > 9 && strcmp(e->d_name + len - 9, ".json.tmp") == 0;
         if (!record && !tmp) continue;
         std::string file = dir_ + "/" + e->d_name;
-        if (remove(file.c_str()) != 0) ok = false;
+        if (::remove(file.c_str()) != 0) ok = false;
     }
     closedir(d);
     return ok;
@@ -104,6 +112,17 @@ bool NvsStorage::save(std::string_view key, const std::string& data) {
     nvs_handle_t h;
     if (nvs_open(namespace_, NVS_READWRITE, &h) != ESP_OK) return false;
     bool ok = nvs_set_blob(h, nvsKey(key).c_str(), data.data(), data.size()) == ESP_OK && nvs_commit(h) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}
+
+bool NvsStorage::remove(std::string_view key) {
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(namespace_, NVS_READWRITE, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return true;  // never written
+    if (err != ESP_OK) return false;
+    err = nvs_erase_key(h, nvsKey(key).c_str());
+    bool ok = (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) && nvs_commit(h) == ESP_OK;
     nvs_close(h);
     return ok;
 }

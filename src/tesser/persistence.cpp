@@ -1,5 +1,8 @@
 // Persistence (docs/DESIGN.md section 12).
+#include <algorithm>
+
 #include "tesser/api.h"
+#include "tesser/budget.h"
 #include "tesser/detail/lazy_patch.h"
 #include "tesser/envelope.h"
 #include "tesser/storage.h"
@@ -44,14 +47,23 @@ void writeLeaf(const Node& n, JsonWriter& w) {
     detail::writeLeaf(w, n, options);
 }
 
-void writePersisted(const Object& o, bool inherited, detail::LazyPatch& lp, JsonWriter& w) {
+uint32_t hashOf(const Node& n) {
+    HashSink sink;
+    JsonWriter w(sink);
+    writeLeaf(n, w);
+    return sink.hash;
+}
+
+// `skip(n)`: a value left out (at its default).
+template <class Skip>
+void writePersisted(const Object& o, bool inherited, detail::LazyPatch& lp, JsonWriter& w, const Skip& skip) {
     for (const Node* c = o.first(); c; c = c->next()) {
         bool p = inherited || c->persisted();
         if (c->type() == NodeType::Object) {
             if (!lp.enter(c->name())) continue;
-            writePersisted(static_cast<const Object&>(*c), p, lp, w);
+            writePersisted(static_cast<const Object&>(*c), p, lp, w, skip);
             lp.leave();
-        } else if (p && isLeaf(*c)) {
+        } else if (p && isLeaf(*c) && !skip(*c)) {
             lp.key(c->name());
             writeLeaf(*c, w);
         }
@@ -59,20 +71,55 @@ void writePersisted(const Object& o, bool inherited, detail::LazyPatch& lp, Json
 }
 
 // A top-level node's record: its value, or for an object the sparse object
-// of its persisted values.
-std::string record(const Node& top, bool inherited) {
-    std::string out;
-    StringSink sink(out);
-    JsonWriter w(sink);
+// of its persisted values; empty when all are at their defaults.
+template <class Skip>
+void writeRecord(const Node& top, bool inherited, JsonWriter& w, const Skip& skip, bool& any) {
     if (top.type() == NodeType::Object) {
         detail::LazyPatch lp(w);
-        writePersisted(static_cast<const Object&>(top), inherited || top.persisted(), lp, w);
-        if (!lp.finish()) out = "{}";
+        writePersisted(static_cast<const Object&>(top), inherited || top.persisted(), lp, w, skip);
+        any = lp.finish();
     } else {
-        writeLeaf(top, w);
+        any = !skip(top);
+        if (any) writeLeaf(top, w);
     }
-    return out;
 }
+
+enum class Record : uint8_t { Written, Empty, NoRoom };
+
+// Measured first, then written in one allocation of its exact size, from
+// the byte budget (docs/DESIGN.md section 15): a record never grows by
+// doubling on a short heap.
+template <class Skip>
+Record record(const Node& top, bool inherited, const Skip& skip, std::string& out, Reservation& held) {
+    bool any = false;
+    CountingSink counter;
+    {
+        JsonWriter w(counter);
+        writeRecord(top, inherited, w, skip, any);
+    }
+    if (!any) return Record::Empty;
+    held = memoryBudget().reserve(counter.count + 1, 0, true);
+    if (!held) return Record::NoRoom;
+    out.clear();
+    out.reserve(counter.count + 1);
+    held.settle();
+    StringSink sink(out);
+    JsonWriter w(sink);
+    writeRecord(top, inherited, w, skip, any);
+    return Record::Written;
+}
+
+// Persisted leaves at or below `n`.
+void persistedLeaves(const Node& n, bool inherited, std::vector<const Node*>& out) {
+    bool p = inherited || n.persisted();
+    if (n.type() == NodeType::Object) {
+        for (const Node* c = static_cast<const Object&>(n).first(); c; c = c->next()) persistedLeaves(*c, p, out);
+    } else if (p && isLeaf(n)) {
+        out.push_back(&n);
+    }
+}
+
+constexpr const char* kVersionKey = "@version";  // no node can be named so
 
 // Applies stored state leniently: whatever doesn't fit the current tree is
 // skipped, so renamed or removed fields never break a boot. `notify` marks
@@ -194,6 +241,33 @@ void Api::persistence(Storage& storage, uint32_t debounceMs) {
     debounceMs_ = debounceMs;
     persistHook_ = [](Api& api, uint32_t nowMs) { api.checkPersistence(nowMs); };
     savedGen_ = seenGen_ = currentGeneration();
+    captureDefaults();
+}
+
+void Api::persistVersion(uint32_t version, Migration migrate) {
+    MutexGuard guard(mutex_);
+    persistVersion_ = version;
+    migrate_ = std::move(migrate);
+}
+
+void Api::captureDefaults() {
+    std::vector<const Node*> leaves;
+    persistedLeaves(*this, persisted(), leaves);
+    bool added = false;
+    for (const Node* n : leaves) {
+        auto at = std::lower_bound(defaults_.begin(), defaults_.end(), n,
+                                   [](const std::pair<const Node*, uint32_t>& d, const Node* k) { return d.first < k; });
+        if (at != defaults_.end() && at->first == n) continue;  // the first one seen stays
+        defaults_.emplace_back(n, hashOf(*n));
+        added = true;
+    }
+    if (added) std::sort(defaults_.begin(), defaults_.end());
+}
+
+bool Api::atDefault(const Node& n) const {
+    auto at = std::lower_bound(defaults_.begin(), defaults_.end(), &n,
+                               [](const std::pair<const Node*, uint32_t>& d, const Node* k) { return d.first < k; });
+    return at != defaults_.end() && at->first == &n && at->second == hashOf(n);
 }
 
 std::string Api::persistedState() {
@@ -202,7 +276,11 @@ std::string Api::persistedState() {
     StringSink sink(out);
     JsonWriter w(sink);
     detail::LazyPatch lp(w);
-    writePersisted(*this, persisted(), lp, w);
+    if (persistVersion_) {
+        lp.key(kVersionKey);
+        w.uinteger(persistVersion_);
+    }
+    writePersisted(*this, persisted(), lp, w, [this](const Node& n) { return atDefault(n); });
     if (!lp.finish()) out = "{}";
     return out;
 }
@@ -211,6 +289,7 @@ bool Api::saveRecords(bool all) {
     if (!storage_) return false;
     uint32_t gen = currentGeneration();
     bool ok = true;
+    auto skip = [this](const Node& n) { return atDefault(n); };
     for (const Node* c = first(); c; c = c->next()) {
         if (!holdsPersisted(*c, persisted())) continue;
         if (!all) {
@@ -218,9 +297,27 @@ bool Api::saveRecords(bool all) {
             newestPersisted(*c, persisted(), savedGen_, gen, newest);
             if (!newest) continue;  // its record is current
         }
-        if (!storage_->save(c->name(), record(*c, persisted()))) {
-            logError("saving state %s failed", c->name());
-            ok = false;
+        std::string text;
+        Reservation held;
+        switch (record(*c, persisted(), skip, text, held)) {
+            case Record::Empty:
+                // Every value at its default: no record, so a new default
+                // reaches this device.
+                if (!storage_->remove(c->name())) {
+                    logError("removing state %s failed", c->name());
+                    ok = false;
+                }
+                break;
+            case Record::NoRoom:
+                logWarning("no memory to save state %s now; trying again", c->name());
+                ok = false;
+                break;
+            case Record::Written:
+                if (!storage_->save(c->name(), text)) {
+                    logError("saving state %s failed", c->name());
+                    ok = false;
+                }
+                break;
         }
     }
     // After a failure the dirty records stay dirty and are written again.
@@ -236,12 +333,17 @@ bool Api::save() {
 bool Api::load() {
     MutexGuard guard(mutex_);
     if (!storage_) return false;
+    captureDefaults();  // nodes declared since persistence()
+    uint32_t stored = 0;
+    std::string data;
+    if (storage_->load(kVersionKey, data)) stored = static_cast<uint32_t>(strtoul(data.c_str(), nullptr, 10));
+    bool older = stored != persistVersion_;
     bool any = false;
     Applier a;
     for (Node* c = first(); c; c = c->next()) {
         if (!holdsPersisted(*c, persisted())) continue;
-        std::string data;
-        if (!storage_->load(c->name(), data)) continue;
+        data.clear();
+        if (!storage_->load(c->name(), data) || data == "null") continue;
         JsonDocument doc;
         a.path = "/";
         a.path += c->name();
@@ -249,9 +351,13 @@ bool Api::load() {
             logWarning("stored state %s doesn't parse; keeping defaults", a.path.c_str());
             continue;
         }
-        a.apply(c, doc.as<JsonVariantConst>(), persisted());
         any = true;
+        // Stored under another version: brought up to this one first.
+        if (older && migrate_ && !migrate_(c->name(), stored, doc.as<JsonVariant>())) continue;
+        a.apply(c, doc.as<JsonVariantConst>(), persisted());
     }
+    // Rewritten under this version: migrated, and sparse.
+    if (older && saveRecords(true)) storage_->save(kVersionKey, std::to_string(persistVersion_));
     savedGen_ = seenGen_ = currentGeneration();
     return any;
 }
@@ -263,11 +369,25 @@ Status Api::restore(std::string_view json, std::vector<std::string>* skipped) {
         !doc.is<JsonObjectConst>()) {
         return Status::BadRequest;
     }
+    // A backup from an older version goes through the migration first.
+    JsonObject root = doc.as<JsonObject>();
+    uint32_t version = root[kVersionKey] | 0u;
+    root.remove(kVersionKey);
+    if (version != persistVersion_ && migrate_) {
+        std::vector<std::string> dropped;
+        for (JsonPair kv : root) {
+            if (!migrate_(kv.key().c_str(), version, kv.value())) dropped.emplace_back(kv.key().c_str());
+        }
+        for (const std::string& k : dropped) root.remove(k);
+    }
     Applier a;
     a.notify = true;
     a.skipped = skipped;
     a.apply(this, doc.as<JsonVariantConst>(), persisted());
-    if (storage_ && !saveRecords(true)) return Status::Internal;
+    if (storage_) {
+        if (!saveRecords(true)) return Status::Internal;
+        if (persistVersion_) storage_->save(kVersionKey, std::to_string(persistVersion_));
+    }
     return Status::Ok;
 }
 

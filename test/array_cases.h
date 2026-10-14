@@ -87,6 +87,8 @@ TEST(array_write) {
 
 TEST(array_changes_and_persistence) {
     Fixture f;
+    tesser::MemoryStorage storage;
+    f.api.persistence(storage);  // the defaults, before any change
     subscription_cases::FakeSubscriber s;
     CHECK_EQ(subscription_cases::subscribe(f.api, &s, "/cal", cases::keys("offsets")).status, Status::Ok);
     CHECK_EQ(subscription_cases::subscribe(f.api, &s, "/cal/offsets/1").status, Status::NotAllowed);
@@ -95,8 +97,6 @@ TEST(array_changes_and_persistence) {
     f.api.poll(1000);
     CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/cal\",\"body\":{\"offsets\":[0,0.5,3,1.5]}}");
 
-    tesser::MemoryStorage storage;
-    f.api.persistence(storage);
     CHECK(f.api.save());
     CHECK_EQ(storage.records["cal"], "{\"offsets\":[0,0.5,3,1.5]}");
     Fixture g;

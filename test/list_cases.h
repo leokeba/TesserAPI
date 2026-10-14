@@ -130,6 +130,9 @@ TEST(list_read_only) {
 
 TEST(list_subscriptions_and_persistence) {
     Fixture f;
+    tesser::MemoryStorage storage;
+    f.list->persist();
+    f.api.persistence(storage);  // the defaults, before any change
     subscription_cases::FakeSubscriber s;
     CHECK_EQ(subscription_cases::subscribe(f.api, &s, "/").status, Status::Ok);
     CHECK_EQ(subscription_cases::subscribe(f.api, &s, "/remotes/0").status, Status::NotAllowed);
@@ -139,9 +142,6 @@ TEST(list_subscriptions_and_persistence) {
              "{\"op\":\"change\",\"path\":\"/\",\"body\":{\"remotes\":[{\"host\":\"a\",\"port\":80,\"enabled\":true},"
              "{\"host\":\"b\",\"port\":99,\"enabled\":false}]}}");
 
-    tesser::MemoryStorage storage;
-    f.list->persist();
-    f.api.persistence(storage);
     CHECK(f.api.save());
     CHECK_EQ(storage.records["remotes"],
              "[{\"host\":\"a\",\"port\":80,\"enabled\":true},{\"host\":\"b\",\"port\":99,\"enabled\":false}]");

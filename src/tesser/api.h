@@ -156,21 +156,37 @@ public:
     // Persistence (docs/DESIGN.md section 12): values and objects marked
     // persist() are saved to `storage` by poll(), debounceMs after the last
     // change to one of them, one record per top-level node; a change
-    // rewrites only the records it touched. Call load() once the tree is
-    // declared.
+    // rewrites only the records it touched. A record holds only the values
+    // that differ from their defaults: what they were when persistence()
+    // (or, for nodes declared since, load()) was first called. So declare
+    // the tree first, then call persistence() and load().
     void persistence(Storage& storage, uint32_t debounceMs = 2000);
+    // Called with each stored record older than the current version (see
+    // persistVersion()), before it is applied: `record` is its top-level
+    // node's name, `version` the version it was stored under (0: before
+    // versions), `value` the record itself, which the migration may change
+    // (rename keys, drop values equal to an old default). False drops the
+    // record.
+    using Migration = std::function<bool(std::string_view record, uint32_t version, JsonVariant value)>;
+    // The version of the stored state's shape, stored with it, and how to
+    // bring older state up to it. load() and restore() run `migrate` on
+    // older records, then save them all under `version`. Before load().
+    void persistVersion(uint32_t version, Migration migrate = nullptr);
     // Applies the stored records. Unknown keys and invalid values are skipped
     // with a warning. Returns false if nothing was stored.
     bool load();
     // Saves every record now. Returns false on a storage error.
     bool save();
     // The whole persisted state as one JSON document (the records under
-    // their names), secrets included: a backup.
+    // their names, and "@version" when persistVersion() set one), secrets
+    // included: a backup. Like the records, values at their default are left
+    // out.
     std::string persistedState();
     // Applies a document like persistedState()'s (a backup), leniently like
     // load(): what doesn't fit the tree is skipped and its path added to
-    // `skipped`. What is applied is marked changed, then everything is
-    // saved. BadRequest if it doesn't parse, Internal if saving failed.
+    // `skipped`. An older one goes through the migration first. What is
+    // applied is marked changed, then everything is saved. BadRequest if it
+    // doesn't parse, Internal if saving failed.
     Status restore(std::string_view json, std::vector<std::string>* skipped = nullptr);
 
     // Removes every subscription of a client. Transports call it when a
@@ -253,6 +269,10 @@ private:
     // Writes the records of top-level nodes (all, or those changed since
     // the last save).
     bool saveRecords(bool all);
+    // Records the defaults of persisted values not yet recorded.
+    void captureDefaults();
+    // Whether `n` holds its default (as captureDefaults() saw it).
+    bool atDefault(const Node& n) const;
 
     Config config_;
     mutable Mutex mutex_;
@@ -268,6 +288,10 @@ private:
     TokenCheck tokenCheck_;
     Storage* storage_ = nullptr;
     uint32_t debounceMs_ = 2000;
+    // Persisted values' defaults: node, hash of its value; sorted by node.
+    std::vector<std::pair<const Node*, uint32_t>> defaults_;
+    uint32_t persistVersion_ = 0;
+    Migration migrate_;
     uint32_t savedGen_ = 0;  // generation when the state was last saved or loaded
     uint32_t seenGen_ = 0;   // newest persisted change seen by poll()
     uint32_t changedAtMs_ = 0;

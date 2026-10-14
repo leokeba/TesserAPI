@@ -135,11 +135,13 @@ def main():
     auth = {'Authorization': 'Bearer test-token'}
     got, data, _, _ = h.raw('GET', '/files/backup')
     check('backup needs the token', got == 403, got)
+    # Only values that differ from their defaults are in it (DESIGN.md §12).
+    name = h.call('get', '/settings/name', {}, ABSENT)[1]
+    h.call('set', '/settings/name', {}, 'in-backup')
     got, data, headers, _ = h.raw('GET', '/files/backup', None, ABSENT, auth)
     backup = json.loads(data) if got == 200 else {}
-    check('backup download', got == 200 and 'settings' in backup and
+    check('backup download', got == 200 and backup.get('settings', {}).get('name') == 'in-backup' and
           headers.get('Content-Type') == 'application/json', (got, data[:120]))
-    name = h.call('get', '/settings/name', {}, ABSENT)[1]
     got, data, _, _ = h.raw('PUT', '/files/backup', None,
                             json.dumps({'settings': {'name': 'restored', 'gone': 1}}).encode(), auth)
     check('backup restore', got == 200 and json.loads(data) == {'skipped': ['/settings/gone']} and

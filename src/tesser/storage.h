@@ -15,6 +15,9 @@ public:
     // Fills `out` with the record stored under `key`; false if there is none.
     virtual bool load(std::string_view key, std::string& out) = 0;
     virtual bool save(std::string_view key, const std::string& data) = 0;
+    // Removes one record (its values are all at their defaults). By default
+    // it saves "null", which load() takes as no record.
+    virtual bool remove(std::string_view key) { return save(key, "null"); }
     // Removes every record (factory reset). The application's state keeps
     // its current values until the next boot.
     virtual bool erase() = 0;
@@ -34,11 +37,17 @@ public:
         saves++;
         return true;
     }
+    bool remove(std::string_view key) override {
+        records.erase(std::string(key));
+        removes++;
+        return true;
+    }
     bool erase() override {
         records.clear();
         return true;
     }
     std::map<std::string, std::string> records;
+    int removes = 0;
     int saves = 0;  // records written
 };
 
@@ -52,6 +61,7 @@ public:
     explicit FileStorage(std::string dir) : dir_(std::move(dir)) {}
     bool load(std::string_view key, std::string& out) override;
     bool save(std::string_view key, const std::string& data) override;
+    bool remove(std::string_view key) override;
     bool erase() override;
 
 private:
@@ -69,6 +79,7 @@ public:
     explicit NvsStorage(const char* nameSpace = "tesser") : namespace_(nameSpace) {}
     bool load(std::string_view key, std::string& out) override;
     bool save(std::string_view key, const std::string& data) override;
+    bool remove(std::string_view key) override;
     bool erase() override;
 
 private:
