@@ -136,7 +136,7 @@ TEST(remote_subpath_and_timeout) {
     CHECK_EQ(r.lines.out.size(), 1u);
     if (!r.lines.out.empty()) {
         CHECK_EQ(r.lines.out[0],
-                 "{\"id\":4,\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"path\":\"/ghost\","
+                 "{\"id\":4,\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"reason\":\"no_answer\",\"path\":\"/ghost\","
                  "\"message\":\"remote node didn't answer\"}}");
     }
     CHECK_EQ(r.gateway.pending(), 0);
@@ -399,7 +399,7 @@ TEST(remote_forwarded_subscription_failures) {
     CHECK_EQ(r.lines.out.size(), 1u);
     if (!r.lines.out.empty()) {
         CHECK_EQ(r.lines.out[0],
-                 "{\"id\":1,\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"path\":\"/ghost\","
+                 "{\"id\":1,\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"reason\":\"no_answer\",\"path\":\"/ghost\","
                  "\"message\":\"remote node didn't answer\"}}");
     }
     CHECK_EQ(r.gateway.subscriptionCount(), 0u);
@@ -497,7 +497,7 @@ TEST(remote_discovered_peers) {
     CHECK_EQ(watcher.last(), "{\"op\":\"change\",\"path\":\"/peers\",\"body\":{\"kitchen-lamp\":null}}");
     // Requests fail at once while it is offline, and a probe finds it again.
     CHECK_EQ(r.ask("{\"id\":2,\"op\":\"get\",\"path\":\"/peers/kitchen-lamp/lamp/on\"}"),
-             "{\"id\":2,\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"path\":\"/peers/kitchen-lamp\","
+             "{\"id\":2,\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"reason\":\"peer_offline\",\"path\":\"/peers/kitchen-lamp\","
              "\"message\":\"peer offline\"}}");
     CHECK_EQ(r.gateway.pending(), 0);
     r.net.clock += 5000;
@@ -514,7 +514,7 @@ TEST(remote_discovered_peers) {
 
     // Advertisements.
     std::string ad = tesser::buildAdvertisement(84, 0xfeed);
-    CHECK_EQ(ad, "{\"tesser\":84,\"schema\":\"0000feed\"}");
+    CHECK_EQ(ad, "{\"tesser\":84,\"schema\":\"0000feed\",\"v\":2}");
     uint8_t port = 0;
     uint32_t hash = 0;
     CHECK(tesser::parseAdvertisement(ad, port, hash));

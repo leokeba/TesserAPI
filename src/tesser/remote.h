@@ -165,6 +165,11 @@ public:
     // so clients can cache the remote's schema under it.
     uint32_t advertisedSchema() const { return advertisedSchema_.load(); }
     void setAdvertisedSchema(uint32_t hash);
+    // The protocol version the peer advertises (docs/DESIGN.md section
+    // 10.1.2; 1: one that predates versions), 0 while unknown. Shown in the
+    // schema.
+    uint8_t protocol() const { return protocol_.load(); }
+    void setProtocol(uint8_t version);
     // The device a mounted peer is (its MAC; empty when unknown), so that a
     // parent mounts each device once, whatever the transport
     // (docs/DESIGN.md section 14.1). Set by DatagramEndpoint::mountPeers().
@@ -344,6 +349,7 @@ private:
     std::vector<std::unique_ptr<Upstream>> upstreams_;  // guarded by mutex_
     std::atomic<bool> online_{true};
     std::atomic<uint32_t> advertisedSchema_{0};
+    std::atomic<uint8_t> protocol_{0};
     std::string ownedName_;
 
     // Streamed sets, guarded by streamMutex_ (a leaf like routesMutex_).

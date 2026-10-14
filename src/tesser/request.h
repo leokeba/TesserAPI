@@ -17,8 +17,10 @@ namespace tesser {
 enum class Op : uint8_t { Get, Set, Subscribe, Unsubscribe };
 
 // value: the data; schema: its description; hash: the FNV-1a hash of the
-// schema, as 8 hex digits, for clients that cache schemas.
-enum class View : uint8_t { Value, Schema, Hash };
+// schema, as 8 hex digits, for clients that cache schemas; info: the
+// protocol version and features, with the hash (docs/DESIGN.md section
+// 10.1.2).
+enum class View : uint8_t { Value, Schema, Hash, Info };
 
 // "get" / "set" / "sub" / "unsub"; false if unknown.
 bool parseOp(std::string_view s, Op& out);

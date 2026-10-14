@@ -141,7 +141,7 @@ TEST(route_one_node_per_device) {
     snprintf(hash, sizeof(hash), "%08lx", static_cast<unsigned long>(r.dev.schemaHash()));
     CHECK_EQ(r.stub(), std::string("{\"type\":\"object\",\"children\":{\"lamp\":{\"type\":\"remote\",\"route\":"
                                    "\"udp\",\"schema\":\"") +
-                           hash + "\",\"id\":\"10521c75f37c\"}}}");
+                           hash + "\",\"id\":\"10521c75f37c\",\"protocol\":2}}}");
     // Requests go that way, and time the round trip.
     tesser::LocalClient client(r.master);
     udp_cases::Result got;

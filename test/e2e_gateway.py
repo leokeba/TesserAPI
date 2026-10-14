@@ -76,6 +76,7 @@ def main():
     _, schema = a.call('get', '/', {'view': 'schema', 'depth': 1}, ABSENT)
     stub = dict(schema['children']['peer'])
     advertised = stub.pop('schema', '')
+    stub.pop('protocol', None)  # once B advertised (docs/DESIGN.md section 10.1.2)
     # The device's MAC once B announced itself (docs/DESIGN.md section 14.1).
     device_b = mac_b.replace(':', '')
     check('schema: remote', stub in ({'type': 'remote', 'mirror': True},
@@ -115,7 +116,8 @@ def main():
         if stub:
             break
         time.sleep(0.5)
-    check('B discovered under /peers', stub == {'type': 'remote', 'schema': advertised, 'id': device_b}, peers)
+    check('B discovered under /peers',
+          stub == {'type': 'remote', 'schema': advertised, 'id': device_b, 'protocol': 2}, peers)
     base = f'/peers/{name_b}'
     check('read through discovered B', a.call('get', base + '/lamp/label', {}, ABSENT) == ('ok', 'desk'))
 

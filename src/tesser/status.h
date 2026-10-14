@@ -20,6 +20,35 @@ enum class Status : uint8_t {
     Internal,      // bug, out of memory, reply dropped
 };
 
+// Why a request failed, for clients that act on it (docs/DESIGN.md section
+// 10.1.2): an error body's "reason", next to its English "message", which
+// may change or be compiled out. None: no reason given.
+enum class Reason : uint8_t {
+    None,
+    LowMemory,          // busy: not enough heap for the reply or the remote's state; try again, or ask for less
+    PendingLimit,       // busy: too many calls waiting for remote nodes or deferred actions; try again soon
+    QueueFull,          // busy: a request queue is full; try again soon
+    Unreachable,        // busy: the remote node couldn't be sent to; try again soon
+    SubscriptionLimit,  // busy: no more subscriptions or streams for this client or node; poll instead
+    TransferBusy,       // busy: another file transfer holds the node or the path
+    PeerOffline,        // timeout: the remote node is known to be offline; nothing was sent
+    NoAnswer,           // timeout: the remote node or a deferred action didn't answer in time
+    Idle,               // timeout: a file transfer was idle too long and was dropped
+    CannotWait,         // not_allowed: this transport can't wait for a deferred reply or deliver notifications
+    NotAuthorized,      // unauthorized: the client's level or the authorizer refuses it
+    CeilingUnsupported, // unauthorized: a remote node too old to limit a gateway's client (only admins reach it)
+    UnknownOption,      // bad_request: a strict request ("v") named an option this node doesn't know
+};
+
+// Wire name: "low_memory", ...; "" for None.
+const char* toString(Reason r);
+// False if unknown (a newer node's reason: act on the status alone).
+bool parseReason(const char* name, Reason& out);
+
+// The envelope protocol this library speaks (docs/DESIGN.md section 10.1.2).
+// 1: every node before versions were announced.
+constexpr int kProtocolVersion = 2;
+
 // Wire name: "ok", "bad_request", ...
 const char* toString(Status s);
 

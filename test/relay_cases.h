@@ -195,7 +195,7 @@ TEST(relay_one_transfer_per_peer) {
     // The device keeps one transfer per client, and the gateway is one:
     // another path of the same device is busy too.
     CHECK_EQ(askOther("{\"op\":\"download\",\"path\":\"/dev/sys/config\"}"),
-             "{\"status\":\"busy\",\"body\":{\"error\":\"busy\",\"path\":\"/dev/sys/config\","
+             "{\"status\":\"busy\",\"body\":{\"error\":\"busy\",\"reason\":\"transfer_busy\",\"path\":\"/dev/sys/config\","
              "\"message\":\"another transfer to this node is in progress\"}}");
     // Requests that aren't transfers go through meanwhile.
     CHECK_EQ(askOther("{\"op\":\"get\",\"path\":\"/dev/sys/level\"}"), "{\"status\":\"ok\",\"body\":3}");
@@ -249,7 +249,7 @@ TEST(relay_retries_and_timeouts) {
     r.gatewayEnd.process();
     CHECK_EQ(r.lines.out.size(), 1u);
     if (!r.lines.out.empty()) {
-        CHECK_EQ(r.lines.out[0], "{\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"path\":\"/ghost\","
+        CHECK_EQ(r.lines.out[0], "{\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"reason\":\"no_answer\",\"path\":\"/ghost\","
                                  "\"message\":\"remote node didn't answer\"}}");
     }
     // That ended it, and freed the peer.
@@ -259,7 +259,7 @@ TEST(relay_retries_and_timeouts) {
     r.gatewayEnd.forgetPeer(addr(9));
     r.gatewayEnd.process();
     CHECK_EQ(r.ask("{\"op\":\"download\",\"path\":\"/ghost/f\"}"),
-             "{\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"path\":\"/ghost\","
+             "{\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"reason\":\"peer_offline\",\"path\":\"/ghost\","
              "\"message\":\"peer offline\"}}");
     CHECK_EQ(r.gateway.pending(), 0);
     CHECK_EQ(r.gatewayEnd.pendingCalls(), 0u);
@@ -370,12 +370,12 @@ TEST(relay_waiting) {
         tesser::RemoteNode& ghost = r.gateway.remote("ghost", r.gatewayEnd, addr(9)).timeout(100);
         CHECK(f.openDownload("/ghost/f", admin, reply) == FileTransfer::Open::Failed);
         CHECK_EQ(reply.status, Status::Timeout);
-        CHECK_EQ(reply.body, "{\"error\":\"timeout\",\"path\":\"/ghost\",\"message\":\"remote node didn't answer\"}");
+        CHECK_EQ(reply.body, "{\"error\":\"timeout\",\"reason\":\"no_answer\",\"path\":\"/ghost\",\"message\":\"remote node didn't answer\"}");
         // A lost one too, though its error has a body.
         r.gatewayEnd.forgetPeer(addr(9));
         for (int i = 0; i < 1000 && ghost.online(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         CHECK(f.openUpload("/ghost/f", admin, 4, reply) == FileTransfer::Open::Failed);
-        CHECK_EQ(reply.body, "{\"error\":\"timeout\",\"path\":\"/ghost\",\"message\":\"peer offline\"}");
+        CHECK_EQ(reply.body, "{\"error\":\"timeout\",\"reason\":\"peer_offline\",\"path\":\"/ghost\",\"message\":\"peer offline\"}");
     }
     {
         // A failed write ends the upload with the device's error.

@@ -45,6 +45,31 @@ bool parseStatus(const char* name, Status& out) {
     return false;
 }
 
+namespace {
+const char* const kReasons[] = {
+    "",           "low_memory", "pending_limit", "queue_full", "unreachable",   "subscription_limit",
+    "transfer_busy", "peer_offline", "no_answer", "idle",      "cannot_wait",   "not_authorized",
+    "ceiling_unsupported", "unknown_option",
+};
+constexpr size_t kReasonCount = sizeof(kReasons) / sizeof(kReasons[0]);
+}  // namespace
+
+const char* toString(Reason r) {
+    size_t i = static_cast<size_t>(r);
+    return i < kReasonCount ? kReasons[i] : "";
+}
+
+bool parseReason(const char* name, Reason& out) {
+    if (!name || !*name) return false;
+    for (size_t i = 1; i < kReasonCount; i++) {
+        if (strcmp(kReasons[i], name) == 0) {
+            out = static_cast<Reason>(i);
+            return true;
+        }
+    }
+    return false;
+}
+
 int httpCode(Status s) {
     size_t i = static_cast<size_t>(s);
     return i < kStatusCount ? kStatus[i].http : 500;

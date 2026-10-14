@@ -59,7 +59,8 @@ void LineTransport::handleLine() {
     Request req;
     EnvelopeId id;
     const char* message = nullptr;
-    Status s = parseEnvelope(text, doc, api_.config().maxDepth, req, id, message);
+    Reason reason = Reason::None;
+    Status s = parseEnvelope(text, doc, api_.config().maxDepth, req, id, message, &reason);
     // "auth", "upload" and "download" aren't request ops, so they fail to
     // parse as requests: read their id alone.
     bool auth = false, file = false;
@@ -67,7 +68,10 @@ void LineTransport::handleLine() {
         JsonObjectConst env = doc.as<JsonObjectConst>();
         auth = env["op"] == "auth";
         file = FileSession::handles(env);
-        if (auth || file) s = envelopeId(env, id, message);
+        if (auth || file) {
+            reason = Reason::None;
+            s = envelopeId(env, id, message);
+        }
         if (auth && s == Status::Ok) {
             handleAuth(env, id);
             return;
@@ -76,7 +80,7 @@ void LineTransport::handleLine() {
     EnvelopeReply reply(id, api_.config().maxResponse, [this](const std::string& m) { send(m); });
     reply.stream([this](const char* data, size_t len, bool first, bool final) { return sendPiece(data, len, first, final); });
     if (s != Status::Ok) {
-        writeError(reply, s, std::string_view(), message);
+        writeError(reply, s, reason, std::string_view(), message);
         return;
     }
     req.client.transport = TransportKind::Serial;
@@ -96,6 +100,12 @@ Access LineTransport::level() const { return authenticated_ ? Access::Admin : ap
 // reset(); an empty or missing token signs out. The reply gives the level.
 void LineTransport::handleAuth(JsonObjectConst envelope, const EnvelopeId& id) {
     EnvelopeReply reply(id, 0, [this](const std::string& m) { send(m); });
+    const char* message = nullptr;
+    Reason reason = Reason::None;
+    if (checkStrict(envelope, {"v", "id", "op", "token"}, message, &reason) != Status::Ok) {
+        writeError(reply, Status::BadRequest, reason, std::string_view(), message);
+        return;
+    }
     JsonVariantConst token = envelope["token"];
     if (!token.isNull() && !token.is<const char*>()) {
         writeError(reply, Status::BadRequest, std::string_view(), "token must be a string");

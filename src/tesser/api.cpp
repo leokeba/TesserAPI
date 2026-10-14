@@ -47,6 +47,8 @@ bool parseView(std::string_view s, View& out) {
         out = View::Schema;
     } else if (s == "hash") {
         out = View::Hash;
+    } else if (s == "info") {
+        out = View::Info;
     } else {
         return false;
     }
@@ -289,7 +291,7 @@ public:
         if (star_) return fanOut(*target);
         if (req_.op != Op::Unsubscribe) {
             Access need = req_.op == Op::Set ? writeNeed_ : readNeed_;
-            if (level_ < need || !allowed(*target)) return replyError(Status::Unauthorized, "not authorized", base_);
+            if (level_ < need || !allowed(*target)) return replyError(Status::Unauthorized, Reason::NotAuthorized, "not authorized", base_);
         }
         if (target->type() == NodeType::Remote) {
             auto& remote = static_cast<RemoteNode&>(*target);
@@ -331,7 +333,7 @@ public:
         }
         Access need = req_.op == Op::Set ? writeNeed_ : readNeed_;
         if (level_ < need || !allowed(*target)) {
-            replyError(Status::Unauthorized, "not authorized", base_);
+            replyError(Status::Unauthorized, Reason::NotAuthorized, "not authorized", base_);
             return nullptr;
         }
         if (relayed) {
@@ -394,20 +396,24 @@ private:
     }
 
     // Records the first error; the reply is written once the walk unwinds.
-    bool error(Status s, const char* message) {
+    bool error(Status s, const char* message, Reason reason = Reason::None) {
         if (!failed_) {
             failed_ = true;
             errStatus_ = s;
+            errReason_ = reason;
             errMessage_ = message;
             errPath_ = trailPath();
         }
         return false;
     }
 
-    void replyError() { writeError(reply_, errStatus_, errPath_, errMessage_, partial_); }
+    void replyError() { writeError(reply_, errStatus_, errReason_, errPath_, errMessage_, partial_); }
 
     void replyError(Status s, const char* message, std::string_view path) {
-        writeError(reply_, s, path.empty() ? std::string_view("/") : path, message);
+        replyError(s, Reason::None, message, path);
+    }
+    void replyError(Status s, Reason reason, const char* message, std::string_view path) {
+        writeError(reply_, s, reason, path.empty() ? std::string_view("/") : path, message);
     }
 
     // ---- resolution ---------------------------------------------------
@@ -493,11 +499,63 @@ private:
 
     // ---- get ----------------------------------------------------------
 
+    // The schema this client would read, whole, without the state of remote
+    // nodes (online, advertised hash), which changes with peers and reaches
+    // subscribers as changes. Otherwise two gateways mounting each other
+    // would re-advertise each other's hashes forever. 8 hex digits.
+    void hashHex(Node& target, char (&hex)[9]) {
+        HashSink sink;
+        JsonWriter hw(sink);
+        hashing_ = true;
+        renderSchema(hw, target, api_.config().maxDepth, Filter());
+        hashing_ = false;
+        snprintf(hex, sizeof(hex), "%08lx", static_cast<unsigned long>(sink.hash));
+    }
+
+    // view=info (docs/DESIGN.md section 10.1.2): what a client reads before
+    // relying on newer options: the protocol, the features, and what
+    // view=hash gives.
+    bool info(Node& target) {
+        if (!req_.query.keys.empty() || !req_.query.exclude.empty() || !req_.body.isNull()) {
+            replyError(Status::BadRequest, "info takes no keys, exclude or shape", base_);
+            return false;
+        }
+        JsonWriter w(reply_.begin(Status::Ok));
+        w.beginObject();
+        w.key("protocol");
+        w.integer(kProtocolVersion);
+        w.key("features");
+        w.beginArray();
+        for (const char* f : {"ceiling", "reasons", "strict", "info"}) w.string(f);
+#if !defined(TESSER_NO_SCHEMA)
+        w.string("schema");
+#endif
+#if !defined(TESSER_NO_MESSAGES)
+        w.string("messages");
+#endif
+        w.endArray();
+#if !defined(TESSER_NO_SCHEMA)
+        char hex[9];
+        hashHex(target, hex);
+        w.key("hash");
+        w.string(hex);
+#endif
+        std::string id = api_.deviceIdHex();
+        if (!id.empty()) {
+            w.key("id");
+            w.string(id);
+        }
+        w.endObject();
+        detail::finishBody(reply_, w, base_);
+        return true;
+    }
+
     // Replies with the target's representation; true if that was a success.
     bool get(Node& target) {
         const Query& q = req_.query;
         bool hasShape = !req_.body.isNull();
         View view = q.view;
+        if (view == View::Info) return info(target);
 #if defined(TESSER_NO_SCHEMA)
         if (view != View::Value) {
             replyError(Status::NotAllowed, "schemas are compiled out (TESSER_NO_SCHEMA)", base_);
@@ -509,18 +567,8 @@ private:
                 replyError(Status::BadRequest, "a hash covers the whole schema: no keys, exclude or shape", base_);
                 return false;
             }
-            // The schema this client would read, whole, without the state of
-            // remote nodes (online, advertised hash), which changes with
-            // peers and reaches subscribers as changes. Otherwise two gateways
-            // mounting each other would re-advertise each other's hashes
-            // forever.
-            HashSink sink;
-            JsonWriter hw(sink);
-            hashing_ = true;
-            renderSchema(hw, target, api_.config().maxDepth, Filter());
-            hashing_ = false;
             char hex[9];
-            snprintf(hex, sizeof(hex), "%08lx", static_cast<unsigned long>(sink.hash));
+            hashHex(target, hex);
             JsonWriter w(reply_.begin(Status::Ok));
             w.string(hex);
             detail::finishBody(reply_, w, base_);
@@ -576,7 +624,7 @@ private:
                 if (c && readable(*c)) return true;
                 push(key);
                 if (c) {
-                    error(Status::Unauthorized, "not authorized");
+                    error(Status::Unauthorized, "not authorized", Reason::NotAuthorized);
                 } else {
                     error(Status::NotFound, "no such key");
                 }
@@ -601,7 +649,7 @@ private:
             if (!push(key)) return error(Status::BadRequest, "shape too deep");
             const Node* c = obj.child(key);
             if (!c) return error(Status::NotFound, "no such key");
-            if (!readable(*c)) return error(Status::Unauthorized, "not authorized");
+            if (!readable(*c)) return error(Status::Unauthorized, "not authorized", Reason::NotAuthorized);
             JsonVariantConst v = kv.value();
             if (v.is<JsonObjectConst>()) {
                 if (c->type() != NodeType::Object) return error(Status::BadRequest, "not an object");
@@ -857,6 +905,10 @@ private:
                     w.key("id");
                     w.string(hex);
                 }
+                if (uint8_t v = hashing_ ? 0 : r.protocol()) {  // docs/DESIGN.md section 10.1.2
+                    w.key("protocol");
+                    w.integer(v);
+                }
                 break;
             }
         }
@@ -917,7 +969,7 @@ private:
         if (req_.query.view != View::Value || !req_.query.keys.empty() || !req_.query.exclude.empty()) {
             return replyError(Status::BadRequest, "set takes no query options", base_);
         }
-        if (level_ < readNeed_) return replyError(Status::Unauthorized, "not authorized", base_);
+        if (level_ < readNeed_) return replyError(Status::Unauthorized, Reason::NotAuthorized, "not authorized", base_);
         std::vector<detail::Match> matches;
         auto add = [&](std::string name, bool offline) {
             matches.emplace_back();
@@ -956,7 +1008,7 @@ private:
 
     void subscribe(Node& target) {
         if (!req_.subscriber) {
-            return replyError(Status::NotAllowed, "this transport can't deliver notifications", base_);
+            return replyError(Status::NotAllowed, Reason::CannotWait, "this transport can't deliver notifications", base_);
         }
         if (!req_.body.isNull()) {
             return replyError(Status::BadRequest, "subscriptions take keys, exclude and depth, not shapes", base_);
@@ -969,7 +1021,7 @@ private:
             return replyError(Status::NotAllowed, "subscribe to the list or array itself, not to its elements", base_);
         }
         Status allowed = api_.subscriptionAllowed(req_.subscriber);
-        if (allowed != Status::Ok) return replyError(allowed, "too many subscriptions", base_);
+        if (allowed != Status::Ok) return replyError(allowed, Reason::SubscriptionLimit, "too many subscriptions", base_);
         // Without this, the first sample after subscribing would become the
         // baseline, and a change made before it would never be notified.
         api_.sampleWatched(target);
@@ -1052,7 +1104,7 @@ private:
                 a.invoke(body, params.get(), call);
                 markLists();
                 if (call.deferred() || call.replied()) return;
-                if (call.status() != Status::Ok) return replyError(call.status(), call.message(), base_);
+                if (call.status() != Status::Ok) return replyError(call.status(), call.reason(), call.message(), base_);
                 JsonWriter w(reply_.begin(Status::Ok));
                 w.null();
                 detail::finishBody(reply_, w, base_);
@@ -1180,7 +1232,7 @@ private:
     // `need`: the level writing `n` takes, its ancestors' included.
     bool validatePatch(Node& n, JsonVariantConst v, Access need) {
         // An action's argument isn't the tree: the action itself was checked.
-        if (!filling_ && (level_ < need || !allowed(n))) return error(Status::Unauthorized, "not authorized");
+        if (!filling_ && (level_ < need || !allowed(n))) return error(Status::Unauthorized, "not authorized", Reason::NotAuthorized);
         switch (n.type()) {
             case NodeType::Object: {
                 if (!v.is<JsonObjectConst>()) return error(Status::InvalidValue, "expected object");
@@ -1312,7 +1364,7 @@ private:
                 std::string path = trailPath();
                 Call call(api_, nullptr, v, req_.client, path);
                 a.invoke(v, params.get(), call);
-                if (call.status() != Status::Ok) return error(call.status(), call.message());
+                if (call.status() != Status::Ok) return error(call.status(), call.message(), call.reason());
                 applied_++;
                 return true;
             }
@@ -1389,6 +1441,7 @@ private:
     bool failed_ = false;
     Status errStatus_ = Status::Internal;
     const char* errMessage_ = nullptr;
+    Reason errReason_ = Reason::None;
     std::string errPath_;
     int applied_ = 0;
     bool partial_ = false;
@@ -1511,7 +1564,7 @@ bool Api::enqueue(const Request& request, Reply& reply) {
     {
         MutexGuard guard(queueMutex_);
         if (queue_.size() >= config_.maxQueued) {
-            writeError(reply, Status::Busy, request.path, "request queue full");
+            writeError(reply, Status::Busy, Reason::QueueFull, request.path, "request queue full");
             return true;
         }
     }
@@ -1550,7 +1603,7 @@ void Api::runQueued() {
         if (parsed) {
             handleNow(q->request, reply);
         } else {
-            writeError(reply, Status::Internal, q->request.path, "out of memory");
+            writeError(reply, Status::Internal, Reason::LowMemory, q->request.path, "out of memory");
         }
         if (!reply.transferred) q->reply->release();
         delete q;

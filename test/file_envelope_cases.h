@@ -310,7 +310,7 @@ TEST(file_envelope_idle_takeover) {
           std::string::npos);
     CHECK_EQ(f.ram.aborted, 1);
     CHECK_EQ(a.send("{\"op\":\"upload\",\"path\":\"/sys/firmware\",\"offset\":4,\"data\":\"YWJjZA==\"}"),
-             "{\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"path\":\"/sys/firmware\",\"message\":"
+             "{\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"reason\":\"idle\",\"path\":\"/sys/firmware\",\"message\":"
              "\"the transfer was idle too long\"}}");
     // A busy transfer isn't idle, however long ago it started.
     f.api.config().transferIdleMs = 30000;

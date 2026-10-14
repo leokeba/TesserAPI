@@ -241,8 +241,10 @@ public:
     // it (UDP); NowTP addresses are MACs. Marks its remote nodes online and
     // mounts it if needed. Safe from any task; takes effect in the next
     // process().
+    // `protocol` is the version it advertises (docs/DESIGN.md section
+    // 10.1.2): 1 for an advertisement that names none, 0 when unknown.
     void peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash,
-                  const PeerAddress& device = PeerAddress());
+                  const PeerAddress& device = PeerAddress(), uint8_t protocol = 0);
 
     // Keeps an advertisement current: once the API's tree has changed (a
     // peer mounted, a node added, a remote node's state, see
@@ -295,6 +297,12 @@ private:
         std::string name;
         uint32_t schemaHash;
         PeerAddress device;
+        uint8_t protocol;
+    };
+    struct Advertised {
+        PeerAddress peer;
+        uint32_t schemaHash;
+        uint8_t protocol;
     };
 
     // A peer's file transfers, dropped once idle for Config::transferIdleMs.
@@ -344,7 +352,7 @@ private:
     void queue(Incoming&& msg);
     void handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply);
     Access levelOf(const PeerAddress& peer);
-    void reject(const Incoming& msg, Status status, const char* message);
+    void reject(const Incoming& msg, Status status, Reason reason, const char* message);
     void expire(uint32_t now, bool all, const PeerAddress* peer);
     Subscriber* subscriberFor(const PeerAddress& peer, bool create);
     void dropPeer(const PeerAddress& peer, PeerLoss reason);
@@ -377,7 +385,7 @@ private:
     std::vector<std::pair<PeerAddress, PeerLoss>> lostPeers_;  // forgetPeer() → process()
     std::vector<Seen> seenPeers_;         // peerSeen() → process()
     // Schema hashes peers advertised, for remote nodes created later.
-    std::vector<std::pair<PeerAddress, uint32_t>> advertised_;  // guarded by mutex_
+    std::vector<Advertised> advertised_;  // guarded by mutex_
     std::vector<std::pair<Object*, uint32_t>> mounts_;  // mountPeers(): parent, mirror interval
     Mutex subscribersMutex_;              // taken before the API lock, never after
     std::vector<PeerSubscriber*> subscribers_;
@@ -418,9 +426,11 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
                                  std::string_view bodyJson);
 
 // Discovery metadata announcing a TesserAPI node:
-// {"tesser":<port>,"schema":"<schemaHash, 8 hex digits>"}.
+// {"tesser":<port>,"schema":"<schemaHash, 8 hex digits>","v":<protocol>}.
 std::string buildAdvertisement(uint8_t port, uint32_t schemaHash);
 // Reads it; false if the metadata isn't a TesserAPI advertisement.
+// `protocol` is 1 when it names none (docs/DESIGN.md section 10.1.2).
 bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash);
+bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash, uint8_t& protocol);
 
 }  // namespace tesser

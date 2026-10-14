@@ -229,7 +229,7 @@ TEST(datagram_envelope_builder) {
     q.keys = "a,b";
     q.view = tesser::View::Schema;
     CHECK_EQ(tesser::buildRequestEnvelope(7, tesser::Op::Get, "/x", q, std::string_view()),
-             "{\"id\":7,\"op\":\"get\",\"path\":\"/x\",\"depth\":2,\"keys\":\"a,b\",\"view\":\"schema\"}");
+             "{\"id\":7,\"op\":\"get\",\"path\":\"/x\",\"depth\":2,\"keys\":\"a,b\",\"view\":\"schema\",\"v\":2}");
     CHECK_EQ(tesser::buildRequestEnvelope(8, tesser::Op::Set, "", tesser::Query(), "{\"a\":1}"),
              "{\"id\":8,\"op\":\"set\",\"path\":\"/\",\"body\":{\"a\":1}}");
 }

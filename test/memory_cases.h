@@ -56,7 +56,7 @@ TEST(memory_reply_refused_when_heap_is_short) {
     heap.set(5000);
     r = p.call(tesser::Op::Get, "/big");
     CHECK_EQ(r.status, Status::Busy);
-    CHECK_EQ(r.body, "{\"error\":\"busy\",\"path\":\"/big\",\"message\":\"not enough memory for the response\"}");
+    CHECK_EQ(r.body, "{\"error\":\"busy\",\"reason\":\"low_memory\",\"path\":\"/big\",\"message\":\"not enough memory for the response\"}");
     CHECK_EQ(p.call(tesser::Op::Get, "/lamp/on").body, "false");
     // Replies under 1 KB aren't checked at all.
     heap.set(0);
@@ -146,7 +146,7 @@ TEST(memory_gateway_relay_refused_when_heap_is_short) {
     r.gatewayEnd.process();  // the relay
     CHECK_EQ(r.lines.out.size(), 1u);
     if (!r.lines.out.empty()) {
-        CHECK_EQ(r.lines.out[0], "{\"id\":5,\"status\":\"busy\",\"body\":{\"error\":\"busy\",\"path\":\"/kitchen\","
+        CHECK_EQ(r.lines.out[0], "{\"id\":5,\"status\":\"busy\",\"body\":{\"error\":\"busy\",\"reason\":\"low_memory\",\"path\":\"/kitchen\","
                                  "\"message\":\"not enough memory for the response\"}}");
     }
     CHECK_EQ(r.gateway.pending(), 0);
@@ -174,7 +174,7 @@ TEST(memory_remote_subscription_admission) {
     remote_cases::Rig r;
     Floor floor(8000, 12000);
     CHECK_EQ(r.ask("{\"id\":1,\"op\":\"sub\",\"path\":\"/kitchen/lamp\"}"),
-             "{\"id\":1,\"status\":\"busy\",\"body\":{\"error\":\"busy\",\"path\":\"/kitchen/lamp\","
+             "{\"id\":1,\"status\":\"busy\",\"body\":{\"error\":\"busy\",\"reason\":\"low_memory\",\"path\":\"/kitchen/lamp\","
              "\"message\":\"not enough memory for another remote subscription\"}}");
     CHECK_EQ(r.device.api.subscriptionCount(), 0u);
     floor.free(20000);

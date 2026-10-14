@@ -41,7 +41,7 @@ std::string_view view(JsonVariantConst v) {
 }  // namespace
 
 Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth, Request& request, EnvelopeId& id,
-                     const char*& message) {
+                     const char*& message, Reason* reason) {
     id.length = 0;
     DeserializationError err = deserializeJson(doc, text.data(), text.size(),
                                                DeserializationOption::NestingLimit(envelopeNesting(maxDepth)));
@@ -53,7 +53,28 @@ Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth,
         message = "envelope must be an object";
         return Status::BadRequest;
     }
-    return requestFromEnvelope(doc.as<JsonObjectConst>(), request, id, message);
+    return requestFromEnvelope(doc.as<JsonObjectConst>(), request, id, message, reason);
+}
+
+Status checkStrict(JsonObjectConst env, std::initializer_list<const char*> known, const char*& message,
+                   Reason* reason) {
+    JsonVariantConst v = env["v"];
+    if (v.isNull()) return Status::Ok;  // lenient: unknown members are ignored
+    if (!v.is<uint8_t>() || v.as<uint8_t>() == 0) {
+        message = "v must be a protocol version, 1-255";
+        return Status::BadRequest;
+    }
+    if (v.as<uint8_t>() < 2) return Status::Ok;
+    for (JsonPairConst kv : env) {
+        bool ok = false;
+        for (const char* k : known) ok = ok || kv.key() == k;
+        if (!ok) {
+            message = "an option this node doesn't know (the request is strict: \"v\")";
+            if (reason) *reason = Reason::UnknownOption;
+            return Status::BadRequest;
+        }
+    }
+    return Status::Ok;
 }
 
 Status envelopeId(JsonObjectConst env, EnvelopeId& id, const char*& message) {
@@ -76,7 +97,8 @@ Status envelopeId(JsonObjectConst env, EnvelopeId& id, const char*& message) {
     return Status::Ok;
 }
 
-Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id, const char*& message) {
+Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id, const char*& message,
+                           Reason* reason) {
     Status s = envelopeId(env, id, message);
     if (s != Status::Ok) return s;
     JsonVariantConst op = env["op"];
@@ -89,6 +111,11 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
     // A gateway's client (docs/DESIGN.md section 13.1): no more than its level.
     request.query.ceiling = ceiling;
     request.client.cap(ceiling);
+    s = checkStrict(env,
+                    {"v", "id", "op", "path", "depth", "keys", "exclude", "view", "interval", "remotes", "changes",
+                     "events", "snapshot", "body"},
+                    message, reason);
+    if (s != Status::Ok) return s;
     JsonVariantConst path = env["path"];
     if (path.isNull()) {
         request.path = "/";
@@ -125,7 +152,7 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
     }
     JsonVariantConst v = env["view"];
     if (!v.isNull() && (!v.is<const char*>() || !parseView(view(v), request.query.view))) {
-        message = "view must be \"value\", \"schema\" or \"hash\"";
+        message = "view must be \"value\", \"schema\", \"hash\" or \"info\"";
         return Status::BadRequest;
     }
     JsonVariantConst interval = env["interval"];
@@ -267,9 +294,13 @@ void handleEnvelope(Api& api, std::string_view text, const Client& client, const
     req.subscriber = subscriber;
     EnvelopeId id;
     const char* message = nullptr;
-    Status s = parseEnvelope(text, doc, api.config().maxDepth, req, id, message);
+    Reason reason = Reason::None;
+    Status s = parseEnvelope(text, doc, api.config().maxDepth, req, id, message, &reason);
     bool file = s != Status::Ok && files && doc.is<JsonObjectConst>() && FileSession::handles(doc.as<JsonObjectConst>());
-    if (file) s = envelopeId(doc.as<JsonObjectConst>(), id, message);
+    if (file) {
+        reason = Reason::None;
+        s = envelopeId(doc.as<JsonObjectConst>(), id, message);
+    }
     EnvelopeReply reply(id, api.config().maxResponse, send);
     if (stream) reply.stream(stream);
     if (file && s == Status::Ok) {
@@ -277,7 +308,7 @@ void handleEnvelope(Api& api, std::string_view text, const Client& client, const
         return;
     }
     if (s != Status::Ok) {
-        writeError(reply, s, std::string_view(), message);
+        writeError(reply, s, reason, std::string_view(), message);
         return;
     }
     api.handle(req, reply);

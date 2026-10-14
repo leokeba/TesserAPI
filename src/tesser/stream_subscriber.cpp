@@ -147,7 +147,7 @@ Status StreamSubscriber::open(Request request, Reply& error) {
         MutexGuard guard(later->mutex);
         if (!answered && !later->ended) {
             later->abandoned = true;
-            writeError(error, Status::Timeout, request.path, "the remote node didn't answer");
+            writeError(error, Status::Timeout, Reason::NoAnswer, request.path, "the remote node didn't answer");
             open_ = false;
             api_.dropSubscriber(this);  // the waiting subscription, answered with nothing
             return Status::Timeout;

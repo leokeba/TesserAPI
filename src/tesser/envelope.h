@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 #include <functional>
+#include <initializer_list>
 #include <string>
 #include <string_view>
 
@@ -37,12 +38,20 @@ constexpr uint8_t kWrittenNesting = JsonWriter::kMaxNesting + 1;
 
 // Parses one envelope (docs/DESIGN.md section 10.1) into `request`. Strings in
 // `request` point into `doc`. On failure returns the status to reply with and
-// sets `message`; `id` is filled whenever the envelope had a usable one.
+// sets `message` (and `reason`, when given); `id` is filled whenever the
+// envelope had a usable one.
 Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth, Request& request, EnvelopeId& id,
-                     const char*& message);
+                     const char*& message, Reason* reason = nullptr);
 
 // Same, from an already parsed envelope object.
-Status requestFromEnvelope(JsonObjectConst envelope, Request& request, EnvelopeId& id, const char*& message);
+Status requestFromEnvelope(JsonObjectConst envelope, Request& request, EnvelopeId& id, const char*& message,
+                           Reason* reason = nullptr);
+
+// A strict envelope ("v" of 2 or more, docs/DESIGN.md section 10.1.2) whose
+// members aren't all among `known`: Status::BadRequest with `message` and
+// `reason` set. Ok otherwise.
+Status checkStrict(JsonObjectConst envelope, std::initializer_list<const char*> known, const char*& message,
+                   Reason* reason);
 
 // Reads only the envelope's id, for envelopes that aren't requests ("auth",
 // "upload", "download"). An unusable id is BadRequest with `message`.

@@ -241,7 +241,7 @@ void writeMapped(Reply& reply, Status s, JsonVariantConst body, const std::strin
     // (docs/DESIGN.md section 13.1): this client may not reach it.
     std::string_view message(body["message"] | "");
     if (s == Status::BadRequest && message.compare(0, 11, "op must be ") == 0) {
-        return writeError(reply, Status::Unauthorized, localPath,
+        return writeError(reply, Status::Unauthorized, Reason::CeilingUnsupported, localPath,
                           "the remote node can't limit a client's access: only admins reach it through a gateway");
     }
     JsonWriter w(reply.begin(s));
@@ -249,6 +249,10 @@ void writeMapped(Reply& reply, Status s, JsonVariantConst body, const std::strin
         w.beginObject();
         w.key("error");
         w.string(toString(s));
+        if (s == Status::Timeout || s == Status::Busy) {
+            w.key("reason");
+            w.string(toString(s == Status::Timeout ? Reason::NoAnswer : Reason::Unreachable));
+        }
         w.key("path");
         w.string(localPath);
         w.key("message");
@@ -626,6 +630,10 @@ void RemoteNode::routeRoundTrip(const DatagramEndpoint* endpoint, const PeerAddr
     }
 }
 
+void RemoteNode::setProtocol(uint8_t version) {
+    if (version && protocol_.exchange(version) != version) changed();
+}
+
 void RemoteNode::setAdvertisedSchema(uint32_t hash) {
     if (advertisedSchema_.exchange(hash) != hash) changed();
 }
@@ -916,14 +924,14 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
     // Known to be unreachable: fail now rather than hold a pending slot
     // until the timeout, as fan-out and file relays do.
     if (!online()) {
-        return writeError(reply, Status::Timeout, localBase.empty() ? std::string_view("/") : localBase,
+        return writeError(reply, Status::Timeout, Reason::PeerOffline, localBase.empty() ? std::string_view("/") : localBase,
                           "peer offline");
     }
-    if (!api.pendingBegin()) return writeError(reply, Status::Busy, basePath, "too many pending calls");
+    if (!api.pendingBegin()) return writeError(reply, Status::Busy, Reason::PendingLimit, basePath, "too many pending calls");
     Reply* detached = reply.detach();
     if (!detached) {
         api.pendingDone();
-        return writeError(reply, Status::NotAllowed, basePath, "this transport can't wait for remote nodes");
+        return writeError(reply, Status::NotAllowed, Reason::CannotWait, basePath, "this transport can't wait for remote nodes");
     }
     std::string remoteBase = remotePath_ == "/" ? std::string() : remotePath_;
     Api* a = &api;
@@ -939,7 +947,7 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
         Sink& out = detached->begin(Status::Ok);
         if (!out.write(json.data(), json.size()) && detached->rollback()) {
             if (detached->outOfMemory()) {
-                writeError(*detached, Status::Busy, okPath, "not enough memory for the response");
+                writeError(*detached, Status::Busy, Reason::LowMemory, okPath, "not enough memory for the response");
             } else {
                 writeError(*detached, Status::TooLarge, okPath, "response too large");
             }
@@ -954,7 +962,7 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
     q.ceiling = request.client.level();
     if (!r.endpoint->requestRaw(r.peer, request.op, remotePathOf(rest), request.body, raw, done, q, timeoutMs_,
                                 this)) {
-        writeError(*detached, Status::Busy, basePath, "couldn't send to the remote node");
+        writeError(*detached, Status::Busy, Reason::Unreachable, basePath, "couldn't send to the remote node");
         detached->release();
         api.pendingDone();
     }
@@ -1067,6 +1075,7 @@ void RemoteNode::pump() {
         if (!onError) return;
         JsonDocument error;
         error["error"] = "timeout";
+        error["reason"] = "peer_offline";
         error["message"] = "peer offline";
         for (const Pending& p : dropped) {
             error["path"] = p.path.empty() ? std::string("/") : p.path;
@@ -1116,7 +1125,7 @@ void RemoteNode::streamDone(Status s, JsonVariantConst body) {
 void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, std::string_view base,
                            Reply& reply) {
     std::string_view basePath = base.empty() ? std::string_view("/") : base;
-    if (!req.subscriber) return writeError(reply, Status::NotAllowed, basePath, "this transport can't deliver notifications");
+    if (!req.subscriber) return writeError(reply, Status::NotAllowed, Reason::CannotWait, basePath, "this transport can't deliver notifications");
     if (!req.body.isNull()) {
         return writeError(reply, Status::BadRequest, basePath, "subscriptions take keys, exclude and depth, not shapes");
     }
@@ -1124,7 +1133,7 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
     Route route;
     if (!this->route(route)) return writeError(reply, Status::Internal, basePath, "no endpoint");
     Status allowed = api.subscriptionAllowed(req.subscriber);
-    if (allowed != Status::Ok) return writeError(reply, allowed, basePath, "too many subscriptions");
+    if (allowed != Status::Ok) return writeError(reply, allowed, Reason::SubscriptionLimit, basePath, "too many subscriptions");
 
     api_ = &api;
     if (localPath_.empty()) localPath_.assign(base.data(), base.size() - rest.size());
@@ -1169,19 +1178,19 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
         }
         if (!online()) {
             std::string localBase(base.substr(0, base.size() - rest.size()));
-            return writeError(reply, Status::Timeout, localBase.empty() ? std::string_view("/") : localBase,
+            return writeError(reply, Status::Timeout, Reason::PeerOffline, localBase.empty() ? std::string_view("/") : localBase,
                               "peer offline");
         }
         // A new or wider copy of the remote's state, and the snapshots
         // rendered from it: only with room to spare above the heap floor.
         if (!heapAbove(heapFloor())) {
-            return writeError(reply, Status::Busy, basePath, "not enough memory for another remote subscription");
+            return writeError(reply, Status::Busy, Reason::LowMemory, basePath, "not enough memory for another remote subscription");
         }
-        if (!api.pendingBegin()) return writeError(reply, Status::Busy, basePath, "too many pending calls");
+        if (!api.pendingBegin()) return writeError(reply, Status::Busy, Reason::PendingLimit, basePath, "too many pending calls");
         Reply* detached = reply.detach();
         if (!detached) {
             api.pendingDone();
-            return writeError(reply, Status::NotAllowed, basePath, "this transport can't wait for remote nodes");
+            return writeError(reply, Status::NotAllowed, Reason::CannotWait, basePath, "this transport can't wait for remote nodes");
         }
         sub.waiting = detached;
         if (!u) {
@@ -1318,6 +1327,7 @@ void RemoteNode::upstreamReply(const std::string& rest, Access level, Status s, 
         JsonDocument noRoom;
         if (s == Status::Ok && !heapAbove(2 * measureJson(body))) {
             noRoom["error"] = "busy";
+            noRoom["reason"] = "low_memory";
             noRoom["path"] = remotePathOf(rest);
             noRoom["message"] = "not enough memory for the remote's state";
             s = Status::Busy;
@@ -1463,12 +1473,16 @@ std::string opFor(const char* op, Access level) {
     return s;
 }
 
+// Strict (docs/DESIGN.md section 10.1.2): a node that doesn't know an
+// option refuses the envelope rather than ignore it.
 std::string fieldsOf(const std::function<void(JsonWriter&)>& write) {
     std::string text;
     StringSink sink(text);
     JsonWriter w(sink);
     w.beginObject();
     write(w);
+    w.key("v");
+    w.integer(kProtocolVersion);
     w.endObject();
     return text.substr(1, text.size() - 2);  // the members, without the braces
 }
@@ -1504,7 +1518,7 @@ public:
     bool claim(Reply& reply) override {
         MutexGuard guard(mutex_);
         if (!claimed_ && !api_.claimTransfer(key_, this)) {
-            writeError(reply, Status::Busy, localPath_, "another transfer to this node is in progress");
+            writeError(reply, Status::Busy, Reason::TransferBusy, localPath_, "another transfer to this node is in progress");
             return false;
         }
         claimed_ = true;
@@ -1670,6 +1684,7 @@ private:
         if (!node_.online()) {
             JsonDocument error;
             error["error"] = "timeout";
+            error["reason"] = "peer_offline";
             error["path"] = remoteBase_.empty() ? std::string("/") : remoteBase_;
             error["message"] = "peer offline";
             done(Status::Timeout, error.as<JsonVariantConst>());

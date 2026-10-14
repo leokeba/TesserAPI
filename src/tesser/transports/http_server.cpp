@@ -751,7 +751,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
         query = static_cast<char*>(malloc(queryLen + 1));
         if (!query || httpd_req_get_url_query_str(req, query, queryLen + 1) != ESP_OK) {
             free(query);
-            writeError(reply, Status::Internal, path, "out of memory");
+            writeError(reply, Status::Internal, Reason::LowMemory, path, "out of memory");
             return ESP_OK;
         }
         size_t len = 0;
@@ -865,7 +865,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
         if (xSemaphoreTake(st->done, pdMS_TO_TICKS(cfg.deferTimeoutMs)) == pdTRUE) {
             reply.sendWhole(st->status, st->body);
         } else {
-            writeError(reply, Status::Timeout, path, "deferred call timed out");
+            writeError(reply, Status::Timeout, Reason::NoAnswer, path, "deferred call timed out");
         }
         st->unref();
     }
@@ -959,7 +959,7 @@ esp_err_t HttpServer::serveStream(httpd_req_t* req, const Request& request, Repl
     {
         MutexGuard guard(streamsMutex_);
         if (streams_.size() >= maxStreams_) {
-            writeError(reply, Status::Busy, request.path, "too many streams");
+            writeError(reply, Status::Busy, Reason::SubscriptionLimit, request.path, "too many streams");
             return ESP_OK;
         }
     }

@@ -136,10 +136,11 @@ bool NowTpTransport::parseAdvertisement(const std::vector<uint8_t>& metadata, ui
 
 void NowTpTransport::peerEvent(nowtp::PeerEvent event, const nowtp::PeerInfo& peer) {
     if (event == nowtp::PeerEvent::Lost) return peerLost(peer.mac);
-    uint8_t port;
+    uint8_t port, protocol;
     uint32_t hash;
-    if (parseAdvertisement(peer.metadata, port, hash) && port == port_) {
-        endpoint_.peerSeen(address(peer.mac), peer.name, hash);
+    std::string_view meta(reinterpret_cast<const char*>(peer.metadata.data()), peer.metadata.size());
+    if (tesser::parseAdvertisement(meta, port, hash, protocol) && port == port_) {
+        endpoint_.peerSeen(address(peer.mac), peer.name, hash, PeerAddress(), protocol);
     }
 }
 

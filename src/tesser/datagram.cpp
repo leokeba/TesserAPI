@@ -48,7 +48,7 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
     }
     if (query.view != View::Value) {
         w.key("view");
-        w.string(query.view == View::Schema ? "schema" : "hash");
+        w.string(query.view == View::Schema ? "schema" : query.view == View::Hash ? "hash" : "info");
     }
     if (!query.remotes) {
         w.key("remotes");
@@ -72,6 +72,15 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
             w.boolean(false);
         }
     }
+    // With options, strict (docs/DESIGN.md section 10.1.2): a node that
+    // doesn't know one refuses the request rather than ignore it.
+    bool options = query.depth >= 0 || !query.keys.empty() || !query.exclude.empty() || query.view != View::Value ||
+                   !query.remotes || query.ceiling < Access::Admin ||
+                   (op == Op::Subscribe && (query.interval || !query.changes || !query.events || !query.snapshot));
+    if (options) {
+        w.key("v");
+        w.integer(kProtocolVersion);
+    }
     if (!bodyJson.empty()) {
         w.key("body");
         w.raw(bodyJson);
@@ -82,17 +91,23 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
 
 std::string buildAdvertisement(uint8_t port, uint32_t schemaHash) {
     char meta[48];
-    int n = snprintf(meta, sizeof(meta), "{\"tesser\":%u,\"schema\":\"%08lx\"}", unsigned(port),
-                     static_cast<unsigned long>(schemaHash));
+    int n = snprintf(meta, sizeof(meta), "{\"tesser\":%u,\"schema\":\"%08lx\",\"v\":%d}", unsigned(port),
+                     static_cast<unsigned long>(schemaHash), kProtocolVersion);
     return std::string(meta, n > 0 ? static_cast<size_t>(n) : 0);
 }
 
 bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash) {
+    uint8_t protocol;
+    return parseAdvertisement(metadata, port, schemaHash, protocol);
+}
+
+bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash, uint8_t& protocol) {
     JsonDocument doc;
     if (deserializeJson(doc, metadata.data(), metadata.size())) return false;
     if (!doc["tesser"].is<uint8_t>() || !doc["schema"].is<const char*>()) return false;
     port = doc["tesser"].as<uint8_t>();
     schemaHash = static_cast<uint32_t>(strtoul(doc["schema"].as<const char*>(), nullptr, 16));
+    protocol = doc["v"].is<uint8_t>() && doc["v"].as<uint8_t>() ? doc["v"].as<uint8_t>() : uint8_t(1);
     return true;
 }
 
@@ -299,7 +314,7 @@ void DatagramEndpoint::queue(Incoming&& msg) {
         return;
     }
     // Full: answer requests with "busy" so clients needn't wait for a timeout.
-    reject(msg, Status::Busy, "request queue full");
+    reject(msg, Status::Busy, Reason::QueueFull, "request queue full");
 }
 
 bool DatagramEndpoint::process() {
@@ -371,7 +386,7 @@ void DatagramEndpoint::checkAdvertisement(uint32_t now) {
     publish_(hash);
 }
 
-void DatagramEndpoint::reject(const Incoming& msg, Status status, const char* message) {
+void DatagramEndpoint::reject(const Incoming& msg, Status status, Reason reason, const char* message) {
     // Only requests get an error reply; responses and notifications are dropped.
     JsonDocument filter;
     filter["id"] = true;
@@ -400,7 +415,7 @@ void DatagramEndpoint::reject(const Incoming& msg, Status status, const char* me
     EnvelopeReply reply(id, 0, [send, to](std::string& m) {
         if (send) send(to, std::move(m), Delivery::Reliable);
     });
-    writeError(reply, status, std::string_view(), message);
+    writeError(reply, status, reason, std::string_view(), message);
 }
 
 namespace {
@@ -683,8 +698,9 @@ void DatagramEndpoint::handle(Incoming& msg) {
     }
     EnvelopeId id;
     const char* message = nullptr;
+    Reason reason = Reason::None;
     bool auth = op == "auth";
-    Status s = auth ? envelopeId(env, id, message) : requestFromEnvelope(env, req, id, message);
+    Status s = auth ? envelopeId(env, id, message) : requestFromEnvelope(env, req, id, message, &reason);
     if (s == Status::Ok && nesting(env) > envelopeNesting(api_->config().maxDepth)) {
         s = Status::BadRequest;
         message = "envelope nested too deeply";
@@ -696,8 +712,9 @@ void DatagramEndpoint::handle(Incoming& msg) {
     EnvelopeReply reply(id, api_->config().maxResponse, [send, to, silent](std::string& m) {
         if (send && !silent) send(to, std::move(m), Delivery::Reliable);
     });
+    if (s == Status::Ok && auth) s = checkStrict(env, {"v", "id", "op", "token"}, message, &reason);
     if (s != Status::Ok) {
-        writeError(reply, s, std::string_view(), message);
+        writeError(reply, s, reason, std::string_view(), message);
         return;
     }
     if (auth) {
@@ -1104,7 +1121,9 @@ void DatagramEndpoint::addRemote(RemoteNode* remote) {
 void DatagramEndpoint::routeAdded(RemoteNode* remote, const PeerAddress& peer) {
     MutexGuard guard(mutex_);
     for (auto& a : advertised_) {
-        if (a.first == peer) remote->setAdvertisedSchema(a.second);
+        if (a.peer != peer) continue;
+        remote->setAdvertisedSchema(a.schemaHash);
+        remote->setProtocol(a.protocol);
     }
     // What this endpoint knows of the peer holds for the new route too.
     if (Known* k = knownLocked(peer)) {
@@ -1157,7 +1176,7 @@ void DatagramEndpoint::mountPeers(Object& parent, uint32_t mirrorIntervalMs) {
 }
 
 void DatagramEndpoint::peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash,
-                                const PeerAddress& device) {
+                                const PeerAddress& device, uint8_t protocol) {
     {
         MutexGuard guard(mutex_);
         for (Seen& s : seenPeers_) {
@@ -1165,10 +1184,11 @@ void DatagramEndpoint::peerSeen(const PeerAddress& peer, std::string_view name, 
                 s.name.assign(name.data(), name.size());
                 s.schemaHash = schemaHash;
                 s.device = device;
+                s.protocol = protocol;
                 return;
             }
         }
-        seenPeers_.push_back(Seen{peer, std::string(name), schemaHash, device});
+        seenPeers_.push_back(Seen{peer, std::string(name), schemaHash, device, protocol});
     }
     if (onQueued_) onQueued_();
 }
@@ -1212,16 +1232,18 @@ void DatagramEndpoint::applySeen(const Seen& seen) {
             if (!r->hasRoute(this, seen.peer)) continue;
             r->setRouteOnline(this, seen.peer, true, now);
             r->setAdvertisedSchema(seen.schemaHash);
+            r->setProtocol(seen.protocol);
             routed.push_back(r);
         }
         bool found = false;
         for (auto& a : advertised_) {
-            if (a.first == seen.peer) {
-                a.second = seen.schemaHash;
+            if (a.peer == seen.peer) {
+                a.schemaHash = seen.schemaHash;
+                a.protocol = seen.protocol;
                 found = true;
             }
         }
-        if (!found) advertised_.emplace_back(seen.peer, seen.schemaHash);
+        if (!found) advertised_.push_back(Advertised{seen.peer, seen.schemaHash, seen.protocol});
         mounts = mounts_;
     }
     if (!api_) return;
@@ -1247,6 +1269,7 @@ void DatagramEndpoint::mount(Object& parentRef, uint32_t mirrorMs, const Seen& s
         if (device.length && r->device() == device) {
             r->addRoute(*this, seen.peer);
             r->setAdvertisedSchema(seen.schemaHash);
+            r->setProtocol(seen.protocol);
             return;
         }
     }

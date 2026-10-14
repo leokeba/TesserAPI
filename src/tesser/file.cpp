@@ -6,6 +6,7 @@
 
 #include "tesser/api.h"
 #include "tesser/call.h"
+#include "tesser/envelope.h"
 #include "tesser/remote.h"
 
 namespace tesser {
@@ -147,7 +148,7 @@ FileTransfer::Open FileTransfer::openLocal(FileNode& file, const Client& client,
         return Open::Failed;
     }
     if (!api_.claimTransfer(path_, this)) {
-        writeError(reply, Status::Busy, path_, "another transfer is in progress");
+        writeError(reply, Status::Busy, Reason::TransferBusy, path_, "another transfer is in progress");
         return Open::Failed;
     }
     claimed_ = true;
@@ -177,7 +178,7 @@ FileTransfer::Open FileTransfer::openLocal(FileNode& file, const Client& client,
 namespace {
 void noTransfer(Reply& reply, const std::string& path, bool expired, const char* what) {
     if (expired) {
-        writeError(reply, Status::Timeout, path, "the transfer was idle too long");
+        writeError(reply, Status::Timeout, Reason::Idle, path, "the transfer was idle too long");
     } else {
         writeError(reply, Status::Internal, path, what);
     }
@@ -548,6 +549,13 @@ void FileSession::handle(JsonObjectConst envelope, const Client& from, Reply& re
     splitOp(text(envelope["op"]), op, ceiling);
     Client client = from;
     client.cap(ceiling);
+    const char* message = nullptr;
+    Reason reason = Reason::None;
+    if (checkStrict(envelope, {"v", "id", "op", "path", "offset", "size", "filename", "data", "length"}, message,
+                    &reason) != Status::Ok) {
+        writeError(reply, Status::BadRequest, reason, std::string_view(), message);
+        return;
+    }
     JsonVariantConst p = envelope["path"];
     std::string_view path = "/";
     if (p.is<const char*>()) {
@@ -607,7 +615,7 @@ void FileSession::upload(JsonObjectConst envelope, std::string_view path, uint64
     } else if (!state_ || !state_->upload || state_->path != path || !state_->transfer.active()) {
         bool expired = state_ && state_->upload && state_->path == path && state_->transfer.expired();
         if (expired) {
-            writeError(reply, Status::Timeout, path, "the transfer was idle too long");
+            writeError(reply, Status::Timeout, Reason::Idle, path, "the transfer was idle too long");
         } else {
             writeError(reply, Status::BadRequest, path, "no upload in progress at this path");
         }
@@ -697,7 +705,7 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
             if (n < 0) {
                 bool expired = s.transfer.expired();
                 state_.reset();
-                writeError(reply, expired ? Status::Timeout : Status::Internal, path,
+                writeError(reply, expired ? Status::Timeout : Status::Internal, expired ? Reason::Idle : Reason::None, path,
                            expired ? "the transfer was idle too long" : "read failed");
                 return;
             }
@@ -748,13 +756,13 @@ namespace {
 // Defers `reply` for a relay call: false, with the error written, if it can't.
 Reply* deferFor(Api& api, Reply& reply, const std::string& path) {
     if (!api.pendingBegin()) {
-        writeError(reply, Status::Busy, path, "too many pending calls");
+        writeError(reply, Status::Busy, Reason::PendingLimit, path, "too many pending calls");
         return nullptr;
     }
     Reply* detached = reply.detach();
     if (!detached) {
         api.pendingDone();
-        writeError(reply, Status::NotAllowed, path, "this transport can't wait for remote nodes");
+        writeError(reply, Status::NotAllowed, Reason::CannotWait, path, "this transport can't wait for remote nodes");
     }
     return detached;
 }
@@ -762,12 +770,12 @@ Reply* deferFor(Api& api, Reply& reply, const std::string& path) {
 // Whether `relay` can take the next envelope; otherwise the error is written.
 bool relayReady(const FileRelay& relay, Reply& reply, const std::string& path, bool upload) {
     if (relay.busy()) {
-        writeError(reply, Status::Busy, path, "the last chunk is still on its way");
+        writeError(reply, Status::Busy, Reason::TransferBusy, path, "the last chunk is still on its way");
         return false;
     }
     if (relay.open()) return true;
     if (relay.expired()) {
-        writeError(reply, Status::Timeout, path, "the transfer was idle too long");
+        writeError(reply, Status::Timeout, Reason::Idle, path, "the transfer was idle too long");
     } else {
         writeError(reply, Status::BadRequest, path,
                    upload ? "no upload in progress at this path" : "no download in progress at this path");

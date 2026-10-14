@@ -5,10 +5,19 @@
 namespace tesser {
 
 void writeError(Reply& reply, Status status, std::string_view path, const char* message, bool partial) {
+    writeError(reply, status, Reason::None, path, message, partial);
+}
+
+void writeError(Reply& reply, Status status, Reason reason, std::string_view path, const char* message,
+                bool partial) {
     JsonWriter w(reply.begin(status));
     w.beginObject();
     w.key("error");
     w.string(toString(status));
+    if (reason != Reason::None) {
+        w.key("reason");
+        w.string(toString(reason));
+    }
     w.key("path");
     w.string(path.empty() ? std::string_view("/") : path);
 #if !defined(TESSER_NO_MESSAGES)
@@ -32,7 +41,7 @@ namespace detail {
 void finishBody(Reply& reply, JsonWriter& w, std::string_view path) {
     if (!w.ok() && reply.rollback()) {
         if (reply.outOfMemory()) {
-            writeError(reply, Status::Busy, path, "not enough memory for the response");
+            writeError(reply, Status::Busy, Reason::LowMemory, path, "not enough memory for the response");
         } else {
             writeError(reply, Status::TooLarge, path, "response too large");
         }
@@ -112,12 +121,14 @@ Pending Call::defer() {
     if (!reply_ || replied_ || deferred_) return Pending();
     if (!api_.pendingBegin()) {
         fail(Status::Busy, "too many pending calls");
+        reason_ = Reason::PendingLimit;
         return Pending();
     }
     Reply* detached = reply_->detach();
     if (!detached) {
         api_.pendingDone();
         fail(Status::NotAllowed, "transport can't defer replies");
+        reason_ = Reason::CannotWait;
         return Pending();
     }
     deferred_ = true;

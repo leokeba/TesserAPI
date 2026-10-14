@@ -16,8 +16,11 @@ namespace tesser {
 
 class Api;
 
-// Writes the standard error body: {"error":..,"path":..,"message":..}.
+// Writes the standard error body: {"error":..,"reason":..,"path":..,"message":..},
+// "reason" only when there is one.
 void writeError(Reply& reply, Status status, std::string_view path, const char* message, bool partial = false);
+void writeError(Reply& reply, Status status, Reason reason, std::string_view path, const char* message,
+                bool partial = false);
 
 namespace detail {
 // Ends a reply whose body was written through `w`, turning an overflow into a
@@ -112,6 +115,7 @@ public:
     // Used by the core.
     Status status() const { return status_; }
     const char* message() const { return message_; }
+    Reason reason() const { return reason_; }
     bool replied() const { return replied_; }
     bool deferred() const { return deferred_; }
 
@@ -123,6 +127,7 @@ private:
     std::string_view path_;
     Status status_ = Status::Ok;
     const char* message_ = nullptr;
+    Reason reason_ = Reason::None;  // defer()'s refusals
     bool replied_ = false;
     bool deferred_ = false;
 };

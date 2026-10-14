@@ -216,7 +216,7 @@ TEST(auth_read_only_unless_authenticated) {
     CHECK_EQ(cases::get(d.api, "/lamp").status, Status::Ok);
     cases::Resp r = cases::set(d.api, "/lamp/on", "true");
     CHECK_EQ(r.status, Status::Unauthorized);
-    CHECK_EQ(r.body, "{\"error\":\"unauthorized\",\"path\":\"/lamp/on\",\"message\":\"not authorized\"}");
+    CHECK_EQ(r.body, "{\"error\":\"unauthorized\",\"reason\":\"not_authorized\",\"path\":\"/lamp/on\",\"message\":\"not authorized\"}");
     CHECK_EQ(cases::set(d.api, "/lamp/toggle", nullptr).status, Status::Unauthorized);
     CHECK(!d.lamp.on);
 

@@ -188,9 +188,9 @@ TEST(wildcard_remote_nodes) {
     // An offline peer is reported at once; a peer without the path is skipped.
     p.ghost.setOnline(false);
     CHECK_EQ(p.ask("{\"id\":1,\"op\":\"set\",\"path\":\"/peers/*/lamp/brightness\",\"body\":7}"),
-             "{\"id\":1,\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"path\":\"/peers/*/lamp/brightness\","
+             "{\"id\":1,\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"reason\":\"peer_offline\",\"path\":\"/peers/*/lamp/brightness\","
              "\"message\":\"1 of 3 failed: ghost: peer offline\",\"partial\":true,"
-             "\"failed\":{\"ghost\":{\"error\":\"timeout\",\"path\":\"/peers/ghost\",\"message\":\"peer offline\"}},"
+             "\"failed\":{\"ghost\":{\"error\":\"timeout\",\"reason\":\"peer_offline\",\"path\":\"/peers/ghost\",\"message\":\"peer offline\"}},"
              "\"ok\":{\"a\":7,\"b\":7}}}");
     CHECK_EQ(p.a.lamp.brightness, 7);
     CHECK_EQ(p.b.lamp.brightness, 7);
@@ -222,7 +222,7 @@ TEST(wildcard_remote_nodes) {
     // The first failure in tree order sets the status (ghost was mounted first).
     CHECK(busy.find("\"status\":\"timeout\"") != std::string::npos);
     CHECK(busy.find("\"message\":\"3 of 4 failed: ghost: peer offline\"") != std::string::npos);
-    CHECK(busy.find("\"b\":{\"error\":\"busy\",\"path\":\"/peers/b/lamp/brightness\","
+    CHECK(busy.find("\"b\":{\"error\":\"busy\",\"reason\":\"pending_limit\",\"path\":\"/peers/b/lamp/brightness\","
                     "\"message\":\"too many pending calls\"}") != std::string::npos);
     CHECK(busy.find("\"ok\":{\"a\":9}") != std::string::npos);
     CHECK_EQ(p.gateway.pending(), 0);

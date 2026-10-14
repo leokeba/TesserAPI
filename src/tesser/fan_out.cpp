@@ -75,7 +75,7 @@ public:
             std::string match = matchPath(i);
             if (results_[i].offline) {
                 StringReply r;
-                writeError(r, Status::Timeout, match, "peer offline");
+                writeError(r, Status::Timeout, Reason::PeerOffline, match, "peer offline");
                 record(i, r.status, std::move(r.body));
                 continue;
             }
@@ -208,6 +208,14 @@ private:
         if (first) {
             w.key("error");
             w.string(toString(first->status));
+            // The first failure's reason, with its status.
+            JsonDocument filter, firstBody;
+            filter["reason"] = true;
+            if (!deserializeJson(firstBody, first->body, DeserializationOption::Filter(filter)) &&
+                firstBody["reason"].is<const char*>()) {
+                w.key("reason");
+                w.string(firstBody["reason"].as<const char*>());
+            }
             w.key("path");
             w.string(path_);
 #if !defined(TESSER_NO_MESSAGES)

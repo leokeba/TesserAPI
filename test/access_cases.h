@@ -71,7 +71,7 @@ TEST(access_filters_reads) {
              "{\"brightness\":10,\"net\":{\"port\":80,\"password\":null},\"users\":{\"admin\":null}}");
     Resp r = get(d.api, Access::User, "/users/admin");
     CHECK_EQ(r.status, Status::Unauthorized);
-    CHECK_EQ(r.body, "{\"error\":\"unauthorized\",\"path\":\"/users/admin\",\"message\":\"not authorized\"}");
+    CHECK_EQ(r.body, "{\"error\":\"unauthorized\",\"reason\":\"not_authorized\",\"path\":\"/users/admin\",\"message\":\"not authorized\"}");
     CHECK_EQ(get(d.api, Access::User, "/", cases::keys("users")).status, Status::Unauthorized);
     CHECK_EQ(get(d.api, Access::User, "/", Query(), "{\"users\":null}").status, Status::Unauthorized);
     CHECK_EQ(get(d.api, Access::User, "/", cases::keys("net")).body, "{\"net\":{\"port\":80,\"password\":null}}");
@@ -96,7 +96,7 @@ TEST(access_guards_writes) {
     // A patch is refused whole when one of its keys needs more.
     Resp r = set(d.api, Access::User, "/", "{\"brightness\":30,\"net\":{\"port\":8080}}");
     CHECK_EQ(r.status, Status::Unauthorized);
-    CHECK_EQ(r.body, "{\"error\":\"unauthorized\",\"path\":\"/net\",\"message\":\"not authorized\"}");
+    CHECK_EQ(r.body, "{\"error\":\"unauthorized\",\"reason\":\"not_authorized\",\"path\":\"/net\",\"message\":\"not authorized\"}");
     CHECK_EQ(d.brightness, 20);
     CHECK_EQ(set(d.api, Access::Admin, "/", "{\"brightness\":30,\"net\":{\"port\":8080,\"reboot\":null}}").status,
              Status::Ok);

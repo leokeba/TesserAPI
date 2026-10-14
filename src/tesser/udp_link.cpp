@@ -307,7 +307,7 @@ void UdpLink::sendAck(const PeerAddress& to, uint32_t id, uint8_t status, uint64
     sendDatagram(to, buf, len);
 }
 
-// {"name":"...","schema":"<8 hex digits>","id":"<MAC, 12 hex digits>"}
+// {"name":"...","schema":"<8 hex digits>","id":"<MAC, 12 hex digits>","v":<protocol>}
 void UdpLink::sendAdvert(const PeerAddress& to, uint8_t flags) {
     std::string payload;
     if (advertising_ && !(flags & kBye)) {
@@ -326,6 +326,8 @@ void UdpLink::sendAdvert(const PeerAddress& to, uint8_t flags) {
             w.key("id");
             w.string(hex);
         }
+        w.key("v");
+        w.integer(kProtocolVersion);
         w.endObject();
     }
     std::vector<uint8_t> buf(kHeader + payload.size());
@@ -531,6 +533,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
     std::string name;
     uint32_t hash = 0;
     PeerAddress device;
+    uint8_t protocol = 1;
     {
         MutexGuard guard(mutex_);
         if (!running_ || h.nonce == nonce_) return;  // our own broadcast, looped back
@@ -561,6 +564,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
                 if (!deserializeJson(doc, reinterpret_cast<const char*>(data + kHeader), len - kHeader) &&
                     doc["name"].is<const char*>() && doc["schema"].is<const char*>()) {
                     name = doc["name"].as<const char*>();
+                    protocol = doc["v"].is<uint8_t>() && doc["v"].as<uint8_t>() ? doc["v"].as<uint8_t>() : uint8_t(1);
                     hash = static_cast<uint32_t>(strtoul(doc["schema"].as<const char*>(), nullptr, 16));
                     const char* id = doc["id"] | "";
                     uint8_t mac[6];
@@ -585,7 +589,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
     // A peer that restarted lost its calls and subscriptions: forget them.
     if (restarted) endpoint_.forgetPeer(from, PeerLoss::Restarted);
     for (Inbound& in : inbound) endpoint_.receive(in.from, std::move(in.data), in.reliable, in.broadcast);
-    if (announced) endpoint_.peerSeen(from, name, hash, device);
+    if (announced) endpoint_.peerSeen(from, name, hash, device, protocol);
     if (bye) endpoint_.forgetPeer(from, PeerLoss::Goodbye);
 }
 

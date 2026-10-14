@@ -321,7 +321,7 @@ struct Request {
 | `depth` | `0`–`255`, default unlimited | Levels of objects to expand below the target. An object beyond the limit renders as `{}`. `depth=0` on an object gives `{}`. Values are always rendered, lists and arrays (§4.4, §4.5) included: each is one value and renders whole, its elements' objects too, so `[]` always means empty. |
 | `keys` | comma-separated names | Only these direct children of the target. An unknown name is `not_found`. |
 | `exclude` | comma-separated names | All direct children except these. |
-| `view` | `value` (default), `schema`, `hash` | The representation to return (§7). |
+| `view` | `value` (default), `schema`, `hash`, `info` | The representation to return (§7; `info`: §10.1.2). |
 | `remotes` | `true` (default), `false` | Include mirrored remote nodes' copies (§14). |
 
 `keys` and `exclude` apply only at the target level. Nested selection uses a shape (§5.3). `keys` together with `exclude` is `bad_request`. With `depth`, the target itself is level 0.
@@ -500,9 +500,10 @@ The error body is the same on every transport:
 
 ```json
 {"error": "invalid_value", "path": "/lamp/brightness", "message": "expected integer in [0, 255]"}
+{"error": "busy", "reason": "low_memory", "path": "/peers/lamp", "message": "not enough memory for the response"}
 ```
 
-`message` is compiled out with `TESSER_NO_MESSAGES`.
+`message` is for people: its wording may change, and it is compiled out with `TESSER_NO_MESSAGES`. A client that acts on an error reads `error` and, where one is given, `reason` (§10.1.2).
 
 ## 9. Execution and concurrency
 
@@ -541,7 +542,7 @@ These transports are message-based and two-way, so they share one JSON envelope.
 - **`id`:** any JSON scalar, echoed verbatim. It may be omitted, in which case the response also has no `id`.
 - **`op`:** `get`, `set`, `sub` or `unsub`; `upload` and `download` for file nodes (§10.1.1); on serial and Bluetooth lines, NowTP and UDP also `auth` (§10.4, §13.1). The keys `path`, `depth`, `keys`, `exclude`, `view`, `remotes`, `interval`, `changes`, `events`, `snapshot` and `body` map one-to-one onto `Request`.
 - **A ceiling:** any of these ops but `auth` may end in `@public`, `@user` or `@admin` (`"op": "set@user"`): the node then acts at the lower of the client's level and that one (`Query::ceiling`). Gateways use it for their clients (§13.1). It is in the op, not a key of its own, so that a node that predates it refuses the request (`bad_request`) rather than ignore the limit. A subscription made with one carries it in its notifications (`{"op": "change", "path": "/x", "body": {...}, "as": "user"}`, and the same for events), and only an `unsub` with the same one ends it: one client can hold subscriptions to a path at several levels, and tell their notifications apart.
-- **Unknown envelope keys** are ignored, for forward compatibility.
+- **Unknown envelope keys** are ignored, for forward compatibility, unless the envelope is strict (`"v"`, §10.1.2).
 - **Response:** the response is written as a stream: `{"id":…,"status":"…","body":` followed by the body and then `}`.
   - **Buffered** (NowTP, and every deferred or queued reply): the envelope is sent whole, up to `maxResponse`. A larger body is replaced with a `too_large` error.
   - **Streamed** (serial and WebSocket, for replies sent while the request is handled): `EnvelopeReply::stream()` sends the envelope in 1 KB pieces as it is rendered, so its size isn't limited and memory stays bounded. An error found before the first piece is out still replaces the reply. After that, a failed piece stops the rendering, and the transport ends the message as it can.
@@ -576,6 +577,36 @@ File nodes (§4.6) transfer over these transports too. The client sends one enve
 - **Threading:** as over HTTP, the handler runs under the API lock and the chunks outside it, in the transport's task, in queued mode too. A download chunk is read whole, and kept, before its reply goes out: up to 4 KB, plus its base64.
 - **Below a remote node,** the transfer is relayed to the remote node (§14), and each reply is deferred until the remote's comes.
 - **Generic core:** `tesser::FileSession`, platform-independent and host-tested; the transports only hand it these envelopes. `DatagramEndpoint::request(to, envelope, done)` sends them from a client.
+
+#### 10.1.2 Protocol version, strict requests and error reasons
+
+Nodes of different releases meet in one fleet, so a client learns what a node understands before relying on it, and acts on errors by code rather than by their English.
+
+- **Version:** the envelope protocol has a number, `kProtocolVersion`: **2** for this release; nodes that predate it count as **1**. Protocol 2 has everything up to now: ceilings (§13.1), reasons, strict requests and `view=info` (below), as well as streamed HTTP subscriptions (§10.2), `auth` on lines (§10.4), file envelopes (§10.1.1), events-only subscriptions, `snapshot: false` and `*` fan-out. A client that finds protocol 2 needn't probe for any of them.
+- **`view=info`** (`GET /?view=info`, or `{"op": "get", "path": "/", "view": "info"}`) answers `{"protocol": 2, "features": ["ceiling", "reasons", "strict", "info", "schema", "messages"], "hash": "1a2b3c4d", "id": "c8f09ef4a67c"}`: the version, the features by name, the hash `view=hash` gives at that path (left out with `TESSER_NO_SCHEMA`) and the device id when known. `schema` and `messages` are left out of builds without them; later features get names here before a new version. A client reads it first, in place of `view=hash`; a node that predates it answers `bad_request` ("view must be ..."): protocol 1. Below a remote node it is forwarded, so a client learns a peer's version through its gateway.
+- **Advertisements** carry the version: `{"tesser": 84, "schema": "1a2b3c4d", "v": 2}` over NowTP (§10.3), `"v": 2` in UDP's (§10.7). A gateway keeps it per peer (`RemoteNode::protocol()`, 1 for an advertisement without one, 0 while unknown) and shows it in the stub (`"protocol": 2`, §14.1).
+- **Strict requests:** an envelope with `"v": 2` or more (any op, `auth`, `upload` and `download` included) is refused, `bad_request` with reason `unknown_option`, if a member isn't one the node knows, rather than having the option ignored. Without `"v"` (or with 1) unknown members are ignored as before. The library marks what it sends with options as strict (`buildRequestEnvelope()` whenever the query has one, and every relayed file envelope), so from protocol 2 on, an option a node doesn't know fails rather than silently giving a different result. A plain get or set isn't marked.
+- **Nodes at protocol 1** ignore `"v"`. What a gateway or client sends them that could matter:
+  - A ceiling is in the op, so they refuse it (§13.1): fail closed.
+  - `remotes: false`, a mirror's loop protection, came with remote nodes themselves: a node that can mirror honours it.
+  - `snapshot: false`, `changes: false` and a download's `length` came later. A node that ignores them gives a larger reply, never a wrong one; gateways don't send the first two upstream.
+- **Reasons:** an error body may carry a `reason` (`Reason`, `toString()`, `parseReason()`), next to its status, for what a client does next. An unknown reason (a newer node's) is acted on by the status alone. They don't depend on `TESSER_NO_MESSAGES`, and a gateway relays a remote node's as it wrote them; a `*` fan-out's error has its first failure's.
+
+| Reason | With | Meaning, and what a client does |
+|---|---|---|
+| `low_memory` | `busy`, `internal` | Not enough heap for the reply, a remote's state or a queued request: try again, or ask for less (pieces) |
+| `pending_limit` | `busy` | Too many calls waiting for remote nodes or deferred actions (`maxPending`): try again soon |
+| `queue_full` | `busy` | A request queue is full (queued mode, a datagram endpoint): try again soon |
+| `unreachable` | `busy` | The gateway couldn't send to the remote node: try again soon |
+| `subscription_limit` | `busy` | No more subscriptions or HTTP streams for this client or node: poll instead |
+| `transfer_busy` | `busy` | Another file transfer holds the path or the remote node |
+| `peer_offline` | `timeout` | The remote node is known to be offline; nothing was sent |
+| `no_answer` | `timeout` | The remote node or a deferred action didn't answer in time |
+| `idle` | `timeout` | A file transfer was idle too long and was dropped |
+| `cannot_wait` | `not_allowed` | This transport can't wait for a deferred reply, or deliver notifications |
+| `not_authorized` | `unauthorized` | The client's level or the authorizer refuses it |
+| `ceiling_unsupported` | `unauthorized` | A remote node too old to limit a gateway's client: only admins reach it (§13.1) |
+| `unknown_option` | `bad_request` | A strict request named an option this node doesn't know |
 
 ### 10.2 HTTP (`esp_http_server`)
 
@@ -629,7 +660,7 @@ tesser::NowTpTransport now(api, transport, /*port*/ 84);
 - **Security:** ESP-NOW frames aren't authenticated. Writes over NowTP should be restricted with an allowlist of MACs or encrypted peers (§13). A peer may also present a token with `auth`, as over UDP (§10.7).
 - **Threading:** NowTP runs its receive callbacks while holding its own lock, so the adapter never handles a request there. It queues each message (a bounded queue, default 8, then `busy`), and a worker task (or `poll()`) handles it under the API lock. A message NowTP reassembled from several frames is taken as NowTP built it (`Message::buffer`, NowTP 8320a40 and later; `DatagramEndpoint::receiveOwned()`), so a large one isn't on the heap twice; a single frame's data, and every message with an older NowTP, is copied (§15). The lock order is therefore always API, then NowTP, and replies sent from any API context can't deadlock.
 - **Client:** the same endpoint sends requests to other nodes (`get`, `set`, or `endpoint().request()`) and matches responses by `id`, with a timeout per call (default 3 s) and at most 8 calls in flight. Handlers run in the worker task. `peerLost(mac)` fails a lost peer's calls at once.
-- **Discovery:** `advertise()` puts `{"tesser": <port>, "schema": "<schemaHash>"}` into NowTP discovery metadata, and `parseAdvertisement()` reads it, so clients can tell TesserAPI nodes apart and keep a cached schema while its hash (`Api::schemaHash()`, FNV-1a of the full schema) is unchanged. `peerEvent()` takes NowTP's peer events, and `mountPeers()` mounts the TesserAPI peers it reports (§14.1).
+- **Discovery:** `advertise()` puts `{"tesser": <port>, "schema": "<schemaHash>", "v": 2}` (`v`: the protocol, §10.1.2) into NowTP discovery metadata, and `parseAdvertisement()` reads it, so clients can tell TesserAPI nodes apart and keep a cached schema while its hash (`Api::schemaHash()`, FNV-1a of the full schema) is unchanged. `peerEvent()` takes NowTP's peer events, and `mountPeers()` mounts the TesserAPI peers it reports (§14.1).
 - **Re-advertising:** after the first `advertise()`, the advertisement follows the tree. A global schema revision (`schemaRevision()`) counts the changes that can alter a schema hash: a node added (a peer mounted, too) or a modifier. Temporary objects (list elements and prototypes), value changes and remote nodes' state (online, advertised hash) don't count. Once the revision has stayed unchanged for 1 s, the worker recomputes `schemaHash()` and updates the metadata if the hash differs, so a gateway that mounts a burst of peers re-advertises once. The logic is `DatagramEndpoint::autoAdvertise()`, host-tested with the in-memory link.
 - **Generic core:** all of this lives in `tesser::DatagramEndpoint`, which is platform-independent and host-tested with an in-memory link. Another datagram transport (UDP, §10.7; LoRa, ...) only needs a send function and a call to `receive()`.
 - **Optional:** the adapter is compiled only when NowTP is available. The core never includes NowTP.
@@ -726,7 +757,7 @@ The §10.1 envelopes between nodes and clients on a LAN, Ethernet or Wi-Fi, thro
   | 14 | 2 | Data: fragment size `S` |
   | 16 | 4 | Data: message length |
 
-  A message (one envelope, at most `maxMessage`, 16 KB) is cut into fragments of `S` bytes (`fragmentSize`, 1400), the last one 1 to `S`; fragment `i` is at offset `i × S`. A datagram is at most 1420 bytes, under the 1472 bytes of UDP payload an Ethernet frame holds, since ESP-IDF's lwIP doesn't reassemble IP fragments by default (`CONFIG_LWIP_IP4_REASSEMBLY`). UDP's checksum covers the rest. A partial acknowledgement carries the fragments received as a 64-bit mask (bit `i`: fragment `i`). An advertisement carries `{"name": "...", "schema": "<8 hex digits>", "id": "<MAC, 12 hex digits>"}`, or nothing (a bare query, a goodbye).
+  A message (one envelope, at most `maxMessage`, 16 KB) is cut into fragments of `S` bytes (`fragmentSize`, 1400), the last one 1 to `S`; fragment `i` is at offset `i × S`. A datagram is at most 1420 bytes, under the 1472 bytes of UDP payload an Ethernet frame holds, since ESP-IDF's lwIP doesn't reassemble IP fragments by default (`CONFIG_LWIP_IP4_REASSEMBLY`). UDP's checksum covers the rest. A partial acknowledgement carries the fragments received as a 64-bit mask (bit `i`: fragment `i`). An advertisement carries `{"name": "...", "schema": "<8 hex digits>", "id": "<MAC, 12 hex digits>", "v": 2}` (`v`: the protocol, §10.1.2), or nothing (a bare query, a goodbye).
 - **Reliable delivery** (`Delivery::Reliable`: requests, replies, notifications), modelled on NowTP's (its PROTOCOL.md):
   1. The sender sends every fragment, with ack-request on the last.
   2. The receiver answers an ack-request with complete or partial, and sends complete unasked when the message completes.
@@ -956,12 +987,12 @@ nowApi.advertise();                       // on every node, once its tree is com
 - **Declared devices:** a node declared with an address (`peers.remote("far-lamp", udp.endpoint(), udpAddress(10, 0, 2, 7, 8484))`; pass the name as a `std::string` when it is made at run time, and the node keeps a copy; for a device on another subnet whose advertisements don't arrive) is the same device as a mounted one: when that address advertises, the node takes the device's MAC, and the device's other transports add their routes to it rather than mounting it again. `RemoteNode::byDevice(parent, mac)` finds the node of a device (under the API lock).
 - **A node's own id:** each node shows its device at the root of its schema, `GET /?view=schema` → `{"type": "object", "id": "c8f09ef4a67c", ...}`, the same value its stub shows on a gateway, outside the hash; and `HttpServer::advertise()` puts `id=<12 hex digits>` in its mDNS TXT record. It is the Wi-Fi station MAC, or what `Api::setDeviceId()` set (a node whose peers know it by another MAC). So a client can tell when a node it reaches directly and one it reaches through a gateway are the same device.
 - **Nodes are never removed.** A lost peer stays mounted and shows offline; it comes back online as soon as it is heard from or announces itself again. A node also probes its offline routes with a get at depth 0, so a device that doesn't advertise comes back when it answers: first 5 s after a route is lost (`probe(ms)`, 0 to stop), then with the wait doubling up to a minute, so a device that is gone for good costs a datagram or so a minute (a reliable one over UDP: about six with its retransmissions).
-- **Remote node stub:** the parent's schema shows each remote node's state. `"online": false` appears while the peer is lost, `"route"` names the route in use when the node has several (`"udp/ethernet"`, `"nowtp"`, §14.3), `"schema"` is the hash the peer advertises, so a client can cache the peer's own schema under it, and `"id"` is the device's MAC (12 hex digits) when known, so a client can refer to a node by device rather than by name. None of these is part of the hash (§7):
+- **Remote node stub:** the parent's schema shows each remote node's state. `"online": false` appears while the peer is lost, `"route"` names the route in use when the node has several (`"udp/ethernet"`, `"nowtp"`, §14.3), `"schema"` is the hash the peer advertises, so a client can cache the peer's own schema under it, `"id"` is the device's MAC (12 hex digits) when known, so a client can refer to a node by device rather than by name, and `"protocol"` is the version it advertises (§10.1.2; 1 for an advertisement that predates versions, absent while unknown). None of these is part of the hash (§7):
 
   ```json
   GET /peers?view=schema&depth=1
   {"type": "object", "children": {
-     "tesser-lamp": {"type": "remote", "route": "udp", "schema": "1a2b3c4d", "id": "10521c75f37c"},
+     "tesser-lamp": {"type": "remote", "route": "udp", "schema": "1a2b3c4d", "id": "10521c75f37c", "protocol": 2},
      "heliostat-3": {"type": "remote", "online": false, "schema": "99f0e1aa", "id": "8cbfea8ff250"}}}
   ```
 

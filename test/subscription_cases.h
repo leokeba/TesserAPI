@@ -62,7 +62,7 @@ TEST(sub_without_snapshot) {
     CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"on\":true}}");
     q.interval = 5;
     CHECK_EQ(tesser::buildRequestEnvelope(3, Op::Subscribe, "/lamp", q, std::string_view()),
-             "{\"id\":3,\"op\":\"sub\",\"path\":\"/lamp\",\"interval\":5,\"snapshot\":false}");
+             "{\"id\":3,\"op\":\"sub\",\"path\":\"/lamp\",\"interval\":5,\"snapshot\":false,\"v\":2}");
 }
 
 TEST(sub_snapshot_and_changes) {
@@ -229,7 +229,7 @@ TEST(sub_events_only) {
     q.changes = false;
     q.snapshot = false;
     CHECK_EQ(tesser::buildRequestEnvelope(3, Op::Subscribe, "/", q, std::string_view()),
-             "{\"id\":3,\"op\":\"sub\",\"path\":\"/\",\"changes\":false,\"snapshot\":false}");
+             "{\"id\":3,\"op\":\"sub\",\"path\":\"/\",\"changes\":false,\"snapshot\":false,\"v\":2}");
 }
 
 TEST(sub_watch_and_changed) {

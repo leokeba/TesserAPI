@@ -104,14 +104,14 @@ TEST(ceiling_on_the_wire) {
     Query q;
     q.ceiling = Access::User;
     CHECK_EQ(tesser::buildRequestEnvelope(4, Op::Set, "/net/port", q, "81"),
-             "{\"id\":4,\"op\":\"set@user\",\"path\":\"/net/port\",\"body\":81}");
+             "{\"id\":4,\"op\":\"set@user\",\"path\":\"/net/port\",\"v\":2,\"body\":81}");
     q.ceiling = Access::Admin;  // admin: no ceiling, as before
     CHECK_EQ(tesser::buildRequestEnvelope(4, Op::Get, "/", q, ""), "{\"id\":4,\"op\":\"get\",\"path\":\"/\"}");
 
     // On any node: the level is the lower of the client's and the op's.
     Device d;
     CHECK_EQ(cases::roundTrip(d.api, "{\"id\":1,\"op\":\"get@public\",\"path\":\"/users/logins\"}"),
-             "{\"id\":1,\"status\":\"unauthorized\",\"body\":{\"error\":\"unauthorized\",\"path\":\"/users/logins\","
+             "{\"id\":1,\"status\":\"unauthorized\",\"body\":{\"error\":\"unauthorized\",\"reason\":\"not_authorized\",\"path\":\"/users/logins\","
              "\"message\":\"not authorized\"}}");
     CHECK(cases::roundTrip(d.api, "{\"id\":2,\"op\":\"set@user\",\"path\":\"/net/port\",\"body\":81}")
               .find("\"status\":\"unauthorized\"") != std::string::npos);
@@ -200,7 +200,7 @@ TEST(ceiling_old_nodes_fail_closed) {
     rig = &r;
     Client anon(r.gateway, Access::Public), admin(r.gateway, Access::Admin);
     CHECK_EQ(anon.call(r, Op::Get, "/dev/brightness").body,
-             "{\"error\":\"unauthorized\",\"path\":\"/dev\",\"message\":\"the remote node can't limit a client's "
+             "{\"error\":\"unauthorized\",\"reason\":\"ceiling_unsupported\",\"path\":\"/dev\",\"message\":\"the remote node can't limit a client's "
              "access: only admins reach it through a gateway\"}");
     CHECK_EQ(anon.call(r, Op::Subscribe, "/dev").status, Status::Unauthorized);
     CHECK_EQ(r.device.api.subscriptionCount(), 0u);
