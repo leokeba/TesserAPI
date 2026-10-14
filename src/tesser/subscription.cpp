@@ -52,8 +52,8 @@ bool passesFilter(const Subscription& sub, std::string_view name) {
     return true;
 }
 
-void changesIn(const Object& o, uint16_t since, int depth, const Subscription* top, const detail::RenderOptions& options,
-               detail::LazyPatch& lp, JsonWriter& w) {
+void changesIn(const Object& o, uint32_t since, uint32_t now, int depth, const Subscription* top,
+               const detail::RenderOptions& options, detail::LazyPatch& lp, JsonWriter& w) {
     if (depth <= 0) return;
     for (const Node* c = o.first(); c; c = c->next()) {
         if (!detail::hasValue(*c)) continue;
@@ -62,9 +62,9 @@ void changesIn(const Object& o, uint16_t since, int depth, const Subscription* t
         if (top && !passesFilter(*top, c->name())) continue;
         if (c->type() == NodeType::Object) {
             if (!lp.enter(c->name())) continue;
-            changesIn(static_cast<const Object&>(*c), since, depth - 1, nullptr, options, lp, w);
+            changesIn(static_cast<const Object&>(*c), since, now, depth - 1, nullptr, options, lp, w);
             lp.leave();
-        } else if (detail::isLeaf(*c) && newerGeneration(c->generation(), since)) {
+        } else if (detail::isLeaf(*c) && changedSince(c->generation(), since, now)) {
             lp.key(c->name());
             detail::writeLeaf(w, *c, options);
         }
@@ -303,8 +303,15 @@ void Api::sampleWatched(Node& node) {
 void Api::flush(Subscription& sub, uint32_t nowMs) {
     if (!sub.changes) return;  // events only
     if (sub.interval && nowMs - sub.lastFlushMs < sub.interval) return;
-    uint16_t gen = currentGeneration();
+    uint32_t gen = currentGeneration();
     if (gen == sub.since) return;
+    if (gen - sub.since > kGenerationHorizon) {
+        // Undelivered for long: the window is narrowed, so stamps a lap old
+        // can't fall into it. What is older is sent no more, and "overflow"
+        // tells the client to re-read.
+        sub.since = gen - kGenerationHorizon;
+        sub.subscriber->missed = true;
+    }
 
     // Rendered straight into the envelope (no separate body to copy), and
     // refused, to be tried again at the next flush, if the heap can't hold
@@ -330,9 +337,9 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
     if (n.type() == NodeType::Object) {
         detail::LazyPatch lp(w);
         int depth = sub.depth < 0 || sub.depth > config_.maxDepth ? config_.maxDepth : sub.depth;
-        changesIn(static_cast<const Object&>(n), sub.since, depth, &sub, options, lp, w);
+        changesIn(static_cast<const Object&>(n), sub.since, gen, depth, &sub, options, lp, w);
         any = lp.finish();
-    } else if (detail::isLeaf(n) && newerGeneration(n.generation(), sub.since)) {
+    } else if (detail::isLeaf(n) && changedSince(n.generation(), sub.since, gen)) {
         detail::writeLeaf(w, n, options);
         any = true;
     }

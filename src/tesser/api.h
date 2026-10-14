@@ -47,7 +47,7 @@ struct Subscription {
     bool changes = true;
     bool events = true;
     bool remotes = true;
-    uint16_t since = 0;  // generation of the last flush
+    uint32_t since = 0;  // generation of the last flush
     uint32_t lastFlushMs = 0;
     // Forwarded below a remote node (docs/DESIGN.md section 14): the remote
     // node relays its changes; poll() leaves it alone.
@@ -257,8 +257,8 @@ private:
     TokenCheck tokenCheck_;
     Storage* storage_ = nullptr;
     uint32_t debounceMs_ = 2000;
-    uint16_t savedGen_ = 0;  // generation when the state was last saved or loaded
-    uint16_t seenGen_ = 0;   // newest persisted change seen by poll()
+    uint32_t savedGen_ = 0;  // generation when the state was last saved or loaded
+    uint32_t seenGen_ = 0;   // newest persisted change seen by poll()
     uint32_t changedAtMs_ = 0;
     uint32_t lastPersistCheckMs_ = 0;
     // Set by persistence(): poll() reaches the persistence code through it,

@@ -756,7 +756,7 @@ The §10.1 envelopes between nodes and clients on a LAN, Ethernet or Wi-Fi, thro
 ## 11. Change tracking and subscriptions
 
 **Tracking changes:**
-- A global 16-bit generation counter is stamped on a node when it changes (compared with wrap-around; 0 means "never changed"). It costs no extra memory: the field fits in the node's padding.
+- A global 32-bit generation counter is stamped on a node when it changes (0 means "never changed"). A subscription and the persistence code each keep the generation they last looked at, and a node changed since if its stamp lies between that and the counter, compared modulo 2^32: so no change is missed however many changes elsewhere came in between, across the counter's wrap too. A stamp unchanged for a whole lap (2^32 changes) can fall in that window once more, which costs one needless notification or save. To keep the window narrow, a subscription left undelivered for more than 2^30 changes drops what is older (its next notification says `"overflow": true`), and the persistence code's generation follows the counter while nothing persisted changes. Generations never leave the device. Cost: 4 bytes per node on 32-bit targets (a 16-bit stamp, compared with wrap-around, fitted in the node's padding, but a value changed once came back in every notification after 32,768 other changes, and persisted changes went unsaved, in about an hour of a busy device).
 - A node is marked changed:
   - automatically, when a set or patch goes through the API
   - explicitly, with `node.changed()` or `api.changed("/path")`. On an object, `changed()` marks every value below it. Both are thread-safe and cheap.
@@ -1039,8 +1039,8 @@ Targets to be measured on a classic ESP32 and a C3, and enforced in CI:
 | Item | Target |
 |---|---|
 | Flash, core + HTTP transport | ≤ 40 KB above the application's baseline, ArduinoJson included (measured below: 45.5 KB) |
-| RAM per value leaf | ≤ 32 B with a bound variable, ≤ 56 B with a getter and setter, + 28 B with a range or description |
-| RAM per object node | ≤ 32 B |
+| RAM per value leaf | ≤ 32 B with a bound variable, ≤ 60 B with a getter and setter, + 28 B with a range or description |
+| RAM per object node | ≤ 36 B |
 | Request handling | Request body document (bounded by `maxRequestBody`) + 512 B streaming buffer (HTTP) or 1 KB (serial, WebSocket), or the response buffer (NowTP and deferred replies, bounded by `maxResponse`) |
 | Stack | Rendering depth bounded by `maxDepth` (default 16). JSON parsing: request bodies nest at most `maxDepth` + 1 levels (one more for an envelope); responses, notifications and stored records up to 65, the most a node's JSON writer produces, since a schema nests two or three levels per tree level and the writing peer's `maxDepth` may differ. On Xtensa with `-Og` (ESP-IDF's default), each tree level costs about 230 B of stack to render a schema or apply a patch, and each JSON level about 96 B to parse (6.2 KB at 65) |
 
@@ -1056,15 +1056,15 @@ Targets to be measured on a classic ESP32 and a C3, and enforced in CI:
 - **Admission:** a forwarded subscription (§14) that needs a new or wider copy of a remote's state is refused `busy` ("not enough memory for another remote subscription") unless the free heap is twice the floor; one the shared copy already covers is answered from it as usual. UdpLink also drops a message whose reassembly would cross the floor.
 - `setLargestFreeBlockProbe()` and `setFreeHeapProbe()` replace the probes in tests. Note that on ESP-IDF, with exceptions off, `new (std::nothrow)` aborts like plain `new` instead of returning null: these checks come before allocating for that reason.
 
-Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware`):
+Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware`; the node sizes were measured with 16-bit generations, and 32-bit ones add 4 bytes, from `sizeof`):
 
 | Item | Measured |
 |---|---|
 | `Api` object | 324 B (two statically allocated FreeRTOS mutexes make most of it) |
-| Value bound to a variable | 28 B |
-| Value with getter and setter (small captures) | 56 B |
-| Object | 32 B |
-| Value with a range | 64 B (28 B node + 36 B metadata) |
+| Value bound to a variable | 32 B |
+| Value with getter and setter (small captures) | 60 B |
+| Object | 36 B |
+| Value with a range | 68 B (32 B node + 36 B metadata) |
 | List of any length | one node; elements are built per request |
 | Full GET of a 13-leaf tree (227 B response) | 0.43 ms |
 | Envelope parse + keyed GET + reply | 0.9 ms |

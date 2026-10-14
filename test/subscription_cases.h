@@ -432,4 +432,62 @@ TEST(queued_requests_die_with_their_client) {
     d.api.poll(1000);  // nothing left to run
 }
 
+// The generation counter wraps (docs/DESIGN.md section 11): a value changed
+// once is notified once, however many changes elsewhere follow, and changes
+// across the wrap are all seen.
+TEST(sub_generation_wraparound) {
+    tesser::detail::setGeneration(0x1000);  // these stamps stay clear of the wrap
+    cases::Device d;
+    FakeSubscriber s;
+    subscribe(d.api, &s, "/lamp");
+    cases::set(d.api, "/lamp/on", "true");
+    d.api.poll(1000);
+    CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"on\":true}}");
+    // Many changes elsewhere, past half of what 16 bits held.
+    for (int i = 0; i < 40000; i++) d.api.changed("/config/level");
+    cases::set(d.api, "/lamp/brightness", "1");
+    d.api.poll(1010);
+    CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"brightness\":1}}");
+    // Across the wrap of the 32-bit counter, and half of it away; polled
+    // along the way, as a live device is.
+    auto advance = [&](uint32_t to) {
+        while (to - tesser::currentGeneration() > tesser::kGenerationHorizon / 2) {
+            tesser::detail::setGeneration(tesser::currentGeneration() + tesser::kGenerationHorizon / 2);
+            d.api.poll(1000);
+        }
+        tesser::detail::setGeneration(to);
+    };
+    advance(0xfffffffeu);
+    cases::set(d.api, "/lamp/brightness", "2");
+    d.api.poll(1020);
+    CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"brightness\":2}}");
+    d.api.changed("/config/level");
+    d.api.changed("/config/level");
+    cases::set(d.api, "/lamp/label", "\"x\"");
+    d.api.poll(1030);
+    CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"label\":\"x\"}}");
+    advance(tesser::currentGeneration() + 0x80000000u);
+    cases::set(d.api, "/lamp/on", "false");
+    d.api.poll(1040);
+    CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"on\":false}}");
+    // Jumped over, the first changes' stamps may each be notified once
+    // more (a whole lap old): never again after that.
+    size_t sent = s.messages.size();
+    d.api.poll(1050);
+    CHECK_EQ(s.messages.size(), sent);
+    // A subscription left undelivered for longer than the horizon loses
+    // what is older (the next notification says "overflow": re-read), and
+    // stays in step afterwards.
+    s.failNext = 1;
+    cases::set(d.api, "/lamp/brightness", "3");
+    d.api.poll(1060);
+    CHECK_EQ(s.messages.size(), sent);
+    tesser::detail::setGeneration(tesser::currentGeneration() + tesser::kGenerationHorizon + 10);
+    cases::set(d.api, "/lamp/label", "\"y\"");
+    d.api.poll(1070);
+    CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"label\":\"y\"},\"overflow\":true}");
+    d.api.poll(1080);
+    CHECK_EQ(s.messages.size(), sent + 1);
+}
+
 }  // namespace subscription_cases

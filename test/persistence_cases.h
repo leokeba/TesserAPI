@@ -289,4 +289,35 @@ TEST(auth_by_transport) {
     CHECK_EQ(d.lamp.brightness, 5);
 }
 
+// The generation counter wraps (docs/DESIGN.md section 11): a persisted
+// change is saved however many other changes came before it.
+TEST(persist_generation_wraparound) {
+    MemoryStorage storage;
+    Settings s(&storage, 1000);
+    s.api.poll(10000);
+    // Many changes to values that aren't persisted, past half of what 16
+    // bits held, then a persisted one.
+    for (int i = 0; i < 40000; i++) s.api.changed("/on");
+    cases::set(s.api, "/config/brightness", "1");
+    s.api.poll(10100);
+    s.api.poll(11200);
+    CHECK_EQ(storage.saves, 1);
+    // More than half the 32-bit counter later, and across its wrap.
+    tesser::detail::setGeneration(0xfffffff0u);
+    for (int i = 0; i < 40; i++) s.api.changed("/on");
+    cases::set(s.api, "/config/brightness", "2");
+    s.api.poll(12000);
+    s.api.poll(13100);
+    CHECK_EQ(storage.saves, 2);
+    CHECK(storage.records["config"].find("\"brightness\":2") != std::string::npos);
+    tesser::detail::setGeneration(tesser::currentGeneration() + 0x80000000u + 40000);
+    s.api.poll(14000);  // nothing to save
+    cases::set(s.api, "/config/brightness", "3");
+    s.api.poll(14100);
+    s.api.poll(15200);
+    CHECK_EQ(storage.saves, 3);
+    s.api.poll(17000);
+    CHECK_EQ(storage.saves, 3);
+}
+
 }  // namespace persistence_cases

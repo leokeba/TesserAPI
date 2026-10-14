@@ -24,14 +24,17 @@ bool holdsPersisted(const Node& n, bool inherited) {
     return false;
 }
 
-// Newest change among persisted values at or below `n` (0: none ever changed).
-void newestPersisted(const Node& n, bool inherited, uint16_t& newest) {
+// Newest change after `since` (as of `now`) among persisted values at or
+// below `n`; `newest` stays 0 when there is none.
+void newestPersisted(const Node& n, bool inherited, uint32_t since, uint32_t now, uint32_t& newest) {
     bool p = inherited || n.persisted();
     if (n.type() == NodeType::Object) {
-        for (const Node* c = static_cast<const Object&>(n).first(); c; c = c->next()) newestPersisted(*c, p, newest);
+        for (const Node* c = static_cast<const Object&>(n).first(); c; c = c->next()) {
+            newestPersisted(*c, p, since, now, newest);
+        }
     } else if (p && isLeaf(n)) {
-        uint16_t g = n.generation();
-        if (g && (newest == 0 || newerGeneration(g, newest))) newest = g;
+        uint32_t g = n.generation();
+        if (changedSince(g, since, now) && (newest == 0 || g - since > newest - since)) newest = g;
     }
 }
 
@@ -206,14 +209,14 @@ std::string Api::persistedState() {
 
 bool Api::saveRecords(bool all) {
     if (!storage_) return false;
-    uint16_t gen = currentGeneration();
+    uint32_t gen = currentGeneration();
     bool ok = true;
     for (const Node* c = first(); c; c = c->next()) {
         if (!holdsPersisted(*c, persisted())) continue;
         if (!all) {
-            uint16_t newest = 0;
-            newestPersisted(*c, persisted(), newest);
-            if (!newerGeneration(newest, savedGen_)) continue;  // its record is current
+            uint32_t newest = 0;
+            newestPersisted(*c, persisted(), savedGen_, gen, newest);
+            if (!newest) continue;  // its record is current
         }
         if (!storage_->save(c->name(), record(*c, persisted()))) {
             logError("saving state %s failed", c->name());
@@ -272,9 +275,17 @@ void Api::checkPersistence(uint32_t nowMs) {
     // A walk over the tree: at most every 50 ms.
     if (nowMs - lastPersistCheckMs_ < 50) return;
     lastPersistCheckMs_ = nowMs;
-    uint16_t newest = 0;
-    newestPersisted(*this, persisted(), newest);
-    if (!newerGeneration(newest, savedGen_)) return;
+    uint32_t gen = currentGeneration();
+    uint32_t newest = 0;
+    newestPersisted(*this, persisted(), savedGen_, gen, newest);
+    if (!newest) {
+        // Nothing to save while other values keep changing: savedGen_
+        // follows the counter, so the window stays narrow and a stamp a
+        // whole lap old can't fall into it. A margin behind, in case a
+        // change has taken its generation but not stamped it yet.
+        if (gen - savedGen_ > kGenerationHorizon) savedGen_ = seenGen_ = gen - (uint32_t(1) << 16);
+        return;
+    }
     if (newest != seenGen_) {  // a new change: restart the debounce
         seenGen_ = newest;
         changedAtMs_ = nowMs;

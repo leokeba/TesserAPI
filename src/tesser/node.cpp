@@ -45,16 +45,18 @@ const char* kindName(ValueKind k) {
 int declarationErrors() { return g_declarationErrors.load(); }
 
 namespace {
-std::atomic<uint16_t> g_generation{0};
+std::atomic<uint32_t> g_generation{0};
 
-uint16_t nextGeneration() {
-    uint16_t g = static_cast<uint16_t>(g_generation.fetch_add(1) + 1);
-    if (g == 0) g = static_cast<uint16_t>(g_generation.fetch_add(1) + 1);  // 0 means "never changed"
+uint32_t nextGeneration() {
+    uint32_t g = g_generation.fetch_add(1) + 1;
+    if (g == 0) g = g_generation.fetch_add(1) + 1;  // 0 means "never changed"
     return g;
 }
 }  // namespace
 
-uint16_t currentGeneration() { return g_generation.load(); }
+uint32_t currentGeneration() { return g_generation.load(); }
+
+void detail::setGeneration(uint32_t g) { g_generation.store(g); }
 
 namespace {
 std::atomic<uint32_t> g_schemaRevision{0};
@@ -67,7 +69,7 @@ void Node::touch() {
 }
 
 void Node::changed() {
-    uint16_t g = nextGeneration();
+    uint32_t g = nextGeneration();
     if (type_ != NodeType::Object) {
         generation_.store(g, std::memory_order_relaxed);
         return;

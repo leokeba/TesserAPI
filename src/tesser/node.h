@@ -73,12 +73,26 @@ struct NodeMeta {
     }
 };
 
-// Change tracking: a global generation counter, stamped on nodes as they
-// change. 16 bits, compared with wrap-around; 0 means "never changed".
-uint16_t currentGeneration();
+// Change tracking: a global 32-bit generation counter, stamped on nodes as
+// they change; 0 means "never changed". A reader keeps the generation it
+// last looked at (`since`) and reads the counter (`now`) before it looks at
+// stamps.
+uint32_t currentGeneration();
 
-// True if generation `a` is newer than `b`.
-inline bool newerGeneration(uint16_t a, uint16_t b) { return a != 0 && static_cast<int16_t>(a - b) > 0; }
+// True if a node stamped `stamp` changed after `since`, as of `now`: its
+// stamp is in (since, now], so a change is never missed, whatever the
+// counter did meanwhile. A stamp unchanged for a whole lap can fall into the
+// window again, which costs one needless notification or save; readers keep
+// `since` within kGenerationHorizon of the counter so the window stays
+// narrow.
+inline bool changedSince(uint32_t stamp, uint32_t since, uint32_t now) {
+    return stamp != 0 && stamp - since - 1 < now - since;
+}
+constexpr uint32_t kGenerationHorizon = uint32_t(1) << 30;
+namespace detail {
+// Moves the counter (tests: wrap-around).
+void setGeneration(uint32_t g);
+}  // namespace detail
 
 // Bumped whenever the shape of a tree changes: a node is added, a modifier
 // changes a node's schema. Temporary objects (list elements) and remote
@@ -117,7 +131,7 @@ public:
     // this automatically; call it when the application changes bound state.
     // Thread-safe and cheap.
     void changed();
-    uint16_t generation() const { return generation_.load(std::memory_order_relaxed); }
+    uint32_t generation() const { return generation_.load(std::memory_order_relaxed); }
 
 protected:
     friend class Object;
@@ -154,7 +168,7 @@ protected:
     NodeMeta* meta_ = nullptr;
     NodeType type_;
     uint8_t flags_ = 0;
-    std::atomic<uint16_t> generation_{0};
+    std::atomic<uint32_t> generation_{0};
 };
 
 // The modifiers every node type has, returning the node's own type so they
