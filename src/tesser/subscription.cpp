@@ -94,8 +94,15 @@ Access readNeed(const Object& root, std::string_view path) {
     return need;
 }
 
-// Appends the closing of a notification envelope.
-void closeEnvelope(std::string& msg, bool overflow) {
+// Appends the closing of a notification envelope: the level of a
+// subscription made with one ("sub@user"), so the gateway that made it
+// knows which of its subscriptions it is for.
+void closeEnvelope(std::string& msg, bool overflow, Access ceiling) {
+    if (ceiling < Access::Admin) {
+        msg += ",\"as\":\"";
+        msg += toString(ceiling);
+        msg += '"';
+    }
     if (overflow) msg += ",\"overflow\":true";
     msg += '}';
 }
@@ -189,11 +196,11 @@ void Api::addSubscription(Subscription&& sub) {
     subs_.push_back(std::move(sub));
 }
 
-size_t Api::removeSubscriptions(Subscriber* subscriber, std::string_view path) {
+size_t Api::removeSubscriptions(Subscriber* subscriber, std::string_view path, Access ceiling) {
     MutexGuard guard(mutex_);
     std::vector<Subscription> gone;
     for (size_t i = 0; i < subs_.size();) {
-        if (subs_[i].subscriber == subscriber && subs_[i].path == path) {
+        if (subs_[i].subscriber == subscriber && subs_[i].path == path && subs_[i].ceiling == ceiling) {
             gone.push_back(std::move(subs_[i]));
             subs_.erase(subs_.begin() + static_cast<std::ptrdiff_t>(i));
         } else {
@@ -215,13 +222,16 @@ void Api::subscriptionsRemoved(std::vector<Subscription>& gone, bool clientGone)
     }
     for (const Subscription& g : gone) {
         if (!g.forwarded) continue;
+        // Upstream subscriptions are per path and level.
         bool used = false;
-        for (const Subscription& s : subs_) used = used || (s.node == g.node && s.path == g.path);
+        for (const Subscription& s : subs_) {
+            used = used || (s.forwarded && s.node == g.node && s.path == g.path && s.access == g.access);
+        }
         if (used) {
             // The others may need less: the upstream subscription narrows.
-            static_cast<RemoteNode*>(g.node)->narrowed(g.path);
+            static_cast<RemoteNode*>(g.node)->narrowed(g.path, g.access);
         } else {
-            static_cast<RemoteNode*>(g.node)->released(g.path);
+            static_cast<RemoteNode*>(g.node)->released(g.path, g.access);
         }
     }
 }
@@ -349,7 +359,7 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
         return;
     }
     bool overflow = sub.subscriber->missed.exchange(false);
-    closeEnvelope(msg, overflow);
+    closeEnvelope(msg, overflow, sub.ceiling);
     if (sub.subscriber->notify(msg, Delivery::Reliable)) {
         sub.since = gen;
         sub.lastFlushMs = nowMs;
@@ -362,7 +372,8 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
 
 // ---- events -----------------------------------------------------------------
 
-void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter&)>& write) {
+void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter&)>& write,
+                    const std::function<bool(const Subscription&)>& accept) {
     MutexGuard guard(mutex_);
     if (subs_.empty()) return;
 
@@ -383,9 +394,12 @@ void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter
 
     Access need = readNeed(*this, path);
 
-    std::vector<Subscriber*> notified;
+    // Once per client and level: a gateway holding subscriptions at two
+    // levels gets the event for each.
+    std::vector<std::pair<Subscriber*, Access>> notified;
     for (const Subscription& sub : subs_) {
         if (!sub.events || sub.waiting || sub.access < need) continue;
+        if (accept && !accept(sub)) continue;
         // The subscription's path must be a prefix of the event's, at a
         // segment boundary, within its depth and key filter.
         std::string_view ev(path);
@@ -403,13 +417,13 @@ void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter
             if (sub.depth >= 0 && segments > sub.depth) continue;
         }
         bool seen = false;
-        for (Subscriber* s : notified) seen = seen || s == sub.subscriber;
+        for (const auto& n : notified) seen = seen || (n.first == sub.subscriber && n.second == sub.ceiling);
         if (seen) continue;
-        notified.push_back(sub.subscriber);
+        notified.emplace_back(sub.subscriber, sub.ceiling);
 
         std::string msg = base;
         bool overflow = sub.subscriber->missed.exchange(false);
-        closeEnvelope(msg, overflow);
+        closeEnvelope(msg, overflow, sub.ceiling);
         if (!sub.subscriber->notify(msg, Delivery::Reliable)) sub.subscriber->missed = true;
     }
 }

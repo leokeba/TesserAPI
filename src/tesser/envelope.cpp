@@ -80,10 +80,15 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
     Status s = envelopeId(env, id, message);
     if (s != Status::Ok) return s;
     JsonVariantConst op = env["op"];
-    if (!op.is<const char*>() || !parseOp(view(op), request.op)) {
+    std::string_view name;
+    Access ceiling = Access::Admin;
+    if (!op.is<const char*>() || !splitOp(view(op), name, ceiling) || !parseOp(name, request.op)) {
         message = "op must be \"get\", \"set\", \"sub\" or \"unsub\"";
         return Status::BadRequest;
     }
+    // A gateway's client (docs/DESIGN.md section 13.1): no more than its level.
+    request.query.ceiling = ceiling;
+    request.client.cap(ceiling);
     JsonVariantConst path = env["path"];
     if (path.isNull()) {
         request.path = "/";

@@ -124,7 +124,7 @@ FileTransfer::Open FileTransfer::open(std::string_view path, const Client& clien
         if (notFile) return Open::NotFile;
         if (node) return openLocal(*node, client, op, size, filename, reply);
         if (!remote.node) return Open::Failed;
-        relay_ = remote.node->relayFile(api_, remote.rest, remote.base);
+        relay_ = remote.node->relayFile(api_, remote.rest, remote.base, remote.level);
     }
     // Relayed: the peer's replies come from another task, outside the lock.
     if (!relay_) {
@@ -528,7 +528,9 @@ size_t FileSession::downloadChunk(const Config& config) { return chunkWithin(con
 
 bool FileSession::handles(JsonObjectConst envelope) {
     JsonVariantConst op = envelope["op"];
-    return op == "upload" || op == "download";
+    std::string_view name;
+    Access ceiling;
+    return op.is<const char*>() && splitOp(text(op), name, ceiling) && (name == "upload" || name == "download");
 }
 
 void FileSession::reset() { state_.reset(); }
@@ -539,7 +541,13 @@ bool FileSession::busy() const {
     return !relay || relay->open();
 }
 
-void FileSession::handle(JsonObjectConst envelope, const Client& client, Reply& reply) {
+void FileSession::handle(JsonObjectConst envelope, const Client& from, Reply& reply) {
+    // "upload@user": a gateway's client (docs/DESIGN.md section 13.1).
+    std::string_view op;
+    Access ceiling = Access::Admin;
+    splitOp(text(envelope["op"]), op, ceiling);
+    Client client = from;
+    client.cap(ceiling);
     JsonVariantConst p = envelope["path"];
     std::string_view path = "/";
     if (p.is<const char*>()) {
@@ -555,7 +563,7 @@ void FileSession::handle(JsonObjectConst envelope, const Client& client, Reply& 
         return;
     }
     uint64_t offset = off.as<uint64_t>();
-    if (envelope["op"] == "upload") {
+    if (op == "upload") {
         upload(envelope, path, offset, client, reply);
     } else {
         download(envelope, path, offset, client, reply);

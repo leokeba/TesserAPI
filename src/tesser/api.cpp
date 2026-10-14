@@ -30,6 +30,16 @@ bool parseOp(std::string_view s, Op& out) {
     return true;
 }
 
+bool splitOp(std::string_view op, std::string_view& name, Access& ceiling) {
+    size_t at = op.find('@');
+    name = op.substr(0, at);
+    ceiling = Access::Admin;
+    if (at == std::string_view::npos) return true;
+    if (parseAccess(op.substr(at + 1), ceiling)) return true;
+    name = op;
+    return false;
+}
+
 bool parseView(std::string_view s, View& out) {
     if (s == "value") {
         out = View::Value;
@@ -235,7 +245,17 @@ void renderValue(JsonWriter& w, const Node& n, int depth, const RenderOptions& o
         }
         case NodeType::Custom: static_cast<const CustomNode&>(n).write(w); break;
         case NodeType::Array: static_cast<const ArrayNode&>(n).write(w); break;
-        case NodeType::Remote: static_cast<const RemoteNode&>(n).writeCopy(w, depth); break;
+        case NodeType::Remote: {
+            // The copy holds what a client at the mirror's level reads:
+            // nothing for one below it (docs/DESIGN.md section 14).
+            const auto& r = static_cast<const RemoteNode&>(n);
+            if (options.access < r.mirrorLevel()) {
+                w.null();
+            } else {
+                r.writeCopy(w, depth);
+            }
+            break;
+        }
         case NodeType::Action:
         case NodeType::Event:
         case NodeType::File: w.null(); break;
@@ -276,8 +296,10 @@ public:
             bool itself = remoteRest_.empty();
             if (req_.op == Op::Get || req_.op == Op::Set) return forward(remote);
             // A mirrored remote node itself is subscribed to locally, like a
-            // value; anything else is forwarded. Unsubscribing is local.
-            if (req_.op == Op::Subscribe && (!itself || !remote.mirrored())) {
+            // value, by clients the copy is for; anything else is forwarded.
+            // Unsubscribing is local.
+            bool local = itself && remote.mirrored() && level_ >= remote.mirrorLevel();
+            if (req_.op == Op::Subscribe && !local) {
                 return remote.subscribe(api_, req_, remoteRest_, base_, reply_);
             }
         }
@@ -316,6 +338,7 @@ public:
             remote->node = static_cast<RemoteNode*>(target);
             remote->rest.assign(remoteRest_.data(), remoteRest_.size());
             remote->base.assign(base_.data(), base_.size());
+            remote->level = level_;
             return nullptr;
         }
         return static_cast<FileNode*>(target);
@@ -970,11 +993,12 @@ private:
         sub.events = req_.query.events;
         sub.remotes = req_.query.remotes;
         sub.access = level_;
+        sub.ceiling = req_.query.ceiling;
         api_.addSubscription(std::move(sub));
     }
 
     void unsubscribe() {
-        size_t removed = req_.subscriber ? api_.removeSubscriptions(req_.subscriber, base_) : 0;
+        size_t removed = req_.subscriber ? api_.removeSubscriptions(req_.subscriber, base_, req_.query.ceiling) : 0;
         JsonWriter w(reply_.begin(Status::Ok));
         w.uinteger(removed);
         detail::finishBody(reply_, w, base_);
@@ -1403,6 +1427,12 @@ Access Api::tokenAccess(std::string_view token) const {
 }
 
 void Api::handle(const Request& request, Reply& reply) {
+    if (request.client.level() > request.query.ceiling) {
+        // Asked to act at a lower level (docs/DESIGN.md section 13.1).
+        Request capped = request;
+        capped.client.cap(request.query.ceiling);
+        return handle(capped, reply);
+    }
     if (config_.queued && enqueue(request, reply)) return;
     handleNow(request, reply);
 }

@@ -218,6 +218,10 @@ void notifyChange(Subscription& sub, const std::function<void(JsonWriter&)>& bod
     m.string(sub.path);
     m.key("body");
     body(m);
+    if (sub.ceiling < Access::Admin) {  // made with one: "sub@user"
+        m.key("as");
+        m.string(toString(sub.ceiling));
+    }
     if (sub.subscriber->missed.exchange(false)) {
         m.key("overflow");
         m.boolean(true);
@@ -233,6 +237,13 @@ void notifyChange(Subscription& sub, const std::function<void(JsonWriter&)>& bod
 void writeMapped(Reply& reply, Status s, JsonVariantConst body, const std::string& localBase,
                  const std::string& remoteBase) {
     std::string_view localPath = localBase.empty() ? std::string_view("/") : std::string_view(localBase);
+    // A node that predates ceilings refuses an op like "get@user"
+    // (docs/DESIGN.md section 13.1): this client may not reach it.
+    std::string_view message(body["message"] | "");
+    if (s == Status::BadRequest && message.compare(0, 11, "op must be ") == 0) {
+        return writeError(reply, Status::Unauthorized, localPath,
+                          "the remote node can't limit a client's access: only admins reach it through a gateway");
+    }
     JsonWriter w(reply.begin(s));
     if (s != Status::Ok && body.isNull()) {
         w.beginObject();
@@ -639,33 +650,36 @@ void RemoteNode::detach(const DatagramEndpoint* endpoint) {
 // The route in use changed (`from` was it before): subscriptions move to the
 // new one, now.
 void RemoteNode::rerouted(const Route& from, uint32_t nowMs) {
-    std::vector<std::string> paths;
+    std::vector<std::pair<std::string, Access>> paths;
     {
         MutexGuard guard(mutex_);
         for (auto& u : upstreams_) {
             if (!u->ready) continue;
-            paths.push_back(remotePathOf(u->rest));
+            paths.emplace_back(remotePathOf(u->rest), u->level);
             u->stale = true;  // renewed below, on the new route
             u->lastSubscribeMs = nowMs - 2000;
         }
     }
     if (mirror_) {
-        paths.push_back(remotePath_);
+        paths.emplace_back(remotePath_, mirrorLevel_);
         subscribedOnce_ = false;  // tick() subscribes again at once
     }
     // Back to a preferred route while the other one still works: drop what
     // the device sends that way. (A lost route's subscriptions end on their
     // own: the device fails to deliver to it.)
     if (!from.endpoint || !from.online || !hasRoute(from.endpoint, from.peer)) return;
-    for (const std::string& p : paths) {
+    for (const auto& p : paths) {
+        Query q;
+        q.ceiling = p.second;
         from.endpoint->request(
-            from.peer, Op::Unsubscribe, p, std::string_view(), [](Status, JsonVariantConst) {}, Query(), timeoutMs_,
+            from.peer, Op::Unsubscribe, p.first, std::string_view(), [](Status, JsonVariantConst) {}, q, timeoutMs_,
             this);
     }
 }
 
-RemoteNode& RemoteNode::mirror(uint32_t intervalMs, uint32_t refreshMs) {
+RemoteNode& RemoteNode::mirror(uint32_t intervalMs, uint32_t refreshMs, Access level) {
     mirror_ = true;
+    mirrorLevel_ = level;
     touch();
     mirrorIntervalMs_ = intervalMs;
     refreshMs_ = refreshMs;
@@ -698,9 +712,9 @@ std::string RemoteNode::remotePathOf(std::string_view rest) const {
     return p;
 }
 
-RemoteNode::Upstream* RemoteNode::findUpstream(std::string_view rest) {
+RemoteNode::Upstream* RemoteNode::findUpstream(std::string_view rest, Access level) {
     for (auto& u : upstreams_) {
-        if (u->rest == rest) return u.get();
+        if (u->rest == rest && u->level == level) return u.get();
     }
     return nullptr;
 }
@@ -769,7 +783,12 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
 
     // Forwarded subscriptions: renewed every refreshMs in case the remote
     // node restarted, every 2 s after a failed renewal.
-    std::vector<std::pair<std::string, uint32_t>> renew;
+    struct Renewal {
+        std::string rest;
+        Access level;
+        uint32_t interval;
+    };
+    std::vector<Renewal> renew;
     {
         MutexGuard guard(mutex_);
         for (auto& u : upstreams_) {
@@ -778,13 +797,13 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
             if (nowMs - u->lastSubscribeMs < every) continue;
             u->subscribing = true;
             u->lastSubscribeMs = nowMs;
-            renew.emplace_back(u->rest, u->interval);
+            renew.push_back(Renewal{u->rest, u->level, u->interval});
         }
     }
     for (auto& r : renew) {
-        if (!sendUpstream(r.first, r.second, true)) {
+        if (!sendUpstream(r.rest, r.level, r.interval, true)) {
             MutexGuard guard(mutex_);
-            if (Upstream* u = findUpstream(r.first)) u->subscribing = false;
+            if (Upstream* u = findUpstream(r.rest, r.level)) u->subscribing = false;
         }
     }
 
@@ -801,12 +820,15 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
     lastSubscribeMs_ = nowMs;
     subscribing_ = true;
     // Drop any previous subscription first, so renewals don't pile up.
+    Query unsub;
+    unsub.ceiling = mirrorLevel_;
     cur.endpoint->request(
-        cur.peer, Op::Unsubscribe, remotePath_, std::string_view(), [](Status, JsonVariantConst) {}, Query(),
+        cur.peer, Op::Unsubscribe, remotePath_, std::string_view(), [](Status, JsonVariantConst) {}, unsub,
         timeoutMs_, this);
     Query q;
     q.interval = mirrorIntervalMs_;
     q.remotes = false;  // never mirror the peer's own mirrors: no loops between gateways
+    q.ceiling = mirrorLevel_;  // the copy is what a client at that level reads
     bool sent = cur.endpoint->request(
         cur.peer, Op::Subscribe, remotePath_, std::string_view(),
         [this](Status s, JsonVariantConst body) {
@@ -844,9 +866,13 @@ bool RemoteNode::handleNotification(const DatagramEndpoint& by, const PeerAddres
     }
     std::string_view rest = path.substr(base.size());
     if (rest == "/") rest = std::string_view();
+    // The level of the subscription it comes from ("as"; none: admin).
+    Access level = Access::Admin;
+    if (envelope["as"].is<const char*>() && !parseAccess(envelope["as"].as<const char*>(), level)) return false;
+    bool forMirror = mirror_ && level == mirrorLevel_;
     std::string_view op(envelope["op"] | "");
     if (op == "change") {
-        if (!mirror_ || !rest.empty()) return relayChange(rest, envelope["body"]);
+        if (!forMirror || !rest.empty()) return relayChange(rest, level, envelope["body"]);
         {
             MutexGuard guard(mutex_);
             if (hasCopy_) {
@@ -860,12 +886,20 @@ bool RemoteNode::handleNotification(const DatagramEndpoint& by, const PeerAddres
         return true;
     }
     if (op == "event") {
-        if (!mirror_ && upstreamCount() == 0) return false;
+        if (!forMirror && upstreamCount() == 0) return false;
         std::string local;
         if (!localPath(local)) return true;
         local.append(rest.data(), rest.size());
         JsonVariantConst body = envelope["body"];
-        api_->emitEvent(local, [body](JsonWriter& w) { w.variant(body); });
+        // It came at `level`, once for every subscription of this node's at
+        // that level it concerns: for the local subscribers at that level
+        // below this node, and, from the mirror, for those of the copy.
+        api_->emitEvent(
+            local, [body](JsonWriter& w) { w.variant(body); },
+            [this, level, forMirror](const Subscription& sub) {
+                if (sub.forwarded) return sub.node == this && sub.access == level;
+                return forMirror && sub.access >= level;
+            });
         return true;
     }
     return false;
@@ -915,8 +949,11 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
         detached->release();
         a->pendingDone();
     };
-    if (!r.endpoint->requestRaw(r.peer, request.op, remotePathOf(rest), request.body, raw, done, request.query,
-                                timeoutMs_, this)) {
+    // No more than the client may (docs/DESIGN.md section 13.1).
+    Query q = request.query;
+    q.ceiling = request.client.level();
+    if (!r.endpoint->requestRaw(r.peer, request.op, remotePathOf(rest), request.body, raw, done, q, timeoutMs_,
+                                this)) {
         writeError(*detached, Status::Busy, basePath, "couldn't send to the remote node");
         detached->release();
         api.pendingDone();
@@ -1105,14 +1142,19 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
     sub.remotes = req.query.remotes;
     sub.forwarded = true;
     sub.snapshot = req.query.snapshot;
+    // Shared only with subscribers at the same level, which the upstream
+    // subscription asks the remote for (docs/DESIGN.md section 13.1).
+    sub.access = req.client.level();
+    sub.ceiling = req.query.ceiling;
+    Access level = sub.access;
 
     bool start = false, renew = false;
     uint32_t interval = 0;
     // What the upstream subscription must hold once this one joins.
-    Spec want = wanted(sub.path, &sub);
+    Spec want = wanted(sub.path, level, &sub);
     {
         MutexGuard guard(mutex_);
-        Upstream* u = findUpstream(rest);
+        Upstream* u = findUpstream(rest, level);
         if (u && u->ready && covers(u->copySpec, specOf(sub))) {
             // Shared: the snapshot comes from the copy, right away.
             JsonWriter w(reply.begin(Status::Ok));
@@ -1146,6 +1188,7 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
             upstreams_.emplace_back(new Upstream());
             u = upstreams_.back().get();
             u->rest.assign(rest.data(), rest.size());
+            u->level = level;
             // An events-only subscriber doesn't pace the others' changes.
             u->interval = sub.changes ? req.query.interval : 0;
         }
@@ -1162,29 +1205,29 @@ void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, 
     }
     std::string r(rest);
     api.addSubscription(std::move(sub));  // waiting for the upstream snapshot
-    if (start && !sendUpstream(r, interval, renew)) upstreamReply(r, Status::Busy, JsonVariantConst());
+    if (start && !sendUpstream(r, level, interval, renew)) upstreamReply(r, level, Status::Busy, JsonVariantConst());
 }
 
-RemoteNode::Spec RemoteNode::wanted(const std::string& local, const Subscription* extra) {
+RemoteNode::Spec RemoteNode::wanted(const std::string& local, Access level, const Subscription* extra) {
     std::vector<Spec> specs;
     if (extra) specs.push_back(specOf(*extra));
     if (Api* api = api_) {
         api->forwardedSubscriptions(this, [&](Subscription& sub) {
-            if (sub.path == local) specs.push_back(specOf(sub));
+            if (sub.path == local && sub.access == level) specs.push_back(specOf(sub));
             return true;
         });
     }
     return unionOf(specs);
 }
 
-void RemoteNode::narrowed(std::string_view localPath) {
+void RemoteNode::narrowed(std::string_view localPath, Access level) {
     if (localPath.size() < localPath_.size()) return;
     std::string rest(localPath.substr(localPath_.size()));
-    Spec want = wanted(std::string(localPath), nullptr);
+    Spec want = wanted(std::string(localPath), level, nullptr);
     uint32_t interval;
     {
         MutexGuard guard(mutex_);
-        Upstream* u = findUpstream(rest);
+        Upstream* u = findUpstream(rest, level);
         if (!u || u->spec == want) return;
         u->spec = want;
         // In flight: its reply sees the new spec and asks again.
@@ -1192,18 +1235,19 @@ void RemoteNode::narrowed(std::string_view localPath) {
         u->subscribing = true;
         interval = u->interval;
     }
-    if (!sendUpstream(rest, interval, true)) {
+    if (!sendUpstream(rest, level, interval, true)) {
         MutexGuard guard(mutex_);
-        if (Upstream* u = findUpstream(rest)) u->subscribing = false;
+        if (Upstream* u = findUpstream(rest, level)) u->subscribing = false;
     }
 }
 
-bool RemoteNode::upstreamSpec(std::string_view localPath, std::string& keys, std::string& exclude, int& depth) const {
+bool RemoteNode::upstreamSpec(std::string_view localPath, std::string& keys, std::string& exclude, int& depth,
+                              Access level) const {
     if (localPath.size() < localPath_.size()) return false;
     std::string_view rest = localPath.substr(localPath_.size());
     MutexGuard guard(mutex_);
     for (const auto& u : upstreams_) {
-        if (u->rest != rest) continue;
+        if (u->rest != rest || u->level != level) continue;
         keys = u->sent.keys;
         exclude = u->sent.exclude;
         depth = u->sent.depth;
@@ -1212,19 +1256,21 @@ bool RemoteNode::upstreamSpec(std::string_view localPath, std::string& keys, std
     return false;
 }
 
-bool RemoteNode::sendUpstream(const std::string& rest, uint32_t interval, bool renew) {
+bool RemoteNode::sendUpstream(const std::string& rest, Access level, uint32_t interval, bool renew) {
     Route r;
     if (!route(r)) return false;
     std::string path = remotePathOf(rest);
     if (renew) {
+        Query unsub;
+        unsub.ceiling = level;
         r.endpoint->request(
-            r.peer, Op::Unsubscribe, path, std::string_view(), [](Status, JsonVariantConst) {}, Query(), timeoutMs_,
+            r.peer, Op::Unsubscribe, path, std::string_view(), [](Status, JsonVariantConst) {}, unsub, timeoutMs_,
             this);
     }
     Spec spec;
     {
         MutexGuard guard(mutex_);
-        if (Upstream* u = findUpstream(rest)) {
+        if (Upstream* u = findUpstream(rest, level)) {
             u->sent = u->spec;
             spec = u->spec;
         }
@@ -1236,12 +1282,14 @@ bool RemoteNode::sendUpstream(const std::string& rest, uint32_t interval, bool r
     q.keys = spec.keys;
     q.exclude = spec.exclude;
     q.depth = spec.depth;
+    q.ceiling = level;  // the remote filters as for these subscribers
     return r.endpoint->request(
         r.peer, Op::Subscribe, path, std::string_view(),
-        [this, rest](Status s, JsonVariantConst body) { upstreamReply(rest, s, body); }, q, timeoutMs_, this);
+        [this, rest, level](Status s, JsonVariantConst body) { upstreamReply(rest, level, s, body); }, q, timeoutMs_,
+        this);
 }
 
-void RemoteNode::upstreamReply(const std::string& rest, Status s, JsonVariantConst body) {
+void RemoteNode::upstreamReply(const std::string& rest, Access level, Status s, JsonVariantConst body) {
     Api* api = api_;
     if (!api) return;
     bool again = false;
@@ -1250,14 +1298,16 @@ void RemoteNode::upstreamReply(const std::string& rest, Status s, JsonVariantCon
         // Lock order: the API, then this node.
         MutexGuard apiGuard(api->mutex());
         MutexGuard guard(mutex_);
-        Upstream* u = findUpstream(rest);
+        Upstream* u = findUpstream(rest, level);
         if (!u) {
             // Released while subscribing: drop the subscription it made.
             Route r;
             if (s == Status::Ok && route(r)) {
+                Query unsub;
+                unsub.ceiling = level;
                 r.endpoint->request(
                     r.peer, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {},
-                    Query(), timeoutMs_, this);
+                    unsub, timeoutMs_, this);
             }
             return;
         }
@@ -1295,7 +1345,7 @@ void RemoteNode::upstreamReply(const std::string& rest, Status s, JsonVariantCon
         bool anyLeft = false, stillWaiting = false;
         JsonVariantConst copy = u->copy.as<JsonVariantConst>();
         api->forwardedSubscriptions(this, [&](Subscription& sub) {
-            if (sub.path != localPath) return true;
+            if (sub.path != localPath || sub.access != level) return true;
             if (sub.waiting) {
                 if (s == Status::Ok && !covers(u->copySpec, specOf(sub))) {
                     // Joined while a narrower request was in flight: next one.
@@ -1342,26 +1392,26 @@ void RemoteNode::upstreamReply(const std::string& rest, Status s, JsonVariantCon
             again = true;
         }
     }
-    if (again && !sendUpstream(rest, interval, true)) {
+    if (again && !sendUpstream(rest, level, interval, true)) {
         MutexGuard guard(mutex_);
-        if (Upstream* u = findUpstream(rest)) {
+        if (Upstream* u = findUpstream(rest, level)) {
             u->subscribing = false;
             u->stale = true;  // tick() tries again
         }
     }
 }
 
-bool RemoteNode::relayChange(std::string_view rest, JsonVariantConst patch) {
+bool RemoteNode::relayChange(std::string_view rest, Access level, JsonVariantConst patch) {
     Api* api = api_;
     if (!api) return false;
     MutexGuard apiGuard(api->mutex());
     MutexGuard guard(mutex_);
-    Upstream* u = findUpstream(rest);
+    Upstream* u = findUpstream(rest, level);
     if (!u || !u->ready) return false;
     merge(u->copy.as<JsonVariant>(), patch);
     std::string localPath = localPath_ + std::string(rest);
     api->forwardedSubscriptions(this, [&](Subscription& sub) {
-        if (sub.path != localPath || sub.waiting || !sub.changes) return true;
+        if (sub.path != localPath || sub.access != level || sub.waiting || !sub.changes) return true;
         if (!patch.is<JsonObjectConst>()) {
             notifyChange(sub, [&](JsonWriter& w) { w.variant(patch); });
         } else if (hasChanges(patch, depthOf(sub), &sub)) {
@@ -1372,14 +1422,14 @@ bool RemoteNode::relayChange(std::string_view rest, JsonVariantConst patch) {
     return true;
 }
 
-void RemoteNode::released(std::string_view localPath) {
+void RemoteNode::released(std::string_view localPath, Access level) {
     if (localPath.size() < localPath_.size()) return;
     std::string rest(localPath.substr(localPath_.size()));
     bool found = false;
     {
         MutexGuard guard(mutex_);
         for (size_t i = 0; i < upstreams_.size(); i++) {
-            if (upstreams_[i]->rest != rest) continue;
+            if (upstreams_[i]->rest != rest || upstreams_[i]->level != level) continue;
             found = upstreams_[i]->ready;  // still subscribing: upstreamReply() unsubscribes
             upstreams_.erase(upstreams_.begin() + static_cast<std::ptrdiff_t>(i));
             break;
@@ -1387,8 +1437,10 @@ void RemoteNode::released(std::string_view localPath) {
     }
     Route r;
     if (found && route(r)) {
+        Query unsub;
+        unsub.ceiling = level;
         r.endpoint->request(
-            r.peer, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {}, Query(),
+            r.peer, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {}, unsub,
             timeoutMs_, this);
     }
 }
@@ -1399,6 +1451,17 @@ namespace {
 
 constexpr int kAttempts = 3;            // a call whose reply timed out is sent twice more
 constexpr size_t kFallbackChunk = 192;  // a peer that gave no chunk size
+
+// An envelope's op for a client at `level`: "upload", "upload@user"
+// (docs/DESIGN.md section 13.1).
+std::string opFor(const char* op, Access level) {
+    std::string s(op);
+    if (level < Access::Admin) {
+        s += '@';
+        s += toString(level);
+    }
+    return s;
+}
 
 std::string fieldsOf(const std::function<void(JsonWriter&)>& write) {
     std::string text;
@@ -1413,13 +1476,16 @@ std::string fieldsOf(const std::function<void(JsonWriter&)>& write) {
 class RemoteFile : public FileRelay, public TransferHolder, public std::enable_shared_from_this<RemoteFile> {
 public:
     RemoteFile(Api& api, RemoteNode& node, std::string remotePath, std::string localBase, std::string remoteBase,
-               std::string localPath)
+               std::string localPath, Access level)
         : api_(api),
           node_(node),
           remotePath_(std::move(remotePath)),
           localBase_(std::move(localBase)),
           remoteBase_(std::move(remoteBase)),
-          localPath_(std::move(localPath)) {
+          localPath_(std::move(localPath)),
+          get_(opFor("get", level)),
+          upload_(opFor("upload", level)),
+          download_(opFor("download", level)) {
         // The claim is on the peer, under a key no path can have.
         char hex[24];
         snprintf(hex, sizeof(hex), "@%lx:", static_cast<unsigned long>(reinterpret_cast<uintptr_t>(node.endpoint())));
@@ -1450,7 +1516,7 @@ public:
         std::string path = remotePath_;
         call(std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
                  w.key("op");
-                 w.string("get");
+                 w.string(get_);
                  w.key("path");
                  w.string(path);
                  w.key("view");
@@ -1472,7 +1538,7 @@ public:
         auto self = shared_from_this();
         call(std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
                  w.key("op");
-                 w.string("upload");
+                 w.string(upload_);
                  w.key("path");
                  w.string(path);
                  w.key("size");
@@ -1511,7 +1577,7 @@ public:
         auto self = shared_from_this();
         call(std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
                  w.key("op");
-                 w.string("download");
+                 w.string(download_);
                  w.key("path");
                  w.string(path);
                  if (offset) {
@@ -1659,7 +1725,7 @@ private:
                 data += '"';
                 fields = std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
                     w.key("op");
-                    w.string("upload");
+                    w.string(upload_);
                     w.key("path");
                     w.string(remotePath_);
                     w.key("offset");
@@ -1736,6 +1802,7 @@ private:
     Api& api_;
     RemoteNode& node_;
     const std::string remotePath_, localBase_, remoteBase_, localPath_;
+    const std::string get_, upload_, download_;  // ops at the client's level
     std::string key_;
     mutable Mutex mutex_;
     bool claimed_ = false;
@@ -1752,12 +1819,13 @@ private:
 
 }  // namespace
 
-std::shared_ptr<FileRelay> RemoteNode::relayFile(Api& api, std::string_view rest, std::string_view base) {
+std::shared_ptr<FileRelay> RemoteNode::relayFile(Api& api, std::string_view rest, std::string_view base,
+                                                 Access level) {
     if (!endpoint()) return nullptr;
     std::string remoteBase = remotePath_ == "/" ? std::string() : remotePath_;
     std::string localBase(base.substr(0, base.size() - rest.size()));
     return std::make_shared<RemoteFile>(api, *this, remotePathOf(rest), std::move(localBase), std::move(remoteBase),
-                                        std::string(base));
+                                        std::string(base), level);
 }
 
 RemoteNode& Object::remote(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer,

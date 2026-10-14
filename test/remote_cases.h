@@ -69,13 +69,17 @@ struct WaitReply : tesser::Reply {
     void release() override { delete this; }
 };
 
-// Subscribes `sub` through a reply that can wait; the body once it came.
-inline std::string subscribeWaiting(Rig& r, tesser::Subscriber* sub, const char* path, tesser::Query q = tesser::Query()) {
+// Subscribes `sub` through a reply that can wait, as a client at `level`;
+// the body once it came.
+inline std::string subscribeWaiting(Rig& r, tesser::Subscriber* sub, const char* path, tesser::Query q = tesser::Query(),
+                                    tesser::Access level = tesser::Access::Admin) {
     tesser::Request req;
     req.op = tesser::Op::Subscribe;
     req.path = path;
     req.query = q;
     req.subscriber = sub;
+    req.client.access = level;
+    req.client.authenticated = level != tesser::Access::Public;
     WaitReply reply;
     std::shared_ptr<std::string> out = reply.out;
     r.gateway.handle(req, reply);

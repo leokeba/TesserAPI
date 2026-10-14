@@ -29,19 +29,24 @@ struct FakeSubscriber : tesser::Subscriber {
     std::string last() const { return messages.empty() ? "" : messages.back(); }
 };
 
-inline Resp request(Api& api, tesser::Subscriber* sub, Op op, const char* path, Query q = Query()) {
+// As an admin client, unless `level` says otherwise.
+inline Resp request(Api& api, tesser::Subscriber* sub, Op op, const char* path, Query q = Query(),
+                    tesser::Access level = tesser::Access::Admin) {
     tesser::Request req;
     req.op = op;
     req.path = path;
     req.query = q;
     req.subscriber = sub;
+    req.client.access = level;
+    req.client.authenticated = level != tesser::Access::Public;
     tesser::StringReply reply;
     api.handle(req, reply);
     return {reply.status, reply.body};
 }
 
-inline Resp subscribe(Api& api, tesser::Subscriber* sub, const char* path, Query q = Query()) {
-    return request(api, sub, Op::Subscribe, path, q);
+inline Resp subscribe(Api& api, tesser::Subscriber* sub, const char* path, Query q = Query(),
+                      tesser::Access level = tesser::Access::Admin) {
+    return request(api, sub, Op::Subscribe, path, q, level);
 }
 
 TEST(sub_without_snapshot) {

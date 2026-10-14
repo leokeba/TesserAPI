@@ -54,6 +54,10 @@ struct Subscription {
     bool forwarded = false;
     bool snapshot = true;
     Access access = Access::Admin;  // the client's level: what notifications may include
+    // The level the client asked to act at ("sub@user", docs/DESIGN.md
+    // section 13.1): its notifications carry it as "as", and only an unsub
+    // at the same level ends it. Admin: none.
+    Access ceiling = Access::Admin;
     Reply* waiting = nullptr;  // detached reply awaiting the remote's snapshot
 };
 
@@ -181,8 +185,12 @@ public:
     // changed since the last sample. A subscription samples its subtree
     // before its snapshot, so the snapshot is the baseline.
     void sampleWatched(Node& node);
-    size_t removeSubscriptions(Subscriber* subscriber, std::string_view path);
-    void emitEvent(const std::string& path, const std::function<void(JsonWriter&)>& write);
+    // The subscriptions of `subscriber` to `path` made at `ceiling`.
+    size_t removeSubscriptions(Subscriber* subscriber, std::string_view path, Access ceiling = Access::Admin);
+    // Sends an event to the subscriptions it concerns; with `accept`, only
+    // to those it accepts (a remote node's events, docs/DESIGN.md section 14).
+    void emitEvent(const std::string& path, const std::function<void(JsonWriter&)>& write,
+                   const std::function<bool(const Subscription&)>& accept = nullptr);
     // Calls fn for each forwarded subscription to `node`, under the API lock;
     // fn returns false to remove the subscription. Used by RemoteNode.
     void forwardedSubscriptions(const Node* node, const std::function<bool(Subscription&)>& fn);
@@ -205,6 +213,7 @@ public:
         RemoteNode* node = nullptr;
         std::string rest;  // the path below it
         std::string base;  // the full local path
+        Access level = Access::Admin;  // the client's: the most the remote grants it
     };
     FileNode* fileNode(const Request& request, Reply& reply, bool& notFile,
                        std::vector<std::unique_ptr<Node>>& elements, RemoteTarget* remote = nullptr);

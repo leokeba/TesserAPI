@@ -30,6 +30,7 @@
 #include "wildcard_cases.h"
 #include "stream_sub_cases.h"
 #include "udp_cases.h"
+#include "ceiling_cases.h"
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"

@@ -24,7 +24,14 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
         w.uinteger(id);
     }
     w.key("op");
-    w.string(toString(op));
+    if (query.ceiling < Access::Admin) {
+        std::string named = toString(op);
+        named += '@';
+        named += toString(query.ceiling);
+        w.string(named);
+    } else {
+        w.string(toString(op));
+    }
     w.key("path");
     w.string(path.empty() ? std::string_view("/") : path);
     if (query.depth >= 0) {
@@ -784,7 +791,10 @@ void DatagramEndpoint::handleFile(JsonObjectConst envelope, const Incoming& msg,
         writeError(reply, s, std::string_view(), message);
         return;
     }
-    if (envelope["op"] == "upload" && options_.requireReliableSet && !msg.reliable) {
+    std::string_view op;
+    Access ceiling;
+    splitOp(envelope["op"] | "", op, ceiling);
+    if (op == "upload" && options_.requireReliableSet && !msg.reliable) {
         writeError(reply, Status::NotAllowed, std::string_view(), "uploads must be sent reliably");
         return;
     }

@@ -25,6 +25,19 @@ bool parseOp(std::string_view s, Op& out);
 bool parseView(std::string_view s, View& out);
 const char* toString(Op op);
 
+// Access levels, ordered (docs/DESIGN.md section 13): a client has one, and a
+// node may require one to be read or written.
+enum class Access : uint8_t { Public, User, Admin };
+
+// "public" / "user" / "admin".
+const char* toString(Access a);
+bool parseAccess(std::string_view s, Access& out);
+
+// An envelope's op with the level it acts at (docs/DESIGN.md section 13.1):
+// "get" (`ceiling` admin, no limit) or "get@user". False if the suffix
+// isn't a level; `name` is then the whole text.
+bool splitOp(std::string_view op, std::string_view& name, Access& ceiling);
+
 struct Query {
     static constexpr int kUnlimited = -1;
     int depth = kUnlimited;  // levels of objects expanded below the target
@@ -39,6 +52,12 @@ struct Query {
     bool changes = true;    // deliver change notifications (false: events only)
     bool events = true;     // also deliver events under the path
     bool snapshot = true;   // reply with the current state (false: with null)
+    // Act at no more than this level (docs/DESIGN.md section 13.1): what a
+    // gateway asks for its client. Below admin, it goes in the envelope's
+    // op ("get@user"), which nodes that predate it refuse; a subscription
+    // made with one says so in its notifications and ends only with an
+    // unsub at the same level.
+    Access ceiling = Access::Admin;
 };
 
 enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket, Udp };
@@ -53,14 +72,6 @@ enum class NetInterface : uint8_t { Any, Ethernet, Wifi, Ap };
 // "" / "ethernet" / "wifi" (the station) / "ap" (the soft-AP).
 const char* toString(NetInterface iface);
 bool parseNetInterface(std::string_view s, NetInterface& out);
-
-// Access levels, ordered (docs/DESIGN.md section 13): a client has one, and a
-// node may require one to be read or written.
-enum class Access : uint8_t { Public, User, Admin };
-
-// "public" / "user" / "admin".
-const char* toString(Access a);
-bool parseAccess(std::string_view s, Access& out);
 
 // Who sent a request, as far as the transport knows.
 struct Client {
@@ -77,6 +88,13 @@ struct Client {
     Access access = Access::Public;
 
     Access level() const { return authenticated && access == Access::Public ? Access::Admin : access; }
+    // Lowers the client to `ceiling` if it is above: an HTTP client whose
+    // token has that level (authenticated unless public).
+    void cap(Access ceiling) {
+        if (level() <= ceiling) return;
+        access = ceiling;
+        authenticated = ceiling != Access::Public;
+    }
 };
 
 // How a message to a client should be delivered, for transports that offer

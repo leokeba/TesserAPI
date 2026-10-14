@@ -95,8 +95,11 @@ public:
     // Keeps a local copy of the remote tree through a subscription, so reads
     // of a parent include it and local subscribers get its changes and
     // events. `intervalMs` is the subscription's interval; the subscription
-    // is renewed every `refreshMs` in case the remote node restarted.
-    RemoteNode& mirror(uint32_t intervalMs = 500, uint32_t refreshMs = 30000);
+    // is renewed every `refreshMs` in case the remote node restarted. The
+    // copy is what a client at `level` reads (docs/DESIGN.md section 14),
+    // and only clients at `level` or above get it; admin: whatever the
+    // remote gives this node.
+    RemoteNode& mirror(uint32_t intervalMs = 500, uint32_t refreshMs = 30000, Access level = Access::Public);
 
     // Asks offline routes whether the device answers again, with a get at
     // depth 0: a device that doesn't advertise (a declared address on
@@ -143,6 +146,8 @@ public:
     const std::string& remotePath() const { return remotePath_; }
     uint32_t timeoutMs() const { return timeoutMs_; }
     bool mirrored() const { return mirror_; }
+    // The level the mirrored copy is read at (see mirror()).
+    Access mirrorLevel() const { return mirrorLevel_; }
     bool hasCopy() const;
 
     // Whether the device is reachable, as far as the endpoints know: false
@@ -213,31 +218,36 @@ public:
     virtual void writeCopy(JsonWriter& w, int depth = 255) const;
 
     // Forwards a request whose path continues below this node (`rest`,
-    // "" for the node itself); `base` is the full local path. Called by the
-    // request handler, under the API lock.
+    // "" for the node itself); `base` is the full local path. Below admin,
+    // the client's level goes with it (docs/DESIGN.md section 13.1). Called
+    // by the request handler, under the API lock.
     virtual void forward(Api& api, const Request& request, std::string_view rest, std::string_view base,
                          Reply& reply);
 
     // Subscribes a local client below this node (`rest`, "" for the node
-    // itself when it isn't mirrored). Clients of the same path share one
-    // upstream subscription; see docs/DESIGN.md section 14. Called by the
-    // request handler, under the API lock.
+    // itself when it isn't mirrored for the client). Clients of the same
+    // path and level share one upstream subscription; see docs/DESIGN.md
+    // section 14. Called by the request handler, under the API lock.
     virtual void subscribe(Api& api, const Request& request, std::string_view rest, std::string_view base,
                            Reply& reply);
     // A file transfer relayed to the peer (docs/DESIGN.md section 14), not
     // yet claimed: `rest` is the path below this node, `base` the full local
-    // path. Null without an endpoint. Virtual like forward().
-    virtual std::shared_ptr<FileRelay> relayFile(Api& api, std::string_view rest, std::string_view base);
+    // path, `level` the client's. Null without an endpoint. Virtual like
+    // forward().
+    virtual std::shared_ptr<FileRelay> relayFile(Api& api, std::string_view rest, std::string_view base,
+                                                 Access level = Access::Admin);
 
-    // The last local subscription to `localPath` is gone. Called by the API,
-    // under its lock.
-    virtual void released(std::string_view localPath);
-    // One of several local subscriptions to `localPath` is gone: the
-    // upstream one may narrow. Called by the API, under its lock.
-    virtual void narrowed(std::string_view localPath);
-    // What the upstream subscription to `localPath` asks the remote for
-    // (keys, exclude, depth; tests, diagnostics): false without one.
-    bool upstreamSpec(std::string_view localPath, std::string& keys, std::string& exclude, int& depth) const;
+    // The last local subscription to `localPath` at `level` is gone. Called
+    // by the API, under its lock.
+    virtual void released(std::string_view localPath, Access level);
+    // One of several local subscriptions to `localPath` at `level` is gone:
+    // the upstream one may narrow. Called by the API, under its lock.
+    virtual void narrowed(std::string_view localPath, Access level);
+    // What the upstream subscription to `localPath` for clients at `level`
+    // asks the remote for (keys, exclude, depth; tests, diagnostics): false
+    // without one.
+    bool upstreamSpec(std::string_view localPath, std::string& keys, std::string& exclude, int& depth,
+                      Access level = Access::Admin) const;
     // Upstream subscriptions currently held (tests, diagnostics).
     size_t upstreamCount() const;
 
@@ -257,9 +267,11 @@ public:
     };
 
 private:
-    // One subscription to the remote node, shared by local subscribers.
+    // One subscription to the remote node, shared by local subscribers at
+    // one level.
     struct Upstream {
         std::string rest;  // below this node; "" for the node itself
+        Access level = Access::Admin;  // its subscribers': the ceiling it asks for
         JsonDocument copy;  // the remote's state, kept with its notifications
         bool ready = false;
         bool subscribing = false;
@@ -270,8 +282,8 @@ private:
         Spec sent;      // what the request in flight (or the last) asked for
         Spec copySpec;  // what `copy` holds
     };
-    // The union of `local`'s subscribers' needs, plus `extra`'s.
-    Spec wanted(const std::string& local, const Subscription* extra);
+    // The union of the needs of `local`'s subscribers at `level`, plus `extra`'s.
+    Spec wanted(const std::string& local, Access level, const Subscription* extra);
     struct RouteSlot {
         Route route;
         uint32_t added;  // tie-break: routes of the same rank keep this order
@@ -283,11 +295,11 @@ private:
     };
 
     bool localPath(std::string& out);
-    Upstream* findUpstream(std::string_view rest);
+    Upstream* findUpstream(std::string_view rest, Access level);
     std::string remotePathOf(std::string_view rest) const;
-    bool sendUpstream(const std::string& rest, uint32_t interval, bool renew);
-    void upstreamReply(const std::string& rest, Status status, JsonVariantConst body);
-    bool relayChange(std::string_view rest, JsonVariantConst patch);
+    bool sendUpstream(const std::string& rest, Access level, uint32_t interval, bool renew);
+    void upstreamReply(const std::string& rest, Access level, Status status, JsonVariantConst body);
+    bool relayChange(std::string_view rest, Access level, JsonVariantConst patch);
     // Under routesMutex_.
     int activeLocked() const;
     void updateOnlineLocked();
@@ -318,6 +330,7 @@ private:
     static constexpr uint32_t kMaxProbeMs = 60000;  // mounted, or a route added: tick() tells onStateChange()
 
     bool mirror_ = false;
+    Access mirrorLevel_ = Access::Public;
     uint32_t mirrorIntervalMs_ = 500;
     uint32_t refreshMs_ = 30000;
     uint32_t lastSubscribeMs_ = 0;
