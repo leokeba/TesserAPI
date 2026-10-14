@@ -324,8 +324,8 @@ Reservation DatagramEndpoint::hold(const PeerAddress& from, std::string_view tex
             MutexGuard guard(mutex_);
             stats_.dropped++;
         }
-        // A request is answered, so its client needn't wait for a timeout.
-        reject(from, text, broadcast, Status::Busy, Reason::QueueFull, "request queue full");
+        // Answered, or its call failed, so nobody waits for a timeout.
+        refuse(from, text, broadcast, Reason::QueueFull);
     }
     return r;
 }
@@ -472,6 +472,27 @@ void DatagramEndpoint::checkAdvertisement(uint32_t now) {
     if (hash == publishedHash_) return;
     publishedHash_ = hash;
     publish_(hash);
+}
+
+// A message that can't be taken or parsed now: a request is answered busy,
+// and a reply fails its call, at once, rather than either waiting for a
+// timeout and a resend (docs/DESIGN.md section 15).
+void DatagramEndpoint::refuse(const PeerAddress& from, std::string_view text, bool broadcast, Reason reason) {
+    JsonDocument filter;
+    filter["id"] = true;
+    filter["status"] = true;
+    JsonDocument doc;
+    if (deserializeJson(doc, text.data(), text.size(), DeserializationOption::Filter(filter),
+                        DeserializationOption::NestingLimit(kWrittenNesting))) {
+        return;
+    }
+    if (doc["status"].is<const char*>()) {
+        failCall(doc["id"].as<uint32_t>(), Status::Busy, reason,
+                 reason == Reason::LowMemory ? "not enough memory for the reply" : "no room for the reply");
+    } else {
+        reject(from, text, broadcast, Status::Busy, reason,
+               reason == Reason::LowMemory ? "not enough memory for the request" : "request queue full");
+    }
 }
 
 void DatagramEndpoint::reject(const PeerAddress& from, std::string_view text, bool broadcast, Status status,
@@ -658,8 +679,11 @@ void DatagramEndpoint::handle(Incoming& msg) {
     if (text.size() > 1024) {
         parsing = memoryBudget().reserve(2 * text.size(), 0, false);
         if (!parsing) {
-            MutexGuard guard(mutex_);
-            stats_.dropped++;
+            {
+                MutexGuard guard(mutex_);
+                stats_.dropped++;
+            }
+            refuse(msg.from, msg.view(), msg.broadcast, Reason::LowMemory);
             return;
         }
     }
@@ -938,7 +962,7 @@ void DatagramEndpoint::dropFiles(const PeerAddress* peer, uint32_t now) {
     }
 }
 
-bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope,
+bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, std::string envelope,
                                    ResponseHandler done, uint32_t timeoutMs, const void* owner, bool internal,
                                    RawHandler raw) {
     uint32_t now = clock_ ? clock_() : 0;
@@ -966,7 +990,8 @@ bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, const std
     }
     if (startAuth) sendAuth(to, token);
     if (hold) return true;
-    if (send_ && send_(to, envelope, Delivery::Reliable)) return true;
+    // Taken by the link, not copied (a large envelope on a short heap).
+    if (send_ && send_(to, std::move(envelope), Delivery::Reliable)) return true;
     MutexGuard guard(mutex_);
     for (size_t i = 0; i < calls_.size(); i++) {
         if (calls_[i].id == id) {
@@ -1157,12 +1182,17 @@ bool DatagramEndpoint::requestFields(const PeerAddress& to, std::string_view fie
     }
     char head[20];
     int n = snprintf(head, sizeof(head), "{\"id\":%lu,", static_cast<unsigned long>(id));
+    // One allocation of its exact size, if the heap can spare it (docs/DESIGN.md
+    // section 15): a relayed file chunk is several KB.
+    size_t size = static_cast<size_t>(n) + fields.size() + 1;
+    Reservation room = memoryBudget().reserve(size, 0, true);
+    if (!room) return false;
     std::string text;
-    text.reserve(static_cast<size_t>(n) + fields.size() + 1);
+    text.reserve(size);
     text.append(head, static_cast<size_t>(n));
     text.append(fields.data(), fields.size());
     text += '}';
-    return sendRequest(to, id, text, std::move(done), timeoutMs, owner);
+    return sendRequest(to, id, std::move(text), std::move(done), timeoutMs, owner);
 }
 
 bool DatagramEndpoint::broadcast(const PeerAddress& to, Op op, std::string_view path, std::string_view bodyJson,

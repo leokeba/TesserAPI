@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "tesser/api.h"
+#include "tesser/budget.h"
 #include "tesser/call.h"
 #include "tesser/envelope.h"
 #include "tesser/remote.h"
@@ -331,7 +332,18 @@ bool FileTransfer::write(const uint8_t* data, size_t len, Reply& reply) {
         return false;
     }
     if (relay_) {
-        // Whole chunks of the peer's size, and the rest at the end.
+        // Whole chunks of the peer's size, and the rest at the end; grown to
+        // its exact need within the byte budget (docs/DESIGN.md section 15).
+        size_t need = relayBuf_.size() + len;
+        if (need > relayBuf_.capacity()) {
+            Reservation room = memoryBudget().reserve(need, 0, true);
+            if (!room) {
+                close();
+                writeError(reply, Status::Busy, Reason::LowMemory, path_, "not enough memory to relay the upload");
+                return false;
+            }
+            relayBuf_.reserve(need);
+        }
         relayBuf_.insert(relayBuf_.end(), data, data + len);
         received_ += len;
         activeMs_ = millis32();

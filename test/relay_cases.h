@@ -9,6 +9,7 @@
 
 #include "datagram_cases.h"
 #include "file_envelope_cases.h"
+#include "memory_cases.h"
 
 namespace relay_cases {
 
@@ -147,6 +148,48 @@ TEST(relay_envelope_upload) {
     CHECK(r.ask("{\"op\":\"upload\",\"path\":\"/dev/sys/firmware\",\"offset\":4,\"data\":\"YQ==\"}")
               .find("no upload in progress") != std::string::npos);
     CHECK_EQ(r.gateway.pending(), 0);
+}
+
+TEST(relay_upload_on_a_short_heap) {
+    // A gateway short of memory refuses a chunk (busy, low_memory) rather
+    // than build it anyway and abort; the transfer stays open, and the
+    // client sends the rest again from what the device has.
+    Rig r;
+    std::string first = r.big.substr(0, 1500);
+    {
+        memory_cases::Floor floor(8000, 9000);  // 1 KB above the floor
+        std::string reply = r.ask("{\"id\":1,\"op\":\"upload\",\"path\":\"/dev/big\",\"size\":3000,\"data\":\"" +
+                                  b64(first) + "\"}");
+        CHECK(reply.find("\"status\":\"busy\"") != std::string::npos);
+        CHECK(reply.find("\"reason\":\"low_memory\"") != std::string::npos);
+    }
+    CHECK_EQ(r.ask("{\"id\":2,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":0,\"data\":\"" + b64(first) + "\"}"),
+             "{\"id\":2,\"status\":\"ok\",\"body\":{\"received\":1500}}");
+    CHECK_EQ(r.ask("{\"id\":3,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":1500,\"data\":\"" +
+                   b64(r.big.substr(1500)) + "\"}"),
+             "{\"id\":3,\"status\":\"ok\",\"body\":null}");
+    CHECK_EQ(r.got, r.big);
+    CHECK_EQ(r.gateway.pending(), 0);
+}
+
+TEST(relay_reply_without_room_fails_at_once) {
+    // A large reply the endpoint can't parse now fails its call at once
+    // (busy, low_memory), not after the call's timeout.
+    datagram_cases::Net net;
+    DatagramEndpoint client(nullptr, tesser::TransportKind::NowTP, net.sender(addr(1)), net.clockFn());
+    datagram_cases::Result res;
+    CHECK(client.request(addr(2), tesser::Op::Get, "/big", "", datagram_cases::capture(res)));
+    uint32_t id = DatagramEndpoint::callIdOf(net.frames.front().text);
+    std::string big = "{\"id\":" + std::to_string(id) + ",\"status\":\"ok\",\"body\":\"" + std::string(3000, 'x') + "\"}";
+    {
+        memory_cases::Floor floor(8000, 11500);  // room to copy it, not to parse it
+        client.receive(addr(2), big.data(), big.size(), true);
+        client.process();
+    }
+    CHECK(res.called);
+    CHECK_EQ(res.status, Status::Busy);
+    CHECK(res.body.find("\"reason\":\"low_memory\"") != std::string::npos);
+    CHECK_EQ(client.pendingCalls(), 0u);
 }
 
 TEST(relay_envelope_download) {

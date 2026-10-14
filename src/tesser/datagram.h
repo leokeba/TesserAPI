@@ -398,7 +398,7 @@ private:
         SendFailure failure;
     };
 
-    bool sendRequest(const PeerAddress& to, uint32_t id, const std::string& envelope, ResponseHandler done,
+    bool sendRequest(const PeerAddress& to, uint32_t id, std::string envelope, ResponseHandler done,
                      uint32_t timeoutMs, const void* owner, bool internal = false, RawHandler raw = nullptr);
     bool takeRaw(const Incoming& msg);
     uint32_t nextCallId();
@@ -411,6 +411,7 @@ private:
     Access levelOf(const PeerAddress& peer);
     void reject(const PeerAddress& from, std::string_view text, bool broadcast, Status status, Reason reason,
                 const char* message);
+    void refuse(const PeerAddress& from, std::string_view text, bool broadcast, Reason reason);
     static Options checked(Options o);
     // Replies to `to` hand their buffer to ownedSend_, when there is one.
     void ownReplies(EnvelopeReply& reply, const PeerAddress& to, bool silent);

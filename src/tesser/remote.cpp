@@ -1595,10 +1595,21 @@ public:
     }
 
     void write(std::vector<uint8_t> data, Done done) override {
+        bool room = true;
         {
             MutexGuard guard(mutex_);
-            pending_.insert(pending_.end(), data.begin(), data.end());
+            // Grown to its exact need, within the byte budget (docs/DESIGN.md
+            // section 15); else the chunk is refused, for the client to send
+            // again.
+            size_t need = pending_.size() + data.size();
+            if (need > pending_.capacity()) {
+                Reservation growth = memoryBudget().reserve(need, 0, true);
+                room = static_cast<bool>(growth);
+                if (room) pending_.reserve(need);
+            }
+            if (room) pending_.insert(pending_.end(), data.begin(), data.end());
         }
+        if (!room) return lowMemory(done);
         pump(std::move(done));
     }
 
@@ -1751,29 +1762,47 @@ private:
                 offset = received_;
                 part = chunk_ ? chunk_ : kFallbackChunk;
                 if (part > pending_.size()) part = pending_.size();
-                std::string data = "\"";
-                detail::base64Encode(pending_.data(), part, data);
-                data += '"';
-                fields = std::make_shared<const std::string>(fieldsOf([&](JsonWriter& w) {
+                // Built once, at its exact size: the members, then the data
+                // encoded in place. Only with room for it and for the
+                // envelope it is copied into (docs/DESIGN.md section 15).
+                std::string head = fieldsOf([&](JsonWriter& w) {
                     w.key("op");
                     w.string(upload_);
                     w.key("path");
                     w.string(remotePath_);
                     w.key("offset");
                     w.uinteger(offset);
-                    w.key("data");
-                    w.raw(data);
-                }));
+                });
+                static constexpr char kData[] = ",\"data\":\"";
+                size_t size = head.size() + sizeof(kData) - 1 + (part + 2) / 3 * 4 + 1;
+                Reservation room = memoryBudget().reserve(2 * size + 32, 0, false);
+                if (room) {
+                    std::string text;
+                    text.reserve(size);
+                    text += head;
+                    text += kData;
+                    detail::base64Encode(pending_.data(), part, text);
+                    text += '"';
+                    fields = std::make_shared<const std::string>(std::move(text));
+                }
             }
         }
         if (closed || idle) {
             done(closed ? Status::Busy : Status::Ok, JsonVariantConst());
             return;
         }
+        if (!fields) return lowMemory(done);
         auto self = shared_from_this();
         call(fields, [self, done, offset, part](Status s, JsonVariantConst body) {
-            if (s != Status::Ok) {
+            if (s == Status::Busy) {
+                // The peer (or this node) had no room or no queue: the
+                // transfer stays open, and the client sends the rest again.
+                MutexGuard guard(self->mutex_);
+                self->pending_.clear();
+            } else if (s != Status::Ok) {
                 self->failed(s);
+            }
+            if (s != Status::Ok) {
                 done(s, body);
                 return;
             }
@@ -1814,9 +1843,24 @@ private:
     }
 
     // An error ends the transfer, except a bad offset, which the client can
-    // correct.
+    // correct, and busy, which it can try again.
     void failed(Status s) {
-        if (s != Status::BadRequest) close();
+        if (s != Status::BadRequest && s != Status::Busy) close();
+    }
+
+    // No room to relay what the client sent: dropped, for it to send again
+    // from received(); the transfer stays open.
+    void lowMemory(const Done& done) {
+        {
+            MutexGuard guard(mutex_);
+            pending_.clear();
+        }
+        JsonDocument error;
+        error["error"] = "busy";
+        error["reason"] = "low_memory";
+        error["path"] = remoteBase_.empty() ? std::string("/") : remoteBase_;
+        error["message"] = "not enough memory to relay the chunk";
+        done(Status::Busy, error.as<JsonVariantConst>());
     }
 
     void finishLocked() {
