@@ -236,6 +236,17 @@ size_t largestFreeBlock() {
 // what it needs (a reply nearly its full size: measured on DEVKIT-R1, a 4 KB
 // download chunk's reply was refused for growing to 5.9 KB). The growth stays
 // reserved until the buffer has it.
+void reserveExactly(std::string& s, size_t capacity) {
+    if (capacity <= s.capacity()) return;
+    // Copied into a new string, reserved from its small buffer: the same
+    // peak as reserve() (old and new buffers), without libstdc++'s doubling
+    // of an allocated capacity, empty or not.
+    std::string grown;
+    grown.reserve(capacity);
+    grown.append(s);
+    s.swap(grown);
+}
+
 bool growFor(std::string& s, size_t need) {
     if (need <= s.capacity()) return true;
     size_t grown = s.capacity() + s.capacity() / 2;
@@ -254,7 +265,7 @@ bool growFor(std::string& s, size_t need) {
     };
     size_t capacity = grown > need && fits(grown) ? grown : fits(need) ? need : 0;
     if (!capacity) return false;
-    s.reserve(capacity);
+    reserveExactly(s, capacity);
     return true;  // released: the heap shows the buffer now
 }
 

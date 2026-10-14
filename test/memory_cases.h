@@ -190,7 +190,8 @@ TEST(memory_remote_subscription_admission) {
 TEST(memory_large_receive_dropped_under_floor) {
     // A link's lent buffer (NowTP) isn't copied when the heap can't spare
     // it above the floor: a request is answered busy at once, anything else
-    // is lost, as datagrams can be.
+    // is lost, as datagrams can be. The reason says it was the heap, not
+    // the endpoint's queue.
     cases::Device dev;
     datagram_cases::Net net;
     tesser::DatagramEndpoint ep(&dev.api, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(2)),
@@ -200,7 +201,7 @@ TEST(memory_large_receive_dropped_under_floor) {
     ep.receive(datagram_cases::addr(1), big.data(), big.size(), true);
     CHECK_EQ(ep.stats().dropped, 1u);
     CHECK_EQ(net.frames.size(), 1u);
-    if (!net.frames.empty()) CHECK(net.frames[0].text.find("\"reason\":\"queue_full\"") != std::string::npos);
+    if (!net.frames.empty()) CHECK(net.frames[0].text.find("\"reason\":\"low_memory\"") != std::string::npos);
     net.frames.clear();
     std::string small = "{\"id\":2,\"op\":\"get\",\"path\":\"/lamp/on\"}";
     ep.receive(datagram_cases::addr(1), small.data(), small.size(), true);

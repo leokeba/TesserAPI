@@ -345,8 +345,11 @@ Reservation DatagramEndpoint::hold(const PeerAddress& from, std::string_view tex
             MutexGuard guard(mutex_);
             stats_.dropped++;
         }
-        // Answered, or its call failed, so nobody waits for a timeout.
-        refuse(from, text, broadcast, Reason::QueueFull);
+        // Answered, or its call failed, so nobody waits for a timeout: the
+        // queue's own limit is queue_full, the heap low_memory (a relay then
+        // asks for less, docs/DESIGN.md section 14).
+        bool queueRoom = static_cast<bool>(incoming_.reserve(text.size(), budgetKey(from), true, false));
+        refuse(from, text, broadcast, heap && queueRoom ? Reason::LowMemory : Reason::QueueFull);
     }
     return r;
 }

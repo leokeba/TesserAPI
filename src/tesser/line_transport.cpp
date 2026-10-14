@@ -37,7 +37,7 @@ bool growLine(std::string& s) {
         room = memoryBudget().reserve(capacity, 0, true);
         if (!room) return false;
     }
-    s.reserve(capacity);
+    reserveExactly(s, capacity);
     return true;
 }
 

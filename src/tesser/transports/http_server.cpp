@@ -1222,6 +1222,7 @@ void HttpServer::answerAsync(DeferredState* st, bool timedOut) {
         st->status = r.status;
         st->body = std::move(r.body);
     }
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
     auto work = [](void* arg) {
         auto* s = static_cast<DeferredState*>(arg);
         httpd_resp_set_status(s->async, statusLine(s->status));
@@ -1236,6 +1237,9 @@ void HttpServer::answerAsync(DeferredState* st, bool timedOut) {
         httpd_req_async_handler_complete(st->async);
         st->unref();
     }
+#else
+    st->unref();  // never watched: requests turn async only with ESP-IDF 5.3 and later
+#endif
 }
 
 void HttpServer::onAsyncTimer(void* arg) {

@@ -22,6 +22,10 @@ public:
 // bytes, unless it leaves the heap floor free (setHeapFloor()): false
 // then, and `s` is untouched.
 bool growFor(std::string& s, size_t need);
+// Gives `s` room for exactly `capacity` bytes, keeping its content. With
+// libstdc++ (ESP-IDF's, GCC's), reserve() on a string that has allocated
+// takes at least twice its capacity, which the byte accountant wouldn't see.
+void reserveExactly(std::string& s, size_t capacity);
 
 // Appends to a string, up to `limit` bytes (0: none). `guarded`: grows
 // only as far as the heap can give (growFor()); `lowMemory` then tells why
