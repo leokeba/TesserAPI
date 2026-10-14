@@ -108,7 +108,12 @@ private:
     static esp_err_t onWebSocket(httpd_req_t* req);
     static esp_err_t onWebSocketHandshake(httpd_req_t* req);
     static void onClose(httpd_handle_t server, int fd);
-    esp_err_t serve(httpd_req_t* req);
+    // `inWorker`: on a remote worker (the request is async already).
+    esp_err_t serve(httpd_req_t* req, bool inWorker = false);
+    // Hands a request below a remote node to a worker task; false (pool
+    // busy, no task): serve it here.
+    bool dispatchRemote(httpd_req_t* req);
+    static void remoteTask(void* arg);
     esp_err_t receiveFile(httpd_req_t* req, FileTransfer& file, Reply& reply);
     esp_err_t sendFile(httpd_req_t* req, FileTransfer& file);
     esp_err_t serveWebSocket(httpd_req_t* req);
@@ -151,6 +156,7 @@ private:
     // section 10.2), each holding its handler's reference.
     mutable Mutex asyncMutex_{kRankLeaf, "http async"};
     std::vector<DeferredState*> async_;
+    std::atomic<int> remoteJobs_{0};  // requests below remote nodes on workers
     struct esp_timer* asyncTimer_ = nullptr;
     friend class HttpReply;
 };

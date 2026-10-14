@@ -213,6 +213,9 @@ public:
     void forwardedSubscriptions(const Node* node, const std::function<bool(Subscription&)>& fn);
     // Finds the API whose tree holds `node`, and the node's path.
     static Api* owner(const Node& node, std::string& path);
+    // Whether `path` reaches a remote node (it or below it): a request there
+    // may wait on a peer (HttpServer serves those off its task).
+    bool belowRemote(std::string_view path) const;
 
     // Used by Call/Pending.
     bool pendingBegin();

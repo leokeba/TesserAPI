@@ -1495,6 +1495,26 @@ Access Api::tokenAccess(std::string_view token) const {
     return tokenCheck_ ? tokenCheck_(token) : Access::Public;
 }
 
+bool Api::belowRemote(std::string_view path) const {
+    MutexGuard guard(mutex_);
+    const Node* node = this;
+    size_t pos = 0;
+    while (pos < path.size()) {
+        if (path[pos] == '/') {
+            pos++;
+            continue;
+        }
+        if (node->type() == NodeType::Remote) return true;
+        if (node->type() != NodeType::Object) return false;
+        size_t slash = path.find('/', pos);
+        if (slash == std::string_view::npos) slash = path.size();
+        node = static_cast<const Object*>(node)->child(path.substr(pos, slash - pos));
+        if (!node) return false;
+        pos = slash;
+    }
+    return node->type() == NodeType::Remote;
+}
+
 void Api::handle(const Request& request, Reply& reply) {
     if (request.client.level() > request.query.ceiling) {
         // Asked to act at a lower level (docs/DESIGN.md section 13.1).

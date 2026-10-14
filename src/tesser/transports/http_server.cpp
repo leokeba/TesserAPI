@@ -730,6 +730,9 @@ void HttpServer::end() {
         esp_timer_delete(asyncTimer_);
         asyncTimer_ = nullptr;
     }
+    // Workers serving requests below remote nodes use the server: they end
+    // within the remote's timeout (bounded wait).
+    for (int i = 0; i < 1100 && remoteJobs_.load() > 0; i++) vTaskDelay(pdMS_TO_TICKS(10));
     // Async requests still waiting: answered as timed out.
     std::vector<DeferredState*> waiting;
     {
@@ -785,7 +788,59 @@ esp_err_t HttpServer::onOptions(httpd_req_t* req) {
 
 esp_err_t HttpServer::onRequest(httpd_req_t* req) { return static_cast<HttpServer*>(req->user_ctx)->serve(req); }
 
-esp_err_t HttpServer::serve(httpd_req_t* req) {
+// ---- requests below remote nodes ------------------------------------------------
+
+namespace {
+constexpr int kRemoteWorkers = 2;
+struct RemoteJob {
+    HttpServer* server;
+    httpd_req_t* req;  // async
+};
+}  // namespace
+
+// A request below a remote node may wait on the peer before anything else
+// (the probe for a file, a relay, a forwarded call): on a worker task of its
+// own, so httpd goes on serving (docs/DESIGN.md section 10.2).
+bool HttpServer::dispatchRemote(httpd_req_t* req) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+    if (remoteJobs_.fetch_add(1) >= kRemoteWorkers) {
+        remoteJobs_--;
+        return false;
+    }
+    httpd_req_t* async = nullptr;
+    if (httpd_req_async_handler_begin(req, &async) != ESP_OK) {
+        remoteJobs_--;
+        return false;
+    }
+    auto* job = new RemoteJob{this, async};
+    if (xTaskCreate(&HttpServer::remoteTask, "tesser_remote", 6144, job, 5, nullptr) != pdPASS) {
+        // No room for a task: served here after all, from the async copy.
+        delete job;
+        serve(async, true);
+        httpd_req_async_handler_complete(async);
+        remoteJobs_--;
+    }
+    return true;
+#else
+    (void)req;
+    return false;
+#endif
+}
+
+void HttpServer::remoteTask(void* arg) {
+    auto* job = static_cast<RemoteJob*>(arg);
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+    esp_err_t err = job->server->serve(job->req, true);
+    // A failure means the connection can't carry on, as when a handler fails.
+    if (err != ESP_OK) httpd_sess_trigger_close(job->req->handle, httpd_req_to_sockfd(job->req));
+    httpd_req_async_handler_complete(job->req);
+    job->server->remoteJobs_--;
+#endif
+    delete job;
+    vTaskDelete(nullptr);
+}
+
+esp_err_t HttpServer::serve(httpd_req_t* req, bool inWorker) {
     HttpReply reply(*this, req);
     const Config& cfg = api_.config();
 
@@ -891,6 +946,10 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
         }
     }
 
+    // Below a remote node, before anything waits on the peer: on a worker.
+    // (A streamed subscription stays here, its socket kept by httpd.)
+    if (!inWorker && !sub && api_.belowRemote(path) && dispatchRemote(req)) return ESP_OK;
+
     // File nodes (docs/DESIGN.md section 4.6): raw bytes both ways, before
     // the body is read, so maxRequestBody doesn't apply to uploads.
     if (sub && request.op != Op::Get) {
@@ -906,7 +965,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
         if (o == FileTransfer::Open::Ok) {
             // Relayed to a remote node, it waits for each chunk's reply: off
             // the httpd task (docs/DESIGN.md section 14).
-            if (file.relay() && relayAsync(req, owned, request.op == Op::Set)) return ESP_OK;
+            if (!inWorker && file.relay() && relayAsync(req, owned, request.op == Op::Set)) return ESP_OK;
             return request.op == Op::Set ? receiveFile(req, file, reply) : sendFile(req, file);
         }
         if (o == FileTransfer::Open::Failed) {
@@ -956,7 +1015,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req) {
         // when the reply comes (or deferTimeoutMs passes), and the server
         // goes on serving everyone else (docs/DESIGN.md section 10.2).
         httpd_req_t* async = nullptr;
-        if (httpd_req_async_handler_begin(req, &async) == ESP_OK) {
+        if (!inWorker && httpd_req_async_handler_begin(req, &async) == ESP_OK) {
             st->async = async;
             st->server = this;
             st->deadlineMs = millis32() + cfg.deferTimeoutMs;
