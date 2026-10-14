@@ -6,11 +6,15 @@
 
 #include <stdint.h>
 
+#include <atomic>
+#include <memory>
+
 #include <string>
 #include <vector>
 
 #include "esp_http_server.h"
 #include "tesser/api.h"
+#include "tesser/budget.h"
 
 struct esp_timer;  // esp_timer.h, kept out of applications' include path
 
@@ -79,6 +83,18 @@ public:
     httpd_handle_t handle() const { return server_; }
     Api& api() { return api_; }
 
+    // Frames and stream chunks handed to the httpd task (httpd_queue_work)
+    // hold their bytes here (docs/DESIGN.md section 15): 16 KB in all, 8 KB
+    // per connection by default; beyond, a notification is refused and the
+    // next says "overflow".
+    ByteBudget& queueBudget() { return queued_; }
+    struct WorkStats {
+        uint32_t queued = 0;   // items httpd accepted
+        uint32_t run = 0;      // items that ran: queued - run are waiting (or lost)
+        uint32_t refused = 0;  // by the budget or by httpd
+    };
+    WorkStats workStats() const;
+
 private:
     class WsClient;
     class Stream;
@@ -96,6 +112,7 @@ private:
     WsClient* wsClient(int fd, bool create);
     void dropWsClient(int fd);
     bool wsSend(int fd, const std::string& message);
+    bool wsSendShared(int fd, std::shared_ptr<const std::string> message);
     Access access(httpd_req_t* req) const;
     esp_err_t serveStream(httpd_req_t* req, const Request& request, Reply& reply);
     bool streamSend(Stream* stream, const std::string& piece);
@@ -103,6 +120,8 @@ private:
     static void onKeepAlive(void* arg);
 
     Api& api_;
+    ByteBudget queued_{"httpd queue", 16384, 8192};
+    std::atomic<uint32_t> workQueued_{0}, workRun_{0}, workRefused_{0};
     httpd_handle_t server_ = nullptr;
     bool ownsServer_ = false;
     uint16_t port_ = 80;

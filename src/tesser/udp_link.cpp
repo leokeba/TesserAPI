@@ -155,10 +155,12 @@ UdpLink::UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock, Optio
     : send_(std::move(send)),
       clock_(clock),
       options_(options),
+      outgoingBytes_("udp outgoing", options.outgoingBytes, options.outgoingBytesPerPeer),
+      reassembly_("udp reassembly", options.reassemblyBytes, options.reassemblyBytesPerPeer),
       endpoint_(
           api, TransportKind::Udp,
           [this](const PeerAddress& to, std::string m, Delivery d) { return sendMessage(to, std::move(m), d); },
-          std::move(clock), endpointOptions),
+          std::move(clock), withLink(endpointOptions, options)),
       api_(api) {
     if (options_.fragmentSize < 64) options_.fragmentSize = 64;
     size_t most = size_t(options_.fragmentSize) * kMaxFragments;
@@ -167,6 +169,12 @@ UdpLink::UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock, Optio
 }
 
 UdpLink::~UdpLink() { running_ = false; }
+
+DatagramEndpoint::Options UdpLink::withLink(DatagramEndpoint::Options o, const Options& link) {
+    size_t most = size_t(link.fragmentSize < 64 ? 64 : link.fragmentSize) * kMaxFragments;
+    o.maxMessage = link.maxMessage < most ? link.maxMessage : most;
+    return o;
+}
 
 void UdpLink::start(uint32_t nonce) {
     MutexGuard guard(mutex_);
@@ -274,6 +282,12 @@ bool UdpLink::sendMessage(const PeerAddress& to, std::string message, Delivery d
     MutexGuard guard(mutex_);
     if (!running_) return false;
     if (reliable && outgoing_.size() >= options_.maxOutgoing) return false;
+    // Kept until acknowledged: counted (allocated already).
+    Reservation held;
+    if (reliable) {
+        held = outgoingBytes_.reserve(message.size(), budgetKey(to), true, false);
+        if (!held) return false;
+    }
     uint32_t id = nextId_++;
     if (!reliable) {
         // Copies of a broadcast keep its id: receivers apply the first.
@@ -285,7 +299,7 @@ bool UdpLink::sendMessage(const PeerAddress& to, std::string message, Delivery d
     // Kept for retransmissions: taken, not copied (a large reply on a
     // fragmented heap had no room for a second block).
     outgoing_.push_back(Outgoing{to, id, std::move(message), count, 0, t + options_.ackTimeoutMs, options_.ackTimeoutMs,
-                                 t + options_.sendTimeoutMs});
+                                 t + options_.sendTimeoutMs, std::move(held)});
     const Outgoing& o = outgoing_.back();
     transmit(to, id, o.data, count, allOf(count), kReliable);
     return true;
@@ -408,16 +422,21 @@ void UdpLink::dropPartials(const PeerAddress& from) {
     }
 }
 
-// Evicts the oldest partial messages until `bytes` more fit the budget.
-bool UdpLink::makeRoom(size_t bytes) {
-    if (bytes > options_.reassemblyBytes) return false;
+Reservation UdpLink::makeRoom(const PeerAddress& from, size_t bytes) {
     for (;;) {
-        size_t used = 0;
-        for (const Partial& p : partials_) used += p.data.size();
-        if (used + bytes <= options_.reassemblyBytes) return true;
-        size_t oldest = 0;
-        for (size_t i = 1; i < partials_.size(); i++) {
-            if (static_cast<int32_t>(partials_[i].touchedMs - partials_[oldest].touchedMs) < 0) oldest = i;
+        // About to be allocated: the heap floor and one block too.
+        Reservation r = reassembly_.reserve(bytes, budgetKey(from), true, true);
+        if (r || partials_.empty()) return r;
+        // The sender's own oldest first, so one peer can't push out others.
+        size_t oldest = partials_.size();
+        for (int pass = 0; pass < 2 && oldest == partials_.size(); pass++) {
+            for (size_t i = 0; i < partials_.size(); i++) {
+                if (pass == 0 && partials_[i].from != from) continue;
+                if (oldest == partials_.size() ||
+                    static_cast<int32_t>(partials_[i].touchedMs - partials_[oldest].touchedMs) < 0) {
+                    oldest = i;
+                }
+            }
         }
         partials_.erase(partials_.begin() + static_cast<std::ptrdiff_t>(oldest));
         stats_.dropped++;
@@ -472,13 +491,15 @@ void UdpLink::handleData(const PeerAddress& from, Peer& peer, const uint8_t* dat
     if (!p) {
         // A heap too fragmented for the message: dropped, and the sender
         // tries again, rather than an abort.
-        if (!makeRoom(h.length) || largestFreeBlock() < size_t(h.length) + 1024 || !heapAbove(h.length)) {
+        Reservation held = makeRoom(from, h.length);
+        if (!held) {
             stats_.dropped++;
             return;
         }
         partials_.push_back(Partial{from, h.nonce, h.id, std::string(h.length, '\0'), 0, h.chunk, h.count,
-                                    static_cast<uint8_t>(h.flags & (kReliable | kBroadcast)), t});
+                                    static_cast<uint8_t>(h.flags & (kReliable | kBroadcast)), t, std::move(held)});
         p = &partials_.back();
+        p->held.settle();
     }
     memcpy(&p->data[size_t(h.index) * h.chunk], payload, n);
     p->got |= flag(h.index);

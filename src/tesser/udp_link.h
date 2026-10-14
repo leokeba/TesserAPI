@@ -47,7 +47,14 @@ public:
         uint32_t ackTimeoutMs = 100;      // first retransmission of an unacknowledged message; doubles, up to 1 s
         uint32_t sendTimeoutMs = 3000;    // a reliable message fails after this (the peer is then forgotten)
         size_t maxOutgoing = 16;          // reliable messages waiting for their acknowledgement
-        size_t reassemblyBytes = 32768;   // messages being reassembled, in total
+        // Their bytes, in all and to any one peer (docs/DESIGN.md section 15;
+        // 0: no limit). Beyond, a send fails: the request or reply is busy.
+        size_t outgoingBytes = 24576;
+        size_t outgoingBytesPerPeer = 16384;
+        // Messages being reassembled, in all and from any one peer; beyond,
+        // the oldest are dropped (the sender sends them again).
+        size_t reassemblyBytes = 24576;
+        size_t reassemblyBytesPerPeer = 16384;
         size_t maxPeers = 16;             // peers remembered (duplicate suppression, discovery)
         uint32_t advertiseMs = 5000;      // advertisement period, once advertise() is called
         uint32_t peerTimeoutMs = 15000;   // an advertised peer silent for this long is lost
@@ -151,6 +158,7 @@ private:
         uint32_t probeMs;
         uint32_t backoffMs;
         uint32_t deadlineMs;
+        Reservation held;  // its bytes, in outgoing_
     };
     struct Partial {
         PeerAddress from;
@@ -162,6 +170,7 @@ private:
         uint8_t count;
         uint8_t flags;
         uint32_t touchedMs;
+        Reservation held;  // its bytes, in reassembly_
     };
     struct Inbound {
         PeerAddress from;
@@ -183,12 +192,19 @@ private:
                     std::vector<Inbound>& out);
     void handleAck(const PeerAddress& from, const uint8_t* data, size_t len, uint32_t now);
     void dropPartials(const PeerAddress& from);
-    bool makeRoom(size_t bytes);
+    // The endpoint's options, with the link's message limit.
+    static DatagramEndpoint::Options withLink(DatagramEndpoint::Options o, const Options& link);
+    // Reserves `bytes` for a message from `from`, dropping older partial
+    // messages (its own first) while the budget or the heap refuses.
+    Reservation makeRoom(const PeerAddress& from, size_t bytes);
     uint32_t now() const { return clock_ ? clock_() : 0; }
 
     PacketFn send_;
     DatagramEndpoint::ClockFn clock_;
     Options options_;
+    // Before the messages holding their reservations.
+    ByteBudget outgoingBytes_;
+    ByteBudget reassembly_;
     DatagramEndpoint endpoint_;
     Api* api_;
 

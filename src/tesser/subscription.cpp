@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "tesser/api.h"
+#include "tesser/budget.h"
 #include "tesser/call.h"
 #include "tesser/detail/lazy_patch.h"
 #include "tesser/remote.h"
@@ -378,7 +379,7 @@ void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter
     if (subs_.empty()) return;
 
     std::string base;
-    StringSink sink(base);
+    StringSink sink(base, 0, true);  // guarded: refused on a short heap
     JsonWriter w(sink);
     w.beginObject();
     w.key("op");
@@ -391,8 +392,35 @@ void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter
     } else {
         w.null();
     }
+    bool built = w.ok();
 
     Access need = readNeed(*this, path);
+
+    // One message per variant (level, overflow), shared by every subscriber
+    // it goes to, with its bytes counted while any of them holds it.
+    struct Held {
+        std::string text;
+        Reservation bytes;
+    };
+    struct Variant {
+        Access ceiling;
+        bool overflow;
+        std::shared_ptr<const std::string> message;
+    };
+    std::vector<Variant> variants;
+    auto messageFor = [&](Access ceiling, bool overflow) -> std::shared_ptr<const std::string> {
+        for (const Variant& v : variants) {
+            if (v.ceiling == ceiling && v.overflow == overflow) return v.message;
+        }
+        auto held = std::make_shared<Held>();
+        if (!built || !growFor(held->text, base.size() + 48)) return nullptr;
+        held->text = base;
+        closeEnvelope(held->text, overflow, ceiling);
+        held->bytes = memoryBudget().reserve(held->text.capacity(), 0, false, false);
+        std::shared_ptr<const std::string> m(held, &held->text);
+        variants.push_back(Variant{ceiling, overflow, m});
+        return m;
+    };
 
     // Once per client and level: a gateway holding subscriptions at two
     // levels gets the event for each.
@@ -421,10 +449,9 @@ void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter
         if (seen) continue;
         notified.emplace_back(sub.subscriber, sub.ceiling);
 
-        std::string msg = base;
         bool overflow = sub.subscriber->missed.exchange(false);
-        closeEnvelope(msg, overflow, sub.ceiling);
-        if (!sub.subscriber->notify(msg, Delivery::Reliable)) sub.subscriber->missed = true;
+        std::shared_ptr<const std::string> msg = messageFor(sub.ceiling, overflow);
+        if (!msg || !sub.subscriber->notifyShared(msg, Delivery::Reliable)) sub.subscriber->missed = true;
     }
 }
 

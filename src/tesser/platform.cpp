@@ -1,5 +1,6 @@
 #include "tesser/platform.h"
 
+#include "tesser/budget.h"
 #include "tesser/sink.h"
 
 #include <stdarg.h>
@@ -87,15 +88,18 @@ bool growFor(std::string& s, size_t need) {
     size_t capacity = need > grown ? need : grown;
     // Small buffers (error replies) always go: refusing them would leave the
     // client with nothing at all.
+    Reservation growth;
     if (capacity > 256) {
         // The heap as a whole: the growth and a copy further down, and the
-        // floor left to everything else.
-        if (!heapAbove(capacity - s.capacity() + need)) return false;
+        // floor left to everything else, after what other tasks' buffers
+        // are about to take (the accountant, docs/DESIGN.md section 15).
+        growth = memoryBudget().reserve(capacity - s.capacity() + need, 0, false);
+        if (!growth) return false;
         // One block that size, a copy further down, and headroom.
         if (capacity > 1024 && largestFreeBlock() < capacity + need + 1024) return false;
     }
     s.reserve(capacity);
-    return true;
+    return true;  // released: the heap shows the buffer now
 }
 
 bool stationMac(uint8_t mac[6]) {

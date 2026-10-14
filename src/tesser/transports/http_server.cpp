@@ -305,6 +305,9 @@ public:
     WsClient(HttpServer& server, int socket) : server_(server), fd(socket), files(server.api_) {}
     Access access = Access::Public;
     bool notify(const std::string& message, Delivery) override { return server_.wsSend(fd, message); }
+    bool notifyShared(const std::shared_ptr<const std::string>& message, Delivery) override {
+        return server_.wsSendShared(fd, message);
+    }
 
 private:
     HttpServer& server_;
@@ -377,7 +380,8 @@ struct WsWork {
     HttpServer* server;
     httpd_handle_t handle;
     int fd;
-    std::string message;
+    std::shared_ptr<const std::string> message;  // shared with other clients' frames (events)
+    Reservation held;
 };
 }  // namespace
 #endif
@@ -386,21 +390,33 @@ struct WsWork {
 // notifications and deferred replies from other tasks never interleave
 // with the server's own writes.
 bool HttpServer::wsSend(int fd, const std::string& message) {
+    return wsSendShared(fd, std::make_shared<const std::string>(message));
+}
+
+bool HttpServer::wsSendShared(int fd, std::shared_ptr<const std::string> message) {
 #if CONFIG_HTTPD_WS_SUPPORT
     httpd_handle_t handle = server_;
     if (!handle) return false;
-    auto* work = new WsWork{this, handle, fd, message};
+    // Counted until the httpd task has sent it (docs/DESIGN.md section 15).
+    Reservation held = queued_.reserve(message->size(), static_cast<uintptr_t>(fd) + 1, false, false);
+    if (!held) {
+        workRefused_++;
+        return false;
+    }
+    auto* work = new WsWork{this, handle, fd, std::move(message), std::move(held)};
     esp_err_t err = httpd_queue_work(
         handle,
         [](void* arg) {
             auto* w = static_cast<WsWork*>(arg);
+            w->server->workRun_++;
             bool ok = httpd_ws_get_fd_info(w->handle, w->fd) == HTTPD_WS_CLIENT_WEBSOCKET;
             if (ok) {
                 httpd_ws_frame_t frame = {};
                 frame.type = HTTPD_WS_TYPE_TEXT;
                 frame.final = true;
-                frame.payload = reinterpret_cast<uint8_t*>(&w->message[0]);
-                frame.len = w->message.size();
+                // httpd only reads the payload.
+                frame.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(w->message->data()));
+                frame.len = w->message->size();
                 ok = httpd_ws_send_frame_async(w->handle, w->fd, &frame) == ESP_OK;
             }
             if (!ok) w->server->dropWsClient(w->fd);
@@ -408,15 +424,25 @@ bool HttpServer::wsSend(int fd, const std::string& message) {
         },
         work);
     if (err != ESP_OK) {
+        workRefused_++;
         delete work;
         return false;
     }
+    workQueued_++;
     return true;
 #else
     (void)fd;
     (void)message;
     return false;
 #endif
+}
+
+HttpServer::WorkStats HttpServer::workStats() const {
+    WorkStats s;
+    s.queued = workQueued_.load();
+    s.run = workRun_.load();
+    s.refused = workRefused_.load();
+    return s;
 }
 
 namespace {
@@ -886,6 +912,7 @@ struct StreamWork {
     void* stream;
     int fd;
     std::string chunk;
+    Reservation held;
 };
 }  // namespace
 
@@ -893,12 +920,26 @@ struct StreamWork {
 // (httpd_queue_work), so writes from other tasks never interleave.
 bool HttpServer::streamSend(Stream* stream, const std::string& piece) {
     char size[12];
-    snprintf(size, sizeof(size), "%x\r\n", static_cast<unsigned>(piece.size()));
-    auto* work = new StreamWork{this, stream->handle, stream, stream->fd, std::string(size) + piece + "\r\n"};
+    int n = snprintf(size, sizeof(size), "%x\r\n", static_cast<unsigned>(piece.size()));
+    // The chunk, built in one allocation and counted until sent.
+    size_t len = static_cast<size_t>(n) + piece.size() + 2;
+    Reservation held = queued_.reserve(len, static_cast<uintptr_t>(stream->fd) + 1, true, true);
+    if (!held) {
+        workRefused_++;
+        return false;
+    }
+    std::string chunk;
+    chunk.reserve(len);
+    held.settle();
+    chunk.append(size, static_cast<size_t>(n));
+    chunk += piece;
+    chunk += "\r\n";
+    auto* work = new StreamWork{this, stream->handle, stream, stream->fd, std::move(chunk), std::move(held)};
     esp_err_t err = httpd_queue_work(
         stream->handle,
         [](void* arg) {
             auto* w = static_cast<StreamWork*>(arg);
+            w->server->workRun_++;
             bool live = false;
             {
                 // Still open, and the socket still its own: a closed socket's
@@ -928,9 +969,11 @@ bool HttpServer::streamSend(Stream* stream, const std::string& piece) {
         },
         work);
     if (err != ESP_OK) {
+        workRefused_++;
         delete work;
         return false;
     }
+    workQueued_++;
     return true;
 }
 

@@ -2,6 +2,7 @@
 set(TESSER_CORE_SRCS
     src/tesser/status.cpp
     src/tesser/platform.cpp
+    src/tesser/budget.cpp
     src/tesser/json_writer.cpp
     src/tesser/node.cpp
     src/tesser/call.cpp

@@ -28,9 +28,19 @@ class NowTpTransport {
 public:
     static constexpr uint8_t kDefaultPort = 84;
 
+    // The endpoint's options for NowTP messages of up to `maxMessageSize`
+    // bytes: pass NowTP's Config::maxMessageSize when it isn't the default
+    // (docs/DESIGN.md section 15), so a reply that wouldn't fit answers
+    // too_large instead of being rejected by the link.
+    static DatagramEndpoint::Options endpointOptions(size_t maxMessageSize = 16 * 1024) {
+        DatagramEndpoint::Options o;
+        o.maxMessage = maxMessageSize;
+        return o;
+    }
+
     // `api` may be null for a client-only node.
     NowTpTransport(Api* api, nowtp::EspNowTransport& now, uint8_t port = kDefaultPort,
-                   DatagramEndpoint::Options options = DatagramEndpoint::Options());
+                   DatagramEndpoint::Options options = endpointOptions());
     ~NowTpTransport();
     NowTpTransport(const NowTpTransport&) = delete;
     NowTpTransport& operator=(const NowTpTransport&) = delete;

@@ -20,6 +20,7 @@ inline size_t freeProbe() { return g_free; }
 
 // A heap floor and the free heap the library sees; restored after.
 struct Floor {
+    size_t before = tesser::heapFloor();
     Floor(size_t floor, size_t free) {
         g_free = free;
         tesser::setFreeHeapProbe(&freeProbe);
@@ -27,7 +28,7 @@ struct Floor {
     }
     ~Floor() {
         tesser::setFreeHeapProbe(nullptr);
-        tesser::setHeapFloor(0);
+        tesser::setHeapFloor(before);  // the device's own, on target
     }
     void free(size_t bytes) { g_free = bytes; }
 };
@@ -188,15 +189,19 @@ TEST(memory_remote_subscription_admission) {
 
 TEST(memory_large_receive_dropped_under_floor) {
     // A link's lent buffer (NowTP) isn't copied when the heap can't spare
-    // it: the message is lost, as datagrams can be.
+    // it above the floor: a request is answered busy at once, anything else
+    // is lost, as datagrams can be.
     cases::Device dev;
     datagram_cases::Net net;
     tesser::DatagramEndpoint ep(&dev.api, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(2)),
                                 net.clockFn());
     std::string big = "{\"id\":1,\"op\":\"get\",\"path\":\"/lamp\",\"pad\":\"" + std::string(600, 'p') + "\"}";
-    Floor floor(8000, 8800);
+    Floor floor(8000, 8500);
     ep.receive(datagram_cases::addr(1), big.data(), big.size(), true);
     CHECK_EQ(ep.stats().dropped, 1u);
+    CHECK_EQ(net.frames.size(), 1u);
+    if (!net.frames.empty()) CHECK(net.frames[0].text.find("\"reason\":\"queue_full\"") != std::string::npos);
+    net.frames.clear();
     std::string small = "{\"id\":2,\"op\":\"get\",\"path\":\"/lamp/on\"}";
     ep.receive(datagram_cases::addr(1), small.data(), small.size(), true);
     ep.process();

@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -117,6 +118,12 @@ public:
     // Api::poll() or from an event's emit(); must not block for long.
     // Returns false if it couldn't be queued.
     virtual bool notify(const std::string& message, Delivery delivery) = 0;
+    // Same, for a message other subscribers get too (an event): immutable,
+    // and counted once (docs/DESIGN.md section 15). A transport that queues
+    // it for another task keeps this one rather than a copy.
+    virtual bool notifyShared(const std::shared_ptr<const std::string>& message, Delivery delivery) {
+        return notify(*message, delivery);
+    }
     // Set when a notification was lost (by the core when notify() fails, or by
     // the transport when a queued one fails later). The next notification
     // carries "overflow": true so the client knows to re-read.

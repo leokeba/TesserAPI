@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "tesser/call.h"
+#include "tesser/budget.h"
 #include "tesser/node.h"
 #include "tesser/platform.h"
 #include "tesser/request.h"
@@ -237,6 +238,7 @@ public:
         Request request;
         std::string path, keys, exclude, body;
         Reply* reply = nullptr;
+        Reservation held;  // the copies' bytes (docs/DESIGN.md section 15)
     };
 
 private:

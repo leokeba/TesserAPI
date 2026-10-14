@@ -14,6 +14,7 @@
 
 #include <ArduinoJson.h>
 
+#include "tesser/budget.h"
 #include "tesser/platform.h"
 #include "tesser/request.h"
 
@@ -85,6 +86,18 @@ public:
         uint32_t timeoutMs = 3000;       // default client call timeout
         size_t maxCalls = 8;             // client calls in flight
         size_t maxTokens = 8;            // peers holding a token ("auth"); the oldest is forgotten
+        // The largest message the link carries (NowTP's
+        // Config::maxMessageSize, UdpLink's maxMessage); 0: no limit. A reply
+        // that would be larger answers too_large (the client reads in
+        // pieces), and a larger notification is missed ("overflow"), rather
+        // than either failing on the link. Every node of a link must take
+        // what the others send it: give them all the same.
+        size_t maxMessage = 0;
+        // Bytes of incoming messages waiting for process(), in all and from
+        // any one peer (docs/DESIGN.md section 15); 0: no limit. Raised to
+        // maxMessage if below it, so the largest message can always queue.
+        size_t queueBytes = 20480;
+        size_t queueBytesPerPeer = 16384;
     };
 
     struct Stats {
@@ -283,6 +296,9 @@ public:
     // The default call timeout (Options::timeoutMs).
     uint32_t timeoutMs() const { return options_.timeoutMs; }
     Api* api() const { return api_; }
+    // The largest reply: the API's Config::maxResponse within the link's
+    // Options::maxMessage.
+    size_t replyLimit() const;
 
 private:
     struct FreeDeleter {
@@ -297,12 +313,14 @@ private:
         bool broadcast = false;
         std::unique_ptr<char, FreeDeleter> owned;
         size_t ownedLen = 0;
+        Reservation held;  // its bytes, in incoming_
         std::string_view view() const { return owned ? std::string_view(owned.get(), ownedLen) : std::string_view(text); }
     };
     class PeerSubscriber : public Subscriber {
     public:
         PeerSubscriber(DatagramEndpoint& ep, const PeerAddress& address) : ep_(ep), peer(address) {}
         bool notify(const std::string& message, Delivery delivery) override {
+            if (ep_.options_.maxMessage && message.size() > ep_.options_.maxMessage) return false;
             return ep_.send_ && ep_.send_(peer, message, delivery);
         }
 
@@ -379,7 +397,12 @@ private:
     void queue(Incoming&& msg);
     void handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply);
     Access levelOf(const PeerAddress& peer);
-    void reject(const Incoming& msg, Status status, Reason reason, const char* message);
+    void reject(const PeerAddress& from, std::string_view text, bool broadcast, Status status, Reason reason,
+                const char* message);
+    static Options checked(Options o);
+    // Holds `len` bytes from `from` in incoming_ (`heap`: about to be
+    // allocated); empty, with a busy reply to a request, when refused.
+    Reservation hold(const PeerAddress& from, std::string_view text, bool broadcast, bool heap);
     // `reason`: why the calls of a forgotten peer fail (None: a plain timeout).
     void expire(uint32_t now, bool all, const PeerAddress* peer, Reason reason = Reason::None);
     void failCall(uint32_t id, Status status, Reason reason, const char* message);
@@ -397,6 +420,7 @@ private:
 
     Api* api_;
     TransportKind kind_;
+    ByteBudget incoming_;  // queued messages (Options::queueBytes)
     SendFn send_;
     ClockFn clock_;
     Options options_;
@@ -445,6 +469,9 @@ private:
 // reported twice.
 void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLossHandler lost);
 void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLostHandler lost);
+
+// A peer as a ByteBudget key (per-peer limits).
+uintptr_t budgetKey(const PeerAddress& peer);
 
 // The text of member `key` of a JSON object (`json` must be valid JSON):
 // false if it has none.

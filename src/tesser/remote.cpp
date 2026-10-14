@@ -5,6 +5,7 @@
 #include <algorithm>
 
 #include "tesser/api.h"
+#include "tesser/budget.h"
 #include "tesser/call.h"
 #include "tesser/detail/lazy_patch.h"
 #include "tesser/envelope.h"
@@ -883,7 +884,14 @@ bool RemoteNode::handleNotification(const DatagramEndpoint& by, const PeerAddres
         if (!forMirror || !rest.empty()) return relayChange(rest, level, envelope["body"]);
         {
             MutexGuard guard(mutex_);
-            if (hasCopy_) {
+            // Merged, the change takes about twice its text more in the
+            // copy: only within the budget (docs/DESIGN.md section 15). Else
+            // the copy goes, and is taken again whole within 2 s.
+            Reservation room = memoryBudget().reserve(2 * measureJson(envelope["body"]), 0, false);
+            if (!room) {
+                copy_.clear();
+                hasCopy_ = false;
+            } else if (hasCopy_) {
                 merge(copy_.as<JsonVariant>(), envelope["body"]);
             } else {
                 copy_.set(envelope["body"]);
@@ -1418,6 +1426,14 @@ bool RemoteNode::relayChange(std::string_view rest, Access level, JsonVariantCon
     MutexGuard guard(mutex_);
     Upstream* u = findUpstream(rest, level);
     if (!u || !u->ready) return false;
+    // Only within the budget (docs/DESIGN.md section 15): else the change
+    // isn't relayed, and the subscription is renewed soon, its subscribers
+    // getting the whole state if it differs.
+    Reservation room = memoryBudget().reserve(2 * measureJson(patch), 0, false);
+    if (!room) {
+        u->stale = true;  // renewed within 2 s
+        return true;
+    }
     merge(u->copy.as<JsonVariant>(), patch);
     std::string localPath = localPath_ + std::string(rest);
     api->forwardedSubscriptions(this, [&](Subscription& sub) {

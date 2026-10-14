@@ -1568,6 +1568,14 @@ bool Api::enqueue(const Request& request, Reply& reply) {
             return true;
         }
     }
+    // The copies kept until poll() runs it, counted (docs/DESIGN.md section 15).
+    size_t bytes = request.path.size() + request.query.keys.size() + request.query.exclude.size() +
+                   (request.body.isNull() ? 0 : measureJson(request.body)) + sizeof(QueuedRequest);
+    Reservation held = memoryBudget().reserve(bytes, 0, false);
+    if (!held) {
+        writeError(reply, Status::Busy, Reason::LowMemory, request.path, "not enough memory to queue the request");
+        return true;
+    }
     Reply* detached = reply.detach();
     if (!detached) return false;  // the transport can't wait: handle inline
     auto* q = new QueuedRequest();
@@ -1581,6 +1589,8 @@ bool Api::enqueue(const Request& request, Reply& reply) {
     q->request.query.exclude = q->exclude;
     q->request.body = JsonVariantConst();
     q->reply = detached;
+    held.settle();
+    q->held = std::move(held);
     MutexGuard guard(queueMutex_);
     queue_.push_back(q);
     return true;

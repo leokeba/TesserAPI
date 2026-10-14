@@ -33,6 +33,7 @@
 #include "ceiling_cases.h"
 #include "protocol_cases.h"
 #include "link_failure_cases.h"
+#include "budget_cases.h"
 #include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"

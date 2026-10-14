@@ -112,7 +112,25 @@ bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& sche
 }
 
 DatagramEndpoint::DatagramEndpoint(Api* api, TransportKind kind, SendFn send, ClockFn clock, Options options)
-    : api_(api), kind_(kind), send_(std::move(send)), clock_(std::move(clock)), options_(options) {}
+    : api_(api),
+      kind_(kind),
+      incoming_("incoming", checked(options).queueBytes, checked(options).queueBytesPerPeer),
+      send_(std::move(send)),
+      clock_(std::move(clock)),
+      options_(checked(options)) {}
+
+DatagramEndpoint::Options DatagramEndpoint::checked(Options o) {
+    if (o.maxMessage && o.queueBytesPerPeer && o.queueBytesPerPeer < o.maxMessage) o.queueBytesPerPeer = o.maxMessage;
+    if (o.queueBytes && o.queueBytesPerPeer && o.queueBytes < o.queueBytesPerPeer) o.queueBytes = o.queueBytesPerPeer;
+    return o;
+}
+
+size_t DatagramEndpoint::replyLimit() const {
+    size_t limit = api_ ? api_->config().maxResponse : 0;
+    size_t link = options_.maxMessage;
+    if (!limit || (link && link < limit)) limit = link;
+    return limit;
+}
 
 // Pending handlers are dropped without being called: whatever they capture
 // may already be gone. (A captured Pending still answers its own client.)
@@ -283,23 +301,51 @@ void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::Pe
                  }));
 }
 
+uintptr_t budgetKey(const PeerAddress& p) {
+    uint32_t h = 2166136261u;
+    for (uint8_t i = 0; i < p.length; i++) h = (h ^ p.bytes[i]) * 16777619u;
+    return h ? h : 1;
+}
+
+Reservation DatagramEndpoint::hold(const PeerAddress& from, std::string_view text, bool broadcast, bool heap) {
+    Reservation r = incoming_.reserve(text.size(), budgetKey(from), true, heap);
+    if (!r) {
+        {
+            MutexGuard guard(mutex_);
+            stats_.dropped++;
+        }
+        // A request is answered, so its client needn't wait for a timeout.
+        reject(from, text, broadcast, Status::Busy, Reason::QueueFull, "request queue full");
+    }
+    return r;
+}
+
 void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t len, bool reliable,
                                bool broadcast) {
-    // The link's buffer (NowTP's) is only lent: a large message is copied,
-    // if the heap can spare it. If not, it is dropped like a lost datagram,
-    // and the call it belongs to times out.
-    if (len > 256 && (!heapAbove(2 * len) || largestFreeBlock() < len + 1024)) {
-        MutexGuard guard(mutex_);
-        stats_.dropped++;
-        return;
-    }
-    receive(from, std::string(data, len), reliable, broadcast);
+    // The link's buffer (NowTP's) is only lent: copied if the budget, the
+    // heap floor and the largest block allow it (docs/DESIGN.md section 15).
+    // If not, a request is answered busy; anything else is dropped like a
+    // lost datagram, and the call it belongs to times out.
+    Reservation held = hold(from, std::string_view(data, len), broadcast, true);
+    if (!held) return;
+    Incoming msg;
+    msg.from = from;
+    msg.text.assign(data, len);
+    held.settle();
+    msg.held = std::move(held);
+    msg.reliable = reliable;
+    msg.broadcast = broadcast;
+    queue(std::move(msg));
 }
 
 void DatagramEndpoint::receive(const PeerAddress& from, std::string&& text, bool reliable, bool broadcast) {
+    // Allocated already: counted, not checked against the heap.
+    Reservation held = hold(from, text, broadcast, false);
+    if (!held) return;
     Incoming msg;
     msg.from = from;
     msg.text = std::move(text);
+    msg.held = std::move(held);
     msg.reliable = reliable;
     msg.broadcast = broadcast;
     queue(std::move(msg));
@@ -308,9 +354,12 @@ void DatagramEndpoint::receive(const PeerAddress& from, std::string&& text, bool
 void DatagramEndpoint::receiveOwned(const PeerAddress& from, void* buffer, size_t len, bool reliable,
                                     bool broadcast) {
     Incoming msg;
+    msg.owned.reset(static_cast<char*>(buffer));  // freed even when refused
+    Reservation held = hold(from, std::string_view(msg.owned.get(), len), broadcast, false);
+    if (!held) return;
     msg.from = from;
-    msg.owned.reset(static_cast<char*>(buffer));
     msg.ownedLen = len;
+    msg.held = std::move(held);
     msg.reliable = reliable;
     msg.broadcast = broadcast;
     queue(std::move(msg));
@@ -332,7 +381,7 @@ void DatagramEndpoint::queue(Incoming&& msg) {
         return;
     }
     // Full: answer requests with "busy" so clients needn't wait for a timeout.
-    reject(msg, Status::Busy, Reason::QueueFull, "request queue full");
+    reject(msg.from, msg.view(), msg.broadcast, Status::Busy, Reason::QueueFull, "request queue full");
 }
 
 bool DatagramEndpoint::process() {
@@ -415,20 +464,20 @@ void DatagramEndpoint::checkAdvertisement(uint32_t now) {
     publish_(hash);
 }
 
-void DatagramEndpoint::reject(const Incoming& msg, Status status, Reason reason, const char* message) {
+void DatagramEndpoint::reject(const PeerAddress& from, std::string_view text, bool broadcast, Status status,
+                              Reason reason, const char* message) {
     // Only requests get an error reply; responses and notifications are dropped.
     JsonDocument filter;
     filter["id"] = true;
     filter["op"] = true;
     JsonDocument doc;
-    std::string_view text = msg.view();
     if (deserializeJson(doc, text.data(), text.size(), DeserializationOption::Filter(filter),
                         DeserializationOption::NestingLimit(kWrittenNesting))) {
         return;
     }
     if (!doc["op"].is<const char*>()) return;
     // A broadcast request without an id is never answered.
-    if (msg.broadcast && doc["id"].isNull()) return;
+    if (broadcast && doc["id"].isNull()) return;
     EnvelopeId id;
     JsonVariantConst idv = doc["id"];
     if (!idv.isNull()) {
@@ -439,7 +488,7 @@ void DatagramEndpoint::reject(const Incoming& msg, Status status, Reason reason,
             id.length = raw.size();
         }
     }
-    PeerAddress to = msg.from;
+    PeerAddress to = from;
     SendFn send = send_;
     EnvelopeReply reply(id, 0, [send, to](std::string& m) {
         if (send) send(to, std::move(m), Delivery::Reliable);
@@ -595,10 +644,14 @@ void DatagramEndpoint::handle(Incoming& msg) {
     // Parsed, a large message takes about as much again: only above the
     // heap floor (dropped otherwise, like a lost datagram).
     std::string_view text = msg.view();
-    if (text.size() > 1024 && !heapAbove(2 * text.size())) {
-        MutexGuard guard(mutex_);
-        stats_.dropped++;
-        return;
+    Reservation parsing;  // the document, about as large as the text
+    if (text.size() > 1024) {
+        parsing = memoryBudget().reserve(2 * text.size(), 0, false);
+        if (!parsing) {
+            MutexGuard guard(mutex_);
+            stats_.dropped++;
+            return;
+        }
     }
     // Responses and notifications nest as deep as the peer wrote them;
     // requests are held to the same limit as on other transports below.
@@ -738,7 +791,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
     SendFn send = send_;
     // A broadcast request without an id is never answered.
     bool silent = msg.broadcast && id.length == 0;
-    EnvelopeReply reply(id, api_->config().maxResponse, [send, to, silent](std::string& m) {
+    EnvelopeReply reply(id, replyLimit(), [send, to, silent](std::string& m) {
         if (send && !silent) send(to, std::move(m), Delivery::Reliable);
     });
     if (s == Status::Ok && auth) s = checkStrict(env, {"v", "id", "op", "token"}, message, &reason);
@@ -830,7 +883,7 @@ void DatagramEndpoint::handleFile(JsonObjectConst envelope, const Incoming& msg,
     PeerAddress to = msg.from;
     SendFn send = send_;
     bool silent = msg.broadcast && id.length == 0;
-    EnvelopeReply reply(id, api_->config().maxResponse, [send, to, silent](std::string& m) {
+    EnvelopeReply reply(id, replyLimit(), [send, to, silent](std::string& m) {
         if (send && !silent) send(to, std::move(m), Delivery::Reliable);
     });
     if (s != Status::Ok) {
