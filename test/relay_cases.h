@@ -205,8 +205,9 @@ TEST(relay_upload_on_a_short_heap) {
     reply = chunk(8500, "{\"id\":2,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":0,\"data\":\"" + b64(first) + "\"}");
     CHECK_EQ(reply.substr(0, 40), "{\"id\":2,\"status\":\"busy\",\"body\":{\"error\":");
     CHECK(reply.find("\"reason\":\"low_memory\"") != std::string::npos);
-    // Room for some of it: 384 bytes taken.
-    reply = chunk(9700, "{\"id\":3,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":0,\"data\":\"" + b64(first) + "\"}");
+    // Room for some of it (384 bytes, their part and the link's copies of
+    // it): 384 bytes taken.
+    reply = chunk(10400, "{\"id\":3,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":0,\"data\":\"" + b64(first) + "\"}");
     CHECK_EQ(reply, "{\"id\":3,\"status\":\"ok\",\"body\":{\"received\":384}}");
     CHECK_EQ(r.ask("{\"id\":4,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":384,\"data\":\"" +
                    b64(r.big.substr(384)) + "\"}"),

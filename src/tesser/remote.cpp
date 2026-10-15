@@ -1949,8 +1949,14 @@ private:
                         static constexpr char kData[] = ",\"data\":\"";
                         size_t size =
                             static_cast<size_t>(n) + head.size() + sizeof(kData) - 1 + (part + 2) / 3 * 4 + 2;
+                        // The envelope, in one block, and room for the link's
+                        // copies of it in flight (its frames, then the
+                        // radio's: about twice it, measured on DEVKIT-V3), not
+                        // held here; without, the part goes again at half the
+                        // size (smaller()).
                         Reservation room = memoryBudget().reserve(size + 32, 0, true);
-                        self->noRoom_ = !room || !out.reserve(size);
+                        Reservation link = room ? memoryBudget().reserve(2 * size, 0, false) : Reservation();
+                        self->noRoom_ = !room || !link || !out.reserve(size);
                         if (self->noRoom_) return false;
                         out.append(idHead, static_cast<size_t>(n));
                         out.append(head);
