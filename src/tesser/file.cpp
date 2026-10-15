@@ -571,6 +571,39 @@ bool base64Decode(std::string_view text, std::vector<uint8_t>& out) {
     return true;
 }
 
+uint32_t crc32(const uint8_t* data, size_t len, uint32_t crc) {
+    // A nibble at a time: 64 bytes of table, fast enough for 4 KB chunks.
+    static const uint32_t kTable[16] = {0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac, 0x76dc4190, 0x6b6b51f4,
+                                        0x4db26158, 0x5005713c, 0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c,
+                                        0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c};
+    crc = ~crc;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        crc = (crc >> 4) ^ kTable[crc & 15];
+        crc = (crc >> 4) ^ kTable[crc & 15];
+    }
+    return ~crc;
+}
+
+bool crc32OfBase64(std::string_view text, uint32_t& crc) {
+    crc = 0;
+    if (text.size() % 4) return false;
+    for (size_t i = 0; i < text.size(); i += 4) {
+        bool last = i + 4 == text.size();
+        int pad = 0;
+        if (last && text[i + 3] == '=') pad = text[i + 2] == '=' ? 2 : 1;
+        uint32_t v = 0;
+        for (size_t j = 0; j < 4; j++) {
+            int d = j < 4 - size_t(pad) ? base64Value(text[i + j]) : 0;
+            if (d < 0) return false;
+            v = v << 6 | uint32_t(d);
+        }
+        uint8_t bytes[3] = {uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
+        crc = crc32(bytes, size_t(3 - pad), crc);
+    }
+    return true;
+}
+
 }  // namespace detail
 
 namespace {
@@ -641,7 +674,7 @@ void FileSession::handle(JsonObjectConst envelope, const Client& from, Reply& re
     client.cap(ceiling);
     const char* message = nullptr;
     Reason reason = Reason::None;
-    Status strict = checkStrict(envelope, {"v", "id", "op", "path", "offset", "size", "filename", "data", "length"},
+    Status strict = checkStrict(envelope, {"v", "id", "op", "path", "offset", "size", "filename", "data", "length", "crc32"},
                                 message, &reason);
     // Parsed without its data (uploadFilter()), it may have lost members:
     // a strict envelope's keys are checked in its text.
@@ -649,7 +682,7 @@ void FileSession::handle(JsonObjectConst envelope, const Client& from, Reply& re
     if (strict == Status::Ok && !raw.empty() && v.is<uint8_t>() && v.as<uint8_t>() >= 2) {
         bool known = true;
         jsonKeys(raw, [&known](std::string_view k) {
-            for (const char* ok : {"v", "id", "op", "path", "offset", "size", "filename", "data", "length"}) {
+            for (const char* ok : {"v", "id", "op", "path", "offset", "size", "filename", "data", "length", "crc32"}) {
                 if (k == ok) return true;
             }
             known = false;
@@ -715,6 +748,21 @@ void FileSession::upload(JsonObjectConst envelope, std::string_view raw, std::st
     if (bad) {
         writeError(reply, Status::BadRequest, path, "data must be base64");
         return;
+    }
+    // The client's check of the bytes it meant (a serial line can lose some
+    // and still be base64): compared before anything is written, and
+    // refused for the client to send again (docs/DESIGN.md section 10.1.1).
+    JsonVariantConst crc = envelope["crc32"];
+    if (!crc.isNull()) {
+        if (!crc.is<uint32_t>()) {
+            writeError(reply, Status::BadRequest, path, "crc32 must be an unsigned 32-bit integer");
+            return;
+        }
+        if (detail::crc32(data.data(), data.size()) != crc.as<uint32_t>()) {
+            writeError(reply, Status::BadRequest, Reason::Checksum, path,
+                       "the data doesn't match its crc32: send the chunk again");
+            return;
+        }
     }
     JsonVariantConst size = envelope["size"];
     if (!size.isNull()) {
@@ -803,6 +851,14 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
         }
         if (len.as<uint32_t>() < max) length = len.as<uint32_t>();
     }
+    // The reply carries the chunk's CRC-32 when asked (docs/DESIGN.md
+    // section 10.1.1).
+    JsonVariantConst wantCrc = envelope["crc32"];
+    if (!wantCrc.isNull() && !wantCrc.is<bool>()) {
+        writeError(reply, Status::BadRequest, path, "crc32 must be a boolean");
+        return;
+    }
+    bool crc = wantCrc.as<bool>();
     bool opening = offset == 0;
     if (opening) {
         // Offset 0 starts a new download, ending whatever was in progress.
@@ -820,9 +876,9 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
         state->path.assign(path.data(), path.size());
         state->size = state->transfer.size();
         state_ = std::move(state);
-        if (o == FileTransfer::Open::Remote) return relayDownload(true, 0, length, max, reply);
+        if (o == FileTransfer::Open::Remote) return relayDownload(true, 0, length, max, crc, reply);
     } else if (state_ && !state_->upload && state_->path == path && state_->transfer.relay()) {
-        return relayDownload(false, offset, length, max, reply);
+        return relayDownload(false, offset, length, max, crc, reply);
     } else if (!state_ || state_->upload || state_->path != path) {
         writeError(reply, Status::BadRequest, path, "no download in progress at this path");
         return;
@@ -901,6 +957,10 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
     w.uinteger(s.lastOffset);
     w.key("data");
     w.base64(s.chunk.data(), n);
+    if (crc) {
+        w.key("crc32");
+        w.uinteger(detail::crc32(s.chunk.data(), n));
+    }
     w.key("end");
     w.boolean(last);
     w.endObject();
@@ -1012,7 +1072,7 @@ namespace {
 // comes. A reply this node has no memory to hold is asked for again, half as
 // long: the peer sends the start of the same chunk (docs/DESIGN.md section
 // 14).
-void relayChunk(std::shared_ptr<FileRelay> relay, Reply* detached, Api* api, size_t max, std::string path,
+void relayChunk(std::shared_ptr<FileRelay> relay, Reply* detached, Api* api, size_t max, bool crc, std::string path,
                 uint64_t offset, size_t length) {
     relay->download(offset, length, [=](Status s, JsonVariantConst body, std::string_view data) {
         if (s != Status::Ok || !body.is<JsonObjectConst>()) {
@@ -1022,7 +1082,19 @@ void relayChunk(std::shared_ptr<FileRelay> relay, Reply* detached, Api* api, siz
             // reply's text; only its largest chunk is capped at ours.
             JsonWriter w(detached->begin(Status::Ok));
             w.beginObject();
-            bool wrote = false;  // `data`, where the peer had it: after "offset"
+            // `data`, where the peer had it (after "offset"), and its crc32
+            // if asked: of the bytes as they came from the peer, decoded a
+            // group at a time, so the hop to the client is the one checked.
+            auto writeData = [&] {
+                w.key("data");
+                w.string(data);
+                uint32_t sum = 0;
+                if (crc && detail::crc32OfBase64(data, sum)) {
+                    w.key("crc32");
+                    w.uinteger(sum);
+                }
+            };
+            bool wrote = false;
             for (JsonPairConst kv : body.as<JsonObjectConst>()) {
                 if (kv.key() == "data") continue;
                 w.key(std::string_view(kv.key().c_str(), kv.key().size()));
@@ -1033,20 +1105,17 @@ void relayChunk(std::shared_ptr<FileRelay> relay, Reply* detached, Api* api, siz
                     w.variant(kv.value());
                 }
                 if (kv.key() == "offset") {
-                    w.key("data");
-                    w.string(data);
+                    writeData();
                     wrote = true;
                 }
             }
-            if (!wrote) {
-                w.key("data");
-                w.string(data);
-            }
+            if (!wrote) writeData();
             w.endObject();
             size_t got = data.size() / 4 * 3;
             if (!w.ok() && detached->outOfMemory() && got > FileRelay::kMinPart && detached->rollback()) {
                 size_t half = got / 2 / 3 * 3;
-                relayChunk(relay, detached, api, max, path, offset, half > FileRelay::kMinPart ? half : FileRelay::kMinPart);
+                relayChunk(relay, detached, api, max, crc, path, offset,
+                           half > FileRelay::kMinPart ? half : FileRelay::kMinPart);
                 return;
             }
             detail::finishBody(*detached, w, path);
@@ -1058,7 +1127,7 @@ void relayChunk(std::shared_ptr<FileRelay> relay, Reply* detached, Api* api, siz
 
 }  // namespace
 
-void FileSession::relayDownload(bool opening, uint64_t offset, size_t length, size_t max, Reply& reply) {
+void FileSession::relayDownload(bool opening, uint64_t offset, size_t length, size_t max, bool crc, Reply& reply) {
     // The relay's parts are at most our upload chunk (RemoteFile::download()).
     if (max > uploadChunk(api_.config())) max = uploadChunk(api_.config());
     std::shared_ptr<FileRelay> relay = state_->transfer.relay();
@@ -1066,7 +1135,7 @@ void FileSession::relayDownload(bool opening, uint64_t offset, size_t length, si
     if (!opening && !relayReady(*relay, reply, path, false)) return;
     Reply* detached = deferFor(api_, reply, path);
     if (!detached) return;
-    relayChunk(relay, detached, &api_, max, path, offset, length);
+    relayChunk(relay, detached, &api_, max, crc, path, offset, length);
 }
 
 }  // namespace tesser

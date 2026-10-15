@@ -777,6 +777,30 @@ TEST(envelope_response_limit) {
           std::string::npos);
 }
 
+TEST(line_transport_overrun) {
+    // A line that lost bytes on the way in (a UART overrun) isn't parsed,
+    // even when what is left still is JSON: it is answered busy under its
+    // id, for the client to send it again; the next line is read as usual.
+    Device d;
+    Lines lines;
+    tesser::LineTransport t(d.api, [&](const char* data, size_t n) { lines.add(data, n); });
+    const char head[] = "{\"id\":7,\"op\":\"set\",\"path\":\"/lamp/brightness\",";
+    t.feed(head, sizeof(head) - 1);
+    t.lineDamaged();
+    const char tail[] = "\"body\":12}\n";  // "body":120 lost a byte, say
+    t.feed(tail, sizeof(tail) - 1);
+    CHECK_EQ(lines.out.size(), 1u);
+    if (!lines.out.empty())
+        CHECK_EQ(lines.out[0], "{\"id\":7,\"status\":\"busy\",\"body\":{\"error\":\"busy\",\"reason\":\"line_overrun\","
+                               "\"path\":\"/\",\"message\":\"bytes of the line were lost: send it again\"}}");
+    CHECK_EQ(d.lamp.brightness, 128);
+    CHECK_EQ(t.overruns(), 1u);
+    const char again[] = "{\"id\":8,\"op\":\"get\",\"path\":\"/lamp/brightness\"}\n";
+    t.feed(again, sizeof(again) - 1);
+    CHECK_EQ(lines.out.size(), 2u);
+    if (lines.out.size() == 2) CHECK_EQ(lines.out[1], "{\"id\":8,\"status\":\"ok\",\"body\":128}");
+}
+
 TEST(line_transport_framing) {
     Device d;
     Lines lines;

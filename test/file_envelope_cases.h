@@ -195,6 +195,40 @@ TEST(file_envelope_chunk_limits) {
     CHECK_EQ(downloadAll(l2, "/big", 100000), big);
 }
 
+TEST(file_envelope_crc32) {
+    // The check value of CRC-32 (IEEE, as zlib's), and of base64 text.
+    const char* nine = "123456789";
+    CHECK_EQ(tesser::detail::crc32(reinterpret_cast<const uint8_t*>(nine), 9), 0xCBF43926u);
+    uint32_t sum = 0;
+    CHECK(tesser::detail::crc32OfBase64("eyJsZQ==", sum));
+    CHECK_EQ(sum, 1378081651u);
+    CHECK(!tesser::detail::crc32OfBase64("eyJsZQ=", sum));
+
+    Fixture f;
+    Line line(f.api);
+    // An upload chunk with a crc32 that doesn't match its data (bytes lost
+    // on a line, still base64) is refused, and the transfer stays open.
+    CHECK_EQ(line.send("{\"id\":1,\"op\":\"upload\",\"path\":\"/sys/firmware\",\"size\":6}"),
+             "{\"id\":1,\"status\":\"ok\",\"body\":{\"received\":0,\"chunk\":2880}}");
+    CHECK_EQ(line.send("{\"id\":2,\"op\":\"upload\",\"path\":\"/sys/firmware\",\"offset\":0,\"data\":\"YWJjZGVm\","
+                       "\"crc32\":3094309647}"),
+             "{\"id\":2,\"status\":\"bad_request\",\"body\":{\"error\":\"bad_request\",\"reason\":\"checksum\","
+             "\"path\":\"/sys/firmware\",\"message\":\"the data doesn't match its crc32: send the chunk again\"}}");
+    CHECK(line.send("{\"id\":3,\"op\":\"upload\",\"path\":\"/sys/firmware\",\"offset\":0,\"data\":\"YWJjZGVm\","
+                    "\"crc32\":-1}")
+              .find("crc32 must be") != std::string::npos);
+    CHECK_EQ(line.send("{\"v\":2,\"id\":4,\"op\":\"upload\",\"path\":\"/sys/firmware\",\"offset\":0,"
+                       "\"data\":\"YWJjZGVm\",\"crc32\":1267612143}"),
+             "{\"id\":4,\"status\":\"ok\",\"body\":{\"bytes\":6}}");
+    CHECK_EQ(f.ram.data, "abcdef");
+    // A download reply carries its chunk's crc32 when asked.
+    CHECK_EQ(line.send("{\"v\":2,\"id\":5,\"op\":\"download\",\"path\":\"/sys/config\",\"length\":4,\"crc32\":true}"),
+             "{\"id\":5,\"status\":\"ok\",\"body\":{\"size\":11,\"filename\":\"config\",\"contentType\":"
+             "\"application/json\",\"chunk\":4096,\"offset\":0,\"data\":\"eyJsZQ==\",\"crc32\":1378081651,\"end\":false}}");
+    CHECK(line.send("{\"id\":6,\"op\":\"download\",\"path\":\"/sys/config\",\"crc32\":1}").find("crc32 must be a boolean") !=
+          std::string::npos);
+}
+
 TEST(file_envelope_upload) {
     Fixture f;
     Line line(f.api);

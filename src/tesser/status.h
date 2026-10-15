@@ -41,6 +41,8 @@ enum class Reason : uint8_t {
     SendFailed,         // timeout: the link couldn't deliver to the remote node, now offline
     AuthFailed,         // timeout: the remote node holds another pairing key (NowTP), or none
     Rejected,           // internal: the remote node refused the message (no listener on the port, too large)
+    LineOverrun,        // busy: bytes of the request were lost on the line (a UART overrun); send it again
+    Checksum,           // bad_request: a file chunk's data doesn't match its crc32; send it again
 };
 
 // Wire name: "low_memory", ...; "" for None.

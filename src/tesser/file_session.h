@@ -65,7 +65,7 @@ private:
     // 14), and the reply deferred until the peer's comes.
     void relayUpload(bool opening, uint64_t size, std::string_view filename, uint64_t offset,
                      std::vector<uint8_t> data, Reply& reply);
-    void relayDownload(bool opening, uint64_t offset, size_t length, size_t max, Reply& reply);
+    void relayDownload(bool opening, uint64_t offset, size_t length, size_t max, bool crc, Reply& reply);
 
     Api& api_;
     std::unique_ptr<State> state_;
@@ -76,6 +76,11 @@ namespace detail {
 void base64Encode(const uint8_t* data, size_t len, std::string& out);
 // False on a character outside the alphabet or a bad length.
 bool base64Decode(std::string_view text, std::vector<uint8_t>& out);
+// CRC-32 (IEEE 802.3, as zlib's crc32()) of `len` bytes, continuing `crc`.
+uint32_t crc32(const uint8_t* data, size_t len, uint32_t crc = 0);
+// The same of the bytes `text` encodes, decoded a group at a time (no
+// buffer); false if it isn't base64.
+bool crc32OfBase64(std::string_view text, uint32_t& crc);
 }  // namespace detail
 
 }  // namespace tesser

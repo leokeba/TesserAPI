@@ -49,7 +49,7 @@ namespace {
 const char* const kReasons[] = {
     "",           "low_memory", "pending_limit", "queue_full", "unreachable",   "subscription_limit",
     "transfer_busy", "peer_offline", "no_answer", "idle",      "cannot_wait",   "not_authorized",
-    "ceiling_unsupported", "unknown_option", "send_failed", "auth_failed", "rejected",
+    "ceiling_unsupported", "unknown_option", "send_failed", "auth_failed", "rejected", "line_overrun", "checksum",
 };
 constexpr size_t kReasonCount = sizeof(kReasons) / sizeof(kReasons[0]);
 }  // namespace

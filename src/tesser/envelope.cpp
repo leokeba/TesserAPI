@@ -48,7 +48,7 @@ bool isUploadEnvelope(std::string_view text) {
 
 JsonDocument uploadFilter() {
     JsonDocument filter;
-    for (const char* k : {"v", "id", "op", "path", "offset", "size", "filename", "length"}) filter[k] = true;
+    for (const char* k : {"v", "id", "op", "path", "offset", "size", "filename", "length", "crc32"}) filter[k] = true;
     return filter;
 }
 

@@ -526,7 +526,7 @@ private:
         w.integer(kProtocolVersion);
         w.key("features");
         w.beginArray();
-        for (const char* f : {"ceiling", "reasons", "strict", "info"}) w.string(f);
+        for (const char* f : {"ceiling", "reasons", "strict", "info", "crc32"}) w.string(f);
 #if !defined(TESSER_NO_SCHEMA)
         w.string("schema");
 #endif

@@ -43,22 +43,37 @@ bool growLine(std::string& s) {
 
 }  // namespace
 
+// The id at the start of the line, if it is still there.
+EnvelopeId LineTransport::keptId() const {
+    EnvelopeId id;
+    size_t brace = line_.find('{');
+    std::string_view raw;
+    if (brace != std::string::npos && jsonMember(std::string_view(line_).substr(brace), "id", raw) &&
+        raw.size() <= EnvelopeId::kMax) {
+        memcpy(id.json, raw.data(), raw.size());
+        id.length = raw.size();
+    }
+    return id;
+}
+
+void LineTransport::lineDamaged() { damaged_ = true; }
+
 void LineTransport::feed(char c) {
     if (c == '\n') {
-        if (discarding_) {
+        if (damaged_) {
+            // Bytes of this line were lost (lineDamaged()): what is left may
+            // still parse, wrongly. Answered under its id, to be sent again.
+            damaged_ = discarding_ = starved_ = false;
+            overruns_++;
+            EnvelopeReply reply(keptId(), 0, [this](const std::string& m) { send(m, false); });
+            writeError(reply, Status::Busy, Reason::LineOverrun, std::string_view(),
+                       "bytes of the line were lost: send it again");
+        } else if (discarding_) {
             discarding_ = false;
             overflows_++;
             // The line's start was kept: its id, so the client hears which
             // request failed rather than waiting it out.
-            EnvelopeId id;
-            size_t brace = line_.find('{');
-            std::string_view raw;
-            if (brace != std::string::npos &&
-                jsonMember(std::string_view(line_).substr(brace), "id", raw) && raw.size() <= EnvelopeId::kMax) {
-                memcpy(id.json, raw.data(), raw.size());
-                id.length = raw.size();
-            }
-            EnvelopeReply reply(id, 0, [this](const std::string& m) { send(m, false); });
+            EnvelopeReply reply(keptId(), 0, [this](const std::string& m) { send(m, false); });
             if (starved_)
                 writeError(reply, Status::Busy, Reason::LowMemory, std::string_view(), "not enough memory for the line");
             else
@@ -179,7 +194,7 @@ void LineTransport::reset() {
     api_.dropSubscriber(this);
     line_.clear();
     line_.shrink_to_fit();
-    discarding_ = starved_ = false;
+    discarding_ = starved_ = damaged_ = false;
     token_.clear();
     files_.reset();
 }

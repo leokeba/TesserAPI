@@ -278,6 +278,15 @@ TEST(relay_download_on_a_short_heap) {
     CHECK_EQ(small.gateway.pending(), 0);
 }
 
+TEST(relay_download_crc32) {
+    // Asked by the client, the gateway adds the chunk's crc32, computed from
+    // the device's text: the device isn't asked (it may not know it).
+    Rig r;
+    CHECK_EQ(r.ask("{\"id\":1,\"op\":\"download\",\"path\":\"/dev/sys/config\",\"length\":4,\"crc32\":true}"),
+             "{\"id\":1,\"status\":\"ok\",\"body\":{\"size\":11,\"filename\":\"config\",\"contentType\":"
+             "\"application/json\",\"chunk\":576,\"offset\":0,\"data\":\"eyJsZQ==\",\"crc32\":1378081651,\"end\":false}}");
+}
+
 TEST(relay_envelope_download) {
     Rig r;
     // The device's chunks as they come, base64 and all.

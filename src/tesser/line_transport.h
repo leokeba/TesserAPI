@@ -51,8 +51,19 @@ public:
     // Lines dropped for exceeding the limit (Config::maxRequestBody + 256).
     size_t overflows() const { return overflows_; }
 
+    // Bytes were lost on the way in (a UART overrun): the line being read
+    // is answered busy (line_overrun) under its id at its end, rather than
+    // parsed. From the task that feeds the line, between feed() calls;
+    // allocates nothing.
+    void lineDamaged();
+    // A damaged line whose end hasn't come yet.
+    bool damagedPending() const { return damaged_; }
+    // Lines answered so.
+    size_t overruns() const { return overruns_; }
+
 private:
     void handleLine();
+    EnvelopeId keptId() const;
     void handleAuth(JsonObjectConst envelope, const EnvelopeId& id);
     Access level() const;
     // A whole message (a notification, `mayDrop`, or a deferred reply):
@@ -71,10 +82,12 @@ private:
     std::string waiting_;
     bool discarding_ = false;
     bool starved_ = false;  // discarding_ because the heap couldn't hold the line
+    bool damaged_ = false;  // lineDamaged(): bytes of this line were lost
     bool authenticated_ = true;
     std::string token_;  // from the last "auth" envelope
     FileSession files_;
     size_t overflows_ = 0;
+    size_t overruns_ = 0;
 };
 
 }  // namespace tesser
