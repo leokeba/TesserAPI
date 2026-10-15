@@ -654,6 +654,46 @@ struct Threaded {
     }
 };
 
+TEST(relay_probe_remembered) {
+    // Over HTTP, whether a path below a remote node is a file decides how
+    // a request goes: asked of the peer once, then remembered while it
+    // advertises the same schema hash.
+    Threaded t;
+    Rig& r = *t.rig;
+    tesser::Client admin;
+    admin.authenticated = true;
+    auto requests = [&] { return r.deviceEnd.stats().requests; };
+    auto notFile = [&] {
+        FileTransfer f(r.gateway, FileTransfer::Remotes::Wait);
+        tesser::StringReply reply;
+        return f.openDownload("/dev/sys/level", admin, reply) == FileTransfer::Open::NotFile;
+    };
+    auto download = [&] {
+        FileTransfer f(r.gateway, FileTransfer::Remotes::Wait);
+        tesser::StringReply reply;
+        return f.openDownload("/dev/big", admin, reply) == FileTransfer::Open::Ok;
+    };
+    // No hash advertised: nothing would say an answer went stale.
+    uint32_t before = requests();
+    CHECK(notFile());
+    CHECK(notFile());
+    CHECK_EQ(requests() - before, 2u);
+    r.dev.setAdvertisedSchema(0x1234);
+    before = requests();
+    CHECK(notFile());
+    CHECK(notFile());
+    CHECK_EQ(requests() - before, 1u);  // asked once
+    before = requests();
+    CHECK(download());  // the probe, then the first chunk
+    CHECK(download());  // the first chunk only
+    CHECK_EQ(requests() - before, 3u);
+    // A new schema (new firmware): asked again.
+    r.dev.setAdvertisedSchema(0x5678);
+    before = requests();
+    CHECK(notFile());
+    CHECK_EQ(requests() - before, 1u);
+}
+
 TEST(relay_waiting) {
     Threaded t;
     Rig& r = *t.rig;

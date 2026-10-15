@@ -227,6 +227,12 @@ public:
     // The schema hash the peer advertises (0: unknown), shown in the schema
     // so clients can cache the remote's schema under it.
     uint32_t advertisedSchema() const { return advertisedSchema_.load(); }
+    // Whether the peer's node at `remotePath` is a file node, as its schema
+    // said while it advertised its current hash; false when not known (no
+    // hash, or not asked since). learnedFile() records an answer. A few
+    // paths are kept, the oldest going first (docs/DESIGN.md section 14).
+    bool knownFile(std::string_view remotePath, bool& isFile) const;
+    void learnedFile(std::string_view remotePath, bool isFile);
     void setAdvertisedSchema(uint32_t hash);
     // The protocol version the peer advertises (docs/DESIGN.md section
     // 10.1.2; 1: one that predates versions), 0 while unknown. Shown in the
@@ -383,6 +389,16 @@ private:
     uint32_t timeoutMs_ = 0;
 
     mutable Mutex routesMutex_{kRankLeaf, "remote routes"};  // a leaf: nothing is called while it is held
+    // knownFile(): paths the peer's schema described, under the hash it
+    // advertised then.
+    struct KnownPath {
+        std::string path;
+        uint32_t schemaHash;
+        bool file;
+    };
+    static constexpr size_t kKnownPaths = 8;
+    mutable Mutex pathsMutex_{kRankLeaf, "remote paths"};
+    std::vector<KnownPath> knownPaths_;
     std::vector<RouteSlot> routes_;
     std::vector<RouteKind> order_;
     bool hasOrder_ = false;

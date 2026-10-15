@@ -307,17 +307,25 @@ FileTransfer::Open FileTransfer::openRelay(Op op, uint64_t size, std::string_vie
     // file decides, as for a local path. The peer's other answers about the
     // path are left to the request forwarded as usual; no answer (timeout,
     // busy, offline) is an error.
+    // What the peer's schema said of the path, as long as it is unchanged,
+    // spares the round trip.
     JsonDocument body;
-    Status s = waitFor(*relay_, [this](FileRelay::Done d) { relay_->probe(std::move(d)); }, body);
-    if (s == Status::Timeout || s == Status::Busy || s == Status::Internal) {
-        relay_->writeReply(reply, s, body.as<JsonVariantConst>());
-        close();
-        return Open::Failed;
+    bool isFile = false;
+    if (!relay_->knownFile(isFile)) {
+        Status s = waitFor(*relay_, [this](FileRelay::Done d) { relay_->probe(std::move(d)); }, body);
+        if (s == Status::Timeout || s == Status::Busy || s == Status::Internal) {
+            relay_->writeReply(reply, s, body.as<JsonVariantConst>());
+            close();
+            return Open::Failed;
+        }
+        isFile = s == Status::Ok && body["type"] == "file";
+        if (s == Status::Ok) relay_->learnedFile(isFile);
     }
-    if (s != Status::Ok || body["type"] != "file") {
+    if (!isFile) {
         close();
         return Open::NotFile;
     }
+    Status s;
     if (!relay_->claim(reply)) {
         close();
         return Open::Failed;

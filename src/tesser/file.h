@@ -57,6 +57,14 @@ public:
     // Asks the peer for the path's schema, at depth 0: whether it is a file
     // node. Needs no claim.
     virtual void probe(Done done) = 0;
+    // What a probe found, remembered while the peer's schema is unchanged:
+    // true, with `isFile`, when known, so the probe is skipped
+    // (docs/DESIGN.md section 14).
+    virtual bool knownFile(bool& isFile) const {
+        (void)isFile;
+        return false;
+    }
+    virtual void learnedFile(bool isFile) { (void)isFile; }
     // Upload: opens it, without data. `done` gets {"received": 0, "chunk": n},
     // or the upload's reply when `size` is 0.
     virtual void openUpload(uint64_t size, std::string_view filename, Done done) = 0;

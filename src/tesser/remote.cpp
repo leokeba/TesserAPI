@@ -760,6 +760,34 @@ void RemoteNode::setProtocol(uint8_t version) {
     if (version && protocol_.exchange(version) != version) changed();
 }
 
+bool RemoteNode::knownFile(std::string_view remotePath, bool& isFile) const {
+    uint32_t hash = advertisedSchema_.load();
+    if (!hash) return false;
+    MutexGuard guard(pathsMutex_);
+    for (const KnownPath& k : knownPaths_) {
+        if (k.schemaHash == hash && k.path == remotePath) {
+            isFile = k.file;
+            return true;
+        }
+    }
+    return false;
+}
+
+void RemoteNode::learnedFile(std::string_view remotePath, bool isFile) {
+    uint32_t hash = advertisedSchema_.load();
+    if (!hash) return;  // nothing would tell it went stale
+    MutexGuard guard(pathsMutex_);
+    for (KnownPath& k : knownPaths_) {
+        if (k.path == remotePath) {
+            k.schemaHash = hash;
+            k.file = isFile;
+            return;
+        }
+    }
+    if (knownPaths_.size() >= kKnownPaths) knownPaths_.erase(knownPaths_.begin());
+    knownPaths_.push_back(KnownPath{std::string(remotePath), hash, isFile});
+}
+
 void RemoteNode::setAdvertisedSchema(uint32_t hash) {
     if (advertisedSchema_.exchange(hash) != hash) changed();
 }
@@ -1718,6 +1746,9 @@ public:
         activeMs_ = millis32();
         return true;
     }
+
+    bool knownFile(bool& isFile) const override { return node_.knownFile(remotePath_, isFile); }
+    void learnedFile(bool isFile) override { node_.learnedFile(remotePath_, isFile); }
 
     void probe(Done done) override {
         std::string path = remotePath_;
