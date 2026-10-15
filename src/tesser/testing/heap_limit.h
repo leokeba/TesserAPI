@@ -19,16 +19,34 @@
 //
 // A test that wants to know rather than abort sets onExceeded(): the
 // allocation then goes ahead, and the hook gets its size.
+//
+// On target (ESP_PLATFORM) the heap is the real one: the controls are
+// inline no-ops and the implementation compiles to nothing, so test cases
+// shared with an on-target test firmware build there unchanged.
 // Guards of its own rather than #pragma once: a file that included it
 // already can include it again with the implementation macro.
 #ifndef TESSER_TESTING_HEAP_LIMIT_H
 #define TESSER_TESTING_HEAP_LIMIT_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 namespace tesser {
 namespace testing {
 
+#if defined(ESP_PLATFORM)
+inline size_t heapUsed() { return 0; }
+inline size_t heapPeak() { return 0; }
+inline void resetHeapPeak() {}
+inline void setHeapLimit(size_t) {}
+inline size_t heapLimit() { return 0; }
+inline size_t heapLeft() { return SIZE_MAX; }
+inline void setHeapFloorRule(size_t, size_t = 256) {}
+using Exceeded = void (*)(size_t bytes, size_t used, size_t limit);
+inline void onExceeded(Exceeded) {}
+inline void setHeapExempt(bool) {}
+inline bool heapExempt() { return false; }
+#else
 // Bytes operator new holds now, and the most it has held since
 // resetHeapPeak().
 size_t heapUsed();
@@ -61,6 +79,7 @@ void onExceeded(Exceeded hook);
 // test accounts for them itself).
 void setHeapExempt(bool exempt);
 bool heapExempt();
+#endif
 
 class HeapExempt {
 public:
@@ -90,7 +109,7 @@ private:
 
 #endif  // TESSER_TESTING_HEAP_LIMIT_H
 
-#if defined(TESSER_HEAP_LIMIT_IMPLEMENTATION) && !defined(TESSER_HEAP_LIMIT_IMPLEMENTED)
+#if defined(TESSER_HEAP_LIMIT_IMPLEMENTATION) && !defined(TESSER_HEAP_LIMIT_IMPLEMENTED) && !defined(ESP_PLATFORM)
 #define TESSER_HEAP_LIMIT_IMPLEMENTED
 
 #include <stdint.h>
