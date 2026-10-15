@@ -50,8 +50,9 @@ std::string formatRouteOrder(const std::vector<RouteKind>& order);
 // reaches it (UDP and NowTP, say): requests go by the first online one in
 // the route order (docs/DESIGN.md section 14.3).
 //
-// Created with Object::remote(); lives as long as the tree. Either may be
-// destroyed first: a destroyed endpoint detaches its routes, and a node left
+// Created with Object::remote(); lives as long as the tree (one mounted for
+// an announced peer may be evicted: DatagramEndpoint::Options::maxMounted).
+// Either may be destroyed first: a destroyed endpoint detaches its routes, and a node left
 // without one answers "no endpoint".
 class RemoteNode : public Annotated<RemoteNode> {
 public:
@@ -139,6 +140,27 @@ public:
     // The remote node under `parent` mounted for `device`, or null. Under
     // the API lock.
     static RemoteNode* byDevice(const Object& parent, const PeerAddress& device);
+
+    // ---- discovered peers (DatagramEndpoint::mountPeers()) ----------------
+    // Mounted by an endpoint for a peer that announced itself, rather than
+    // declared by the application: such a node may be evicted when the
+    // endpoint has mounted as many as it takes (docs/DESIGN.md section 14.1).
+    bool autoMounted() const { return autoMounted_; }
+    void setAutoMounted() { autoMounted_ = true; }
+    // Relayed file transfers that hold the node (RemoteNode::relayFile()):
+    // it isn't evicted while one does. Any task.
+    void relayHeld(bool held) { held ? relays_.fetch_add(1) : relays_.fetch_sub(1); }
+    int relays() const { return relays_.load(); }
+    // When the device was last heard on any route (0: never), and whether
+    // every route goes through `endpoint`.
+    uint32_t lastHeardMs() const;
+    bool onlyThrough(const DatagramEndpoint* endpoint) const;
+    // Routes through `endpoint`.
+    size_t routeCount(const DatagramEndpoint* endpoint) const;
+    // Points the offline route through `endpoint` heard longest ago at
+    // `peer` instead: a node's routes stay bounded however many addresses
+    // announce its device. False if every route there is online.
+    bool replaceOfflineRoute(DatagramEndpoint& endpoint, const PeerAddress& peer);
 
     // The active route's endpoint and address (null and empty without one).
     DatagramEndpoint* endpoint() const;
@@ -329,6 +351,8 @@ private:
     PeerAddress lastPeer_;
     bool lastOnline_ = true;
     std::atomic<bool> announce_{false};
+    bool autoMounted_ = false;
+    std::atomic<int> relays_{0};
     uint32_t probeMs_ = 5000;
     uint32_t probeWaitMs_ = 5000;  // until the next probe; doubles up to kMaxProbeMs
     uint32_t lastProbeMs_ = 0;

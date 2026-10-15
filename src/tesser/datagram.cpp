@@ -13,6 +13,10 @@
 
 namespace tesser {
 
+namespace {
+constexpr size_t kMaxKnown = 32;  // peers known_ (and advertised_) keeps
+}  // namespace
+
 std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, const Query& query,
                                  std::string_view bodyJson) {
     std::string out;
@@ -267,7 +271,7 @@ DatagramEndpoint::Known& DatagramEndpoint::learnLocked(const PeerAddress& peer, 
         k->authFailed = false;
         return *k;
     }
-    if (known_.size() >= 32) {
+    if (known_.size() >= kMaxKnown) {
         size_t oldest = 0;
         for (size_t i = 1; i < known_.size(); i++) {
             bool older = known_[i].online == known_[oldest].online
@@ -906,6 +910,18 @@ void DatagramEndpoint::handle(Incoming& msg) {
         req.subscriber = subscriberFor(msg.from, req.op == Op::Subscribe);
     }
     api_->handle(req, reply);
+    // A peer holds a subscriber only while it has a subscription: one
+    // refused, or the last one ended, leaves nothing behind.
+    if (req.subscriber) {
+        MutexGuard guard(subscribersMutex_);
+        for (size_t i = 0; i < subscribers_.size(); i++) {
+            if (subscribers_[i] != req.subscriber) continue;
+            if (api_->subscriptionsOf(subscribers_[i])) break;
+            delete subscribers_[i];
+            subscribers_.erase(subscribers_.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+    }
 }
 
 Access DatagramEndpoint::levelOf(const PeerAddress& peer) {
@@ -998,6 +1014,20 @@ void DatagramEndpoint::handleFile(JsonObjectConst envelope, const Incoming& msg,
         if (f.peer == msg.from) files = &f;
     }
     if (!files) {
+        // A peer's first transfer: only so many at once (Options::
+        // maxFileSessions); one with nothing in progress makes room.
+        if (options_.maxFileSessions && files_.size() >= options_.maxFileSessions) {
+            for (size_t i = 0; i < files_.size(); i++) {
+                if (files_[i].session->done()) {
+                    files_.erase(files_.begin() + static_cast<std::ptrdiff_t>(i));
+                    break;
+                }
+            }
+        }
+        if (options_.maxFileSessions && files_.size() >= options_.maxFileSessions) {
+            writeError(reply, Status::Busy, Reason::TransferBusy, std::string_view(), "too many transfers in progress");
+            return;
+        }
         files_.push_back(PeerFiles{msg.from, std::unique_ptr<FileSession>(new FileSession(*api_)), now});
         files = &files_.back();
     }
@@ -1358,6 +1388,19 @@ void DatagramEndpoint::cancelCalls(const void* owner) {
     }
 }
 
+size_t DatagramEndpoint::peerSubscribers() const {
+    MutexGuard guard(subscribersMutex_);
+    return subscribers_.size();
+}
+
+bool DatagramEndpoint::hasCalls(const void* owner) const {
+    MutexGuard guard(mutex_);
+    for (const CallSlot& c : calls_) {
+        if (c.owner == owner) return true;
+    }
+    return false;
+}
+
 void DatagramEndpoint::addRemote(RemoteNode* remote) {
     MutexGuard guard(mutex_);
     for (RemoteNode* r : remotes_) {
@@ -1532,7 +1575,11 @@ void DatagramEndpoint::applySeen(const Seen& seen) {
                 found = true;
             }
         }
-        if (!found) advertised_.push_back(Advertised{seen.peer, seen.schemaHash, seen.protocol});
+        if (!found) {
+            // As many as known_ holds: one forgotten announces again.
+            if (advertised_.size() >= kMaxKnown) advertised_.erase(advertised_.begin());
+            advertised_.push_back(Advertised{seen.peer, seen.schemaHash, seen.protocol});
+        }
         mounts = mounts_;
     }
     if (!api_) return;
@@ -1556,7 +1603,14 @@ void DatagramEndpoint::mount(Object& parentRef, uint32_t mirrorMs, const Seen& s
         auto* r = const_cast<RemoteNode*>(static_cast<const RemoteNode*>(c));
         if (r->hasRoute(this, seen.peer)) return;
         if (device.length && r->device() == device) {
-            r->addRoute(*this, seen.peer);
+            // Bounded however many addresses announce the device (over UDP
+            // the device is what the peer says): an offline route makes
+            // room, else the address isn't added.
+            if (!options_.maxRoutesPerNode || r->routeCount(this) < options_.maxRoutesPerNode) {
+                r->addRoute(*this, seen.peer);
+            } else if (!r->replaceOfflineRoute(*this, seen.peer)) {
+                return;
+            }
             r->setAdvertisedSchema(seen.schemaHash);
             r->setProtocol(seen.protocol);
             return;
@@ -1573,10 +1627,58 @@ void DatagramEndpoint::mount(Object& parentRef, uint32_t mirrorMs, const Seen& s
         name = name.empty() ? std::string(suffix) : name + "-" + suffix;
     }
     if (name.empty() || parent->child(name)) return;
+    if (!roomToMount()) return;
     RemoteNode& node = parent->add(new RemoteNode(std::move(name), *this, seen.peer, "/"));
+    node.setAutoMounted();
     node.setDevice(device);
     if (mirrorMs) node.mirror(mirrorMs);
     node.changed();  // subscribers of the parent see the new key
+}
+
+// Under the API lock: room for one more node mounted for a peer
+// (Options::maxMounted). Past it, the node that was heard longest ago among
+// those nothing uses is evicted: mounted here, offline, reached through this
+// endpoint only (no other endpoint's task holds it), and without a
+// subscription, a call in flight or a relayed transfer (docs/DESIGN.md
+// section 14.1).
+bool DatagramEndpoint::roomToMount() {
+    if (!options_.maxMounted) return true;
+    std::vector<std::pair<Object*, uint32_t>> mounts;
+    {
+        MutexGuard guard(mutex_);
+        mounts = mounts_;
+    }
+    size_t count = 0;
+    Object* evictParent = nullptr;
+    RemoteNode* evict = nullptr;
+    uint32_t evictHeard = 0;
+    for (auto& m : mounts) {
+        for (Node* c = m.first->first(); c; c = c->next()) {
+            if (c->type() != NodeType::Remote) continue;
+            auto* r = static_cast<RemoteNode*>(c);
+            if (!r->autoMounted() || !r->routeCount(this)) continue;
+            count++;
+            if (r->online() || !r->onlyThrough(this) || r->relays() || hasCalls(r) || api_->subscribedLocked(*r)) {
+                continue;
+            }
+            uint32_t heard = r->lastHeardMs();
+            if (!evict || static_cast<int32_t>(heard - evictHeard) < 0) {
+                evict = r;
+                evictParent = m.first;
+                evictHeard = heard;
+            }
+        }
+    }
+    if (count < options_.maxMounted) return true;
+    if (!evict) {
+        MutexGuard guard(mutex_);
+        stats_.unmounted++;
+        return false;
+    }
+    evictParent->remove(evict);
+    MutexGuard guard(mutex_);
+    stats_.evicted++;
+    return true;
 }
 
 void DatagramEndpoint::expire(uint32_t now, bool all, const PeerAddress* peer, Reason reason) {

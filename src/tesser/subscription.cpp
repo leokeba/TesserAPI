@@ -21,10 +21,7 @@ constexpr uint32_t kNotifyBackoffMaxMs = 2000;  // and longest
 // before any mutex in another translation unit is guaranteed to exist.
 std::atomic<Api*> g_apis{nullptr};
 
-Mutex& apisMutex() {
-    static Mutex m;  // constructed on first use
-    return m;
-}
+Mutex& apisMutex() { return detail::treeWalkMutex(); }
 
 bool findPath(const Object& o, const Node* target, std::string& path) {
     for (const Node* c = o.first(); c; c = c->next()) {
@@ -285,6 +282,20 @@ void Api::dropSubscriber(Subscriber* subscriber) {
 size_t Api::subscriptionCount() const {
     MutexGuard guard(mutex_);
     return subs_.size();
+}
+
+size_t Api::subscriptionsOf(const Subscriber* subscriber) const {
+    MutexGuard guard(mutex_);
+    size_t n = 0;
+    for (const Subscription& s : subs_) n += s.subscriber == subscriber;
+    return n;
+}
+
+bool Api::subscribedLocked(const Node& node) const {
+    for (const Subscription& s : subs_) {
+        if (s.node == &node) return true;
+    }
+    return false;
 }
 
 void Api::poll() { poll(millis32()); }

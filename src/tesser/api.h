@@ -39,7 +39,7 @@ struct Config {
 // One client's interest in a subtree (see docs/DESIGN.md section 11).
 struct Subscription {
     Subscriber* subscriber = nullptr;
-    Node* node = nullptr;  // the subscribed node; nodes are never removed
+    Node* node = nullptr;  // the subscribed node: never removed while subscribed
     std::string path;      // normalized, "" for the root
     std::string keys;
     std::string exclude;
@@ -198,6 +198,11 @@ public:
     // connection closes and before destroying a Subscriber.
     void dropSubscriber(Subscriber* subscriber);
     size_t subscriptionCount() const;
+    // Whether a subscription is on `node`, or forwarded below it (a remote
+    // node). Under the API lock.
+    bool subscribedLocked(const Node& node) const;
+    // How many subscriptions `subscriber` holds. Any task.
+    size_t subscriptionsOf(const Subscriber* subscriber) const;
 
     // Used by the request handler and EventNode.
     // Status::Ok, or Busy when a limit is reached.

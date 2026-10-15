@@ -331,6 +331,37 @@ size_t Object::childCount() const {
     return count;
 }
 
+namespace detail {
+Mutex& treeWalkMutex() {
+    static Mutex m;  // constructed on first use
+    return m;
+}
+}  // namespace detail
+
+void Object::remove(Node* child) {
+    {
+        // A walk without the API lock holds this for its whole length: once
+        // the node is unlinked under it, no walk reaches it any more.
+        MutexGuard guard(detail::treeWalkMutex());
+        Node* prev = nullptr;
+        Node* n = first_.load(std::memory_order_acquire);
+        while (n && n != child) {
+            prev = n;
+            n = n->next_.load(std::memory_order_acquire);
+        }
+        if (!n) return;
+        Node* next = n->next_.load(std::memory_order_acquire);
+        if (prev) {
+            prev->next_.store(next, std::memory_order_release);
+        } else {
+            first_.store(next, std::memory_order_release);
+        }
+        if (last_ == n) last_ = prev;
+    }
+    delete child;
+    touch();  // the schema changed
+}
+
 void Object::link(Node* node) {
     const char* problem = nullptr;
     if (!validName(node->name_)) {

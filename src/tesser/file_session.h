@@ -44,6 +44,10 @@ public:
     void reset();
     // A transfer is open, or its last chunk can still be sent again.
     bool busy() const;
+    // Nothing in progress: no transfer, or a download whose last chunk went
+    // out (it can still be asked for again, until another transfer needs
+    // the room).
+    bool done() const;
 
     // The largest chunk of file data, in bytes, that an upload envelope may
     // carry and a download reply carries, under `config`'s limits.

@@ -620,6 +620,12 @@ bool FileSession::handles(JsonObjectConst envelope) {
 
 void FileSession::reset() { state_.reset(); }
 
+bool FileSession::done() const {
+    if (!state_) return true;
+    if (const std::shared_ptr<FileRelay>& relay = state_->transfer.relay()) return relay->finished();
+    return !state_->upload && state_->end && state_->position == state_->lastOffset + state_->chunk.size();
+}
+
 bool FileSession::busy() const {
     if (!state_) return false;
     const std::shared_ptr<FileRelay>& relay = state_->transfer.relay();

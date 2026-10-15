@@ -94,7 +94,16 @@ namespace detail {
 void setGeneration(uint32_t g);
 }  // namespace detail
 
-// Bumped whenever the shape of a tree changes: a node is added, a modifier
+class Mutex;
+
+namespace detail {
+// Held by whoever walks a tree without its API's lock (Api::owner()), and
+// by Object::remove() while it unlinks a node: a walk sees the node or not,
+// and never a node being destroyed. Also guards the registry of APIs.
+Mutex& treeWalkMutex();
+}  // namespace detail
+
+// Bumped whenever the shape of a tree changes: a node is added or removed, a modifier
 // changes a node's schema. Temporary objects (list elements) and remote
 // nodes' state (online, advertised hash) don't count. Lets transports re-advertise a changed schema
 // (docs/DESIGN.md section 10.3) without rendering it to find out.
@@ -1257,7 +1266,7 @@ public:
     size_t childCount() const;
 
 protected:
-    friend class DatagramEndpoint;  // mounts discovered peers
+    friend class DatagramEndpoint;  // mounts discovered peers, and evicts them
 
     template <class N>
     N& add(N* node) {
@@ -1265,6 +1274,9 @@ protected:
         return *node;
     }
     void link(Node* node);
+    // Unlinks `child` and destroys it, under the API lock. Only for nodes
+    // nothing else points to (docs/DESIGN.md section 14.1).
+    void remove(Node* child);
 
 private:
     std::atomic<Node*> first_{nullptr};  // see Node::next_

@@ -399,6 +399,52 @@ RemoteNode::~RemoteNode() {
 
 // ---- routes -----------------------------------------------------------------
 
+uint32_t RemoteNode::lastHeardMs() const {
+    MutexGuard guard(routesMutex_);
+    uint32_t last = 0;
+    for (const RouteSlot& r : routes_) {
+        if (r.route.heardMs && (!last || static_cast<int32_t>(r.route.heardMs - last) > 0)) last = r.route.heardMs;
+    }
+    return last;
+}
+
+bool RemoteNode::onlyThrough(const DatagramEndpoint* endpoint) const {
+    MutexGuard guard(routesMutex_);
+    for (const RouteSlot& r : routes_) {
+        if (r.route.endpoint != endpoint) return false;
+    }
+    return true;
+}
+
+size_t RemoteNode::routeCount(const DatagramEndpoint* endpoint) const {
+    MutexGuard guard(routesMutex_);
+    size_t n = 0;
+    for (const RouteSlot& r : routes_) n += r.route.endpoint == endpoint;
+    return n;
+}
+
+bool RemoteNode::replaceOfflineRoute(DatagramEndpoint& endpoint, const PeerAddress& peer) {
+    {
+        MutexGuard guard(routesMutex_);
+        RouteSlot* oldest = nullptr;
+        for (RouteSlot& r : routes_) {
+            if (r.route.endpoint != &endpoint || r.route.online) continue;
+            if (!oldest || static_cast<int32_t>(r.route.heardMs - oldest->route.heardMs) < 0) oldest = &r;
+        }
+        if (!oldest) return false;
+        if (lastEndpoint_ == &endpoint && lastPeer_ == oldest->route.peer) lastPeer_ = peer;
+        oldest->route.peer = peer;
+        oldest->route.heardMs = 0;
+        oldest->route.rttMs = 0;
+        oldest->route.iface = endpoint.interfaceOf(peer);
+    }
+    endpoint.routeAdded(this, peer);
+    std::string token = this->token();
+    if (!token.empty()) endpoint.setPeerToken(peer, token);
+    announce_ = true;
+    return true;
+}
+
 void RemoteNode::addRoute(DatagramEndpoint& endpoint, const PeerAddress& peer) {
     bool registered = false;
     NetInterface iface = endpoint.interfaceOf(peer);
@@ -1530,6 +1576,7 @@ public:
           get_(opFor("get", level)),
           upload_(opFor("upload", level)),
           download_(opFor("download", level)) {
+        node_.relayHeld(true);  // not evicted meanwhile
         // The claim is on the peer, under a key no path can have.
         char hex[24];
         snprintf(hex, sizeof(hex), "@%lx:", static_cast<unsigned long>(reinterpret_cast<uintptr_t>(node.endpoint())));
@@ -1543,6 +1590,7 @@ public:
     // Owners close() first; this only covers a relay dropped while claimed.
     ~RemoteFile() override {
         if (claimed_) api_.releaseTransfer(key_);
+        node_.relayHeld(false);
     }
 
     bool claim(Reply& reply) override {

@@ -100,6 +100,15 @@ public:
         // maxMessage if below it, so the largest message can always queue.
         size_t queueBytes = 20480;
         size_t queueBytesPerPeer = 16384;
+        // What peers can make this node hold (docs/DESIGN.md section 14.1):
+        // nodes mounted for peers that announced themselves (mountPeers());
+        // past it, an offline one nothing uses is evicted, else the new peer
+        // isn't mounted. Routes a peer's announcement adds to one node,
+        // through this endpoint; past it, an offline one is replaced. File
+        // transfers peers have open at once; past it, busy. 0: no limit.
+        size_t maxMounted = 16;
+        size_t maxRoutesPerNode = 4;
+        size_t maxFileSessions = 4;
     };
 
     struct Stats {
@@ -108,6 +117,8 @@ public:
         uint32_t dropped = 0;    // queue full or malformed
         uint32_t timeouts = 0;   // client calls that expired
         uint32_t unmatched = 0;  // responses for no pending call
+        uint32_t evicted = 0;    // mounted nodes removed for a new one (maxMounted)
+        uint32_t unmounted = 0;  // peers not mounted: maxMounted, none to evict
     };
 
     // `api` may be null for a client-only endpoint.
@@ -209,6 +220,11 @@ public:
                    BroadcastHandler onReply = nullptr, uint32_t windowMs = 0, const void* owner = nullptr);
     // Drops (without calling) the pending calls tagged with `owner`.
     void cancelCalls(const void* owner);
+    // Whether a call made for `owner` is in flight.
+    bool hasCalls(const void* owner) const;
+    // Peers holding a subscription here, and peers with a file transfer open.
+    size_t peerSubscribers() const;
+    size_t fileSessions() const { return files_.size(); }
 
     // Used by RemoteNode: a node with a route through this endpoint, and
     // that route (`peer`), so it gets the peer's advertised hash.
@@ -465,6 +481,7 @@ private:
     void unreachable(const PeerAddress& peer);
     void applySeen(const Seen& seen);
     void mount(Object& parent, uint32_t mirrorMs, const Seen& seen, const PeerAddress& device);
+    bool roomToMount();
     void markOnline(const PeerAddress& peer, bool online);
     // Under mutex_.
     Known* knownLocked(const PeerAddress& peer);
@@ -499,7 +516,7 @@ private:
     // Schema hashes peers advertised, for remote nodes created later.
     std::vector<Advertised> advertised_;  // guarded by mutex_
     std::vector<std::pair<Object*, uint32_t>> mounts_;  // mountPeers(): parent, mirror interval
-    Mutex subscribersMutex_{kRankSubscribers, "endpoint subscribers"};  // taken before the API lock, never after
+    mutable Mutex subscribersMutex_{kRankSubscribers, "endpoint subscribers"};  // taken before the API lock, never after
     std::vector<PeerSubscriber*> subscribers_;
     std::vector<RemoteNode*> remotes_;  // guarded by mutex_
     std::vector<PeerFiles> files_;      // used in process() only

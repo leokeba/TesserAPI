@@ -30,5 +30,6 @@
 #include "budget_cases.h"
 #include "lock_cases.h"
 #include "heap_cases.h"
+#include "caps_cases.h"
 
 int main(int argc, char** argv) { return check::run(argc > 1 ? argv[1] : nullptr) ? 1 : 0; }
