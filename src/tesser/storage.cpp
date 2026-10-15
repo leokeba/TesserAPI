@@ -19,13 +19,27 @@ std::string FileStorage::path(std::string_view key) const {
     return p;
 }
 
+// Files are read and written unbuffered (setvbuf before any I/O): on
+// ESP-IDF, newlib gives a FILE a buffer the size of the filesystem's block
+// at its first read or write, 4 KB on LittleFS, which a tight board may not
+// have and which a caller reserving its memory first can't foresee
+// (docs/DESIGN.md section 12). A host build can't see it.
 bool FileStorage::load(std::string_view key, std::string& out) {
     FILE* f = fopen(path(key).c_str(), "rb");
     if (!f) return false;
+    setvbuf(f, nullptr, _IONBF, 0);
     out.clear();
-    char buf[256];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    // Its size, so the string is allocated once.
+    long size = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+    if (size > 0 && fseek(f, 0, SEEK_SET) == 0) {
+        out.resize(static_cast<size_t>(size));
+        out.resize(fread(&out[0], 1, out.size(), f));
+    } else {
+        rewind(f);
+        char buf[256];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    }
     fclose(f);
     return !out.empty();
 }
@@ -36,6 +50,7 @@ bool FileStorage::save(std::string_view key, const std::string& data) {
     std::string tmp = file + ".tmp";
     FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) return false;
+    setvbuf(f, nullptr, _IONBF, 0);  // the record goes in one write, no FILE buffer
     bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
     ok = (fclose(f) == 0) && ok;
     if (!ok) {
@@ -52,9 +67,8 @@ bool FileStorage::save(std::string_view key, const std::string& data) {
 
 bool FileStorage::remove(std::string_view key) {
     std::string file = path(key);
-    FILE* f = fopen(file.c_str(), "rb");
-    if (!f) return true;  // none stored
-    fclose(f);
+    struct stat st;
+    if (stat(file.c_str(), &st) != 0) return true;  // none stored
     return ::remove(file.c_str()) == 0;
 }
 

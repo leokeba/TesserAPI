@@ -200,6 +200,16 @@ TEST(persist_file_storage) {
     CHECK(file.save("other", "3"));
     CHECK(file.load("config", out));
     CHECK_EQ(out, "{\"a\":2}");
+    // A record larger than a read piece comes back whole, in one string
+    // sized from the file (unbuffered, docs/DESIGN.md section 12).
+    std::string big = "\"" + std::string(3000, 'r') + "\"";
+    CHECK(file.save("big", big));
+    CHECK(file.load("big", out));
+    CHECK_EQ(out, big);
+    CHECK_EQ(out.capacity() < 2 * big.size(), true);
+    CHECK(file.remove("big"));
+    CHECK(file.remove("big"));  // none stored: fine
+    CHECK(!file.load("big", out));
     CHECK(file.load("other", out));
     CHECK_EQ(out, "3");
     CHECK(file.erase());
