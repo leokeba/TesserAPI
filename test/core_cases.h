@@ -10,6 +10,7 @@
 
 #include "TesserAPI.h"
 #include "check.h"
+#include "tesser/testing/heap_limit.h"
 
 namespace cases {
 
@@ -696,6 +697,7 @@ struct Lines {
     std::vector<std::string> out;
     std::string partial;
     void add(const char* data, size_t len) {
+        tesser::testing::HeapExempt client;  // the other end's memory (heap_cases.h)
         partial.append(data, len);
         size_t nl;
         while ((nl = partial.find('\n')) != std::string::npos) {

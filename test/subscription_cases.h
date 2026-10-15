@@ -23,6 +23,7 @@ struct FakeSubscriber : tesser::Subscriber {
             failNext--;
             return false;
         }
+        tesser::testing::HeapExempt client;  // the subscriber's own (heap_cases.h)
         messages.push_back(m);
         return true;
     }
@@ -41,6 +42,7 @@ inline Resp request(Api& api, tesser::Subscriber* sub, Op op, const char* path, 
     req.client.authenticated = level != tesser::Access::Public;
     tesser::StringReply reply;
     api.handle(req, reply);
+    tesser::testing::HeapExempt client;  // the client's copy (heap_cases.h)
     return {reply.status, reply.body};
 }
 

@@ -378,6 +378,13 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
         sub.since = gen;
         return;
     }
+    // Room for the envelope's end, through the accountant: a string the
+    // sink grew to its exact size would otherwise double for one more byte
+    // (libstdc++), unchecked.
+    if (!growFor(msg, msg.size() + 48)) {
+        putOff();
+        return;
+    }
     bool overflow = sub.subscriber->missed.exchange(false);
     closeEnvelope(msg, overflow, sub.ceiling);
     if (sub.subscriber->notify(msg, Delivery::Reliable)) {

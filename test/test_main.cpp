@@ -1,4 +1,7 @@
 // Host test runner: ./tesser_tests [filter]
+#define TESSER_HEAP_LIMIT_IMPLEMENTATION
+#include "tesser/testing/heap_limit.h"
+
 #include "core_cases.h"
 #include "datagram_cases.h"
 #include "subscription_cases.h"
@@ -26,5 +29,6 @@
 #include "link_failure_cases.h"
 #include "budget_cases.h"
 #include "lock_cases.h"
+#include "heap_cases.h"
 
 int main(int argc, char** argv) { return check::run(argc > 1 ? argv[1] : nullptr) ? 1 : 0; }

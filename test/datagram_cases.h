@@ -33,6 +33,7 @@ struct Net {
 
     DatagramEndpoint::SendFn sender(PeerAddress self) {
         return [this, self](const PeerAddress& to, const std::string& m, Delivery d) {
+            tesser::testing::HeapExempt link;  // the link's buffers (heap_cases.h)
             if (!dropAll) frames.push_back(Frame{self, to, m, d});
             return true;
         };
@@ -45,8 +46,12 @@ struct Net {
         for (int round = 0; round < 20; round++) {
             bool any = false;
             while (!frames.empty()) {
-                Frame f = frames.front();
-                frames.pop_front();
+                Frame f;
+                {
+                    tesser::testing::HeapExempt link;
+                    f = frames.front();
+                    frames.pop_front();
+                }
                 for (auto& n : nodes) {
                     if (n.first == f.to) n.second->receive(f.from, f.text.data(), f.text.size(), f.delivery == Delivery::Reliable);
                 }

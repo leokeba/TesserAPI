@@ -44,8 +44,12 @@ struct Rig {
           dev(gateway.remote("dev", gatewayEnd, addr(2))),
           line(gateway, [this](const char* d, size_t n) { lines.add(d, n); }) {
         for (int i = 0; i < 3000; i++) big += char('a' + i % 26);
-        device.api.file("big").maxSize(100000).text([this] { return big; },
+        device.api.file("big").maxSize(100000).text([this] {
+                                                        tesser::testing::HeapExempt app;  // the application's copy
+                                                        return big;
+                                                    },
                                                     [this](std::string_view text, tesser::JsonWriter&) {
+                                                        tesser::testing::HeapExempt app;  // the application's copy
                                                         got = std::string(text);
                                                         return tesser::Check::ok();
                                                     });
@@ -55,16 +59,25 @@ struct Rig {
         net.nodes = {{addr(1), &gatewayEnd}, {addr(2), &deviceEnd}};
     }
 
+    // What the client and the test hold is exempt from a heap limit
+    // (heap_cases.h); the gateway's and the device's work isn't.
     std::string ask(const std::string& envelope) {
+        bool exempt = tesser::testing::heapExempt();
+        tesser::testing::setHeapExempt(true);
         lines.out.clear();
         std::string l = envelope + "\n";
+        tesser::testing::setHeapExempt(false);
         line.feed(l.data(), l.size());
         net.run();
-        return lines.out.size() == 1 ? lines.out[0] : "<" + std::to_string(lines.out.size()) + " lines>";
+        tesser::testing::setHeapExempt(true);
+        std::string reply = lines.out.size() == 1 ? lines.out[0] : "<" + std::to_string(lines.out.size()) + " lines>";
+        tesser::testing::setHeapExempt(exempt);
+        return reply;
     }
 
     // Uploads `data` in envelopes of `chunk` bytes; returns the last reply.
     std::string uploadAll(const char* path, const std::string& data, size_t chunk) {
+        tesser::testing::HeapExempt client;
         std::string r;
         size_t at = 0;
         do {
@@ -81,6 +94,7 @@ struct Rig {
 
     // Downloads `path` in chunks of up to `length`, checking offsets.
     std::string downloadAll(const char* path, size_t length, size_t* chunks = nullptr) {
+        tesser::testing::HeapExempt client;
         std::string out;
         for (int i = 0; i < 100; i++) {
             std::string r = ask("{\"op\":\"download\",\"path\":\"" + std::string(path) + "\",\"offset\":" +

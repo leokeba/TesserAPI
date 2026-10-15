@@ -10,6 +10,7 @@
 #include "tesser/datagram.h"
 #include "tesser/envelope.h"
 #include "tesser/remote.h"
+#include "tesser/sink.h"
 
 namespace tesser {
 
@@ -32,10 +33,28 @@ private:
     size_t pos_ = 0;
 };
 
+// What a relayed transfer's state takes (RemoteNode::relayFile()), checked
+// before it is made.
+constexpr size_t kRelayState = 512;
+// And a reply detached to wait for the peer's (EnvelopeReply::detach()).
+constexpr size_t kDetachedReply = 320;
+
 class TextSink : public FileSink {
 public:
     explicit TextSink(std::shared_ptr<const FileNode::TextSetter> set) : set_(std::move(set)) {}
+    // The whole file is held: room for the size announced, taken at once
+    // within the byte accountant (docs/DESIGN.md section 15). False if the
+    // heap can't.
+    bool reserve(uint64_t size) {
+        if (size <= 256) return true;
+        Reservation room = memoryBudget().reserve(static_cast<size_t>(size));
+        if (!room) return false;
+        reserveExactly(text_, static_cast<size_t>(size));
+        return true;
+    }
     Check write(const uint8_t* data, size_t len) override {
+        // More than announced (HTTP without a length): grown as it comes.
+        if (!growFor(text_, text_.size() + len)) return Check::fail(Status::Busy, "not enough memory for the file");
         text_.append(reinterpret_cast<const char*>(data), len);
         return Check::ok();
     }
@@ -56,7 +75,14 @@ FileNode& FileNode::text(TextGetter get, TextSetter set) {
     }
     if (set) {
         auto shared = std::make_shared<const TextSetter>(std::move(set));
-        upload([shared](FileRequest&) { return std::unique_ptr<FileSink>(new TextSink(shared)); });
+        upload([shared](FileRequest& r) -> std::unique_ptr<FileSink> {
+            std::unique_ptr<TextSink> sink(new TextSink(shared));
+            if (!sink->reserve(r.size)) {
+                r.refuse(Status::Busy, "not enough memory for the file");
+                return nullptr;
+            }
+            return sink;
+        });
     }
     return *this;
 }
@@ -127,6 +153,12 @@ FileTransfer::Open FileTransfer::open(std::string_view path, const Client& clien
         if (notFile) return Open::NotFile;
         if (node) return openLocal(*node, client, op, size, filename, reply);
         if (!remote.node) return Open::Failed;
+        // The relay's state, only with room for it (docs/DESIGN.md section 15).
+        Reservation room = memoryBudget().reserve(kRelayState);
+        if (!room) {
+            writeError(reply, Status::Busy, Reason::LowMemory, path_, "not enough memory for a transfer");
+            return Open::Failed;
+        }
         relay_ = remote.node->relayFile(api_, remote.rest, remote.base, remote.level);
     }
     // Relayed: the peer's replies come from another task, outside the lock.
@@ -695,6 +727,12 @@ void FileSession::upload(JsonObjectConst envelope, std::string_view raw, std::st
             return;
         }
         state_.reset();
+        // The transfer's state, only with room for it.
+        Reservation room = memoryBudget().reserve(sizeof(State));
+        if (!room) {
+            writeError(reply, Status::Busy, Reason::LowMemory, path, "not enough memory for a transfer");
+            return;
+        }
         auto state = std::unique_ptr<State>(new State(api_));
         std::string_view name = filename.isNull() ? std::string_view() : text(filename);
         FileTransfer::Open o = state->transfer.openUpload(path, client, size.as<uint64_t>(), reply, name);
@@ -763,6 +801,12 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
     if (opening) {
         // Offset 0 starts a new download, ending whatever was in progress.
         state_.reset();
+        // The transfer's state, only with room for it.
+        Reservation room = memoryBudget().reserve(sizeof(State));
+        if (!room) {
+            writeError(reply, Status::Busy, Reason::LowMemory, path, "not enough memory for a transfer");
+            return;
+        }
         auto state = std::unique_ptr<State>(new State(api_));
         FileTransfer::Open o = state->transfer.openDownload(path, client, reply);
         if (o == FileTransfer::Open::NotFile) writeError(reply, Status::NotAllowed, path, "not a file");
@@ -863,6 +907,12 @@ namespace {
 
 // Defers `reply` for a relay call: false, with the error written, if it can't.
 Reply* deferFor(Api& api, Reply& reply, const std::string& path) {
+    // The detached reply (an envelope's id, its buffer), only with room.
+    Reservation room = memoryBudget().reserve(kDetachedReply);
+    if (!room) {
+        writeError(reply, Status::Busy, Reason::LowMemory, path, "not enough memory to wait for the remote node");
+        return nullptr;
+    }
     if (!api.pendingBegin()) {
         writeError(reply, Status::Busy, Reason::PendingLimit, path, "too many pending calls");
         return nullptr;
@@ -936,9 +986,12 @@ void FileSession::relayUpload(bool opening, uint64_t size, std::string_view file
         api->pendingDone();
     };
     if (opening) {
-        relay->openUpload(size, filename, [relay, data, answer](Status s, JsonVariantConst body) {
-            if (s != Status::Ok || relay->finished() || data.empty()) return answer(s, body);
-            relay->write(data, answer);
+        // The chunk waits for the opening's reply moved, not copied: a
+        // callback (std::function) copies what it captures.
+        auto held = std::make_shared<std::vector<uint8_t>>(std::move(data));
+        relay->openUpload(size, filename, [relay, held, answer](Status s, JsonVariantConst body) {
+            if (s != Status::Ok || relay->finished() || held->empty()) return answer(s, body);
+            relay->write(std::move(*held), answer);
         });
     } else if (data.empty()) {
         answer(Status::Ok, JsonVariantConst());

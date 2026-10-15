@@ -42,13 +42,21 @@ struct Rig {
         net.nodes = {{addr(1), &gatewayEnd}, {addr(2), &deviceEnd}};
     }
 
+    // The client's and the test's memory is exempt from a heap limit
+    // (heap_cases.h); the gateway's and the device's work isn't.
     std::string ask(const std::string& envelope) {
+        bool exempt = tesser::testing::heapExempt();
+        tesser::testing::setHeapExempt(true);
         lines.out.clear();
         std::string l = envelope + "\n";
+        tesser::testing::setHeapExempt(false);
         line.feed(l.data(), l.size());
         net.run();
-        return lines.out.size() == 1 ? cases::withoutOwnId(lines.out[0], "body")
-                                     : "<" + std::to_string(lines.out.size()) + " lines>";
+        tesser::testing::setHeapExempt(true);
+        std::string reply = lines.out.size() == 1 ? cases::withoutOwnId(lines.out[0], "body")
+                                                  : "<" + std::to_string(lines.out.size()) + " lines>";
+        tesser::testing::setHeapExempt(exempt);
+        return reply;
     }
 };
 

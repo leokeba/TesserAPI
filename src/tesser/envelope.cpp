@@ -220,9 +220,11 @@ bool EnvelopeReply::LimitedSink::write(const char* data, size_t len) {
         if (r_.failed_) return false;
         // On a short heap, or past the window (no drain() came: a deep list,
         // say), whole pieces go now, under the lock.
-        if (!growFor(r_.buf_, r_.buf_.size() + len)) {
+        // With room for the closing '}' too: one more byte past an exact
+        // capacity doubles it (libstdc++), unchecked.
+        if (!growFor(r_.buf_, r_.buf_.size() + len + 1)) {
             if (!r_.sendPieces(false)) return false;
-            if (!growFor(r_.buf_, r_.buf_.size() + len)) {
+            if (!growFor(r_.buf_, r_.buf_.size() + len + 1)) {
                 r_.lowMemory_ = true;
                 return false;
             }
