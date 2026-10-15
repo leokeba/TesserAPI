@@ -50,6 +50,11 @@ struct Subscription {
     bool remotes = true;
     uint32_t since = 0;  // generation of the last flush
     uint32_t lastFlushMs = 0;
+    // A notification put off (no memory for it, or the subscriber refused
+    // it) waits backoffMs, from 50 ms doubling to 2 s, before it is built
+    // again; 0 when the last one went.
+    uint32_t backoffMs = 0;
+    uint32_t retryAtMs = 0;
     // Forwarded below a remote node (docs/DESIGN.md section 14): the remote
     // node relays its changes; poll() leaves it alone.
     bool forwarded = false;

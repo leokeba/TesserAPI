@@ -1,6 +1,8 @@
 // Change tracking, subscriptions and events (docs/DESIGN.md section 11).
 #include <string.h>
 
+#include <algorithm>
+
 #include "tesser/api.h"
 #include "tesser/budget.h"
 #include "tesser/call.h"
@@ -10,6 +12,9 @@
 namespace tesser {
 
 namespace {
+
+constexpr uint32_t kNotifyBackoffMs = 50;      // a notification put off, first wait
+constexpr uint32_t kNotifyBackoffMaxMs = 2000;  // and longest
 
 // Registry of live APIs, so an EventNode can find the tree it belongs to.
 // Registration is a lock-free push: APIs are often globals, constructed
@@ -316,6 +321,7 @@ void Api::sampleWatched(Node& node) {
 void Api::flush(Subscription& sub, uint32_t nowMs) {
     if (!sub.changes) return;  // events only
     if (sub.interval && nowMs - sub.lastFlushMs < sub.interval) return;
+    if (sub.backoffMs && static_cast<int32_t>(nowMs - sub.retryAtMs) < 0) return;
     uint32_t gen = currentGeneration();
     if (gen == sub.since) return;
     if (gen - sub.since > kGenerationHorizon) {
@@ -356,7 +362,18 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
         detail::writeLeaf(w, n, options);
         any = true;
     }
-    if (sink.lowMemory) return;  // `since` stays: the changes go with the next flush
+    // Put off: `since` stays, so the changes go with a later flush, merged
+    // with newer ones; not at the next poll() but after a wait that grows,
+    // rather than build the same notification every few milliseconds
+    // while it can't go (docs/DESIGN.md section 15).
+    auto putOff = [&] {
+        sub.backoffMs = sub.backoffMs ? std::min<uint32_t>(sub.backoffMs * 2, kNotifyBackoffMaxMs) : kNotifyBackoffMs;
+        sub.retryAtMs = nowMs + sub.backoffMs;
+    };
+    if (sink.lowMemory) {
+        putOff();
+        return;
+    }
     if (!any) {
         sub.since = gen;
         return;
@@ -366,10 +383,12 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
     if (sub.subscriber->notify(msg, Delivery::Reliable)) {
         sub.since = gen;
         sub.lastFlushMs = nowMs;
+        sub.backoffMs = 0;
     } else {
-        // Not advancing `since` makes the next flush resend these changes,
+        // Not advancing `since` makes a later flush resend these changes,
         // merged with newer ones.
         sub.subscriber->missed = true;
+        putOff();
     }
 }
 

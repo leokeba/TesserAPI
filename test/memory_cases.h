@@ -87,6 +87,39 @@ TEST(memory_notification_waits_for_room) {
     CHECK(sub.last().find("\"overflow\"") == std::string::npos);
 }
 
+TEST(memory_notification_backs_off) {
+    // A notification the heap can't hold isn't built again at every poll()
+    // (every 10 ms on target) while it can't go: the wait doubles, from
+    // 50 ms to 2 s. Measured on DEVKIT-R1 before this: a 5-6 KB change
+    // notification rebuilt and refused every 10 ms.
+    cases::Device d;
+    std::string big(3000, 'x');
+    auto& bigNode = d.api.value("big", big);
+    subscription_cases::FakeSubscriber sub;
+    CHECK_EQ(subscription_cases::subscribe(d.api, &sub, "/", cases::keys("big")).status, Status::Ok);
+    uint32_t tries = 0;
+    {
+        Floor floor(8000, 9000);
+        big.assign(3000, 'y');
+        bigNode.changed();
+        uint32_t before = tesser::memoryBudget().refused();
+        for (uint32_t t = 1000; t <= 11000; t += 10) d.api.poll(t);
+        tries = tesser::memoryBudget().refused() - before;
+        CHECK(sub.messages.empty());
+    }
+    // 1000, 1050, 1150, 1350, 1750, 2550, then every 2 s: 10, not 1001.
+    CHECK(tries >= 8 && tries <= 12);
+    // Room again: it goes within the longest wait.
+    for (uint32_t t = 11010; t <= 13010 && sub.messages.empty(); t += 10) d.api.poll(t);
+    CHECK_EQ(sub.messages.size(), 1u);
+    CHECK(sub.last().find("yyyy") != std::string::npos);
+    // Sent, the next change goes at once.
+    big.assign(3000, 'z');
+    bigNode.changed();
+    d.api.poll(13020);
+    CHECK_EQ(sub.messages.size(), 2u);
+}
+
 TEST(memory_json_member) {
     std::string_view out;
     CHECK(tesser::jsonMember("{\"id\":3,\"status\":\"ok\",\"body\":{\"a\":[1,{\"b\":\"}\"}]}}", "body", out));

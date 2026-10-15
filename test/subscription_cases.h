@@ -154,6 +154,8 @@ TEST(sub_failed_notify_retries_with_overflow) {
     CHECK(s.missed.load());
     cases::set(d.api, "/lamp/on", "true");
     d.api.poll(1010);
+    CHECK_EQ(s.messages.size(), 0u);  // put off for 50 ms
+    d.api.poll(1050);
     CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"on\":true,\"brightness\":7},\"overflow\":true}");
     CHECK(!s.missed.load());
 }
@@ -489,9 +491,9 @@ TEST(sub_generation_wraparound) {
     CHECK_EQ(s.messages.size(), sent);
     tesser::detail::setGeneration(tesser::currentGeneration() + tesser::kGenerationHorizon + 10);
     cases::set(d.api, "/lamp/label", "\"y\"");
-    d.api.poll(1070);
+    d.api.poll(1110);  // after the 50 ms the failed one was put off
     CHECK_EQ(s.last(), "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"label\":\"y\"},\"overflow\":true}");
-    d.api.poll(1080);
+    d.api.poll(1120);
     CHECK_EQ(s.messages.size(), sent + 1);
 }
 
