@@ -461,6 +461,14 @@ bool HttpServer::wsSendShared(int fd, std::shared_ptr<const std::string> message
             auto* w = static_cast<WsWork*>(arg);
             w->server->workRun_++;
             bool ok = httpd_ws_get_fd_info(w->handle, w->fd) == HTTPD_WS_CLIENT_WEBSOCKET;
+            // The stack copies a frame to send it, and holds the copy until
+            // the client acknowledges it: a large one waits, up to 500 ms,
+            // for the heap to hold that copy above the floor, while the
+            // frames before it are acknowledged (docs/DESIGN.md section 15).
+            // Measured on DEVKIT-V3 relaying 3.9 KB frames: 9.4 KB free fell
+            // to 5.7 KB inside the send.
+            size_t size = w->message->size();
+            for (int i = 0; ok && size > 1024 && i < 50 && !heapAbove(size); i++) vTaskDelay(pdMS_TO_TICKS(10));
             if (ok) {
                 httpd_ws_frame_t frame = {};
                 frame.type = HTTPD_WS_TYPE_TEXT;

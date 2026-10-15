@@ -321,6 +321,24 @@ TEST(memory_remote_state_needs_room) {
     CHECK_EQ(r.gateway.pending(), 0);
 }
 
+TEST(memory_mirror_copy_needs_room) {
+    // A mirror's snapshot is parsed straight into its copy, from the reply's
+    // text, only with room for about three times that text in the byte
+    // budget; without, there is no copy until the next try, 2 s later.
+    remote_cases::Rig r;
+    r.kitchen.mirror(0, 30000);
+    {
+        Floor floor(8000, 8100);
+        r.net.run();
+        CHECK(!r.kitchen.hasCopy());
+    }
+    r.net.clock += 2000;
+    r.net.run();
+    CHECK(r.kitchen.hasCopy());
+    CHECK(r.ask("{\"id\":1,\"op\":\"get\",\"path\":\"/\",\"keys\":\"kitchen\"}")
+              .find("\"kitchen\":{\"lamp\":{\"on\":false,\"brightness\":128,") != std::string::npos);
+}
+
 TEST(memory_receive_owned_buffer) {
     // A link hands its malloc'd reassembly buffer over: answered like any
     // message, freed by the endpoint (ASan checks), also when it is dropped.

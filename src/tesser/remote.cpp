@@ -892,18 +892,29 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
     q.interval = mirrorIntervalMs_;
     q.remotes = false;  // never mirror the peer's own mirrors: no loops between gateways
     q.ceiling = mirrorLevel_;  // the copy is what a client at that level reads
-    bool sent = cur.endpoint->request(
-        cur.peer, Op::Subscribe, remotePath_, std::string_view(),
-        [this](Status s, JsonVariantConst body) {
+    // The snapshot is parsed once, from the reply's text, straight into the
+    // copy (the old one goes first), and only with room for it in the byte
+    // budget: parsed as a reply, then copied, it was held three ways at
+    // once, and a peer coming back after a restart took a gateway's free
+    // heap 2 KB below its floor (DEVKIT-V3 mirroring DEVKIT-R1).
+    bool sent = cur.endpoint->requestRaw(
+        cur.peer, Op::Subscribe, remotePath_, JsonVariantConst(),
+        [this](std::string_view text) {
             subscribing_ = false;
-            if (s != Status::Ok || !heapAbove(2 * measureJson(body))) return;  // retried in 2 s
+            // A document takes up to about three times its text in small
+            // values.
+            Reservation room = memoryBudget().reserve(3 * text.size(), 0, false);
+            if (!room) return;  // retried in 2 s
             {
                 MutexGuard guard(mutex_);
-                copy_.set(body);
-                hasCopy_ = true;
+                copy_.clear();
+                hasCopy_ = !deserializeJson(copy_, text.data(), text.size(),
+                                            DeserializationOption::NestingLimit(kWrittenNesting));
+                if (!hasCopy_) copy_.clear();
             }
             changed();
         },
+        [this](Status, JsonVariantConst) { subscribing_ = false; },  // retried in 2 s
         q, timeoutMs_, this);
     if (!sent) subscribing_ = false;
 }
