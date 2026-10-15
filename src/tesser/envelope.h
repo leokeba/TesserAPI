@@ -103,6 +103,7 @@ public:
     Reply* detach() override;
     void release() override;
     bool outOfMemory() const override { return lowMemory_; }
+    size_t limit() const override { return fragment_ ? 0 : limit_; }
     bool wantsDrain() const override;
     void drain() override;
 

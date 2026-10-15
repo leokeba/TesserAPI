@@ -342,6 +342,8 @@ void UdpLink::sendAdvert(const PeerAddress& to, uint8_t flags) {
         }
         w.key("v");
         w.integer(kProtocolVersion);
+        w.key("max");  // the largest message this node takes (docs/DESIGN.md section 14.1)
+        w.uinteger(options_.maxMessage);
         w.endObject();
     }
     std::vector<uint8_t> buf(kHeader + payload.size());
@@ -555,6 +557,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
     uint32_t hash = 0;
     PeerAddress device;
     uint8_t protocol = 1;
+    size_t maxMessage = 0;
     {
         MutexGuard guard(mutex_);
         if (!running_ || h.nonce == nonce_) return;  // our own broadcast, looped back
@@ -586,6 +589,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
                     doc["name"].is<const char*>() && doc["schema"].is<const char*>()) {
                     name = doc["name"].as<const char*>();
                     protocol = doc["v"].is<uint8_t>() && doc["v"].as<uint8_t>() ? doc["v"].as<uint8_t>() : uint8_t(1);
+                    maxMessage = doc["max"].is<uint32_t>() ? doc["max"].as<uint32_t>() : 0;
                     hash = static_cast<uint32_t>(strtoul(doc["schema"].as<const char*>(), nullptr, 16));
                     const char* id = doc["id"] | "";
                     uint8_t mac[6];
@@ -610,7 +614,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
     // A peer that restarted lost its calls and subscriptions: forget them.
     if (restarted) endpoint_.forgetPeer(from, PeerLoss::Restarted);
     for (Inbound& in : inbound) endpoint_.receive(in.from, std::move(in.data), in.reliable, in.broadcast);
-    if (announced) endpoint_.peerSeen(from, name, hash, device, protocol);
+    if (announced) endpoint_.peerSeen(from, name, hash, device, protocol, maxMessage);
     if (bye) endpoint_.forgetPeer(from, PeerLoss::Goodbye);
 }
 

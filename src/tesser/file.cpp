@@ -643,6 +643,7 @@ FileSession::~FileSession() = default;
 
 size_t FileSession::uploadChunk(const Config& config) { return chunkWithin(config.maxRequestBody); }
 size_t FileSession::downloadChunk(const Config& config) { return chunkWithin(config.maxResponse); }
+size_t FileSession::chunkFor(size_t limit) { return chunkWithin(limit); }
 
 size_t FileSession::chunkInRoom(size_t max, size_t thirds) {
     // The envelope's other members, and what the replies' own copies round
@@ -891,7 +892,10 @@ void FileSession::upload(JsonObjectConst envelope, std::string_view raw, std::st
 
 void FileSession::download(JsonObjectConst envelope, std::string_view path, uint64_t offset, const Client& client,
                            Reply& reply) {
+    // Within what the client takes, too (a peer's advertised limit,
+    // docs/DESIGN.md section 14.1).
     size_t max = downloadChunk(api_.config());
+    if (reply.limit() && chunkWithin(reply.limit()) < max) max = chunkWithin(reply.limit());
     size_t length = max;
     JsonVariantConst len = envelope["length"];
     if (!len.isNull()) {

@@ -1000,6 +1000,16 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
         return writeError(reply, Status::Timeout, Reason::PeerOffline, localBase.empty() ? std::string_view("/") : localBase,
                           "peer offline");
     }
+    // Larger than the peer takes (docs/DESIGN.md section 14.1): too large
+    // now, not sent to be lost or refused. The envelope adds its id, op,
+    // path and query to the body.
+    size_t takes = r.endpoint->peerLimit(r.peer);
+    if (takes && !request.body.isNull() && measureJson(request.body) + request.path.size() + 128 > takes) {
+        char message[64];
+        snprintf(message, sizeof(message), "the remote node takes messages of up to %lu bytes",
+                 static_cast<unsigned long>(takes));
+        return writeError(reply, Status::TooLarge, basePath, message);
+    }
     if (!api.pendingBegin()) return writeError(reply, Status::Busy, Reason::PendingLimit, basePath, "too many pending calls");
     Reply* detached = reply.detach();
     if (!detached) {
@@ -1714,6 +1724,9 @@ public:
             if (limit_ && cap > limit_) cap = limit_;
         }
         if (!length || length > cap) length = cap;
+        // A reply this link takes.
+        size_t own = endpoint_ ? endpoint_->maxMessage() : 0;
+        if (own && FileSession::chunkFor(own) < length) length = FileSession::chunkFor(own);
         // And what this node's heap holds now, the reply and its way on.
         length = FileSession::chunkInRoom(length, FileSession::kRelayedDownloadThirds);
         std::string path = remotePath_;
@@ -1899,6 +1912,9 @@ private:
         uint64_t offset = 0;
         size_t part = 0;
         bool closed, idle;
+        // An envelope the peer takes (its advertised limit), asked before
+        // this relay's lock: the link may take its own.
+        size_t takes = endpoint_ && node_.routeUp(endpoint_, peer_) ? endpoint_->peerLimit(peer_) : 0;
         {
             MutexGuard guard(mutex_);
             closed = closed_;
@@ -1908,6 +1924,7 @@ private:
                 part = chunk_ ? chunk_ : kFallbackChunk;
                 if (limit_ && part > limit_) part = limit_;
                 if (part > pending_.size()) part = pending_.size();
+                if (takes && FileSession::chunkFor(takes) < part) part = FileSession::chunkFor(takes);
                 part = FileSession::chunkInRoom(part, FileSession::kRelayedPartThirds);
                 std::string head = fieldsOf([&](JsonWriter& w) {
                     w.key("op");

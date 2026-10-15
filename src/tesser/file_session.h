@@ -53,6 +53,9 @@ public:
     // carry and a download reply carries, under `config`'s limits.
     static size_t uploadChunk(const Config& config);
     static size_t downloadChunk(const Config& config);
+    // The largest chunk whose envelope fits a message of `limit` bytes
+    // (base64, and room for the rest), at most 4 KB.
+    static size_t chunkFor(size_t limit);
     // The data bytes of a chunk, at most `max`, whose way through this node
     // fits in what the heap has now (heapRoom()), each data byte holding
     // `thirds`/3 bytes at once; at least FileRelay::kMinPart (or `max`), for

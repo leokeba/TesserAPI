@@ -526,7 +526,7 @@ private:
         w.integer(kProtocolVersion);
         w.key("features");
         w.beginArray();
-        for (const char* f : {"ceiling", "reasons", "strict", "info", "crc32"}) w.string(f);
+        for (const char* f : {"ceiling", "reasons", "strict", "info", "crc32", "limits"}) w.string(f);
 #if !defined(TESSER_NO_SCHEMA)
         w.string("schema");
 #endif
@@ -545,6 +545,17 @@ private:
             w.key("id");
             w.string(id);
         }
+        // The largest request text this node takes, and reply it sends this
+        // client (docs/DESIGN.md section 10.1.2): within its link's, and the
+        // client's, on a message transport.
+        const Config& c = api_.config();
+        w.key("limits");
+        w.beginObject();
+        w.key("request");
+        w.uinteger(c.maxRequestBody);
+        w.key("response");
+        w.uinteger(reply_.limit() ? reply_.limit() : c.maxResponse);
+        w.endObject();
         w.endObject();
         detail::finishBody(reply_, w, base_);
         return true;

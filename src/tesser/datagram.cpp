@@ -93,10 +93,15 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
     return out;
 }
 
-std::string buildAdvertisement(uint8_t port, uint32_t schemaHash) {
-    char meta[48];
-    int n = snprintf(meta, sizeof(meta), "{\"tesser\":%u,\"schema\":\"%08lx\",\"v\":%d}", unsigned(port),
+std::string buildAdvertisement(uint8_t port, uint32_t schemaHash, size_t maxMessage) {
+    char meta[80];
+    int n = snprintf(meta, sizeof(meta), "{\"tesser\":%u,\"schema\":\"%08lx\",\"v\":%d", unsigned(port),
                      static_cast<unsigned long>(schemaHash), kProtocolVersion);
+    if (n > 0 && maxMessage) {
+        n += snprintf(meta + n, sizeof(meta) - static_cast<size_t>(n), ",\"max\":%lu",
+                      static_cast<unsigned long>(maxMessage));
+    }
+    if (n > 0 && static_cast<size_t>(n) + 1 < sizeof(meta)) meta[n++] = '}';
     return std::string(meta, n > 0 ? static_cast<size_t>(n) : 0);
 }
 
@@ -106,12 +111,19 @@ bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& sche
 }
 
 bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash, uint8_t& protocol) {
+    size_t maxMessage;
+    return parseAdvertisement(metadata, port, schemaHash, protocol, maxMessage);
+}
+
+bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash, uint8_t& protocol,
+                        size_t& maxMessage) {
     JsonDocument doc;
     if (deserializeJson(doc, metadata.data(), metadata.size())) return false;
     if (!doc["tesser"].is<uint8_t>() || !doc["schema"].is<const char*>()) return false;
     port = doc["tesser"].as<uint8_t>();
     schemaHash = static_cast<uint32_t>(strtoul(doc["schema"].as<const char*>(), nullptr, 16));
     protocol = doc["v"].is<uint8_t>() && doc["v"].as<uint8_t>() ? doc["v"].as<uint8_t>() : uint8_t(1);
+    maxMessage = doc["max"].is<uint32_t>() ? doc["max"].as<uint32_t>() : 0;
     return true;
 }
 
@@ -133,6 +145,28 @@ size_t DatagramEndpoint::replyLimit() const {
     size_t limit = api_ ? api_->config().maxResponse : 0;
     size_t link = options_.maxMessage;
     if (!limit || (link && link < limit)) limit = link;
+    return limit;
+}
+
+size_t DatagramEndpoint::peerLimit(const PeerAddress& peer) const {
+    size_t limit = options_.maxMessage;
+    auto lower = [&limit](size_t l) {
+        if (l && (!limit || l < limit)) limit = l;
+    };
+    {
+        MutexGuard guard(mutex_);
+        for (const Known& k : known_) {
+            if (k.peer == peer) lower(k.maxMessage);
+        }
+    }
+    if (peerLimitFn_) lower(peerLimitFn_(peer));  // the link's lock: not under ours
+    return limit;
+}
+
+size_t DatagramEndpoint::replyLimitFor(const PeerAddress& peer) const {
+    size_t limit = replyLimit();
+    size_t theirs = peerLimit(peer);
+    if (theirs && (!limit || theirs < limit)) limit = theirs;
     return limit;
 }
 
@@ -888,7 +922,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
     SendFn send = send_;
     // A broadcast request without an id is never answered.
     bool silent = msg.broadcast && id.length == 0;
-    EnvelopeReply reply(id, replyLimit(), [send, to, silent](std::string& m) {
+    EnvelopeReply reply(id, replyLimitFor(to), [send, to, silent](std::string& m) {
         if (send && !silent) send(to, std::move(m), Delivery::Reliable);
     });
     ownReplies(reply, to, silent);
@@ -993,7 +1027,7 @@ void DatagramEndpoint::handleFile(JsonObjectConst envelope, const Incoming& msg,
     PeerAddress to = msg.from;
     SendFn send = send_;
     bool silent = msg.broadcast && id.length == 0;
-    EnvelopeReply reply(id, replyLimit(), [send, to, silent](std::string& m) {
+    EnvelopeReply reply(id, replyLimitFor(to), [send, to, silent](std::string& m) {
         if (send && !silent) send(to, std::move(m), Delivery::Reliable);
     });
     ownReplies(reply, to, silent);
@@ -1108,6 +1142,15 @@ bool DatagramEndpoint::requestBuilt(const PeerAddress& to, Builder build, Respon
 bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, std::string envelope,
                                    ResponseHandler done, uint32_t timeoutMs, const void* owner, bool internal,
                                    RawHandler raw, std::shared_ptr<Builder> rebuild, Bytes owned) {
+    // Larger than the peer takes: not sent, rather than lost on the way or
+    // refused there.
+    size_t size = owned.data() ? owned.size() : envelope.size();
+    size_t limit = peerLimit(to);
+    if (limit && size > limit) {
+        MutexGuard guard(mutex_);
+        stats_.tooLarge++;
+        return false;
+    }
     uint32_t now = clock_ ? clock_() : 0;
     bool hold = false, startAuth = false;
     std::string token;
@@ -1508,7 +1551,7 @@ void DatagramEndpoint::mountPeers(Object& parent, uint32_t mirrorIntervalMs) {
 }
 
 void DatagramEndpoint::peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash,
-                                const PeerAddress& device, uint8_t protocol) {
+                                const PeerAddress& device, uint8_t protocol, size_t maxMessage) {
     {
         MutexGuard guard(mutex_);
         for (Seen& s : seenPeers_) {
@@ -1517,10 +1560,11 @@ void DatagramEndpoint::peerSeen(const PeerAddress& peer, std::string_view name, 
                 s.schemaHash = schemaHash;
                 s.device = device;
                 s.protocol = protocol;
+                s.maxMessage = maxMessage;
                 return;
             }
         }
-        seenPeers_.push_back(Seen{peer, std::string(name), schemaHash, device, protocol});
+        seenPeers_.push_back(Seen{peer, std::string(name), schemaHash, device, protocol, maxMessage});
     }
     if (onQueued_) onQueued_();
 }
@@ -1560,6 +1604,7 @@ void DatagramEndpoint::applySeen(const Seen& seen) {
         uint32_t now = clock_ ? clock_() : 0;
         Known& k = learnLocked(seen.peer, now);
         if (device.length) k.device = device;
+        k.maxMessage = seen.maxMessage;
         for (RemoteNode* r : remotes_) {
             if (!r->hasRoute(this, seen.peer)) continue;
             r->setRouteOnline(this, seen.peer, true, now);

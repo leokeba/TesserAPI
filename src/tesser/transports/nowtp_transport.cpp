@@ -66,6 +66,26 @@ struct HasSendBuffer<T, decltype(void(std::declval<T&>().sendBuffer(
 // kSendOverhead: 21 bytes as of ce6b645); less, and it reallocates.
 constexpr size_t kSendSlack = 32;
 
+// NowTP deadc54 and later know each peer's largest message, from its
+// discovery (peerMaxMessageSize(), 0 while unknown).
+template <class T, class = void>
+struct HasPeerLimit : std::false_type {};
+template <class T>
+struct HasPeerLimit<T, decltype(void(std::declval<const T&>().peerMaxMessageSize(std::declval<const nowtp::Mac&>())))>
+    : std::true_type {};
+
+template <class T>
+void installPeerLimit(DatagramEndpoint& endpoint, T& now) {
+    if constexpr (HasPeerLimit<T>::value) {
+        endpoint.setPeerLimit([&now](const PeerAddress& peer) {
+            return peer.length == 6 ? now.peerMaxMessageSize(nowtp::Mac::from(peer.bytes)) : size_t(0);
+        });
+    } else {
+        (void)endpoint;
+        (void)now;
+    }
+}
+
 }  // namespace
 
 nowtp::CompletionHandler NowTpTransport::completion(const PeerAddress& to, uint32_t callId) {
@@ -133,6 +153,7 @@ NowTpTransport::NowTpTransport(Api* api, nowtp::EspNowTransport& now, uint8_t po
           &nowMs, options) {
     reports_->endpoint = &endpoint_;
     installOwnedSend(now_);
+    installPeerLimit(endpoint_, now_);
 }
 
 NowTpTransport::~NowTpTransport() {
@@ -211,12 +232,12 @@ bool NowTpTransport::advertise() {
     Api* api = endpoint_.api();
     if (!api) return false;
     uint32_t hash = api->schemaHash();
-    std::string meta = buildAdvertisement(port_, hash);
+    std::string meta = buildAdvertisement(port_, hash, endpoint_.maxMessage());
     bool ok = now_.setDiscoveryMetadata(meta.data(), meta.size()) == nowtp::Status::Ok;
     // From now on the worker (or poll()) re-advertises when the tree changes.
     endpoint_.autoAdvertise(
         [this](uint32_t h) {
-            std::string m = buildAdvertisement(port_, h);
+            std::string m = buildAdvertisement(port_, h, endpoint_.maxMessage());
             now_.setDiscoveryMetadata(m.data(), m.size());
         },
         hash);
@@ -232,9 +253,10 @@ void NowTpTransport::peerEvent(nowtp::PeerEvent event, const nowtp::PeerInfo& pe
     if (event == nowtp::PeerEvent::Lost) return peerLost(peer.mac);
     uint8_t port, protocol;
     uint32_t hash;
+    size_t maxMessage;
     std::string_view meta(reinterpret_cast<const char*>(peer.metadata.data()), peer.metadata.size());
-    if (tesser::parseAdvertisement(meta, port, hash, protocol) && port == port_) {
-        endpoint_.peerSeen(address(peer.mac), peer.name, hash, PeerAddress(), protocol);
+    if (tesser::parseAdvertisement(meta, port, hash, protocol, maxMessage) && port == port_) {
+        endpoint_.peerSeen(address(peer.mac), peer.name, hash, PeerAddress(), protocol, maxMessage);
     }
 }
 

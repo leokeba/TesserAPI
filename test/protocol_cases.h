@@ -20,6 +20,7 @@ TEST(protocol_info_view) {
     std::string info = cases::roundTrip(d.api, "{\"id\":2,\"op\":\"get\",\"path\":\"/\",\"view\":\"info\"}");
     CHECK(info.find("\"body\":{\"protocol\":2,\"features\":[\"ceiling\",\"reasons\",\"strict\",\"info\"") !=
           std::string::npos);
+    CHECK(info.find("\"limits\"") != std::string::npos);
     // The hash is view=hash's.
     size_t at = hash.find("\"body\":\"");
     CHECK(at != std::string::npos);
@@ -104,6 +105,14 @@ TEST(protocol_advertised) {
     CHECK_EQ(v, 2);
     CHECK(tesser::parseAdvertisement("{\"tesser\":84,\"schema\":\"0000feed\"}", port, hash, v));
     CHECK_EQ(v, 1);  // before versions
+    // The largest message the node takes (docs/DESIGN.md section 14.1).
+    std::string ad = tesser::buildAdvertisement(84, 0xfeed, 16384);
+    CHECK_EQ(ad, "{\"tesser\":84,\"schema\":\"0000feed\",\"v\":2,\"max\":16384}");
+    size_t max = 0;
+    CHECK(tesser::parseAdvertisement(ad, port, hash, v, max));
+    CHECK_EQ(max, 16384u);
+    CHECK(tesser::parseAdvertisement("{\"tesser\":84,\"schema\":\"0000feed\",\"v\":2}", port, hash, v, max));
+    CHECK_EQ(max, 0u);  // not said
     // A peer's stub shows the version it advertised.
     remote_cases::Rig r;
     tesser::Object& peers = r.gateway.object("peers");

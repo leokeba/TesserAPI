@@ -119,6 +119,7 @@ public:
         uint32_t unmatched = 0;  // responses for no pending call
         uint32_t evicted = 0;    // mounted nodes removed for a new one (maxMounted)
         uint32_t unmounted = 0;  // peers not mounted: maxMounted, none to evict
+        uint32_t tooLarge = 0;   // requests larger than their peer takes, not sent (peerLimit())
     };
 
     // `api` may be null for a client-only endpoint.
@@ -333,8 +334,10 @@ public:
     // process().
     // `protocol` is the version it advertises (docs/DESIGN.md section
     // 10.1.2): 1 for an advertisement that names none, 0 when unknown.
+    // `maxMessage` the largest message it takes, as it advertises it (0:
+    // not said).
     void peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash,
-                  const PeerAddress& device = PeerAddress(), uint8_t protocol = 0);
+                  const PeerAddress& device = PeerAddress(), uint8_t protocol = 0, size_t maxMessage = 0);
 
     // Keeps an advertisement current: once the API's tree has changed (a
     // peer mounted, a node added, a remote node's state, see
@@ -355,6 +358,19 @@ public:
     // The largest reply: the API's Config::maxResponse within the link's
     // Options::maxMessage.
     size_t replyLimit() const;
+    // The largest message `peer` takes (docs/DESIGN.md section 14.1): the
+    // least of what it advertises, what the link knows of it
+    // (setPeerLimit()) and this link's own Options::maxMessage; 0 when none
+    // is known. Requests larger aren't sent; replies to it are kept within
+    // it (replyLimitFor()).
+    size_t peerLimit(const PeerAddress& peer) const;
+    size_t replyLimitFor(const PeerAddress& peer) const;
+    // What the link itself knows of a peer's limit (NowTP's
+    // peerMaxMessageSize()), 0 when it doesn't. Set before use.
+    void setPeerLimit(std::function<size_t(const PeerAddress&)> fn) { peerLimitFn_ = std::move(fn); }
+    // This link's own limit (Options::maxMessage; 0: none), which nodes
+    // advertise.
+    size_t maxMessage() const { return options_.maxMessage; }
 
 private:
     struct FreeDeleter {
@@ -393,6 +409,7 @@ private:
         uint32_t schemaHash;
         PeerAddress device;
         uint8_t protocol;
+        size_t maxMessage;
     };
     struct Advertised {
         PeerAddress peer;
@@ -436,6 +453,7 @@ private:
         bool online;
         uint32_t heardMs;
         bool authFailed = false;  // reported as such; cleared when heard
+        size_t maxMessage = 0;    // as it advertises (0: not said)
     };
     struct Failure {
         PeerAddress peer;
@@ -492,6 +510,7 @@ private:
 
     Api* api_;
     TransportKind kind_;
+    std::function<size_t(const PeerAddress&)> peerLimitFn_;
     ByteBudget incoming_;  // queued messages (Options::queueBytes)
     SendFn send_;
     OwnedSendFn ownedSend_;
@@ -561,11 +580,15 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
                                  std::string_view bodyJson);
 
 // Discovery metadata announcing a TesserAPI node:
-// {"tesser":<port>,"schema":"<schemaHash, 8 hex digits>","v":<protocol>}.
-std::string buildAdvertisement(uint8_t port, uint32_t schemaHash);
+// {"tesser":<port>,"schema":"<schemaHash, 8 hex digits>","v":<protocol>},
+// and "max":<maxMessage>, the largest message the node takes, unless 0.
+std::string buildAdvertisement(uint8_t port, uint32_t schemaHash, size_t maxMessage = 0);
 // Reads it; false if the metadata isn't a TesserAPI advertisement.
-// `protocol` is 1 when it names none (docs/DESIGN.md section 10.1.2).
+// `protocol` is 1 when it names none (docs/DESIGN.md section 10.1.2),
+// `maxMessage` 0.
 bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash);
 bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash, uint8_t& protocol);
+bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash, uint8_t& protocol,
+                        size_t& maxMessage);
 
 }  // namespace tesser

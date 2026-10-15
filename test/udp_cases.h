@@ -396,7 +396,9 @@ TEST(udp_discovery) {
     cases::Device lamp, fan;
     tesser::Api gateway;
     Net net;
-    UdpLink lampLink(&lamp.api, net.sender(ip(20)), net.clockFn());
+    UdpLink::Options small;
+    small.maxMessage = 4000;  // the lamp takes less than the gateway
+    UdpLink lampLink(&lamp.api, net.sender(ip(20)), net.clockFn(), small);
     UdpLink fanLink(&fan.api, net.sender(ip(21)), net.clockFn());
     UdpLink gw(&gateway, net.sender(ip(1)), net.clockFn());
     auto& peers = gateway.object("peers");
@@ -411,6 +413,9 @@ TEST(udp_discovery) {
     gw.mountPeers(peers);
     net.run();
     CHECK_EQ(cases::get(gateway, "/peers", cases::depth(1)).body, "{\"lamp\":null,\"lamp-152124\":null}");
+    // Each advertises the largest message it takes (docs/DESIGN.md section 14.1).
+    CHECK_EQ(gw.endpoint().peerLimit(ip(20)), 4000u);
+    CHECK_EQ(gw.endpoint().peerLimit(ip(21)), 16384u);
     tesser::Query q = cases::schema(1);
     q.keys = "lamp";
     char hash[9];

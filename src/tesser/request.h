@@ -159,6 +159,9 @@ public:
     // The last write failed because the heap couldn't hold the reply: the
     // core answers "busy" rather than "too_large".
     virtual bool outOfMemory() const { return false; }
+    // The largest reply this one can carry, in bytes (0: no limit): a
+    // message transport's, within what its client takes.
+    virtual size_t limit() const { return 0; }
     // A streamed reply keeps what is written, up to a window, rather than
     // send it under the API lock (docs/DESIGN.md section 9): the core calls
     // drain() where it may let go of the lock, and once the request is done.

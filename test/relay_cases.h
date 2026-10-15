@@ -442,6 +442,37 @@ TEST(file_envelope_upload_sized_to_the_room) {
     CHECK_EQ(got, big.substr(0, 2880));
 }
 
+TEST(relay_peer_limits) {
+    // Each node advertises the largest message it takes; a node sends a
+    // peer no more (docs/DESIGN.md section 14.1). Here the gateway takes
+    // 600 bytes, the device 700.
+    Rig r;
+    r.deviceEnd.peerSeen(addr(1), "gw", 0, tesser::PeerAddress(), 2, 600);
+    r.gatewayEnd.peerSeen(addr(2), "dev", 0, tesser::PeerAddress(), 2, 700);
+    r.net.run();
+    CHECK_EQ(r.gatewayEnd.peerLimit(addr(2)), 700u);
+    CHECK_EQ(r.deviceEnd.replyLimitFor(addr(1)), 600u);
+    // The device's download chunks fit what the gateway takes:
+    // (600 - 256) * 3/4 = 258 bytes, where its own limits allow 576.
+    std::string first = r.ask("{\"id\":1,\"op\":\"download\",\"path\":\"/dev/big\"}");
+    CHECK(first.find("\"chunk\":258,\"offset\":0,\"data\":\"" + b64(r.big.substr(0, 258)) + "\"") !=
+          std::string::npos);
+    CHECK_EQ(r.downloadAll("/dev/big", 100000), r.big);
+    // A request larger than the device takes is refused at once.
+    std::string body(800, 'a');
+    std::string big = r.ask("{\"id\":2,\"op\":\"set\",\"path\":\"/dev/x\",\"body\":\"" + body + "\"}");
+    CHECK(big.find("\"status\":\"too_large\"") != std::string::npos);
+    CHECK(big.find("up to 700 bytes") != std::string::npos);
+    // A relayed upload goes in parts the device takes.
+    std::string data = r.big.substr(0, 2000);
+    CHECK(r.uploadAll("/dev/big", data, 576).find("\"status\":\"ok\"") != std::string::npos);
+    CHECK_EQ(r.got, data);
+    CHECK_EQ(r.gatewayEnd.stats().tooLarge, 0u);
+    // Its view=info says what it takes and sends.
+    CHECK(r.ask("{\"id\":3,\"op\":\"get\",\"path\":\"/dev\",\"view\":\"info\"}")
+              .find("\"limits\":{\"request\":1024,\"response\":600}") != std::string::npos);
+}
+
 TEST(relay_download_crc32) {
     // Asked by the client, the gateway adds the chunk's crc32, computed from
     // the device's text: the device isn't asked (it may not know it).
