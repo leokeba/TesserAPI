@@ -254,7 +254,9 @@ void Api::forwardedSubscriptions(const Node* node, const std::function<bool(Subs
 
 void Api::dropSubscriber(Subscriber* subscriber) {
     {
-        // Queued requests from this client can't be answered any more.
+        // Queued requests from this client can't be answered any more. One
+        // that runQueued() took out already runs under the API lock, taken
+        // below: it is over before the client can be destroyed.
         MutexGuard guard(queueMutex_);
         for (size_t i = 0; i < queue_.size();) {
             if (queue_[i]->request.subscriber == subscriber) {

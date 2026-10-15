@@ -505,12 +505,14 @@ bool DatagramEndpoint::process() {
     size_t before = pendingCalls();
     uint32_t now = clock_ ? clock_() : 0;
     expire(now, false, nullptr);
-    std::vector<RemoteNode*> remotes;
     {
-        MutexGuard guard(mutex_);
-        remotes = remotes_;
+        Pinned remotes(*this);
+        {
+            MutexGuard guard(mutex_);
+            remotes.all();
+        }
+        for (RemoteNode* r : remotes.nodes) r->tick(*this, now);
     }
-    for (RemoteNode* r : remotes) r->tick(*this, now);
     dropFiles(nullptr, now);
     checkAdvertisement(now);
     return worked || pendingCalls() != before;
@@ -737,24 +739,22 @@ bool DatagramEndpoint::takeRaw(const Incoming& msg) {
     }
     uint32_t id = head["id"].as<uint32_t>();
     RawHandler raw;
-    uint32_t sentMs = 0;
-    std::vector<RemoteNode*> remotes;
     {
         MutexGuard guard(mutex_);
         for (size_t i = 0; i < calls_.size(); i++) {
             CallSlot& c = calls_[i];
             if (c.id != id || c.to != msg.from || !c.raw || c.held || c.each) continue;
             raw = std::move(c.raw);
-            sentMs = c.sentMs;
+            // The round trip, for the routes through this peer: under the
+            // lock, which a node's destruction takes.
+            uint32_t rtt = (clock_ ? clock_() : 0) - c.sentMs;
+            for (RemoteNode* r : remotes_) r->routeRoundTrip(this, msg.from, rtt);
             calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(i));
             stats_.responses++;
-            remotes = remotes_;
             break;
         }
     }
     if (!raw) return false;
-    uint32_t rtt = (clock_ ? clock_() : 0) - sentMs;
-    for (RemoteNode* r : remotes) r->routeRoundTrip(this, msg.from, rtt);
     std::string_view body;
     if (!jsonMember(text, "body", body)) body = "null";
     raw(body);
@@ -804,8 +804,6 @@ void DatagramEndpoint::handle(Incoming& msg) {
         std::string token;
         ResponseHandler done;
         BroadcastHandler each;  // a broadcast call stays open for more replies
-        uint32_t sentMs = 0;
-        std::vector<RemoteNode*> remotes;
         {
             MutexGuard guard(mutex_);
             stats_.responses++;
@@ -833,8 +831,12 @@ void DatagramEndpoint::handle(Incoming& msg) {
                         break;
                     }
                     done = std::move(calls_[i].done);
-                    sentMs = calls_[i].sentMs;
-                    remotes = remotes_;
+                    if (done) {
+                        // The round trip, for the routes through this peer:
+                        // under the lock, which a node's destruction takes.
+                        uint32_t rtt = (clock_ ? clock_() : 0) - calls_[i].sentMs;
+                        for (RemoteNode* r : remotes_) r->routeRoundTrip(this, msg.from, rtt);
+                    }
                     calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(i));
                     break;
                 }
@@ -843,11 +845,6 @@ void DatagramEndpoint::handle(Incoming& msg) {
         }
         if (reauth) sendAuth(msg.from, token);
         if (again) return;
-        if (done) {
-            // The round trip, for the routes through this peer.
-            uint32_t rtt = (clock_ ? clock_() : 0) - sentMs;
-            for (RemoteNode* r : remotes) r->routeRoundTrip(this, msg.from, rtt);
-        }
         if (done) done(s, env["body"]);
         if (each) each(msg.from, s, env["body"]);
         return;
@@ -856,15 +853,17 @@ void DatagramEndpoint::handle(Incoming& msg) {
     // Notification from a node we subscribed to: never answered.
     std::string_view op = env["op"].is<const char*>() ? std::string_view(env["op"].as<const char*>()) : "";
     if (op == "change" || op == "event") {
-        std::vector<RemoteNode*> remotes;
         {
-            MutexGuard guard(mutex_);
-            remotes = remotes_;
-        }
-        // Remote nodes take what concerns their mirror; the application's
-        // handler and clients of the peer still see everything.
-        for (RemoteNode* r : remotes) {
-            if (r->handleNotification(*this, msg.from, env)) break;
+            Pinned remotes(*this);
+            {
+                MutexGuard guard(mutex_);
+                remotes.all();
+            }
+            // Remote nodes take what concerns their mirror; the application's
+            // handler and clients of the peer still see everything.
+            for (RemoteNode* r : remotes.nodes) {
+                if (r->handleNotification(*this, msg.from, env)) break;
+            }
         }
         std::vector<std::shared_ptr<ClientInbox>> inboxes;
         {
@@ -1284,7 +1283,7 @@ void DatagramEndpoint::authDone(const PeerAddress& peer, Status status, JsonVari
     if (status == Status::Ok) parseAccess(body["access"] | "", level);
     std::vector<Held> release;
     std::string renewed;
-    std::vector<RemoteNode*> remotes;
+    Pinned routed(*this);  // the nodes with a route through the peer
     {
         MutexGuard guard(mutex_);
         PeerAuth* a = authLocked(peer);
@@ -1303,7 +1302,9 @@ void DatagramEndpoint::authDone(const PeerAddress& peer, Status status, JsonVari
                     release.push_back(Held{c.id, c.text, c.rebuild});
                 }
             }
-            remotes = remotes_;
+            for (RemoteNode* r : remotes_) {
+                if (r->hasRoute(this, peer)) routed.add(r);
+            }
         }
     }
     if (!renewed.empty()) return sendAuth(peer, renewed);
@@ -1312,9 +1313,7 @@ void DatagramEndpoint::authDone(const PeerAddress& peer, Status status, JsonVari
         if (send_ && !t.empty()) send_(peer, std::move(t), Delivery::Reliable);
     }
     if (onAuth_) onAuth_(peer, status, level);
-    for (RemoteNode* r : remotes) {
-        if (r->hasRoute(this, peer)) r->tokenAnswered(status, level);
-    }
+    for (RemoteNode* r : routed.nodes) r->tokenAnswered(status, level);
 }
 
 bool DatagramEndpoint::requestRaw(const PeerAddress& to, Op op, std::string_view path, JsonVariantConst body,
@@ -1466,13 +1465,63 @@ void DatagramEndpoint::routeAdded(RemoteNode* remote, const PeerAddress& peer) {
 }
 
 void DatagramEndpoint::removeRemote(RemoteNode* remote) {
-    MutexGuard guard(mutex_);
+    for (;;) {
+        {
+            MutexGuard guard(mutex_);
+            unlistLocked(remote);
+            if (!pinnedLocked(remote)) return;
+        }
+        // Another task is calling the node (it is out of remotes_ now, so
+        // no new call starts): its destruction waits for the call to end.
+        unpinned_.take(10);
+    }
+}
+
+void DatagramEndpoint::unlistLocked(const RemoteNode* remote) {
     for (size_t i = 0; i < remotes_.size(); i++) {
         if (remotes_[i] == remote) {
             remotes_.erase(remotes_.begin() + static_cast<std::ptrdiff_t>(i));
-            break;
+            return;
         }
     }
+}
+
+bool DatagramEndpoint::pinnedLocked(const RemoteNode* node) const {
+    for (const RemoteNode* p : pinned_) {
+        if (p == node) return true;
+    }
+    return false;
+}
+
+bool DatagramEndpoint::pinned(const RemoteNode* node) const {
+    MutexGuard guard(mutex_);
+    return pinnedLocked(node);
+}
+
+void DatagramEndpoint::Pinned::all() {
+    for (RemoteNode* r : endpoint_.remotes_) add(r);
+}
+
+void DatagramEndpoint::Pinned::add(RemoteNode* node) {
+    nodes.push_back(node);
+    endpoint_.pinned_.push_back(node);
+}
+
+DatagramEndpoint::Pinned::~Pinned() {
+    if (nodes.empty()) return;
+    {
+        MutexGuard guard(endpoint_.mutex_);
+        std::vector<RemoteNode*>& pinned = endpoint_.pinned_;
+        for (RemoteNode* n : nodes) {
+            for (size_t i = 0; i < pinned.size(); i++) {
+                if (pinned[i] == n) {
+                    pinned.erase(pinned.begin() + static_cast<std::ptrdiff_t>(i));
+                    break;
+                }
+            }
+        }
+    }
+    endpoint_.unpinned_.give();
 }
 
 void DatagramEndpoint::addClient(const PeerAddress& peer, std::shared_ptr<ClientInbox> inbox) {
@@ -1598,7 +1647,7 @@ void DatagramEndpoint::applySeen(const Seen& seen) {
     std::vector<std::pair<Object*, uint32_t>> mounts;
     // The device: a NowTP address is its MAC; other links advertise it.
     const PeerAddress& device = seen.device.length || kind_ != TransportKind::NowTP ? seen.device : seen.peer;
-    std::vector<RemoteNode*> routed;  // nodes with a route through the peer
+    Pinned routed(*this);  // nodes with a route through the peer
     {
         MutexGuard guard(mutex_);
         uint32_t now = clock_ ? clock_() : 0;
@@ -1610,7 +1659,7 @@ void DatagramEndpoint::applySeen(const Seen& seen) {
             r->setRouteOnline(this, seen.peer, true, now);
             r->setAdvertisedSchema(seen.schemaHash);
             r->setProtocol(seen.protocol);
-            routed.push_back(r);
+            routed.add(r);
         }
         bool found = false;
         for (auto& a : advertised_) {
@@ -1631,7 +1680,7 @@ void DatagramEndpoint::applySeen(const Seen& seen) {
     MutexGuard apiGuard(api_->mutex());
     // A node declared with this address learns the device it reaches.
     if (device.length) {
-        for (RemoteNode* r : routed) {
+        for (RemoteNode* r : routed.nodes) {
             if (!r->device().length) r->setDevice(device);
         }
     }
@@ -1684,8 +1733,8 @@ void DatagramEndpoint::mount(Object& parentRef, uint32_t mirrorMs, const Seen& s
 // (Options::maxMounted). Past it, the node that was heard longest ago among
 // those nothing uses is evicted: mounted here, offline, reached through this
 // endpoint only (no other endpoint's task holds it), and without a
-// subscription, a call in flight or a relayed transfer (docs/DESIGN.md
-// section 14.1).
+// subscription, a call in flight, a relayed transfer or a task calling it
+// (pinned) (docs/DESIGN.md section 14.1).
 bool DatagramEndpoint::roomToMount() {
     if (!options_.maxMounted) return true;
     std::vector<std::pair<Object*, uint32_t>> mounts;
@@ -1703,7 +1752,8 @@ bool DatagramEndpoint::roomToMount() {
             auto* r = static_cast<RemoteNode*>(c);
             if (!r->autoMounted() || !r->routeCount(this)) continue;
             count++;
-            if (r->online() || !r->onlyThrough(this) || r->relays() || hasCalls(r) || api_->subscribedLocked(*r)) {
+            if (r->online() || !r->onlyThrough(this) || r->relays() || hasCalls(r) || api_->subscribedLocked(*r) ||
+                pinned(r)) {
                 continue;
             }
             uint32_t heard = r->lastHeardMs();
@@ -1719,6 +1769,16 @@ bool DatagramEndpoint::roomToMount() {
         MutexGuard guard(mutex_);
         stats_.unmounted++;
         return false;
+    }
+    {
+        // Out of remotes_ first, so no call into it starts any more: unless
+        // one started since (another task's process()), it goes now.
+        MutexGuard guard(mutex_);
+        if (pinnedLocked(evict)) {
+            stats_.unmounted++;
+            return false;
+        }
+        unlistLocked(evict);
     }
     evictParent->remove(evict);
     MutexGuard guard(mutex_);

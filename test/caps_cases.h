@@ -2,7 +2,10 @@
 // mounted nodes, routes per node, file transfers, subscribers, announcements.
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include "datagram_cases.h"
 #include "remote_cases.h"
@@ -135,6 +138,41 @@ TEST(caps_mirrored_node_evicted) {
     r.gatewayEnd.process();
     r.net.run();
     r.gateway.poll(r.net.clock);
+}
+
+TEST(caps_node_in_use_not_evicted) {
+    // A node another task is calling (its endpoint's process(), here in the
+    // state handler) isn't evicted: it would be destroyed under the call.
+    Rig r;
+    r.seen(10, "a");
+    r.seen(11, "b");
+    r.seen(12, "c");
+    auto* a = static_cast<tesser::RemoteNode*>(r.peers.child("a"));
+    CHECK(a != nullptr);
+    std::atomic<bool> once{false}, mounted{false};
+    std::thread other;
+    tesser::RemoteNode::onStateChange([&](tesser::RemoteNode& node) {
+        if (&node != a || once.exchange(true)) return;
+        // Meanwhile another task processes a new peer, at the cap: a, just
+        // gone offline, is the only node that could make room.
+        other = std::thread([&] {
+            r.seen(13, "d");
+            mounted = true;
+        });
+        for (int i = 0; i < 200 && !mounted; i++) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    });
+    std::thread ticking([&] { r.lost(10); });
+    ticking.join();
+    if (other.joinable()) other.join();
+    tesser::RemoteNode::onStateChange(nullptr);
+    CHECK(once.load());
+    CHECK(mounted.load());
+    CHECK_EQ(r.names(), "{\"a\":null,\"b\":null,\"c\":null}");
+    CHECK_EQ(r.gatewayEnd.stats().unmounted, 1u);
+    // Once the call is over, it can go.
+    r.seen(13, "d");
+    CHECK_EQ(r.names(), "{\"b\":null,\"c\":null,\"d\":null}");
+    CHECK_EQ(r.gatewayEnd.stats().evicted, 1u);
 }
 
 TEST(caps_routes_per_node) {

@@ -312,7 +312,7 @@ private:
     // Set by persistence(): poll() reaches the persistence code through it,
     // so applications that don't persist don't link it.
     void (*persistHook_)(Api& api, uint32_t nowMs) = nullptr;
-    mutable Mutex queueMutex_{kRankLeaf, "api queue"};  // never held with the API lock
+    mutable Mutex queueMutex_{kRankLeaf, "api queue"};  // a leaf: runQueued() takes it under the API lock
     std::vector<QueuedRequest*> queue_;  // a vector: an empty deque allocates
     Api* nextApi_ = nullptr;  // registry used by EventNode
     const Client* current_ = nullptr;  // under mutex_: see currentClient()

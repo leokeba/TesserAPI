@@ -1,7 +1,9 @@
 // Change tracking, subscriptions and events.
 #pragma once
 
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core_cases.h"
@@ -439,6 +441,34 @@ TEST(queued_requests_die_with_their_client) {
     }
     CHECK_EQ(d.api.queuedRequests(), 0u);
     d.api.poll(1000);  // nothing left to run
+}
+
+TEST(queued_request_and_its_client_dropped_meanwhile) {
+    // The client goes away while poll() runs in another task: its request
+    // runs before dropSubscriber() returns, or not at all, never against
+    // the destroyed client (a subscription left pointing at it).
+    cases::Device d;
+    d.api.config().queued = true;
+    cases::Lines lines;
+    auto* t = new tesser::LineTransport(d.api, [&](const char* data, size_t n) { lines.add(data, n); });
+    const char* sub = "{\"id\":1,\"op\":\"sub\",\"path\":\"/lamp\"}\n";
+    t->feed(sub, strlen(sub));
+    CHECK_EQ(d.api.queuedRequests(), 1u);
+    std::thread poller;
+    {
+        tesser::Lock lock(d.api);
+        poller = std::thread([&] { d.api.poll(1000); });
+        // poll() takes the request under the API lock, so it waits for this
+        // one first. (Had it taken it before, it would be gone from the
+        // queue now; 10 ms sleeps: shorter ones busy-wait on ESP-IDF.)
+        for (int i = 0; i < 20 && d.api.queuedRequests() > 0; i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        delete t;  // dropSubscriber(), then the client is gone
+    }
+    poller.join();
+    CHECK_EQ(d.api.subscriptionCount(), 0u);
+    CHECK_EQ(d.api.queuedRequests(), 0u);
 }
 
 // The generation counter wraps (docs/DESIGN.md section 11): a value changed

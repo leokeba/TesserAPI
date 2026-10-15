@@ -211,4 +211,32 @@ TEST(lock_background_work) {
     CHECK(!tesser::background(nullptr));
 }
 
+TEST(lock_remote_node_destroyed_during_its_tick) {
+    // A remote node destroyed while its endpoint's process() calls it from
+    // another task: the destructor waits for the call to end.
+    datagram_cases::Net net;
+    tesser::DatagramEndpoint end(nullptr, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(1)),
+                                 net.clockFn());
+    auto* node = new tesser::RemoteNode("lamp", end, datagram_cases::addr(2), "/");
+    std::atomic<bool> once{false}, destroyed{false}, destroyedDuringCall{false};
+    std::thread destroyer;
+    tesser::RemoteNode::onStateChange([&](tesser::RemoteNode& n) {
+        if (&n != node || once.exchange(true)) return;
+        destroyer = std::thread([&] {
+            delete node;
+            destroyed = true;
+        });
+        // Time enough for the destructor to finish, had it not waited.
+        for (int i = 0; i < 10 && !destroyed; i++) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        destroyedDuringCall = destroyed.load();
+    });
+    std::thread ticking([&] { end.process(); });
+    ticking.join();
+    if (destroyer.joinable()) destroyer.join();
+    tesser::RemoteNode::onStateChange(nullptr);
+    CHECK(once.load());
+    CHECK(destroyed.load());
+    CHECK(!destroyedDuringCall.load());
+}
+
 }  // namespace lock_cases

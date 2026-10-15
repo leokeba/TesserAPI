@@ -229,6 +229,8 @@ public:
 
     // Used by RemoteNode: a node with a route through this endpoint, and
     // that route (`peer`), so it gets the peer's advertised hash.
+    // removeRemote() (its destructor) waits while another task calls the
+    // node from this endpoint (process(), a token's answer).
     void addRemote(RemoteNode* remote);
     void removeRemote(RemoteNode* remote);
     void routeAdded(RemoteNode* remote, const PeerAddress& peer);
@@ -538,6 +540,30 @@ private:
     mutable Mutex subscribersMutex_{kRankSubscribers, "endpoint subscribers"};  // taken before the API lock, never after
     std::vector<PeerSubscriber*> subscribers_;
     std::vector<RemoteNode*> remotes_;  // guarded by mutex_
+    // Remote nodes called without mutex_ (they call back into the endpoint,
+    // the API and the application): pinned under it while the call lasts. A
+    // pinned node isn't evicted, and its destructor (removeRemote()) waits
+    // for the pin to go (docs/DESIGN.md section 9).
+    class Pinned {
+    public:
+        explicit Pinned(DatagramEndpoint& endpoint) : endpoint_(endpoint) {}
+        ~Pinned();
+        // Under mutex_: pins every remote node, or `node`.
+        void all();
+        void add(RemoteNode* node);
+        std::vector<RemoteNode*> nodes;
+
+        Pinned(const Pinned&) = delete;
+        Pinned& operator=(const Pinned&) = delete;
+
+    private:
+        DatagramEndpoint& endpoint_;
+    };
+    bool pinnedLocked(const RemoteNode* node) const;
+    bool pinned(const RemoteNode* node) const;
+    void unlistLocked(const RemoteNode* remote);  // out of remotes_
+    std::vector<RemoteNode*> pinned_;  // one entry per pin; guarded by mutex_
+    Signal unpinned_;                  // given as pins go, for removeRemote()
     std::vector<PeerFiles> files_;      // used in process() only
     std::vector<std::pair<PeerAddress, std::shared_ptr<ClientInbox>>> clients_;  // guarded by mutex_
     std::vector<std::pair<PeerAddress, std::string>> tokens_;  // from "auth", oldest first; guarded by mutex_

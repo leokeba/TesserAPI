@@ -1649,7 +1649,12 @@ bool Api::enqueue(const Request& request, Reply& reply) {
 }
 
 void Api::runQueued() {
-    for (;;) {
+    while (queuedRequests()) {
+        // Taken out of the queue under the API lock, and run before letting
+        // go of it: dropSubscriber() discards the client's requests still
+        // queued, then waits for this lock, so a request already taken out
+        // never runs against a client destroyed meanwhile (its subscriber).
+        MutexGuard api(mutex_);
         QueuedRequest* q;
         {
             MutexGuard guard(queueMutex_);
