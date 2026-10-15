@@ -53,6 +53,21 @@ public:
     // carry and a download reply carries, under `config`'s limits.
     static size_t uploadChunk(const Config& config);
     static size_t downloadChunk(const Config& config);
+    // The data bytes of a chunk, at most `max`, whose way through this node
+    // fits in what the heap has now (heapRoom()), each data byte holding
+    // `thirds`/3 bytes at once; at least FileRelay::kMinPart (or `max`), for
+    // the buffers' own reservations to take or refuse (docs/DESIGN.md
+    // section 15). Asked when the chunk is: a tight heap gets smaller
+    // chunks rather than busy.
+    static size_t chunkInRoom(size_t max, size_t thirds);
+    // Heap held at once per data byte, in thirds: a download chunk read
+    // here (the chunk, its reply's base64, and the network stack's copies
+    // of that reply in flight), a download chunk relayed from a peer (the
+    // peer's reply, ours, and the stack's), and a part relayed to a peer
+    // (its envelope and the link's copy).
+    static constexpr size_t kLocalDownloadThirds = 15;
+    static constexpr size_t kRelayedDownloadThirds = 16;
+    static constexpr size_t kRelayedPartThirds = 8;
 
 private:
     struct State;

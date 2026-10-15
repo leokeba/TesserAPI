@@ -31,6 +31,26 @@ size_t unsettledBytes() {
     return g_unsettled;
 }
 
+size_t heapRoom(bool contiguous) {
+    MutexGuard guard(accountant());
+    ByteBudget& root = memoryBudget();
+    size_t room = SIZE_MAX;
+    if (root.limit_) room = root.used_ < root.limit_ ? root.limit_ - root.used_ : 0;
+    size_t floor = heapFloor();
+    size_t free = freeHeap();
+    if (floor || free != SIZE_MAX) {
+        size_t above = free > floor ? free - floor : 0;
+        above = above > g_unsettled ? above - g_unsettled : 0;
+        if (above < room) room = above;
+    }
+    if (contiguous) {
+        size_t largest = largestFreeBlock();
+        size_t block = largest > kHeadroom ? largest - kHeadroom : 0;
+        if (largest != SIZE_MAX && block < room) room = block;
+    }
+    return room;
+}
+
 ByteBudget::ByteBudget(const char* name, size_t limit, size_t perKey, ByteBudget* parent)
     : name_(name), parent_(parent ? parent : &memoryBudget()), limit_(limit), perKey_(perKey) {}
 

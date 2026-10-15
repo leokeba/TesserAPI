@@ -1688,6 +1688,8 @@ public:
             if (limit_ && cap > limit_) cap = limit_;
         }
         if (!length || length > cap) length = cap;
+        // And what this node's heap holds now, the reply and its way on.
+        length = FileSession::chunkInRoom(length, FileSession::kRelayedDownloadThirds);
         std::string path = remotePath_;
         auto self = shared_from_this();
         // The reply's fields apart from its data, which stays in the text.
@@ -1879,6 +1881,7 @@ private:
                 part = chunk_ ? chunk_ : kFallbackChunk;
                 if (limit_ && part > limit_) part = limit_;
                 if (part > pending_.size()) part = pending_.size();
+                part = FileSession::chunkInRoom(part, FileSession::kRelayedPartThirds);
                 std::string head = fieldsOf([&](JsonWriter& w) {
                     w.key("op");
                     w.string(upload_);

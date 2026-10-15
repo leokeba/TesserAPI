@@ -81,6 +81,7 @@ private:
     friend class Reservation;
     ByteBudget() = default;  // the root
     friend ByteBudget& memoryBudget();
+    friend size_t heapRoom(bool contiguous);
     // Under the accountant's lock.
     bool fits(size_t bytes, uintptr_t key) const;
     void add(size_t bytes, uintptr_t key);
@@ -101,6 +102,13 @@ private:
 ByteBudget& memoryBudget();
 // Heap about to be taken: reserved, not yet settled.
 size_t unsettledBytes();
+// What a heap reservation could take now: the free heap above the floor,
+// less what other reservations are about to take, and within the root's
+// limit; with `contiguous`, also one block with the headroom reserve()
+// leaves. SIZE_MAX without a floor or a limit off target. For sizing a
+// buffer to what there is, rather than refusing it (docs/DESIGN.md
+// section 15); the bytes still need reserving.
+size_t heapRoom(bool contiguous = false);
 
 // For applications: bytes for a large allocation (a TLS session, a
 // download, a backup) out of the same accounting, so they and the

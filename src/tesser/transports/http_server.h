@@ -121,6 +121,7 @@ private:
     WsClient* wsClient(int fd, bool create);
     void dropWsClient(int fd);
     bool wsSend(int fd, const std::string& message);
+    bool wsSend(int fd, std::string&& message);
     bool wsSendShared(int fd, std::shared_ptr<const std::string> message);
     Access access(httpd_req_t* req) const;
     esp_err_t serveStream(httpd_req_t* req, const Request& request, Reply& reply);

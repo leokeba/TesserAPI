@@ -644,6 +644,28 @@ FileSession::~FileSession() = default;
 size_t FileSession::uploadChunk(const Config& config) { return chunkWithin(config.maxRequestBody); }
 size_t FileSession::downloadChunk(const Config& config) { return chunkWithin(config.maxResponse); }
 
+size_t FileSession::chunkInRoom(size_t max, size_t thirds) {
+    // The envelope's other members, and what the replies' own copies round
+    // up to.
+    constexpr size_t kOverhead = 1024;
+    size_t n = max;
+    size_t room = heapRoom();
+    if (room != SIZE_MAX) {
+        room = room > kOverhead ? room - kOverhead : 0;
+        if (room / thirds * 3 < n) n = room / thirds * 3;
+    }
+    // The reply's text is one block, with the headroom a reservation
+    // leaves.
+    size_t block = heapRoom(true);
+    if (block != SIZE_MAX) {
+        block = block > kOverhead ? block - kOverhead : 0;
+        if (block / 4 * 3 < n) n = block / 4 * 3;
+    }
+    if (n < max) n = n / 3 * 3;  // shrunk: whole base64 groups
+    size_t least = max < FileRelay::kMinPart ? max : FileRelay::kMinPart;
+    return n > least ? n : least;
+}
+
 bool FileSession::handles(JsonObjectConst envelope) {
     JsonVariantConst op = envelope["op"];
     std::string_view name;
@@ -896,6 +918,9 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
         return;
     }
     if (!again) {
+        // As much as the heap holds now, on its way out (docs/DESIGN.md
+        // section 15): the client goes on from where the reply ends.
+        length = chunkInRoom(length, kLocalDownloadThirds);
         size_t sent = static_cast<size_t>(s.position - s.lastOffset);
         // Room for the chunk before anything changes: refused, it is asked
         // for again.

@@ -438,6 +438,12 @@ bool HttpServer::wsSend(int fd, const std::string& message) {
     return wsSendShared(fd, std::make_shared<const std::string>(message));
 }
 
+bool HttpServer::wsSend(int fd, std::string&& message) {
+    // Taken, not copied: a reply isn't on a short heap twice while it waits
+    // for the httpd task (docs/DESIGN.md section 15).
+    return wsSendShared(fd, std::make_shared<const std::string>(std::move(message)));
+}
+
 bool HttpServer::wsSendShared(int fd, std::shared_ptr<const std::string> message) {
 #if CONFIG_HTTPD_WS_SUPPORT
     httpd_handle_t handle = server_;
@@ -555,7 +561,7 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
     if (httpd_ws_recv_frame(req, &frame, 0) != ESP_OK) return ESP_FAIL;
     if (frame.len > api_.config().maxRequestBody) {
         EnvelopeId noId;
-        EnvelopeReply reply(noId, 0, [this, fd](const std::string& m) { wsSend(fd, m); });
+        EnvelopeReply reply(noId, 0, [this, fd](std::string& m) { wsSend(fd, std::move(m)); });
         writeError(reply, Status::TooLarge, std::string_view(), "message too large");
         // The payload is still unread: drop the connection.
         return ESP_FAIL;
@@ -565,7 +571,7 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
     Reservation room = memoryBudget().reserve(frame.len + 1, 0, true);
     if (!room) {
         EnvelopeId noId;
-        EnvelopeReply reply(noId, 0, [this, fd](const std::string& m) { wsSend(fd, m); });
+        EnvelopeReply reply(noId, 0, [this, fd](std::string& m) { wsSend(fd, std::move(m)); });
         writeError(reply, Status::Busy, Reason::LowMemory, std::string_view(), "not enough memory for the message");
         return ESP_FAIL;
     }
@@ -602,7 +608,7 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
     // reply that fits in one piece is queued like any frame, which keeps it
     // in order with the notifications queued before it.
     handleEnvelope(
-        api_, text, client, [this, fd](const std::string& m) { wsSend(fd, m); }, ws,
+        api_, text, client, [this, fd](std::string& m) { wsSend(fd, std::move(m)); }, ws,
         [this, req, fd](const char* data, size_t len, bool first, bool final) {
             if (first && final) return wsSend(fd, std::string(data, len));
             httpd_ws_frame_t out = {};

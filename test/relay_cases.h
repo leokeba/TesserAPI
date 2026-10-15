@@ -258,12 +258,29 @@ TEST(relay_download_on_a_short_heap) {
     r.device.api.config().maxResponse = 4096;
     std::string reply;
     {
-        memory_cases::Floor floor(8000, 16500);
+        memory_cases::Floor floor(8000, 25000);
         reply = r.ask("{\"id\":1,\"op\":\"download\",\"path\":\"/dev/big\"}");
     }
     CHECK_EQ(reply, "{\"id\":1,\"status\":\"ok\",\"body\":{\"size\":3000,\"filename\":\"big\",\"contentType\":"
                     "\"application/octet-stream\",\"chunk\":2880,\"offset\":0,\"data\":\"" +
                         b64(r.big.substr(0, 2880)) + "\",\"end\":false}}");
+    // With 8.5 KB above the floor, the gateway asks for what that holds as
+    // it asks (the device's reply, its own, and their copies in flight:
+    // 16/3 bytes per byte of data, after 1 KB for the rest): up to 1401
+    // bytes, less what is held meanwhile, in one round, rather than 2880
+    // refused and asked again for half.
+    Rig tight;
+    tight.device.api.config().maxResponse = 4096;
+    {
+        memory_cases::Floor floor(8000, 16500);
+        reply = tight.ask("{\"id\":1,\"op\":\"download\",\"path\":\"/dev/big\"}");
+    }
+    size_t at = reply.find("\"data\":\"") + 8;
+    size_t n = (reply.find('"', at) - at) / 4 * 3;
+    CHECK(n > 1200 && n <= 1401);
+    CHECK_EQ(reply, "{\"id\":1,\"status\":\"ok\",\"body\":{\"size\":3000,\"filename\":\"big\",\"contentType\":"
+                    "\"application/octet-stream\",\"chunk\":2880,\"offset\":0,\"data\":\"" +
+                        b64(tight.big.substr(0, n)) + "\",\"end\":false}}");
     // Shorter yet, the parts are halved until they fit, whichever node
     // refuses them (the device its reply, the gateway its copy), and the
     // file comes whole.
@@ -276,6 +293,34 @@ TEST(relay_download_on_a_short_heap) {
         CHECK(chunks >= 5);
     }
     CHECK_EQ(small.gateway.pending(), 0);
+}
+
+TEST(file_envelope_download_sized_to_the_room) {
+    // A chunk is sized when it is asked for, to what the heap holds then:
+    // with 8 KB above the floor, a chunk read here holds 5 bytes per byte
+    // of data at once (the chunk, its reply, the stack's copies in flight),
+    // after 1 KB for the rest: up to 1431 bytes rather than 4096, or busy.
+    file_cases::Fixture f;
+    std::string big;
+    for (int i = 0; i < 10000; i++) big += static_cast<char>('a' + i % 26);
+    f.api.file("big").text([&] { return big; }, nullptr);
+    file_envelope_cases::Line line(f.api);
+    std::string first;
+    {
+        memory_cases::Floor floor(8000, 16192);
+        first = line.send("{\"id\":1,\"op\":\"download\",\"path\":\"/big\"}");
+        size_t at = first.find("\"data\":\"") + 8;
+        size_t n = (first.find('"', at) - at) / 4 * 3;
+        CHECK(first.find("\"status\":\"ok\"") != std::string::npos);
+        CHECK(first.find("\"chunk\":4096") != std::string::npos);
+        CHECK(n > 1200 && n <= 1431);
+        CHECK(first.find("\"data\":\"" + b64(big.substr(0, n)) + "\"") != std::string::npos);
+        // The client goes on from where each reply ends, to the end.
+        CHECK_EQ(file_envelope_cases::downloadAll(line, "/big", 4096), big);
+    }
+    // With room, the whole chunk.
+    first = line.send("{\"id\":2,\"op\":\"download\",\"path\":\"/big\"}");
+    CHECK(first.find("\"data\":\"" + b64(big.substr(0, 4096)) + "\"") != std::string::npos);
 }
 
 TEST(relay_download_crc32) {
