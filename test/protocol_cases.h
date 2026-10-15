@@ -98,6 +98,24 @@ TEST(protocol_error_reasons) {
           std::string::npos);
 }
 
+TEST(protocol_forwarded_options_are_strict) {
+    // A gateway forwards a client's options marked "v": 2, so a peer that
+    // doesn't know one refuses it rather than answer something else; a
+    // plain get isn't marked.
+    remote_cases::Rig r;
+    auto sent = [&](const std::string& envelope) {
+        r.lines.out.clear();
+        std::string l = envelope + "\n";
+        r.line.feed(l.data(), l.size());
+        std::string out = r.net.frames.empty() ? std::string() : r.net.frames.front().text;
+        r.net.run();
+        return out;
+    };
+    CHECK(sent("{\"id\":1,\"op\":\"get\",\"path\":\"/kitchen\",\"keys\":\"lamp\"}").find("\"v\":2") !=
+          std::string::npos);
+    CHECK(sent("{\"id\":2,\"op\":\"get\",\"path\":\"/kitchen/lamp\"}").find("\"v\":") == std::string::npos);
+}
+
 TEST(protocol_advertised) {
     uint8_t port = 0, v = 0;
     uint32_t hash = 0;
