@@ -63,11 +63,15 @@ public:
     // Heap held at once per data byte, in thirds: a download chunk read
     // here (the chunk, its reply's base64, and the network stack's copies
     // of that reply in flight), a download chunk relayed from a peer (the
-    // peer's reply, ours, and the stack's), and a part relayed to a peer
-    // (its envelope and the link's copy).
+    // peer's reply, ours, and the stack's), a part relayed to a peer (its
+    // envelope and the link's copy), an upload chunk written here (decoded,
+    // and the sink's copy), and one relayed (decoded, and the part it goes
+    // in with the link's copy).
     static constexpr size_t kLocalDownloadThirds = 15;
     static constexpr size_t kRelayedDownloadThirds = 16;
     static constexpr size_t kRelayedPartThirds = 8;
+    static constexpr size_t kLocalUploadThirds = 6;
+    static constexpr size_t kRelayedUploadThirds = 11;
 
 private:
     struct State;

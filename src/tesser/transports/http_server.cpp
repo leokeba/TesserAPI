@@ -566,14 +566,27 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
         // The payload is still unread: drop the connection.
         return ESP_FAIL;
     }
-    // Room for the frame first (docs/DESIGN.md section 15): on a short heap
-    // the client hears busy, and the connection goes, the payload unread.
-    Reservation room = memoryBudget().reserve(frame.len + 1, 0, true);
+    // Room for the frame first (docs/DESIGN.md section 15): above the floor,
+    // in one block with 256 bytes to spare rather than a reservation's 1 KB
+    // (its bytes are in the network stack's buffers already, and it goes
+    // once handled: on a fragmented gateway, 11 KB free with no block over
+    // 4.6 KB refused a 3.9 KB frame). On a short heap the client hears busy,
+    // and the payload is read and dropped a piece at a time, so the
+    // connection stays. httpd holds no bytes of it ahead: only an HTTP
+    // request's parser does.
+    Reservation room = memoryBudget().reserve(frame.len + 1, 0, false);
+    if (room && frame.len + 1 > 1024 && largestFreeBlock() < frame.len + 1 + 256) room.release();
     if (!room) {
         EnvelopeId noId;
         EnvelopeReply reply(noId, 0, [this, fd](std::string& m) { wsSend(fd, std::move(m)); });
         writeError(reply, Status::Busy, Reason::LowMemory, std::string_view(), "not enough memory for the message");
-        return ESP_FAIL;
+        char drop[128];
+        for (size_t left = frame.len; left;) {
+            int n = httpd_socket_recv(req->handle, fd, drop, left < sizeof(drop) ? left : sizeof(drop), 0);
+            if (n <= 0) return ESP_FAIL;
+            left -= static_cast<size_t>(n);
+        }
+        return ESP_OK;
     }
     std::string text(frame.len, '\0');
     room.settle();

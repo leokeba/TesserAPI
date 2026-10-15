@@ -630,7 +630,7 @@ struct FileSession::State {
     bool upload = false;
     std::string path;  // normalized
     // Download.
-    int64_t size = -1;
+    int64_t size = -1;  // the file's (download), or the upload's
     uint64_t position = 0;     // bytes sent: where the next chunk starts
     uint64_t lastOffset = 0;   // where the last chunk started
     std::vector<uint8_t> chunk;  // read from lastOffset on: the last chunk, kept to send it again, and any read ahead
@@ -661,7 +661,9 @@ size_t FileSession::chunkInRoom(size_t max, size_t thirds) {
         block = block > kOverhead ? block - kOverhead : 0;
         if (block / 4 * 3 < n) n = block / 4 * 3;
     }
-    if (n < max) n = n / 3 * 3;  // shrunk: whole base64 groups
+    // Shrunk: in steps of 384 bytes (whole base64 groups), so the buffers
+    // that come and go are of a few sizes, which a heap reuses.
+    if (n < max) n = n / FileRelay::kMinPart * FileRelay::kMinPart;
     size_t least = max < FileRelay::kMinPart ? max : FileRelay::kMinPart;
     return n > least ? n : least;
 }
@@ -750,41 +752,66 @@ void FileSession::upload(JsonObjectConst envelope, std::string_view raw, std::st
     // (base64 has no escapes).
     std::string_view rawData;
     bool fromRaw = d.isNull() && !raw.empty() && jsonMember(raw, "data", rawData);
-    // The decoded bytes, only with room for them (docs/DESIGN.md section 15).
-    size_t encoded = fromRaw ? rawData.size() : d.is<const char*>() ? text(d).size() : 0;
-    if (encoded > 256) {
-        Reservation room = memoryBudget().reserve(encoded / 4 * 3, 0, true);
-        if (!room) {
-            writeError(reply, Status::Busy, Reason::LowMemory, path, "not enough memory for the chunk");
-            return;
-        }
-        data.reserve(encoded / 4 * 3);
-    }
+    std::string_view b64;  // the data's base64
     bool bad = false;
     if (fromRaw) {
-        bad = rawData.size() < 2 || rawData.front() != '"' || rawData.back() != '"' ||
-              !detail::base64Decode(rawData.substr(1, rawData.size() - 2), data);
+        bad = rawData.size() < 2 || rawData.front() != '"' || rawData.back() != '"';
+        if (!bad) b64 = rawData.substr(1, rawData.size() - 2);
     } else if (!d.isNull()) {
-        bad = !d.is<const char*>() || !detail::base64Decode(text(d), data);
+        bad = !d.is<const char*>();
+        if (!bad) b64 = text(d);
     }
-    if (bad) {
+    // The client's check of the bytes it meant (a serial line can lose some
+    // and still be base64): of the whole chunk, from its text, compared
+    // before anything is written, and refused for the client to send again
+    // (docs/DESIGN.md section 10.1.1).
+    JsonVariantConst crc = envelope["crc32"];
+    uint32_t sum = 0;
+    if (!bad && !crc.isNull()) bad = !detail::crc32OfBase64(b64, sum);
+    if (bad || b64.size() % 4) {
         writeError(reply, Status::BadRequest, path, "data must be base64");
         return;
     }
-    // The client's check of the bytes it meant (a serial line can lose some
-    // and still be base64): compared before anything is written, and
-    // refused for the client to send again (docs/DESIGN.md section 10.1.1).
-    JsonVariantConst crc = envelope["crc32"];
     if (!crc.isNull()) {
         if (!crc.is<uint32_t>()) {
             writeError(reply, Status::BadRequest, path, "crc32 must be an unsigned 32-bit integer");
             return;
         }
-        if (detail::crc32(data.data(), data.size()) != crc.as<uint32_t>()) {
+        if (sum != crc.as<uint32_t>()) {
             writeError(reply, Status::BadRequest, Reason::Checksum, path,
                        "the data doesn't match its crc32: send the chunk again");
             return;
         }
+    }
+    // As much of it as the heap holds now, decoded in one block, only with
+    // room for it (docs/DESIGN.md section 15): the reply's `received` says
+    // where the client goes on from.
+    size_t pad = b64.size() >= 4 && b64.back() == '=' ? (b64[b64.size() - 2] == '=' ? 2 : 1) : 0;
+    size_t whole = b64.size() / 4 * 3 - pad;
+    // Not the chunk that completes the upload: its reply is the upload's
+    // (section 10.1.1), which a client waits for once it has sent the end.
+    JsonVariantConst opening = envelope["size"];
+    uint64_t total = opening.is<uint64_t>() ? opening.as<uint64_t>()
+                     : state_ && state_->upload && state_->path == path && state_->size >= 0
+                         ? static_cast<uint64_t>(state_->size)
+                         : UINT64_MAX;
+    if (whole > 256 && offset + whole < total) {
+        bool local = state_ && state_->upload && state_->path == path && !state_->transfer.relay() &&
+                     opening.isNull();
+        size_t take = chunkInRoom(whole, local ? kLocalUploadThirds : kRelayedUploadThirds);
+        if (take < whole) b64 = b64.substr(0, take / 3 * 4);
+    }
+    if (whole > 256) {
+        Reservation room = memoryBudget().reserve(b64.size() / 4 * 3, 0, true);
+        if (!room) {
+            writeError(reply, Status::Busy, Reason::LowMemory, path, "not enough memory for the chunk");
+            return;
+        }
+        data.reserve(b64.size() / 4 * 3);
+    }
+    if (!b64.empty() && !detail::base64Decode(b64, data)) {
+        writeError(reply, Status::BadRequest, path, "data must be base64");
+        return;
     }
     JsonVariantConst size = envelope["size"];
     if (!size.isNull()) {
@@ -815,6 +842,7 @@ void FileSession::upload(JsonObjectConst envelope, std::string_view raw, std::st
         if (o == FileTransfer::Open::NotFile) writeError(reply, Status::NotAllowed, path, "not a file");
         if (o != FileTransfer::Open::Ok && o != FileTransfer::Open::Remote) return;
         state->upload = true;
+        state->size = static_cast<int64_t>(size.as<uint64_t>());
         state->path.assign(path.data(), path.size());
         state_ = std::move(state);
         if (o == FileTransfer::Open::Remote) return relayUpload(true, size.as<uint64_t>(), name, 0, std::move(data), reply);

@@ -183,10 +183,10 @@ TEST(relay_upload_survives_an_undelivered_reply) {
 }
 
 TEST(relay_upload_on_a_short_heap) {
-    // A gateway short of memory for a part sends it in smaller parts; with
-    // no room even to decode the chunk, it refuses it (busy, low_memory)
-    // rather than build it anyway and abort, and the transfer stays open:
-    // the client sends it again.
+    // A gateway short of memory takes as much of a chunk as it holds, and
+    // the client goes on from `received`; with no room even for the least
+    // of it, it refuses it (busy, low_memory) rather than build it anyway
+    // and abort, and the transfer stays open: the client sends it again.
     Rig r;
     r.device.api.config().maxRequestBody = 4096;  // the chunk would go as one part
     std::string first = r.big.substr(0, 1500);
@@ -205,11 +205,11 @@ TEST(relay_upload_on_a_short_heap) {
     reply = chunk(8500, "{\"id\":2,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":0,\"data\":\"" + b64(first) + "\"}");
     CHECK_EQ(reply.substr(0, 40), "{\"id\":2,\"status\":\"busy\",\"body\":{\"error\":");
     CHECK(reply.find("\"reason\":\"low_memory\"") != std::string::npos);
-    // Room to decode it, not for a part of 1500 bytes: two of 750.
+    // Room for some of it: 384 bytes taken.
     reply = chunk(9700, "{\"id\":3,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":0,\"data\":\"" + b64(first) + "\"}");
-    CHECK_EQ(reply, "{\"id\":3,\"status\":\"ok\",\"body\":{\"received\":1500}}");
-    CHECK_EQ(r.ask("{\"id\":4,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":1500,\"data\":\"" +
-                   b64(r.big.substr(1500)) + "\"}"),
+    CHECK_EQ(reply, "{\"id\":3,\"status\":\"ok\",\"body\":{\"received\":384}}");
+    CHECK_EQ(r.ask("{\"id\":4,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":384,\"data\":\"" +
+                   b64(r.big.substr(384)) + "\"}"),
              "{\"id\":4,\"status\":\"ok\",\"body\":null}");
     CHECK_EQ(r.got, r.big);
     CHECK_EQ(r.gateway.pending(), 0);
@@ -267,8 +267,8 @@ TEST(relay_download_on_a_short_heap) {
     // With 8.5 KB above the floor, the gateway asks for what that holds as
     // it asks (the device's reply, its own, and their copies in flight:
     // 16/3 bytes per byte of data, after 1 KB for the rest): up to 1401
-    // bytes, less what is held meanwhile, in one round, rather than 2880
-    // refused and asked again for half.
+    // bytes, less what is held meanwhile, in steps of 384, in one round,
+    // rather than 2880 refused and asked again for half.
     Rig tight;
     tight.device.api.config().maxResponse = 4096;
     {
@@ -277,7 +277,7 @@ TEST(relay_download_on_a_short_heap) {
     }
     size_t at = reply.find("\"data\":\"") + 8;
     size_t n = (reply.find('"', at) - at) / 4 * 3;
-    CHECK(n > 1200 && n <= 1401);
+    CHECK_EQ(n, 1152u);
     CHECK_EQ(reply, "{\"id\":1,\"status\":\"ok\",\"body\":{\"size\":3000,\"filename\":\"big\",\"contentType\":"
                     "\"application/octet-stream\",\"chunk\":2880,\"offset\":0,\"data\":\"" +
                         b64(tight.big.substr(0, n)) + "\",\"end\":false}}");
@@ -299,7 +299,8 @@ TEST(file_envelope_download_sized_to_the_room) {
     // A chunk is sized when it is asked for, to what the heap holds then:
     // with 8 KB above the floor, a chunk read here holds 5 bytes per byte
     // of data at once (the chunk, its reply, the stack's copies in flight),
-    // after 1 KB for the rest: up to 1431 bytes rather than 4096, or busy.
+    // after 1 KB for the rest: up to 1431 bytes, in steps of 384, rather
+    // than 4096, or busy.
     file_cases::Fixture f;
     std::string big;
     for (int i = 0; i < 10000; i++) big += static_cast<char>('a' + i % 26);
@@ -313,7 +314,7 @@ TEST(file_envelope_download_sized_to_the_room) {
         size_t n = (first.find('"', at) - at) / 4 * 3;
         CHECK(first.find("\"status\":\"ok\"") != std::string::npos);
         CHECK(first.find("\"chunk\":4096") != std::string::npos);
-        CHECK(n > 1200 && n <= 1431);
+        CHECK_EQ(n, 1152u);
         CHECK(first.find("\"data\":\"" + b64(big.substr(0, n)) + "\"") != std::string::npos);
         // The client goes on from where each reply ends, to the end.
         CHECK_EQ(file_envelope_cases::downloadAll(line, "/big", 4096), big);
@@ -375,6 +376,70 @@ TEST(relay_stays_on_its_route) {
     // A new transfer takes the node's route now.
     CHECK(r.uploadAll("/dev/big", r.big.substr(0, 1500), 576).find("\"status\":\"ok\"") != std::string::npos);
     CHECK_EQ(r.got, r.big.substr(0, 1500));
+}
+
+TEST(file_envelope_upload_sized_to_the_room) {
+    // On a fragmented heap (plenty free, no large block), an upload chunk
+    // is taken as far as one block holds it decoded: the reply's
+    // `received` says where the client goes on from. Its crc32 is of the
+    // whole chunk, checked from its text first. Measured on DEVKIT-V3 as a
+    // gateway before this: 11 KB free with a largest block of 3.8 KB
+    // refused a 2880-byte chunk for 11 s, and the client gave up.
+    file_cases::Fixture f;
+    std::string big;
+    for (int i = 0; i < 6000; i++) big += static_cast<char>('a' + i % 26);
+    std::string got;
+    f.api.file("big").maxSize(10000).text([&] { return big; },
+                                          [&](std::string_view text, tesser::JsonWriter&) {
+                                              got = std::string(text);
+                                              return tesser::Check::ok();
+                                          });
+    f.api.config().maxRequestBody = 4096;  // chunks of 2880
+    file_envelope_cases::Line line(f.api);
+    CHECK(line.send("{\"id\":1,\"op\":\"upload\",\"path\":\"/big\",\"size\":6000}").find("\"chunk\":2880") !=
+          std::string::npos);
+    std::string chunk = b64(big.substr(0, 2880));
+    uint32_t sum = tesser::detail::crc32(reinterpret_cast<const uint8_t*>(big.data()), 2880);
+    // Each line comes in whole first (its buffer); then the heap is short.
+    auto send = [&](const std::string& envelope) {
+        line.t.feed(envelope.data(), envelope.size());
+        memory_cases::Floor floor(8000, 30000);
+        memory_cases::Heap heap(3840);
+        size_t before = line.lines.out.size();
+        line.t.feed('\n');
+        return line.lines.out.size() == before + 1 ? line.lines.out.back() : std::string("<no reply>");
+    };
+    {
+        // A wrong crc32 of the whole chunk is caught, though only a part
+        // would be taken.
+        CHECK(send("{\"id\":2,\"op\":\"upload\",\"path\":\"/big\",\"offset\":0,\"crc32\":" +
+                        std::to_string(sum + 1) + ",\"data\":\"" + chunk + "\"}")
+                  .find("\"reason\":\"checksum\"") != std::string::npos);
+        // (3840 - 1024 headroom - 1024) * 3/4 = 1344: 1152 in steps of 384.
+        CHECK_EQ(send("{\"id\":3,\"op\":\"upload\",\"path\":\"/big\",\"offset\":0,\"crc32\":" +
+                           std::to_string(sum) + ",\"data\":\"" + chunk + "\"}"),
+                 "{\"id\":3,\"status\":\"ok\",\"body\":{\"received\":1152}}");
+        // The client goes on from there, to the end.
+        size_t at = 1152;
+        std::string last;
+        for (int i = 0; i < 20 && at < big.size(); i++) {
+            size_t n = big.size() - at < 2880 ? big.size() - at : 2880;
+            last = send("{\"op\":\"upload\",\"path\":\"/big\",\"offset\":" + std::to_string(at) +
+                             ",\"data\":\"" + b64(big.substr(at, n)) + "\"}");
+            if (last.find("\"received\":") == std::string::npos) break;
+            at = std::stoul(last.substr(last.find("\"received\":") + 11));
+        }
+        CHECK_EQ(last, "{\"status\":\"ok\",\"body\":null}");
+        // The chunk that completes an upload is taken whole or not at all:
+        // its reply is the upload's, which a client that has sent the end
+        // waits for.
+        CHECK(send("{\"id\":9,\"op\":\"upload\",\"path\":\"/big\",\"size\":2880,\"data\":\"" + chunk + "\"}")
+                  .find("\"reason\":\"low_memory\"") != std::string::npos);
+    }
+    CHECK_EQ(got, big);
+    CHECK_EQ(line.send("{\"id\":10,\"op\":\"upload\",\"path\":\"/big\",\"size\":2880,\"data\":\"" + chunk + "\"}"),
+             "{\"id\":10,\"status\":\"ok\",\"body\":null}");
+    CHECK_EQ(got, big.substr(0, 2880));
 }
 
 TEST(relay_download_crc32) {
