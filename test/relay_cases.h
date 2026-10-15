@@ -323,6 +323,60 @@ TEST(file_envelope_download_sized_to_the_room) {
     CHECK(first.find("\"data\":\"" + b64(big.substr(0, 4096)) + "\"") != std::string::npos);
 }
 
+// A second way to the device (UDP, preferred), for routes changing under a
+// relay.
+struct TwoRoutes : Rig {
+    DatagramEndpoint deviceUdp{&device.api, tesser::TransportKind::Udp, net.sender(addr(4)), net.clockFn()};
+    DatagramEndpoint gatewayUdp{&gateway, tesser::TransportKind::Udp, net.sender(addr(3)), net.clockFn()};
+    TwoRoutes() {
+        deviceUdp.trust([](const tesser::PeerAddress&) { return true; });
+        net.nodes.push_back({addr(3), &gatewayUdp});
+        net.nodes.push_back({addr(4), &deviceUdp});
+        dev.routeOrder({tesser::TransportKind::Udp, tesser::TransportKind::NowTP});
+        dev.addRoute(gatewayUdp, addr(4));
+    }
+};
+
+TEST(relay_stays_on_its_route) {
+    // A relay goes by the route it opened on: the device keeps a transfer
+    // per client, and the gateway by another link is another client, with
+    // no upload (measured on DEVKIT-V3 relaying a firmware image to
+    // DEVKIT-R1: "no upload in progress at this path" at its last chunk).
+    TwoRoutes r;
+    r.dev.setRouteOnline(&r.gatewayUdp, addr(4), false, r.net.clock);
+    std::string first = r.ask("{\"id\":1,\"op\":\"upload\",\"path\":\"/dev/big\",\"size\":1500,\"data\":\"" +
+                              b64(r.big.substr(0, 576)) + "\"}");
+    CHECK(first.find("\"received\":576") != std::string::npos);
+    // The preferred route comes back: the rest still goes by NowTP.
+    r.dev.setRouteOnline(&r.gatewayUdp, addr(4), true, r.net.clock);
+    CHECK(r.dev.endpoint() == &r.gatewayUdp);
+    CHECK(r.ask("{\"id\":2,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":576,\"data\":\"" +
+                b64(r.big.substr(576, 576)) + "\"}")
+              .find("\"received\":1152") != std::string::npos);
+    CHECK_EQ(r.deviceUdp.fileSessions(), 0u);
+    // Its route offline, the transfer fails at once and ends here, though
+    // the node is online by the other.
+    r.dev.setRouteOnline(&r.gatewayEnd, addr(2), false, r.net.clock);
+    CHECK(r.dev.online());
+    CHECK_EQ(r.ask("{\"id\":3,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":1152,\"data\":\"" +
+                   b64(r.big.substr(1152, 348)) + "\"}"),
+             "{\"id\":3,\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"reason\":\"peer_offline\","
+             "\"path\":\"/dev\",\"message\":\"the route the transfer started on is offline\"}}");
+    CHECK(r.ask("{\"id\":4,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":1152,\"data\":\"" +
+                b64(r.big.substr(1152, 348)) + "\"}")
+              .find("no upload in progress") != std::string::npos);
+    CHECK(r.got.empty());
+    // The device drops its side once it has been idle that long.
+    CHECK_EQ(r.deviceEnd.fileSessions(), 1u);
+    r.net.clock += r.device.api.config().transferIdleMs;
+    r.net.run();
+    r.deviceEnd.process();
+    CHECK_EQ(r.deviceEnd.fileSessions(), 0u);
+    // A new transfer takes the node's route now.
+    CHECK(r.uploadAll("/dev/big", r.big.substr(0, 1500), 576).find("\"status\":\"ok\"") != std::string::npos);
+    CHECK_EQ(r.got, r.big.substr(0, 1500));
+}
+
 TEST(relay_download_crc32) {
     // Asked by the client, the gateway adds the chunk's crc32, computed from
     // the device's text: the device isn't asked (it may not know it).

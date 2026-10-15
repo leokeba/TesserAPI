@@ -119,6 +119,8 @@ public:
     // endpoints.
     void addRoute(DatagramEndpoint& endpoint, const PeerAddress& peer);
     bool hasRoute(const DatagramEndpoint* endpoint, const PeerAddress& peer) const;
+    // The node has that route, and it is online.
+    bool routeUp(const DatagramEndpoint* endpoint, const PeerAddress& peer) const;
     // Every route, in the order they are tried.
     std::vector<Route> routes() const;
     // The route requests use: the first online one in the order, or the

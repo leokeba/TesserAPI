@@ -515,6 +515,14 @@ bool RemoteNode::hasRoute(const DatagramEndpoint* endpoint, const PeerAddress& p
     return false;
 }
 
+bool RemoteNode::routeUp(const DatagramEndpoint* endpoint, const PeerAddress& peer) const {
+    MutexGuard guard(routesMutex_);
+    for (const RouteSlot& r : routes_) {
+        if (r.route.endpoint == endpoint && r.route.peer == peer) return r.route.online;
+    }
+    return false;
+}
+
 // The index of the route in use: the best ranked online one, or the best
 // ranked one when none is online.
 int RemoteNode::activeLocked() const {
@@ -1577,13 +1585,20 @@ public:
           upload_(opFor("upload", level)),
           download_(opFor("download", level)) {
         node_.relayHeld(true);  // not evicted meanwhile
+        // The route the transfer goes by, start to end: the peer keeps a
+        // transfer per client, and the same gateway on another link is
+        // another client (docs/DESIGN.md section 14).
+        RemoteNode::Route route;
+        if (node.route(route)) {
+            endpoint_ = route.endpoint;
+            peer_ = route.peer;
+        }
         // The claim is on the peer, under a key no path can have.
         char hex[24];
-        snprintf(hex, sizeof(hex), "@%lx:", static_cast<unsigned long>(reinterpret_cast<uintptr_t>(node.endpoint())));
+        snprintf(hex, sizeof(hex), "@%lx:", static_cast<unsigned long>(reinterpret_cast<uintptr_t>(endpoint_)));
         key_ = hex;
-        PeerAddress peer = node.peer();
-        for (uint8_t i = 0; i < peer.length; i++) {
-            snprintf(hex, sizeof(hex), "%02x", peer.bytes[i]);
+        for (uint8_t i = 0; i < peer_.length; i++) {
+            snprintf(hex, sizeof(hex), "%02x", peer_.bytes[i]);
             key_ += hex;
         }
     }
@@ -1790,10 +1805,7 @@ public:
     }
     uint32_t patienceMs() const override {
         uint32_t t = node_.timeoutMs();
-        if (!t) {
-            DatagramEndpoint* ep = node_.endpoint();
-            t = ep ? ep->timeoutMs() : 3000;
-        }
+        if (!t) t = node_.routeUp(endpoint_, peer_) ? endpoint_->timeoutMs() : 3000;
         return t * kAttempts + 1000;
     }
 
@@ -1812,17 +1824,21 @@ public:
     }
 
 private:
-    // Sends one envelope, again on a timeout while the relay is open and
-    // the peer online. An offline peer isn't sent to.
+    // Sends one envelope by the transfer's route, again on a timeout while
+    // the relay is open and the route online. Nothing is sent once the
+    // route is offline or gone, even if the node has another: there, the
+    // peer has no transfer from this gateway (`timeout`, which ends the
+    // relay; the peer drops its side when that link loses this node, or
+    // after Config::transferIdleMs).
     // With `raw`, an "ok" reply's body goes to it unparsed instead.
     void call(std::shared_ptr<DatagramEndpoint::Builder> build, Done done, int attempt = 0,
               std::shared_ptr<DatagramEndpoint::RawHandler> raw = nullptr) {
-        if (!node_.online()) {
+        if (!node_.routeUp(endpoint_, peer_)) {
             JsonDocument error;
             error["error"] = "timeout";
             error["reason"] = "peer_offline";
             error["path"] = remoteBase_.empty() ? std::string("/") : remoteBase_;
-            error["message"] = "peer offline";
+            error["message"] = node_.online() ? "the route the transfer started on is offline" : "peer offline";
             done(Status::Timeout, error.as<JsonVariantConst>());
             return;
         }
@@ -1831,7 +1847,7 @@ private:
             inFlight_ = true;
             activeMs_ = millis32();
         }
-        DatagramEndpoint* ep = node_.endpoint();
+        DatagramEndpoint* ep = endpoint_;
         auto self = shared_from_this();
         noRoom_ = false;
         DatagramEndpoint::RawHandler rawOk;
@@ -1842,10 +1858,10 @@ private:
             };
         }
         bool sent = ep && ep->requestBuilt(
-                              node_.peer(), *build,
+                              peer_, *build,
                               [self, build, done, attempt, raw](Status s, JsonVariantConst body) {
                                   if (s == Status::Timeout && attempt + 1 < kAttempts && self->open() &&
-                                      self->node_.online()) {
+                                      self->node_.routeUp(self->endpoint_, self->peer_)) {
                                       self->call(build, done, attempt + 1, raw);
                                       return;
                                   }
@@ -2043,6 +2059,8 @@ private:
     const std::string remotePath_, localBase_, remoteBase_, localPath_;
     const std::string get_, upload_, download_;  // ops at the client's level
     std::string key_;
+    DatagramEndpoint* endpoint_ = nullptr;  // the transfer's route (constructor)
+    PeerAddress peer_;
     mutable Mutex mutex_;
     bool claimed_ = false;
     bool closed_ = false;
