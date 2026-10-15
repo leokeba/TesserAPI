@@ -175,6 +175,41 @@ TEST(route_mount_under_several_parents) {
     CHECK_EQ(r.node().routes().size(), 2u);
 }
 
+TEST(route_hooks_per_api) {
+    // Each Api has its own hooks and route order (Api::remoteHooks()), with
+    // several handlers each: two applications in one program don't replace
+    // each other's. The process-wide ones still hear every node.
+    Defaults d;
+    RemoteNode::setDefaultRouteOrder({TransportKind::NowTP, TransportKind::Udp});
+    Rig r;
+    r.master.remoteHooks().setRouteOrder({TransportKind::Udp, TransportKind::NowTP});
+    r.run();
+    CHECK(r.kind() == TransportKind::Udp);  // the Api's, over the process-wide
+    CHECK(r.node().api() == &r.master);
+    std::vector<std::string> heard;
+    auto first = r.master.remoteHooks().onStateChange([&](RemoteNode& node) {
+        heard.push_back(std::string("first ") + (node.online() ? "online" : "offline"));
+    });
+    r.master.remoteHooks().onStateChange([&](RemoteNode&) { heard.push_back("second"); });
+    r.dev.remoteHooks().onStateChange([&](RemoteNode&) { heard.push_back("other api"); });
+    RemoteNode::onStateChange([&](RemoteNode&) { heard.push_back("process"); });
+    // UDP goes: the node fails over to NowTP, and says so once to each.
+    r.net.lose = [](const udp_cases::Net::Datagram&) { return true; };
+    CHECK_EQ(r.node().stream("/out", "{\"level\":2}"), Status::Ok);
+    r.advance(3100);
+    CHECK(r.kind() == TransportKind::NowTP);
+    CHECK((heard == std::vector<std::string>{"process", "first online", "second"}));
+    // Removed, a handler hears no more; the order follows the Api's at once.
+    r.master.remoteHooks().remove(first);
+    heard.clear();
+    r.net.lose = nullptr;
+    r.advance(5100);
+    CHECK(r.kind() == TransportKind::Udp);
+    CHECK((heard == std::vector<std::string>{"process", "second"}));
+    r.master.remoteHooks().setRouteOrder({TransportKind::NowTP, TransportKind::Udp});
+    CHECK(r.kind() == TransportKind::NowTP);
+}
+
 TEST(route_failover_and_back) {
     Defaults d;
     RemoteNode::setDefaultRouteOrder({TransportKind::Udp, TransportKind::NowTP});

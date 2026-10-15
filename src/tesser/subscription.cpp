@@ -115,6 +115,7 @@ void closeEnvelope(std::string& msg, bool overflow, Access ceiling) {
 // ---- registry ---------------------------------------------------------------
 
 Api::Api() : Object("") {
+    remoteHooks_.reset(new RemoteHooks());
     Api* head = g_apis.load();
     do {
         nextApi_ = head;

@@ -54,6 +54,39 @@ std::string formatRouteOrder(const std::vector<RouteKind>& order);
 // an announced peer may be evicted: DatagramEndpoint::Options::maxMounted).
 // Either may be destroyed first: a destroyed endpoint detaches its routes, and a node left
 // without one answers "no endpoint".
+// What an application hears from the remote nodes of one Api, and the
+// order their routes are tried in (docs/DESIGN.md section 14.3): each Api
+// has its own (Api::remoteHooks()), so two applications in one program
+// don't replace each other's, and each holds several handlers. A node uses
+// its Api's once it knows it (from its first tick), the process-wide ones
+// (RemoteNode's statics) as well. Thread-safe.
+class RemoteHooks {
+public:
+    using StateHandler = std::function<void(RemoteNode& node)>;
+    using AccessHandler = std::function<void(RemoteNode& node, Status status, Access level)>;
+    using Id = uint32_t;
+    // As RemoteNode::onStateChange() and onAccess(), for this Api's nodes;
+    // several of each. The id removes it (remove()).
+    Id onStateChange(StateHandler fn);
+    Id onAccess(AccessHandler fn);
+    void remove(Id id);
+    // The order of this Api's nodes without their own (empty, the default:
+    // RemoteNode::setDefaultRouteOrder()'s).
+    void setRouteOrder(std::vector<RouteKind> order);
+    std::vector<RouteKind> routeOrder() const;
+
+    // For RemoteNode: calls the handlers, without the hooks' lock.
+    void stateChanged(RemoteNode& node) const;
+    void accessAnswered(RemoteNode& node, Status status, Access level) const;
+
+private:
+    mutable Mutex mutex_;  // a leaf: handlers are copied out, then called
+    Id next_ = 1;
+    std::vector<std::pair<Id, StateHandler>> state_;
+    std::vector<std::pair<Id, AccessHandler>> access_;
+    std::vector<RouteKind> order_;
+};
+
 class RemoteNode : public Annotated<RemoteNode> {
 public:
     // A way to reach the device.
@@ -131,14 +164,20 @@ public:
     // the default order. Takes effect at once.
     RemoteNode& routeOrder(std::vector<RouteKind> order);
     std::vector<RouteKind> routeOrder() const;
-    // The order of nodes without their own (initially empty: routes in the
-    // order they were added). Any task.
+    // The order of nodes without their own and whose Api has none
+    // (RemoteHooks::setRouteOrder(); initially empty: routes in the order
+    // they were added). Process-wide: prefer the Api's. Any task.
     static void setDefaultRouteOrder(std::vector<RouteKind> order);
     static std::vector<RouteKind> defaultRouteOrder();
     // Called, from an endpoint's process() and without the API lock, when a
     // node is created or gets a route, and when its online state or route in
-    // use changes. One for every node.
+    // use changes. Process-wide, one for every node of every Api, beside the
+    // Api's own (Api::remoteHooks()), which an application should use: a
+    // second caller replaces this one.
     static void onStateChange(StateHandler fn);
+    // The Api it is mounted in, once known (null before its first tick or
+    // request).
+    Api* api() const;
     // The remote node under `parent` mounted for `device`, or null. Under
     // the API lock.
     static RemoteNode* byDevice(const Object& parent, const PeerAddress& device);
@@ -211,8 +250,8 @@ public:
     Access access() const;
     // Called, in an endpoint's process() and without the API lock, with
     // every answer to a node's token: Status::Ok and the level granted
-    // (public: refused, time to get a new one), or the error. One for every
-    // node.
+    // (public: refused, time to get a new one), or the error. Process-wide,
+    // as onStateChange(): prefer the Api's (RemoteHooks::onAccess()).
     using AccessHandler = std::function<void(RemoteNode& node, Status status, Access level)>;
     static void onAccess(AccessHandler fn);
     // Called by an endpoint.
@@ -323,6 +362,8 @@ private:
         uint8_t attempts = 0;
     };
 
+    // Its Api's route order, else the process-wide default.
+    std::vector<RouteKind> inheritedOrder() const;
     bool localPath(std::string& out);
     Upstream* findUpstream(std::string_view rest, Access level);
     std::string remotePathOf(std::string_view rest) const;
@@ -370,7 +411,8 @@ private:
     mutable Mutex mutex_{kRankRemote, "remote"};  // after the API lock
     JsonDocument copy_;
     bool hasCopy_ = false;
-    Api* api_ = nullptr;
+    std::atomic<Api*> api_{nullptr};  // the Api it is mounted in, once known (localPath())
+    std::atomic<uint32_t> apiLookupMs_{0};  // tick(): when api_ was last looked for
     std::string localPath_;
     std::vector<std::unique_ptr<Upstream>> upstreams_;  // guarded by mutex_
     std::atomic<bool> online_{true};

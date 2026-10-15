@@ -493,6 +493,76 @@ Access RemoteNode::access() const {
     return route(r) ? r.endpoint->grantedAccess(r.peer) : Access::Public;
 }
 
+// ---- RemoteHooks -------------------------------------------------------------
+
+RemoteHooks::Id RemoteHooks::onStateChange(StateHandler fn) {
+    MutexGuard guard(mutex_);
+    Id id = next_++;
+    state_.emplace_back(id, std::move(fn));
+    return id;
+}
+
+RemoteHooks::Id RemoteHooks::onAccess(AccessHandler fn) {
+    MutexGuard guard(mutex_);
+    Id id = next_++;
+    access_.emplace_back(id, std::move(fn));
+    return id;
+}
+
+void RemoteHooks::remove(Id id) {
+    MutexGuard guard(mutex_);
+    for (size_t i = 0; i < state_.size(); i++) {
+        if (state_[i].first == id) state_.erase(state_.begin() + static_cast<std::ptrdiff_t>(i--));
+    }
+    for (size_t i = 0; i < access_.size(); i++) {
+        if (access_[i].first == id) access_.erase(access_.begin() + static_cast<std::ptrdiff_t>(i--));
+    }
+}
+
+void RemoteHooks::setRouteOrder(std::vector<RouteKind> order) {
+    MutexGuard guard(mutex_);
+    order_ = std::move(order);
+}
+
+std::vector<RouteKind> RemoteHooks::routeOrder() const {
+    MutexGuard guard(mutex_);
+    return order_;
+}
+
+void RemoteHooks::stateChanged(RemoteNode& node) const {
+    std::vector<StateHandler> fns;
+    {
+        MutexGuard guard(mutex_);
+        for (const auto& s : state_) fns.push_back(s.second);
+    }
+    for (const StateHandler& fn : fns) {
+        if (fn) fn(node);
+    }
+}
+
+void RemoteHooks::accessAnswered(RemoteNode& node, Status status, Access level) const {
+    std::vector<AccessHandler> fns;
+    {
+        MutexGuard guard(mutex_);
+        for (const auto& a : access_) fns.push_back(a.second);
+    }
+    for (const AccessHandler& fn : fns) {
+        if (fn) fn(node, status, level);
+    }
+}
+
+Api* RemoteNode::api() const { return api_.load(); }
+
+std::vector<RouteKind> RemoteNode::inheritedOrder() const {
+    if (Api* api = api_.load()) {
+        std::vector<RouteKind> order = api->remoteHooks().routeOrder();
+        if (!order.empty()) return order;
+    }
+    return defaultRouteOrder();
+}
+
+// ---- RemoteNode ----------------------------------------------------------------
+
 void RemoteNode::onAccess(AccessHandler fn) {
     MutexGuard guard(sharedMutex());
     sharedAccessHandler() = std::move(fn);
@@ -505,6 +575,7 @@ void RemoteNode::tokenAnswered(Status status, Access level) {
         fn = sharedAccessHandler();
     }
     if (fn) fn(*this, status, level);
+    if (Api* api = api_.load()) api->remoteHooks().accessAnswered(*this, status, level);
 }
 
 bool RemoteNode::hasRoute(const DatagramEndpoint* endpoint, const PeerAddress& peer) const {
@@ -526,7 +597,7 @@ bool RemoteNode::routeUp(const DatagramEndpoint* endpoint, const PeerAddress& pe
 // The index of the route in use: the best ranked online one, or the best
 // ranked one when none is online.
 int RemoteNode::activeLocked() const {
-    std::vector<RouteKind> order = hasOrder_ ? order_ : defaultRouteOrder();
+    std::vector<RouteKind> order = hasOrder_ ? order_ : inheritedOrder();
     auto rank = [&](const RouteSlot& r) {
         size_t i = 0;
         while (i < order.size() && !order[i].covers(r.route.kind(), r.route.iface)) i++;
@@ -550,7 +621,7 @@ std::vector<RemoteNode::Route> RemoteNode::routes() const {
     {
         MutexGuard guard(routesMutex_);
         slots = routes_;
-        order = hasOrder_ ? order_ : defaultRouteOrder();
+        order = hasOrder_ ? order_ : inheritedOrder();
     }
     auto rank = [&](const RouteSlot& r) {
         size_t i = 0;
@@ -783,6 +854,13 @@ RemoteNode::Upstream* RemoteNode::findUpstream(std::string_view rest, Access lev
 }
 
 void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
+    // Its Api, for its hooks and route order: found once, walking the
+    // trees, at most once a second while it isn't in one.
+    if (!api_.load() && (!apiLookupMs_ || nowMs - apiLookupMs_ >= 1000)) {
+        apiLookupMs_ = nowMs ? nowMs : 1;
+        std::string path;
+        localPath(path);
+    }
     // Every endpoint of the node ticks it; the one in use does the work.
     Route cur;
     if (!route(cur) || cur.endpoint != &by) return;
@@ -820,6 +898,7 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
             fn = sharedStateHandler();
         }
         if (fn) fn(*this);
+        if (Api* api = api_.load()) api->remoteHooks().stateChanged(*this);
     }
 
     // Offline routes: does the device answer? Any reply puts the route back.
@@ -920,7 +999,7 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
 }
 
 bool RemoteNode::localPath(std::string& out) {
-    if (!api_) api_ = Api::owner(*this, localPath_);
+    if (!api_.load()) api_ = Api::owner(*this, localPath_);
     out = localPath_;
     return api_ != nullptr;
 }
@@ -975,7 +1054,7 @@ bool RemoteNode::handleNotification(const DatagramEndpoint& by, const PeerAddres
         // It came at `level`, once for every subscription of this node's at
         // that level it concerns: for the local subscribers at that level
         // below this node, and, from the mirror, for those of the copy.
-        api_->emitEvent(
+        api_.load()->emitEvent(
             local, [body](JsonWriter& w) { w.variant(body); },
             [this, level, forMirror](const Subscription& sub) {
                 if (sub.forwarded) return sub.node == this && sub.access == level;

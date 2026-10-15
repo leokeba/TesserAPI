@@ -17,6 +17,8 @@
 
 namespace tesser {
 
+class RemoteHooks;
+
 struct Config {
     size_t maxRequestBody = 4096;  // bytes of request text a transport accepts
     size_t maxResponse = 8192;     // bytes, for transports that buffer responses
@@ -151,6 +153,11 @@ public:
     // Runs poll() every periodMs in a FreeRTOS task.
     bool startTask(uint32_t periodMs = 20, uint32_t stackSize = 4096, unsigned priority = 3);
 #endif
+
+    // What this Api's remote nodes tell the application, and their route
+    // order (docs/DESIGN.md section 14.3): its own, beside the process-wide
+    // RemoteNode hooks. Any task.
+    RemoteHooks& remoteHooks() { return *remoteHooks_; }
 
     // Access control (docs/DESIGN.md section 13). Without an authorizer,
     // everything is allowed.
@@ -305,6 +312,7 @@ private:
     uint32_t lastWatchMs_ = 0;
     Authorizer authorizer_;
     TokenCheck tokenCheck_;
+    std::unique_ptr<RemoteHooks> remoteHooks_;
     Storage* storage_ = nullptr;
     uint32_t debounceMs_ = 2000;
     // Persisted values' defaults: node, hash of its value; sorted by node.
