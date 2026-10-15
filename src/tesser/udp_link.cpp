@@ -245,14 +245,30 @@ bool UdpLink::sendDatagram(const PeerAddress& to, const uint8_t* data, size_t le
 }
 
 // Sends the fragments in `mask`; a reliable message asks for an
-// acknowledgement with the last one.
+// acknowledgement with the last one. A reliable message's fragments go only
+// as far as the heap holds the network stack's copies of them above the
+// floor (lwIP's, then the radio's: about twice a datagram each), at least
+// one: the rest go when that acknowledgement says what is missing, so a
+// large message is paced rather than all in flight at once (docs/DESIGN.md
+// section 10.7). Measured on DEVKIT-V3: a peer's mirror snapshot, sent all
+// at once, took the gateway 2 KB below its floor.
 void UdpLink::transmit(const PeerAddress& to, uint32_t id, const std::string& data, uint8_t count, uint64_t mask,
                        uint8_t flags) {
+    size_t size = options_.fragmentSize;
+    if (flags & kReliable) {
+        unsigned room = 0;
+        while (heapAbove(2 * (room + 1) * (kHeader + size)) && room < count) room++;
+        unsigned sent = 0;
+        for (unsigned i = 0; i < count; i++) {
+            if (!(mask & flag(i))) continue;
+            if (sent >= (room ? room : 1)) mask &= ~flag(i);
+            sent++;
+        }
+    }
     unsigned last = 0;
     for (unsigned i = 0; i < count; i++) {
         if (mask & flag(i)) last = i;
     }
-    size_t size = options_.fragmentSize;
     for (unsigned i = 0; i < count; i++) {
         if (!(mask & flag(i))) continue;
         Header h;

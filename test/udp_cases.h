@@ -541,3 +541,69 @@ TEST(udp_malformed) {
 }
 
 }  // namespace udp_cases
+
+namespace udp_cases {
+
+// A peer mirroring this node subscribes (again, when it comes back): this
+// node's snapshot goes in fragments. Returns the most of its full-size
+// fragments in flight at once, and whether the peer got its copy.
+inline size_t mirrorSnapshotInFlight(size_t limitAbove, size_t floor, bool& mirrored) {
+    cases::Device v;
+    std::string blob(3000, 'x');
+    v.api.value("blob", blob);
+    tesser::Api r;
+    Net net;
+    UdpLink vLink(&v.api, net.sender(ip(20)), net.clockFn());
+    UdpLink rLink(&r, net.sender(ip(21)), net.clockFn());
+    net.nodes = {{ip(20), &vLink}, {ip(21), &rLink}};
+    vLink.setName("v");
+    rLink.setName("r");
+    vLink.advertise();
+    rLink.advertise();
+    net.start();
+    rLink.mountPeers(r.object("peers"), 1000);
+    size_t most = 0;
+    size_t floorBefore = tesser::heapFloor();
+    for (int round = 0; round < 200; round++) {
+        net.deliver();
+        rLink.tick();
+        {
+            // This node's free heap is what its limit leaves; the air's
+            // datagrams count too, as the stack's copies do on target.
+            tesser::testing::HeapLimit limit(limitAbove);
+            // Only the probe's reading matters here: what goes past the
+            // limit (the air's copies) isn't an abort.
+            tesser::testing::onExceeded(+[](size_t, size_t, size_t) {});
+            if (limitAbove) {
+                tesser::setFreeHeapProbe(&tesser::testing::heapLeft);
+                tesser::setHeapFloor(floor);
+            }
+            vLink.tick();
+            tesser::testing::onExceeded(nullptr);
+            tesser::setFreeHeapProbe(nullptr);
+            tesser::setHeapFloor(floorBefore);
+        }
+        size_t inFlight = 0;
+        for (const Net::Datagram& d : net.air) inFlight += d.from == ip(20) && d.data.size() > 1000;
+        if (inFlight > most) most = inFlight;
+        net.clock += 20;
+    }
+    auto* node = static_cast<tesser::RemoteNode*>(r.object("peers").child("v"));
+    mirrored = node && node->hasCopy();
+    return most;
+}
+
+TEST(udp_fragments_paced_on_a_tight_heap) {
+    // A reliable message's fragments go only as far as the heap holds the
+    // stack's copies of them above the floor; the rest follow the
+    // acknowledgements. On target, a mirror snapshot sent all at once took
+    // a gateway 2 KB below its floor.
+    bool mirrored = false;
+    CHECK_EQ(mirrorSnapshotInFlight(0, 0, mirrored), 2u);  // all at once with room (the third is short)
+    CHECK(mirrored);
+    mirrored = false;
+    CHECK_EQ(mirrorSnapshotInFlight(11000, 4000, mirrored), 1u);
+    CHECK(mirrored);
+}
+
+}  // namespace udp_cases
