@@ -35,6 +35,17 @@ namespace {
 
 constexpr size_t kChunk = 512;
 constexpr size_t kFileChunk = 2048;  // file transfers, on the heap
+
+// The stack copies what is sent (TCP's segments, then the radio's buffers)
+// and holds it until the client acknowledges it: about twice it. A large
+// piece waits, up to 500 ms, for the heap to hold that above the floor,
+// while what went before is acknowledged (docs/DESIGN.md section 15).
+// Measured on DEVKIT-V3: a 3.9 KB WebSocket frame took about 6.5 KB to
+// send, and a 100 KB file download held 4-6 KB free for 2.5 s, 2 KB
+// pieces sent as fast as the socket took them.
+void waitForRoom(size_t bytes) {
+    for (int i = 0; bytes > 1024 && i < 50 && !heapAbove(2 * bytes); i++) vTaskDelay(pdMS_TO_TICKS(10));
+}
 // A refused upload's body is read and dropped up to this size, so the client
 // (which sends it all before reading) gets the error; beyond it, the
 // connection is closed.
@@ -461,14 +472,7 @@ bool HttpServer::wsSendShared(int fd, std::shared_ptr<const std::string> message
             auto* w = static_cast<WsWork*>(arg);
             w->server->workRun_++;
             bool ok = httpd_ws_get_fd_info(w->handle, w->fd) == HTTPD_WS_CLIENT_WEBSOCKET;
-            // The stack copies a frame to send it (TCP's segments, then the
-            // radio's buffers), and holds the copy until the client
-            // acknowledges it: a large one waits, up to 500 ms, for the heap
-            // to hold twice its size above the floor, while the frames before
-            // it are acknowledged (docs/DESIGN.md section 15). Measured on
-            // DEVKIT-V3 relaying 3.9 KB frames: a send took about 6.5 KB.
-            size_t size = w->message->size();
-            for (int i = 0; ok && size > 1024 && i < 50 && !heapAbove(2 * size); i++) vTaskDelay(pdMS_TO_TICKS(10));
+            if (ok) waitForRoom(w->message->size());
             if (ok) {
                 httpd_ws_frame_t frame = {};
                 frame.type = HTTPD_WS_TYPE_TEXT;
@@ -1410,6 +1414,7 @@ esp_err_t HttpServer::sendFile(httpd_req_t* req, FileTransfer& file) {
         addCorsHeaders(req);
         int n;
         while ((n = file.read(buf.get(), kFileChunk)) > 0) {
+            waitForRoom(kFileChunk);  // whatever the piece: the stack's buffer fills over many
             if (httpd_resp_send_chunk(req, reinterpret_cast<char*>(buf.get()), n) != ESP_OK) return ESP_FAIL;
         }
         if (n < 0) return ESP_FAIL;  // cut short: the client sees no final chunk
@@ -1437,6 +1442,7 @@ esp_err_t HttpServer::sendFile(httpd_req_t* req, FileTransfer& file) {
     while (left) {
         int n = file.read(buf.get(), kFileChunk);
         if (n <= 0 || static_cast<uint64_t>(n) > left) return ESP_FAIL;  // the client sees it short
+        waitForRoom(kFileChunk);  // whatever the piece: the stack's buffer fills over many
         if (!sendAll(req, reinterpret_cast<char*>(buf.get()), static_cast<size_t>(n))) return ESP_FAIL;
         left -= static_cast<uint64_t>(n);
     }
