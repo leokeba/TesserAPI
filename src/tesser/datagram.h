@@ -118,14 +118,22 @@ public:
 
     // Any task. `reliable`: the link guaranteed delivery (so it was unicast).
     // `broadcast`: the message was sent to every node; a request without an
-    // "id" that came this way gets no reply.
-    void receive(const PeerAddress& from, const char* data, size_t len, bool reliable, bool broadcast = false);
+    // "id" that came this way gets no reply. False only with linkRefuses():
+    // the message wasn't taken (no memory, or the queue is full) and nothing
+    // answered it, so the link must refuse it, for the sender to send it again.
+    bool receive(const PeerAddress& from, const char* data, size_t len, bool reliable, bool broadcast = false);
     // Same, taking the message (a link's reassembly buffer) without a copy.
-    void receive(const PeerAddress& from, std::string&& text, bool reliable, bool broadcast = false);
-    // Same, taking `buffer`, allocated with malloc (freed with free()):
-    // a link that hands its reassembly buffer over (NowTP's
-    // Message::buffer), so a large message is never on the heap twice.
-    void receiveOwned(const PeerAddress& from, void* buffer, size_t len, bool reliable, bool broadcast = false);
+    bool receive(const PeerAddress& from, std::string&& text, bool reliable, bool broadcast = false);
+    // Same, taking `buffer`, allocated with malloc (freed with free(), here,
+    // even when refused): a link that hands its reassembly buffer over
+    // (NowTP's Message::buffer), so a large message is never on the heap twice.
+    bool receiveOwned(const PeerAddress& from, void* buffer, size_t len, bool reliable, bool broadcast = false);
+    // The link can refuse a reliable unicast message from its receive
+    // callback, and its sender then sends it again (NowTP's Message::refused,
+    // f09a571 and later). One the endpoint can't take is then refused
+    // (receive() returns false) rather than answered busy, or, a reply,
+    // failing its call (docs/DESIGN.md section 15).
+    void linkRefuses(bool on) { linkRefuses_ = on; }
 
     // Handles queued messages and expires client calls. Returns true if it did
     // anything.
@@ -436,7 +444,7 @@ private:
     void sendAuth(const PeerAddress& peer, const std::string& token);
     void authDone(const PeerAddress& peer, Status status, JsonVariantConst body);
     void handle(Incoming& msg);
-    void queue(Incoming&& msg);
+    bool queue(Incoming&& msg);
     void handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply);
     Access levelOf(const PeerAddress& peer);
     void reject(const PeerAddress& from, std::string_view text, bool broadcast, Status status, Reason reason,
@@ -447,7 +455,8 @@ private:
     void ownReplies(EnvelopeReply& reply, const PeerAddress& to, bool silent);
     // Holds `len` bytes from `from` in incoming_ (`heap`: about to be
     // allocated); empty, with a busy reply to a request, when refused.
-    Reservation hold(const PeerAddress& from, std::string_view text, bool broadcast, bool heap);
+    Reservation hold(const PeerAddress& from, std::string_view text, bool reliable, bool broadcast, bool heap);
+    bool refusable(bool reliable, bool broadcast) const { return linkRefuses_ && reliable && !broadcast; }
     // `reason`: why the calls of a forgotten peer fail (None: a plain timeout).
     void expire(uint32_t now, bool all, const PeerAddress* peer, Reason reason = Reason::None);
     void failCall(uint32_t id, Status status, Reason reason, const char* message);
@@ -469,6 +478,7 @@ private:
     ByteBudget incoming_;  // queued messages (Options::queueBytes)
     SendFn send_;
     OwnedSendFn ownedSend_;
+    std::atomic<bool> linkRefuses_{false};
     size_t ownedSlack_ = 0;
     ClockFn clock_;
     Options options_;

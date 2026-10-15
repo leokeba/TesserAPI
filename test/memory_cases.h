@@ -246,6 +246,49 @@ TEST(memory_large_receive_dropped_under_floor) {
     CHECK_EQ(ep.stats().requests, 2u);
 }
 
+TEST(memory_receive_refused_to_a_link_that_can) {
+    // A link that can refuse a message (NowTP's Message::refused) is told to,
+    // for a reliable one the endpoint can't take: nothing answers it, and
+    // the sender sends it again. A request answered busy, or a reply failing
+    // its call, would lose what a retry gets.
+    cases::Device dev;
+    datagram_cases::Net net;
+    tesser::DatagramEndpoint ep(&dev.api, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(2)),
+                                net.clockFn());
+    ep.linkRefuses(true);
+    std::string big = "{\"id\":1,\"op\":\"get\",\"path\":\"/lamp\",\"pad\":\"" + std::string(600, 'p') + "\"}";
+    {
+        Floor floor(8000, 8500);
+        CHECK(!ep.receive(datagram_cases::addr(1), big.data(), big.size(), true));
+        CHECK(net.frames.empty());
+        CHECK_EQ(ep.stats().dropped, 1u);
+        // Unreliable (or broadcast): the link can't refuse it; answered as before.
+        CHECK(ep.receive(datagram_cases::addr(1), big.data(), big.size(), false));
+        CHECK_EQ(net.frames.size(), 1u);
+        net.frames.clear();
+        // A buffer handed over costs nothing more: taken under the floor.
+        char* owned = static_cast<char*>(malloc(big.size()));
+        memcpy(owned, big.data(), big.size());
+        CHECK(ep.receiveOwned(datagram_cases::addr(1), owned, big.size(), true));
+    }
+    // Sent again with room: taken.
+    CHECK(ep.receive(datagram_cases::addr(1), big.data(), big.size(), true));
+    ep.process();
+    CHECK_EQ(ep.stats().requests, 2u);
+    // A full queue is refused the same way.
+    tesser::DatagramEndpoint::Options small;
+    small.queueLimit = 1;
+    tesser::DatagramEndpoint narrow(&dev.api, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(2)),
+                                    net.clockFn(), small);
+    narrow.linkRefuses(true);
+    std::string get = "{\"id\":2,\"op\":\"get\",\"path\":\"/lamp/on\"}";
+    CHECK(narrow.receive(datagram_cases::addr(1), get.data(), get.size(), true));
+    CHECK(!narrow.receive(datagram_cases::addr(1), get.data(), get.size(), true));
+    net.frames.clear();
+    narrow.process();
+    CHECK_EQ(narrow.stats().requests, 1u);
+}
+
 TEST(memory_remote_state_needs_room) {
     // Admitted while there was room, the remote's state then finds none:
     // the waiting subscriber hears "busy", and nothing is copied.

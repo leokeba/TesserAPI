@@ -338,13 +338,15 @@ uintptr_t budgetKey(const PeerAddress& p) {
     return h ? h : 1;
 }
 
-Reservation DatagramEndpoint::hold(const PeerAddress& from, std::string_view text, bool broadcast, bool heap) {
+Reservation DatagramEndpoint::hold(const PeerAddress& from, std::string_view text, bool reliable, bool broadcast,
+                                   bool heap) {
     Reservation r = incoming_.reserve(text.size(), budgetKey(from), true, heap);
     if (!r) {
         {
             MutexGuard guard(mutex_);
             stats_.dropped++;
         }
+        if (refusable(reliable, broadcast)) return r;  // the link refuses it: sent again
         // Answered, or its call failed, so nobody waits for a timeout: the
         // queue's own limit is queue_full, the heap low_memory (a relay then
         // asks for less, docs/DESIGN.md section 14).
@@ -354,14 +356,14 @@ Reservation DatagramEndpoint::hold(const PeerAddress& from, std::string_view tex
     return r;
 }
 
-void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t len, bool reliable,
+bool DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t len, bool reliable,
                                bool broadcast) {
     // The link's buffer (NowTP's) is only lent: copied if the budget, the
     // heap floor and the largest block allow it (docs/DESIGN.md section 15).
-    // If not, a request is answered busy; anything else is dropped like a
-    // lost datagram, and the call it belongs to times out.
-    Reservation held = hold(from, std::string_view(data, len), broadcast, true);
-    if (!held) return;
+    // If not, the link refuses it (linkRefuses()), or a request is answered
+    // busy and a reply fails its call.
+    Reservation held = hold(from, std::string_view(data, len), reliable, broadcast, true);
+    if (!held) return !refusable(reliable, broadcast);
     Incoming msg;
     msg.from = from;
     msg.text.assign(data, len);
@@ -369,37 +371,37 @@ void DatagramEndpoint::receive(const PeerAddress& from, const char* data, size_t
     msg.held = std::move(held);
     msg.reliable = reliable;
     msg.broadcast = broadcast;
-    queue(std::move(msg));
+    return queue(std::move(msg));
 }
 
-void DatagramEndpoint::receive(const PeerAddress& from, std::string&& text, bool reliable, bool broadcast) {
+bool DatagramEndpoint::receive(const PeerAddress& from, std::string&& text, bool reliable, bool broadcast) {
     // Allocated already: counted, not checked against the heap.
-    Reservation held = hold(from, text, broadcast, false);
-    if (!held) return;
+    Reservation held = hold(from, text, reliable, broadcast, false);
+    if (!held) return !refusable(reliable, broadcast);
     Incoming msg;
     msg.from = from;
     msg.text = std::move(text);
     msg.held = std::move(held);
     msg.reliable = reliable;
     msg.broadcast = broadcast;
-    queue(std::move(msg));
+    return queue(std::move(msg));
 }
 
-void DatagramEndpoint::receiveOwned(const PeerAddress& from, void* buffer, size_t len, bool reliable,
+bool DatagramEndpoint::receiveOwned(const PeerAddress& from, void* buffer, size_t len, bool reliable,
                                     bool broadcast) {
     Incoming msg;
     msg.owned.reset(static_cast<char*>(buffer));  // freed even when refused
-    Reservation held = hold(from, std::string_view(msg.owned.get(), len), broadcast, false);
-    if (!held) return;
+    Reservation held = hold(from, std::string_view(msg.owned.get(), len), reliable, broadcast, false);
+    if (!held) return !refusable(reliable, broadcast);
     msg.from = from;
     msg.ownedLen = len;
     msg.held = std::move(held);
     msg.reliable = reliable;
     msg.broadcast = broadcast;
-    queue(std::move(msg));
+    return queue(std::move(msg));
 }
 
-void DatagramEndpoint::queue(Incoming&& msg) {
+bool DatagramEndpoint::queue(Incoming&& msg) {
     bool queued = false;
     {
         MutexGuard guard(mutex_);
@@ -412,10 +414,12 @@ void DatagramEndpoint::queue(Incoming&& msg) {
     }
     if (queued) {
         if (onQueued_) onQueued_();
-        return;
+        return true;
     }
+    if (refusable(msg.reliable, msg.broadcast)) return false;  // the link refuses it: sent again
     // Full: answer requests with "busy" so clients needn't wait for a timeout.
     reject(msg.from, msg.view(), msg.broadcast, Status::Busy, Reason::QueueFull, "request queue full");
+    return true;
 }
 
 bool DatagramEndpoint::process() {

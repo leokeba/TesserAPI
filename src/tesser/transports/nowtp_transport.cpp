@@ -36,6 +36,22 @@ uint8_t* takeBuffer(const M& m) {
     }
 }
 
+// NowTP f09a571 and later let a handler refuse a message it can't take
+// (Message::refused): a reliable sender is told busy and sends it again.
+template <class M, class = void>
+struct HasRefused : std::false_type {};
+template <class M>
+struct HasRefused<M, decltype(void(std::declval<const M&>().refused))> : std::true_type {};
+
+template <class M>
+void refuse(const M& m) {
+    if constexpr (HasRefused<M>::value) {
+        m.refused = true;
+    } else {
+        (void)m;
+    }
+}
+
 // NowTP ce6b645 and later send from a malloc()ed buffer they take over
 // (sendBuffer()); older ones only copy.
 template <class T, class = void>
@@ -139,14 +155,20 @@ bool NowTpTransport::begin(bool runTask, uint32_t stackSize, UBaseType_t priorit
         endpoint_.onQueued([task] { xTaskNotifyGive(task); });
         ownHook_ = true;
     }
+    // A message the endpoint can't take now (the heap floor, its queue) is
+    // refused, so the sender sends it again, rather than answered busy
+    // (docs/DESIGN.md section 15).
+    endpoint_.linkRefuses(HasRefused<nowtp::Message>::value);
     now_.listen(port_, [this](const nowtp::Message& m) {
         // A reassembled message is kept as NowTP built it: a large reply
         // isn't on a short heap twice. A single frame's data is copied.
+        bool taken;
         if (uint8_t* buffer = takeBuffer(m)) {
-            endpoint_.receiveOwned(address(m.src), buffer, m.len, m.reliable);
+            taken = endpoint_.receiveOwned(address(m.src), buffer, m.len, m.reliable);
         } else {
-            endpoint_.receive(address(m.src), reinterpret_cast<const char*>(m.data), m.len, m.reliable);
+            taken = endpoint_.receive(address(m.src), reinterpret_cast<const char*>(m.data), m.len, m.reliable);
         }
+        if (!taken) refuse(m);
     });
     return true;
 }
