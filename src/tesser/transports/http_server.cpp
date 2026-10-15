@@ -542,7 +542,7 @@ std::string requestToken(httpd_req_t* req) {
 // token check (Api::authenticate()).
 Access HttpServer::access(httpd_req_t* req) const {
     std::string token = requestToken(req);
-    if (token_ && *token_ && token == token_) return Access::Admin;
+    if (token_ && *token_ && secretEquals(token, token_)) return Access::Admin;
     return api_.tokenAccess(token);
 }
 

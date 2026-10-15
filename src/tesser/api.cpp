@@ -1677,6 +1677,19 @@ void Api::runQueued() {
     }
 }
 
+bool secretEquals(std::string_view presented, std::string_view expected) {
+    // Every byte of the longer one is read, whatever matched before: no
+    // early exit for the compiler to turn the loop into.
+    size_t n = presented.size() > expected.size() ? presented.size() : expected.size();
+    unsigned diff = presented.size() == expected.size() ? 0u : 1u;
+    for (size_t i = 0; i < n; i++) {
+        unsigned a = i < presented.size() ? static_cast<unsigned char>(presented[i]) : 0u;
+        unsigned b = i < expected.size() ? static_cast<unsigned char>(expected[i]) : 0u;
+        diff |= a ^ b;
+    }
+    return diff == 0;
+}
+
 uint32_t Api::schemaHash() {
     StringReply reply;
     Request req;

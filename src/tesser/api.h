@@ -84,6 +84,12 @@ using Authorizer = std::function<bool(const Client& client, Op op, const Node& n
 // WebSocket: "Authorization: Bearer" or ?token=); empty when it presented
 // none. See Api::authenticate().
 using TokenCheck = std::function<Access(std::string_view token)>;
+// Whether a presented secret (a token, a password's hash) equals the
+// expected one, in a time that depends only on their lengths, not on how
+// much of a guess was right: a client timing replies can't find a token a
+// byte at a time. For TokenCheck implementations; the library's own
+// comparisons use it.
+bool secretEquals(std::string_view presented, std::string_view expected);
 
 namespace authorizers {
 // Anyone may read and subscribe; writes and actions need an authenticated

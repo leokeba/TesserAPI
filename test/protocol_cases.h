@@ -126,3 +126,17 @@ TEST(protocol_advertised) {
 }
 
 }  // namespace protocol_cases
+
+namespace protocol_cases {
+
+TEST(protocol_secret_equals) {
+    CHECK(tesser::secretEquals("test-token", "test-token"));
+    CHECK(tesser::secretEquals("", ""));
+    CHECK(!tesser::secretEquals("test-tokem", "test-token"));
+    CHECK(!tesser::secretEquals("test-toke", "test-token"));    // a prefix
+    CHECK(!tesser::secretEquals("test-token1", "test-token"));  // longer
+    CHECK(!tesser::secretEquals("", "test-token"));
+    CHECK(!tesser::secretEquals(std::string_view("a\0", 2), "a"));  // trailing NUL counts
+}
+
+}  // namespace protocol_cases

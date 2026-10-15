@@ -365,7 +365,7 @@ void startNetwork(tesser::Api& api) {
     g_api = &api;
     // Tokens over the message transports ("auth": UDP, NowTP, Bluetooth).
     api.authenticate([](std::string_view token) {
-        return token == "test-token" ? tesser::Access::Admin : tesser::Access::Public;
+        return tesser::secretEquals(token, "test-token") ? tesser::Access::Admin : tesser::Access::Public;
     });
     g_events = xEventGroupCreate();
     esp_err_t err = nvs_flash_init();
