@@ -1939,7 +1939,7 @@ public:
     }
     uint32_t patienceMs() const override {
         uint32_t t = node_.timeoutMs();
-        if (!t) t = node_.routeUp(endpoint_, peer_) ? endpoint_->timeoutMs() : 3000;
+        if (!t) t = routeUsable() ? endpoint_->timeoutMs() : 3000;
         return t * kAttempts + 1000;
     }
 
@@ -1967,7 +1967,7 @@ private:
     // With `raw`, an "ok" reply's body goes to it unparsed instead.
     void call(std::shared_ptr<DatagramEndpoint::Builder> build, Done done, int attempt = 0,
               std::shared_ptr<DatagramEndpoint::RawHandler> raw = nullptr) {
-        if (!node_.routeUp(endpoint_, peer_)) {
+        if (!routeUsable()) {
             JsonDocument error;
             error["error"] = "timeout";
             error["reason"] = "peer_offline";
@@ -1995,7 +1995,7 @@ private:
                               peer_, *build,
                               [self, build, done, attempt, raw](Status s, JsonVariantConst body) {
                                   if (s == Status::Timeout && attempt + 1 < kAttempts && self->open() &&
-                                      self->node_.routeUp(self->endpoint_, self->peer_)) {
+                                      self->routeUsable()) {
                                       self->call(build, done, attempt + 1, raw);
                                       return;
                                   }
@@ -2008,6 +2008,12 @@ private:
             if (noRoom_) return lowMemory(done, false);  // the envelope had no room: its caller decides
             done(Status::Busy, JsonVariantConst());
         }
+    }
+
+    // The transfer's route is online, or its peer was heard so lately that
+    // the link's loss of it waits (DatagramEndpoint::linkLost()).
+    bool routeUsable() const {
+        return node_.routeUp(endpoint_, peer_) || (endpoint_ && endpoint_->lossPending(peer_));
     }
 
     void landed() {
@@ -2024,7 +2030,7 @@ private:
         bool closed, idle;
         // An envelope the peer takes (its advertised limit), asked before
         // this relay's lock: the link may take its own.
-        size_t takes = endpoint_ && node_.routeUp(endpoint_, peer_) ? endpoint_->peerLimit(peer_) : 0;
+        size_t takes = endpoint_ && routeUsable() ? endpoint_->peerLimit(peer_) : 0;
         {
             MutexGuard guard(mutex_);
             closed = closed_;

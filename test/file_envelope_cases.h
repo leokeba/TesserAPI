@@ -448,4 +448,64 @@ TEST(file_envelope_nowtp) {
               .find("no upload in progress") != std::string::npos);
 }
 
+TEST(file_envelope_kept_through_a_link_loss) {
+    // NowTP loses a peer whose announcements it missed, though its chunks
+    // keep coming (measured relaying a firmware image from DEVKIT-V3 to
+    // DEVKIT-R1): a peer heard within the grace keeps its transfer, and one
+    // silent that long is forgotten (docs/DESIGN.md section 10.3).
+    using datagram_cases::addr;
+    using datagram_cases::Net;
+    using datagram_cases::Result;
+    using tesser::DatagramEndpoint;
+    Fixture f;
+    Net net;
+    DatagramEndpoint server(&f.api, tesser::TransportKind::NowTP, net.sender(addr(2)), net.clockFn());
+    DatagramEndpoint client(nullptr, tesser::TransportKind::NowTP, net.sender(addr(1)), net.clockFn());
+    server.trust([](const tesser::PeerAddress&) { return true; });
+    net.nodes = {{addr(1), &client}, {addr(2), &server}};
+    auto call = [&](const char* envelope) {
+        JsonDocument doc;
+        deserializeJson(doc, envelope);
+        Result r;
+        CHECK(client.request(addr(2), doc.as<JsonObjectConst>(), datagram_cases::capture(r)));
+        net.run();
+        return std::string(tesser::toString(r.status)) + " " + r.body;
+    };
+    const char* first = "{\"op\":\"upload\",\"path\":\"/sys/firmware\",\"size\":8,\"data\":\"YWJjZA==\"}";
+    const char* second = "{\"op\":\"upload\",\"path\":\"/sys/firmware\",\"offset\":4,\"data\":\"ZWZnaA==\"}";
+    CHECK_EQ(call(first), "ok {\"received\":4,\"chunk\":2880}");
+    server.linkLost(addr(1));
+    server.process();
+    CHECK(server.lossPending(addr(1)));
+    CHECK_EQ(f.ram.aborted, 0);
+    CHECK_EQ(server.fileSessions(), 1u);
+    CHECK_EQ(call(second), "ok {\"bytes\":8}");
+    CHECK_EQ(f.ram.data, "abcdefgh");
+    CHECK(!server.lossPending(addr(1)));  // heard again
+    // Silent for the grace: forgotten after all, and its transfer with it.
+    CHECK_EQ(call(first), "ok {\"received\":4,\"chunk\":2880}");
+    server.linkLost(addr(1));
+    server.process();
+    net.clock += DatagramEndpoint::kLossGraceMs - 1;
+    server.process();
+    CHECK_EQ(f.ram.aborted, 0);
+    net.clock += 1;
+    server.process();
+    CHECK_EQ(f.ram.aborted, 1);
+    CHECK(!server.lossPending(addr(1)));
+    CHECK_EQ(server.fileSessions(), 0u);
+    // A peer already silent that long is forgotten at once.
+    CHECK_EQ(call(first), "ok {\"received\":4,\"chunk\":2880}");
+    net.clock += DatagramEndpoint::kLossGraceMs;
+    server.linkLost(addr(1));
+    server.process();
+    CHECK_EQ(f.ram.aborted, 2);
+    CHECK(!server.lossPending(addr(1)));
+    // forgetPeer() doesn't wait.
+    CHECK_EQ(call(first), "ok {\"received\":4,\"chunk\":2880}");
+    server.forgetPeer(addr(1));
+    server.process();
+    CHECK_EQ(f.ram.aborted, 3);
+}
+
 }  // namespace file_envelope_cases

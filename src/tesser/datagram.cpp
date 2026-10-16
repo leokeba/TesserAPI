@@ -268,6 +268,7 @@ void DatagramEndpoint::dropPeer(const PeerAddress& peer, PeerLoss reason) {
         if (k) {
             wasHeard = k->online;
             k->online = false;
+            k->lossPending = false;
             device = k->device;
             // A wrong key is reported once, heard or not, until the peer is
             // heard again.
@@ -303,6 +304,7 @@ DatagramEndpoint::Known& DatagramEndpoint::learnLocked(const PeerAddress& peer, 
         k->online = true;
         k->heardMs = now;
         k->authFailed = false;
+        k->lossPending = false;
         return *k;
     }
     if (known_.size() >= kMaxKnown) {
@@ -463,16 +465,22 @@ bool DatagramEndpoint::queue(Incoming&& msg) {
 bool DatagramEndpoint::process() {
     bool worked = false;
     std::vector<std::pair<PeerAddress, PeerLoss>> lost;
+    std::vector<PeerAddress> unheard;
     std::vector<Seen> seen;
     std::vector<Failure> failures;
     {
         MutexGuard guard(mutex_);
         lost.swap(lostPeers_);
+        unheard.swap(unheardPeers_);
         seen.swap(seenPeers_);
         failures.swap(failures_);
     }
     for (const auto& p : lost) {
         dropPeer(p.first, p.second);
+        worked = true;
+    }
+    for (const PeerAddress& p : unheard) {
+        if (!deferLoss(p)) dropPeer(p, PeerLoss::Lost);
         worked = true;
     }
     for (const Failure& f : failures) {
@@ -514,6 +522,7 @@ bool DatagramEndpoint::process() {
         for (RemoteNode* r : remotes.nodes) r->tick(*this, now);
     }
     dropFiles(nullptr, now);
+    dropDeferred(now);
     checkAdvertisement(now);
     return worked || pendingCalls() != before;
 }
@@ -1586,6 +1595,50 @@ void DatagramEndpoint::forgetPeer(const PeerAddress& peer, PeerLoss reason) {
         lostPeers_.emplace_back(peer, reason);
     }
     if (onQueued_) onQueued_();
+}
+
+void DatagramEndpoint::linkLost(const PeerAddress& peer) {
+    {
+        MutexGuard guard(mutex_);
+        unheardPeers_.push_back(peer);
+    }
+    if (onQueued_) onQueued_();
+}
+
+bool DatagramEndpoint::lossPending(const PeerAddress& peer) const {
+    MutexGuard guard(mutex_);
+    for (const Known& k : known_) {
+        if (k.peer == peer) return k.lossPending;
+    }
+    return false;
+}
+
+// A link's loss for a peer heard within kLossGraceMs: offline only, until it
+// is heard again or has been silent that long (dropDeferred()). NowTP loses a
+// peer whose announcements it missed, though its other messages come: a
+// gateway relaying a firmware image lost its transfer on the remote mid-upload
+// ("no upload in progress", DEVKIT-V3 to DEVKIT-R1).
+bool DatagramEndpoint::deferLoss(const PeerAddress& peer) {
+    uint32_t now = clock_ ? clock_() : 0;
+    {
+        MutexGuard guard(mutex_);
+        Known* k = knownLocked(peer);
+        if (!k || !k->online || now - k->heardMs >= kLossGraceMs) return false;
+        k->lossPending = true;
+    }
+    markOnline(peer, false);
+    return true;
+}
+
+void DatagramEndpoint::dropDeferred(uint32_t now) {
+    std::vector<PeerAddress> gone;
+    {
+        MutexGuard guard(mutex_);
+        for (Known& k : known_) {
+            if (k.lossPending && now - k.heardMs >= kLossGraceMs) gone.push_back(k.peer);
+        }
+    }
+    for (const PeerAddress& p : gone) dropPeer(p, PeerLoss::Lost);
 }
 
 void DatagramEndpoint::mountPeers(Object& parent, uint32_t mirrorIntervalMs) {

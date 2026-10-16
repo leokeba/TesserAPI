@@ -262,6 +262,17 @@ public:
     // work happens in the next process(). `reason` goes to onPeerLost().
     void forgetPeer(const PeerAddress& peer, PeerLoss reason = PeerLoss::Lost);
 
+    // The link stopped hearing the peer (NowTP's discovery lost it: no
+    // announcement for a while). A peer this endpoint heard from within
+    // kLossGraceMs is only marked offline: its calls, subscriptions, token
+    // and file transfer stay, and its next message cancels the loss. Once it
+    // has been silent that long, it is forgotten as by forgetPeer(). Safe
+    // from any task, like forgetPeer() (docs/DESIGN.md section 10.3).
+    void linkLost(const PeerAddress& peer);
+    static constexpr uint32_t kLossGraceMs = 5000;
+    // Whether linkLost() was deferred for the peer, which hasn't been heard since.
+    bool lossPending(const PeerAddress& peer) const;
+
     // ---- link failures ----------------------------------------------------
     // The link couldn't deliver a message it had accepted (its completion
     // callback): `callId` is callIdOf() the message, 0 for one that isn't a
@@ -456,6 +467,7 @@ private:
         uint32_t heardMs;
         bool authFailed = false;  // reported as such; cleared when heard
         size_t maxMessage = 0;    // as it advertises (0: not said)
+        bool lossPending = false; // linkLost() deferred: cleared when heard
     };
     struct Failure {
         PeerAddress peer;
@@ -509,6 +521,8 @@ private:
     void checkAdvertisement(uint32_t now);
     void handleFile(JsonObjectConst envelope, const Incoming& msg, const Client& client);
     void dropFiles(const PeerAddress* peer, uint32_t now);
+    bool deferLoss(const PeerAddress& peer);
+    void dropDeferred(uint32_t now);
 
     Api* api_;
     TransportKind kind_;
@@ -532,6 +546,7 @@ private:
     std::vector<Incoming> queue_;  // a vector: an empty deque allocates
     std::vector<CallSlot> calls_;
     std::vector<std::pair<PeerAddress, PeerLoss>> lostPeers_;  // forgetPeer() → process()
+    std::vector<PeerAddress> unheardPeers_;                    // linkLost() → process()
     std::vector<Failure> failures_;                            // sendFailed() → process()
     std::vector<Seen> seenPeers_;         // peerSeen() → process()
     // Schema hashes peers advertised, for remote nodes created later.

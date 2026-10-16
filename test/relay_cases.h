@@ -766,4 +766,49 @@ TEST(relay_waiting) {
     CHECK_EQ(r.gateway.pending(), 0);
 }
 
+TEST(relay_survives_a_link_loss) {
+    // NowTP loses a peer whose announcements it missed, though its messages
+    // come: on both sides mid-transfer, the relay goes on by its route
+    // (DatagramEndpoint::linkLost(); "no upload in progress" relaying a
+    // firmware image from DEVKIT-V3 to DEVKIT-R1).
+    Rig r;
+    auto chunk = [&](size_t at, size_t n) {
+        return r.ask("{\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":" + std::to_string(at) + ",\"data\":\"" +
+                     b64(r.big.substr(at, n)) + "\"}");
+    };
+    CHECK_EQ(r.ask("{\"op\":\"upload\",\"path\":\"/dev/big\",\"size\":3000,\"data\":\"" + b64(r.big.substr(0, 576)) +
+                   "\"}"),
+             "{\"status\":\"ok\",\"body\":{\"received\":576,\"chunk\":576}}");
+    r.gatewayEnd.linkLost(addr(2));
+    r.deviceEnd.linkLost(addr(1));
+    r.gatewayEnd.process();
+    r.deviceEnd.process();
+    CHECK(!r.dev.online());
+    CHECK(r.gatewayEnd.lossPending(addr(2)));
+    CHECK(r.deviceEnd.lossPending(addr(1)));
+    for (size_t at = 576; at < 2880; at += 576) {
+        CHECK_EQ(chunk(at, 576), "{\"status\":\"ok\",\"body\":{\"received\":" + std::to_string(at + 576) + "}}");
+    }
+    CHECK_EQ(chunk(2880, 120), "{\"status\":\"ok\",\"body\":null}");
+    CHECK_EQ(r.got, r.big);
+    CHECK(r.dev.online());  // heard again
+    CHECK(!r.gatewayEnd.lossPending(addr(2)));
+
+    // A device silent for the grace is lost after all: the transfer ends.
+    r.got.clear();
+    CHECK(r.ask("{\"op\":\"upload\",\"path\":\"/dev/big\",\"size\":3000,\"data\":\"" + b64(r.big.substr(0, 576)) +
+                "\"}")
+              .find("\"received\":576") != std::string::npos);
+    r.gatewayEnd.linkLost(addr(2));
+    r.gatewayEnd.process();
+    r.net.clock += DatagramEndpoint::kLossGraceMs;
+    r.gatewayEnd.process();
+    CHECK(!r.gatewayEnd.lossPending(addr(2)));
+    CHECK_EQ(chunk(576, 576), "{\"status\":\"timeout\",\"body\":{\"error\":\"timeout\",\"reason\":\"peer_offline\","
+                              "\"path\":\"/dev\",\"message\":\"peer offline\"}}");
+    CHECK(chunk(576, 576).find("no upload in progress") != std::string::npos);
+    CHECK(r.got.empty());
+    CHECK_EQ(r.gateway.pending(), 0);
+}
+
 }  // namespace relay_cases

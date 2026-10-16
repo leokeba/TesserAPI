@@ -62,7 +62,7 @@ public:
 
     // Call from your NowTP peer-event handler when a peer is lost: fails its
     // pending calls and drops its subscriptions.
-    void peerLost(const nowtp::Mac& mac) { endpoint_.forgetPeer(address(mac)); }
+    void peerLost(const nowtp::Mac& mac) { endpoint_.linkLost(address(mac)); }
     // Or hand it every peer event: TesserAPI peers on this port are marked
     // online (and mounted, with mountPeers()), lost ones offline.
     //   radio.onPeerEvent([](nowtp::PeerEvent e, const nowtp::PeerInfo& p) { nowApi.peerEvent(e, p); });
