@@ -302,24 +302,6 @@ RemoteNode::AccessHandler& sharedAccessHandler() {
     return fn;
 }
 
-constexpr uint8_t kStreamAttempts = 3;  // a streamed set that timed out is sent twice more
-
-// A path below a remote node: "" for the node, else "/a/b".
-std::string normalPath(std::string_view p) {
-    std::string s(p);
-    if (!s.empty() && s.front() != '/') s.insert(0, "/");
-    while (!s.empty() && s.back() == '/') s.pop_back();
-    return s;
-}
-
-// One path is the other or below it.
-bool overlaps(const std::string& a, const std::string& b) {
-    const std::string& shorter = a.size() < b.size() ? a : b;
-    const std::string& longer = a.size() < b.size() ? b : a;
-    return longer.compare(0, shorter.size(), shorter) == 0 &&
-           (longer.size() == shorter.size() || longer[shorter.size()] == '/');
-}
-
 }  // namespace
 
 TransportKind RemoteNode::Route::kind() const { return endpoint ? endpoint->kind() : TransportKind::Local; }
@@ -1165,49 +1147,16 @@ Status RemoteNode::stream(std::string_view path, std::string_view bodyJson) {
     if (deserializeJson(body, bodyJson.data(), bodyJson.size(), DeserializationOption::NestingLimit(kWrittenNesting))) {
         return Status::BadRequest;
     }
-    std::string p = normalPath(path);
-    {
-        MutexGuard guard(streamMutex_);
-        // On top of the last set queued for the path, unless a set to a path
-        // above or below it came after (they must stay in order).
-        bool merged = false;
-        for (size_t i = queue_.size(); i-- > 0;) {
-            if (queue_[i].path == p) {
-                detail::mergeJson(queue_[i].body.as<JsonVariant>(), body.as<JsonVariantConst>());
-                merged = true;
-                break;
-            }
-            if (overlaps(queue_[i].path, p)) break;
-        }
-        if (merged) {
-            streamStats_.queued++;
-            streamStats_.merged++;
-        } else {
-            if (queue_.size() >= streamLimit_) return Status::Busy;
-            queue_.emplace_back();
-            queue_.back().path = std::move(p);
-            queue_.back().body = std::move(body);
-            streamStats_.queued++;
-        }
-    }
-    pump();
-    return Status::Ok;
+    Status s = stream_.push(path, std::move(body));
+    if (s == Status::Ok) pump();
+    return s;
 }
 
-void RemoteNode::onStreamError(StreamErrorHandler fn) {
-    MutexGuard guard(streamMutex_);
-    onStreamError_ = std::move(fn);
-}
+void RemoteNode::onStreamError(StreamErrorHandler fn) { stream_.onError(std::move(fn)); }
 
-RemoteNode::StreamStats RemoteNode::streamStats() const {
-    MutexGuard guard(streamMutex_);
-    return streamStats_;
-}
+RemoteNode::StreamStats RemoteNode::streamStats() const { return stream_.stats(); }
 
-size_t RemoteNode::streaming() const {
-    MutexGuard guard(streamMutex_);
-    return queue_.size() + (inFlight_ ? 1 : 0);
-}
+size_t RemoteNode::streaming() const { return stream_.size(); }
 
 uint32_t RemoteNode::streamTimeoutMs() const {
     // Longer than the link takes to give up on a message (UDP's sendTimeoutMs
@@ -1221,92 +1170,20 @@ uint32_t RemoteNode::streamTimeoutMs() const {
     return t * 2;
 }
 
-// Puts a set that must go again at the front, with the later sets to its
-// path merged on top (up to one to a path above or below it).
-void RemoteNode::requeue(std::vector<Pending>& queue, Pending p) {
-    for (size_t i = 0; i < queue.size();) {
-        if (queue[i].path == p.path) {
-            detail::mergeJson(p.body.as<JsonVariant>(), queue[i].body.as<JsonVariantConst>());
-            queue.erase(queue.begin() + static_cast<std::ptrdiff_t>(i));
-            continue;
-        }
-        if (overlaps(queue[i].path, p.path)) break;
-        i++;
-    }
-    queue.insert(queue.begin(), std::move(p));
-}
-
 // Sends the next streamed set if none is in flight; drops them all if the
 // node is offline.
 void RemoteNode::pump() {
     Route r;
     bool reachable = route(r) && online();
-    std::vector<Pending> dropped;
     std::string path, body;
-    StreamErrorHandler onError;
-    {
-        MutexGuard guard(streamMutex_);
-        if (inFlight_ || queue_.empty()) return;
-        if (!reachable) {
-            dropped.swap(queue_);
-            streamStats_.failed += static_cast<uint32_t>(dropped.size());
-            onError = onStreamError_;
-        } else {
-            flying_ = std::move(queue_.front());
-            queue_.erase(queue_.begin());
-            inFlight_ = true;
-            streamStats_.sent++;
-            path = flying_.path;
-            serializeJson(flying_.body, body);
-        }
-    }
-    if (!reachable) {
-        if (!onError) return;
-        JsonDocument error;
-        error["error"] = "timeout";
-        error["reason"] = "peer_offline";
-        error["message"] = "peer offline";
-        for (const Pending& p : dropped) {
-            error["path"] = p.path.empty() ? std::string("/") : p.path;
-            onError(p.path, Status::Timeout, error.as<JsonVariantConst>());
-        }
-        return;
-    }
+    if (!stream_.next(reachable, path, body)) return;
     bool sent = r.endpoint->request(
         r.peer, Op::Set, remotePathOf(path), std::string_view(body),
-        [this](Status s, JsonVariantConst reply) { streamDone(s, reply); }, Query(), streamTimeoutMs(), this);
-    if (!sent) {
-        // No call slot or no room on the link: tick() tries again.
-        MutexGuard guard(streamMutex_);
-        inFlight_ = false;
-        streamStats_.sent--;
-        requeue(queue_, std::move(flying_));
-    }
-}
-
-void RemoteNode::streamDone(Status s, JsonVariantConst body) {
-    bool retry = s == Status::Timeout || s == Status::Busy;
-    std::string failed;
-    StreamErrorHandler onError;
-    {
-        MutexGuard guard(streamMutex_);
-        if (!inFlight_) return;
-        inFlight_ = false;
-        Pending p = std::move(flying_);
-        if (retry && ++p.attempts < kStreamAttempts) {
-            // Applied or not, it goes again, under anything newer: on the
-            // next route if this one was lost.
-            requeue(queue_, std::move(p));
-        } else if (s != Status::Ok) {
-            failed = p.path;
-            streamStats_.failed++;
-            onError = onStreamError_;
-            retry = false;
-        }
-    }
-    if (onError) onError(failed, s, body);
-    // A busy peer gets a moment: tick() sends it again.
-    if (s != Status::Busy) pump();
+        [this](Status s, JsonVariantConst reply) {
+            if (stream_.done(s, reply)) pump();
+        },
+        Query(), streamTimeoutMs(), this);
+    if (!sent) stream_.unsent();  // tick() tries again
 }
 
 // ---- forwarded subscriptions ------------------------------------------------

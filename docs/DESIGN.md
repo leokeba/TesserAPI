@@ -1212,9 +1212,10 @@ The layout follows NowTP:
 - The component's `Kconfig` selects `CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT` when WebSocket support is on (§10.5).
 - `library.properties` and `library.json` for Arduino and PlatformIO.
 
-**Source files.** A remote node (§14) is split into units, each in its own file:
+**Source files.** A remote node (§14) is split into units, each in its own file. A unit holds its state and its lock (§9), and `test/remote_unit_cases.h` tests it without a node or a link:
 - `remote.cpp`: the node itself. It forwards requests, passes the peer's notifications on, presents tokens and calls the hooks.
 - `remote_relay.cpp`: relayed file transfers (`FileRelay`), which use only the node's public interface.
+- `remote_stream.cpp` (`detail::SetStream`): the queue of streamed sets (§14.3), its merging and retries, under its own leaf lock. The node sends what the queue gives it.
 
 The Bluetooth transport (§10.6) is a header that `TesserAPI.h` doesn't include, so that only the firmware using it compiles a BLE stack. On ESP-IDF, its source compiles to nothing unless NimBLE is enabled.
 

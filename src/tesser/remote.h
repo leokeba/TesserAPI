@@ -8,6 +8,7 @@
 #include <ArduinoJson.h>
 
 #include "tesser/datagram.h"
+#include "tesser/detail/remote_stream.h"
 #include "tesser/node.h"
 #include "tesser/platform.h"
 #include "tesser/request.h"
@@ -107,14 +108,11 @@ public:
     using StateHandler = std::function<void(RemoteNode& node)>;
     // A streamed set that failed: `path` below the node, the status, and the
     // remote's error body (null when it didn't answer).
-    using StreamErrorHandler = std::function<void(const std::string& path, Status status, JsonVariantConst body)>;
-
-    struct StreamStats {
-        uint32_t queued = 0;  // sets accepted
-        uint32_t merged = 0;  // sets merged into one still queued
-        uint32_t sent = 0;    // requests sent, resends included
-        uint32_t failed = 0;  // sets dropped: error reply, peer offline, out of attempts
-    };
+    using StreamErrorHandler = detail::SetStream::ErrorHandler;
+    // queued: sets accepted; merged: sets merged into one still queued;
+    // sent: requests sent, resends included; failed: sets dropped (error
+    // reply, peer offline, out of attempts).
+    using StreamStats = detail::SetStream::Stats;
 
     RemoteNode(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath);
     // Same, owning a copy of its name (nodes mounted at run time).
@@ -276,7 +274,7 @@ public:
     Status stream(std::string_view path, std::string_view bodyJson);
     // Sets that may wait (default 8).
     RemoteNode& streamLimit(size_t entries) {
-        streamLimit_ = entries;
+        stream_.setLimit(entries);
         return *this;
     }
     // Called, in an endpoint's process() and without the API lock, for each
@@ -362,11 +360,6 @@ private:
         Route route;
         uint32_t added;  // tie-break: routes of the same rank keep this order
     };
-    struct Pending {
-        std::string path;  // below the node
-        JsonDocument body;
-        uint8_t attempts = 0;
-    };
 
     // Its Api's route order, else the process-wide default.
     std::vector<RouteKind> inheritedOrder() const;
@@ -380,9 +373,8 @@ private:
     int activeLocked() const;
     void updateOnlineLocked();
     void rerouted(const Route& from, uint32_t nowMs);
+    // Sends the next streamed set if none is in flight.
     void pump();
-    static void requeue(std::vector<Pending>& queue, Pending p);
-    void streamDone(Status s, JsonVariantConst body);
     uint32_t streamTimeoutMs() const;
 
     std::string remotePath_;
@@ -436,14 +428,7 @@ private:
     std::atomic<uint8_t> protocol_{0};
     std::string ownedName_;
 
-    // Streamed sets, guarded by streamMutex_ (a leaf like routesMutex_).
-    mutable Mutex streamMutex_{kRankLeaf, "remote stream"};
-    std::vector<Pending> queue_;
-    Pending flying_;
-    bool inFlight_ = false;
-    size_t streamLimit_ = 8;
-    StreamStats streamStats_;
-    StreamErrorHandler onStreamError_;
+    detail::SetStream stream_;  // streamed sets, under their own lock (a leaf like routesMutex_)
 };
 
 }  // namespace tesser
