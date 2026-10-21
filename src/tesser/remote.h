@@ -10,6 +10,7 @@
 #include "tesser/datagram.h"
 #include "tesser/detail/remote_routes.h"
 #include "tesser/detail/remote_stream.h"
+#include "tesser/detail/remote_upstream.h"
 #include "tesser/node.h"
 #include "tesser/platform.h"
 #include "tesser/request.h"
@@ -172,9 +173,9 @@ public:
     PeerAddress peer() const;
     const std::string& remotePath() const { return remotePath_; }
     uint32_t timeoutMs() const { return timeoutMs_; }
-    bool mirrored() const { return mirror_; }
+    bool mirrored() const { return upstream_.mirrored(); }
     // The level the mirrored copy is read at (see mirror()).
-    Access mirrorLevel() const { return mirrorLevel_; }
+    Access mirrorLevel() const { return upstream_.mirrorLevel(); }
     bool hasCopy() const;
 
     // Whether the device is reachable, as far as the endpoints know: false
@@ -296,40 +297,15 @@ public:
 
     // What an upstream subscription asks for: the union of what its local
     // subscribers need (docs/DESIGN.md section 14).
-    struct Spec {
-        std::string keys;     // sorted, comma-separated; empty: every child
-        std::string exclude;  // likewise, with no keys
-        int depth = -1;       // -1: unlimited
-        bool operator==(const Spec& o) const { return keys == o.keys && exclude == o.exclude && depth == o.depth; }
-        bool operator!=(const Spec& o) const { return !(*this == o); }
-    };
+    using Spec = UpstreamSpec;
 
 private:
-    // One subscription to the remote node, shared by local subscribers at
-    // one level.
-    struct Upstream {
-        std::string rest;  // below this node; "" for the node itself
-        Access level = Access::Admin;  // its subscribers': the ceiling it asks for
-        JsonDocument copy;  // the remote's state, kept with its notifications
-        bool ready = false;
-        bool subscribing = false;
-        bool stale = false;  // a renewal failed: retry soon
-        uint32_t interval = 0;
-        uint32_t lastSubscribeMs = 0;
-        Spec spec;      // what the subscribers need now
-        Spec sent;      // what the request in flight (or the last) asked for
-        Spec copySpec;  // what `copy` holds
-    };
-    // The union of the needs of `local`'s subscribers at `level`, plus `extra`'s.
-    Spec wanted(const std::string& local, Access level, const Subscription* extra);
+    friend class detail::UpstreamCache;  // sends through the node, notifies its Api
 
+    // Finds its Api, and its path there, if not known yet: false while it
+    // isn't in a tree.
     bool localPath(std::string& out);
-    Upstream* findUpstream(std::string_view rest, Access level);
     std::string remotePathOf(std::string_view rest) const;
-    bool sendUpstream(const std::string& rest, Access level, uint32_t interval, bool renew);
-    void upstreamReply(const std::string& rest, Access level, Status status, JsonVariantConst body);
-    bool relayChange(std::string_view rest, Access level, JsonVariantConst patch);
-    void rerouted(const Route& from, uint32_t nowMs);
     // Sends the next streamed set if none is in flight.
     void pump();
     uint32_t streamTimeoutMs() const;
@@ -351,20 +327,10 @@ private:
     bool autoMounted_ = false;
     std::atomic<int> relays_{0};
 
-    bool mirror_ = false;
-    Access mirrorLevel_ = Access::Public;
-    uint32_t mirrorIntervalMs_ = 500;
-    uint32_t refreshMs_ = 30000;
-    uint32_t lastSubscribeMs_ = 0;
-    std::atomic<bool> subscribing_{false};
-    bool subscribedOnce_ = false;
-    mutable Mutex mutex_{kRankRemote, "remote"};  // after the API lock
-    JsonDocument copy_;
-    bool hasCopy_ = false;
+    detail::UpstreamCache upstream_;  // the mirror and shared subscriptions, under the remote lock
     std::atomic<Api*> api_{nullptr};  // the Api it is mounted in, once known (localPath())
     std::atomic<uint32_t> apiLookupMs_{0};  // tick(): when api_ was last looked for
     std::string localPath_;
-    std::vector<std::unique_ptr<Upstream>> upstreams_;  // guarded by mutex_
     std::atomic<uint32_t> advertisedSchema_{0};
     std::atomic<uint8_t> protocol_{0};
     std::string ownedName_;

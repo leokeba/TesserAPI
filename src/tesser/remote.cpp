@@ -2,221 +2,13 @@
 
 #include <stdio.h>
 
-#include <algorithm>
-
 #include "tesser/api.h"
 #include "tesser/budget.h"
 #include "tesser/call.h"
-#include "tesser/detail/lazy_patch.h"
 #include "tesser/detail/remote_json.h"
 #include "tesser/envelope.h"
 
 namespace tesser {
-
-namespace {
-
-// A copy rendered like the value view: objects below `depth` levels as {}.
-void writeLimited(JsonWriter& w, JsonVariantConst v, int depth) {
-    if (v.is<JsonObjectConst>()) {
-        w.beginObject();
-        if (depth > 0) {
-            for (JsonPairConst kv : v.as<JsonObjectConst>()) {
-                w.key(std::string_view(kv.key().c_str(), kv.key().size()));
-                writeLimited(w, kv.value(), depth - 1);
-            }
-        }
-        w.endObject();
-    } else if (v.is<JsonArrayConst>()) {
-        // A remote list or array: one value, whole at any depth.
-        int d = depth > detail::kWholeDepth ? depth : detail::kWholeDepth;
-        w.beginArray();
-        for (JsonVariantConst e : v.as<JsonArrayConst>()) writeLimited(w, e, d);
-        w.endArray();
-    } else {
-        w.variant(v);
-    }
-}
-
-bool inList(std::string_view list, std::string_view name) {
-    size_t pos = 0;
-    while (pos <= list.size()) {
-        size_t comma = list.find(',', pos);
-        if (comma == std::string_view::npos) comma = list.size();
-        std::string_view item = list.substr(pos, comma - pos);
-        while (!item.empty() && item.front() == ' ') item.remove_prefix(1);
-        while (!item.empty() && item.back() == ' ') item.remove_suffix(1);
-        if (item == name) return true;
-        pos = comma + 1;
-    }
-    return false;
-}
-
-bool passes(const Subscription& sub, JsonString key) {
-    std::string_view k(key.c_str(), key.size());
-    if (!sub.keys.empty() && !inList(sub.keys, k)) return false;
-    if (!sub.exclude.empty() && inList(sub.exclude, k)) return false;
-    return true;
-}
-
-int depthOf(const Subscription& sub) { return sub.depth < 0 ? 255 : sub.depth; }
-
-// ---- upstream specs ------------------------------------------------------------
-
-using Spec = RemoteNode::Spec;
-
-std::vector<std::string> listItems(std::string_view list) {
-    std::vector<std::string> out;
-    size_t pos = 0;
-    while (pos <= list.size()) {
-        size_t comma = list.find(',', pos);
-        if (comma == std::string_view::npos) comma = list.size();
-        std::string_view item = list.substr(pos, comma - pos);
-        while (!item.empty() && item.front() == ' ') item.remove_prefix(1);
-        while (!item.empty() && item.back() == ' ') item.remove_suffix(1);
-        if (!item.empty()) out.emplace_back(item);
-        pos = comma + 1;
-    }
-    return out;
-}
-
-std::string joinSorted(std::vector<std::string> items) {
-    std::sort(items.begin(), items.end());
-    items.erase(std::unique(items.begin(), items.end()), items.end());
-    std::string s;
-    for (const std::string& i : items) {
-        if (!s.empty()) s += ',';
-        s += i;
-    }
-    return s;
-}
-
-Spec specOf(const Subscription& sub) {
-    Spec s;
-    std::vector<std::string> keys = listItems(sub.keys);
-    s.keys = joinSorted(keys);
-    if (keys.empty()) s.exclude = joinSorted(listItems(sub.exclude));
-    s.depth = sub.depth < 0 ? -1 : sub.depth;
-    return s;
-}
-
-// Everything any of `specs` needs: the deepest depth; the keys of all when
-// all have keys, else every child but those all of them leave out.
-Spec unionOf(const std::vector<Spec>& specs) {
-    Spec u;
-    if (specs.empty()) return u;
-    bool unlimited = false, allKeyed = true, anyUnkeyed = false;
-    int depth = 0;
-    std::vector<std::string> keys, exclude;
-    for (const Spec& s : specs) {
-        if (s.depth < 0) {
-            unlimited = true;
-        } else if (s.depth > depth) {
-            depth = s.depth;
-        }
-        std::vector<std::string> k = listItems(s.keys);
-        if (!k.empty()) {
-            keys.insert(keys.end(), k.begin(), k.end());
-            continue;
-        }
-        allKeyed = false;
-        std::vector<std::string> e = listItems(s.exclude);
-        if (!anyUnkeyed) {
-            exclude = e;
-            anyUnkeyed = true;
-        } else {
-            std::vector<std::string> both;
-            for (const std::string& x : exclude) {
-                if (std::find(e.begin(), e.end(), x) != e.end()) both.push_back(x);
-            }
-            exclude = both;
-        }
-    }
-    u.depth = unlimited ? -1 : depth;
-    if (allKeyed) {
-        u.keys = joinSorted(keys);
-    } else {
-        std::vector<std::string> left;
-        for (const std::string& x : exclude) {
-            if (std::find(keys.begin(), keys.end(), x) == keys.end()) left.push_back(x);
-        }
-        u.exclude = joinSorted(left);
-    }
-    return u;
-}
-
-// `have` holds everything `need` asks for.
-bool covers(const Spec& have, const Spec& need) { return unionOf({have, need}) == have; }
-
-// A subscription's snapshot, cut from the shared copy: keys and exclude at the
-// top level, then depth, as for a get.
-void writeSnapshot(JsonWriter& w, JsonVariantConst v, const Subscription& sub) {
-    int depth = depthOf(sub);
-    if (!v.is<JsonObjectConst>() || (sub.keys.empty() && sub.exclude.empty())) return writeLimited(w, v, depth);
-    w.beginObject();
-    if (depth > 0) {
-        for (JsonPairConst kv : v.as<JsonObjectConst>()) {
-            if (!passes(sub, kv.key())) continue;
-            w.key(std::string_view(kv.key().c_str(), kv.key().size()));
-            writeLimited(w, kv.value(), depth - 1);
-        }
-    }
-    w.endObject();
-}
-
-// Change notifications follow the local rule (subscription.cpp): values up
-// to `depth` levels down, nothing from objects beyond it.
-bool hasChanges(JsonVariantConst v, int depth, const Subscription* top) {
-    if (depth <= 0) return false;
-    for (JsonPairConst kv : v.as<JsonObjectConst>()) {
-        if (top && !passes(*top, kv.key())) continue;
-        if (!kv.value().is<JsonObjectConst>() || hasChanges(kv.value(), depth - 1, nullptr)) return true;
-    }
-    return false;
-}
-
-void writeChanges(JsonWriter& w, JsonVariantConst v, int depth, const Subscription* top) {
-    w.beginObject();
-    for (JsonPairConst kv : v.as<JsonObjectConst>()) {
-        if (top && !passes(*top, kv.key())) continue;
-        bool object = kv.value().is<JsonObjectConst>();
-        if (object && !hasChanges(kv.value(), depth - 1, nullptr)) continue;
-        w.key(std::string_view(kv.key().c_str(), kv.key().size()));
-        if (object) {
-            writeChanges(w, kv.value(), depth - 1, nullptr);
-        } else {
-            w.variant(kv.value());
-        }
-    }
-    w.endObject();
-}
-
-// Sends one change notification to a forwarded subscriber.
-void notifyChange(Subscription& sub, const std::function<void(JsonWriter&)>& body) {
-    std::string msg;
-    StringSink sink(msg, 0, true);
-    JsonWriter m(sink);
-    m.beginObject();
-    m.key("op");
-    m.string("change");
-    m.key("path");
-    m.string(sub.path);
-    m.key("body");
-    body(m);
-    if (sub.ceiling < Access::Admin) {  // made with one: "sub@user"
-        m.key("as");
-        m.string(toString(sub.ceiling));
-    }
-    if (sub.subscriber->missed.exchange(false)) {
-        m.key("overflow");
-        m.boolean(true);
-    }
-    m.endObject();
-    // There is nothing to resend from later: "overflow" tells the client to
-    // re-read. So it is when the heap couldn't hold this one.
-    if (!m.ok() || !sub.subscriber->notify(msg, Delivery::Reliable)) sub.subscriber->missed = true;
-}
-
-}  // namespace
 
 namespace detail {
 
@@ -547,76 +339,19 @@ void RemoteNode::detach(const DatagramEndpoint* endpoint) {
     if (routes_.detach(endpoint)) changed();
 }
 
-// The route in use changed (`from` was it before): subscriptions move to the
-// new one, now.
-void RemoteNode::rerouted(const Route& from, uint32_t nowMs) {
-    std::vector<std::pair<std::string, Access>> paths;
-    {
-        MutexGuard guard(mutex_);
-        for (auto& u : upstreams_) {
-            if (!u->ready) continue;
-            paths.emplace_back(remotePathOf(u->rest), u->level);
-            u->stale = true;  // renewed below, on the new route
-            u->lastSubscribeMs = nowMs - 2000;
-        }
-    }
-    if (mirror_) {
-        paths.emplace_back(remotePath_, mirrorLevel_);
-        subscribedOnce_ = false;  // tick() subscribes again at once
-    }
-    // Back to a preferred route while the other one still works: drop what
-    // the device sends that way. (A lost route's subscriptions end on their
-    // own: the device fails to deliver to it.)
-    if (!from.endpoint || !from.online || !hasRoute(from.endpoint, from.peer)) return;
-    for (const auto& p : paths) {
-        Query q;
-        q.ceiling = p.second;
-        from.endpoint->request(
-            from.peer, Op::Unsubscribe, p.first, std::string_view(), [](Status, JsonVariantConst) {}, q, timeoutMs_,
-            this);
-    }
-}
-
 RemoteNode& RemoteNode::mirror(uint32_t intervalMs, uint32_t refreshMs, Access level) {
-    mirror_ = true;
-    mirrorLevel_ = level;
+    upstream_.mirror(intervalMs, refreshMs, level);
     touch();
-    mirrorIntervalMs_ = intervalMs;
-    refreshMs_ = refreshMs;
     return *this;
 }
-
-bool RemoteNode::hasCopy() const {
-    MutexGuard guard(mutex_);
-    return hasCopy_;
-}
-
-size_t RemoteNode::upstreamCount() const {
-    MutexGuard guard(mutex_);
-    return upstreams_.size();
-}
-
-void RemoteNode::writeCopy(JsonWriter& w, int depth) const {
-    MutexGuard guard(mutex_);
-    if (hasCopy_) {
-        writeLimited(w, copy_.as<JsonVariantConst>(), depth);
-    } else {
-        w.null();
-    }
-}
-
+bool RemoteNode::hasCopy() const { return upstream_.hasCopy(); }
+size_t RemoteNode::upstreamCount() const { return upstream_.count(); }
+void RemoteNode::writeCopy(JsonWriter& w, int depth) const { upstream_.writeCopy(w, depth); }
 std::string RemoteNode::remotePathOf(std::string_view rest) const {
     std::string p = remotePath_ == "/" ? std::string() : remotePath_;
     p.append(rest.data(), rest.size());
     if (p.empty()) p = "/";
     return p;
-}
-
-RemoteNode::Upstream* RemoteNode::findUpstream(std::string_view rest, Access level) {
-    for (auto& u : upstreams_) {
-        if (u->rest == rest && u->level == level) return u.get();
-    }
-    return nullptr;
 }
 
 void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
@@ -633,7 +368,7 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
     detail::RouteTable::Observed seen = routes_.observe(cur, online());
     if (seen.switched) {
         changed();  // the schema shows the route
-        rerouted(seen.from, nowMs);
+        upstream_.rerouted(*this, seen.from, nowMs);
     }
     if (seen.stateChanged) {
         StateHandler fn;
@@ -653,79 +388,10 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
             r.peer, Op::Get, remotePath_, std::string_view(), [](Status, JsonVariantConst) {}, q, timeoutMs_, this);
     }
 
-    // Forwarded subscriptions: renewed every refreshMs in case the remote
-    // node restarted, every 2 s after a failed renewal.
-    struct Renewal {
-        std::string rest;
-        Access level;
-        uint32_t interval;
-    };
-    std::vector<Renewal> renew;
-    {
-        MutexGuard guard(mutex_);
-        for (auto& u : upstreams_) {
-            if (u->subscribing || !u->ready) continue;
-            uint32_t every = u->stale ? 2000 : refreshMs_;
-            if (nowMs - u->lastSubscribeMs < every) continue;
-            u->subscribing = true;
-            u->lastSubscribeMs = nowMs;
-            renew.push_back(Renewal{u->rest, u->level, u->interval});
-        }
-    }
-    for (auto& r : renew) {
-        if (!sendUpstream(r.rest, r.level, r.interval, true)) {
-            MutexGuard guard(mutex_);
-            if (Upstream* u = findUpstream(r.rest, r.level)) u->subscribing = false;
-        }
-    }
-
+    upstream_.renew(*this, nowMs);
     // Streamed sets that couldn't be sent (no call slot, a busy peer).
     pump();
-
-    if (!mirror_ || subscribing_) return;
-    if (subscribedOnce_) {
-        // Renew: after refreshMs with a copy, every 2 s while there is none.
-        uint32_t every = hasCopy() ? refreshMs_ : 2000;
-        if (nowMs - lastSubscribeMs_ < every) return;
-    }
-    subscribedOnce_ = true;
-    lastSubscribeMs_ = nowMs;
-    subscribing_ = true;
-    // Drop any previous subscription first, so renewals don't pile up.
-    Query unsub;
-    unsub.ceiling = mirrorLevel_;
-    cur.endpoint->request(
-        cur.peer, Op::Unsubscribe, remotePath_, std::string_view(), [](Status, JsonVariantConst) {}, unsub,
-        timeoutMs_, this);
-    Query q;
-    q.interval = mirrorIntervalMs_;
-    q.remotes = false;  // never mirror the peer's own mirrors: no loops between gateways
-    q.ceiling = mirrorLevel_;  // the copy is what a client at that level reads
-    // The snapshot is parsed once, from the reply's text, straight into the
-    // copy (the old one goes first), and only with room for it in the byte
-    // budget: parsed as a reply, then copied, it was held three ways at
-    // once, and a peer coming back after a restart took a gateway's free
-    // heap 2 KB below its floor (DEVKIT-V3 mirroring DEVKIT-R1).
-    bool sent = cur.endpoint->requestRaw(
-        cur.peer, Op::Subscribe, remotePath_, JsonVariantConst(),
-        [this](std::string_view text) {
-            subscribing_ = false;
-            // A document takes up to about three times its text in small
-            // values.
-            Reservation room = memoryBudget().reserve(3 * text.size(), 0, false);
-            if (!room) return;  // retried in 2 s
-            {
-                MutexGuard guard(mutex_);
-                copy_.clear();
-                hasCopy_ = !deserializeJson(copy_, text.data(), text.size(),
-                                            DeserializationOption::NestingLimit(kWrittenNesting));
-                if (!hasCopy_) copy_.clear();
-            }
-            changed();
-        },
-        [this](Status, JsonVariantConst) { subscribing_ = false; },  // retried in 2 s
-        q, timeoutMs_, this);
-    if (!sent) subscribing_ = false;
+    upstream_.refreshMirror(*this, cur, nowMs);
 }
 
 bool RemoteNode::localPath(std::string& out) {
@@ -752,47 +418,8 @@ bool RemoteNode::handleNotification(const DatagramEndpoint& by, const PeerAddres
     // The level of the subscription it comes from ("as"; none: admin).
     Access level = Access::Admin;
     if (envelope["as"].is<const char*>() && !parseAccess(envelope["as"].as<const char*>(), level)) return false;
-    bool forMirror = mirror_ && level == mirrorLevel_;
     std::string_view op(envelope["op"] | "");
-    if (op == "change") {
-        if (!forMirror || !rest.empty()) return relayChange(rest, level, envelope["body"]);
-        {
-            MutexGuard guard(mutex_);
-            // Merged, the change takes about twice its text more in the
-            // copy: only within the budget (docs/DESIGN.md section 15). Else
-            // the copy goes, and is taken again whole within 2 s.
-            Reservation room = memoryBudget().reserve(2 * measureJson(envelope["body"]), 0, false);
-            if (!room) {
-                copy_.clear();
-                hasCopy_ = false;
-            } else if (hasCopy_) {
-                detail::mergeJson(copy_.as<JsonVariant>(), envelope["body"]);
-            } else {
-                copy_.set(envelope["body"]);
-                hasCopy_ = true;
-            }
-        }
-        changed();
-        return true;
-    }
-    if (op == "event") {
-        if (!forMirror && upstreamCount() == 0) return false;
-        std::string local;
-        if (!localPath(local)) return true;
-        local.append(rest.data(), rest.size());
-        JsonVariantConst body = envelope["body"];
-        // It came at `level`, once for every subscription of this node's at
-        // that level it concerns: for the local subscribers at that level
-        // below this node, and, from the mirror, for those of the copy.
-        api_.load()->emitEvent(
-            local, [body](JsonWriter& w) { w.variant(body); },
-            [this, level, forMirror](const Subscription& sub) {
-                if (sub.forwarded) return sub.node == this && sub.access == level;
-                return forMirror && sub.access >= level;
-            });
-        return true;
-    }
-    return false;
+    return upstream_.notified(*this, rest, level, op, envelope);
 }
 
 void RemoteNode::forward(Api& api, const Request& request, std::string_view rest, std::string_view base,
@@ -911,343 +538,28 @@ void RemoteNode::pump() {
 
 void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, std::string_view base,
                            Reply& reply) {
-    std::string_view basePath = base.empty() ? std::string_view("/") : base;
-    if (!req.subscriber) return writeError(reply, Status::NotAllowed, Reason::CannotWait, basePath, "this transport can't deliver notifications");
-    if (!req.body.isNull()) {
-        return writeError(reply, Status::BadRequest, basePath, "subscriptions take keys, exclude and depth, not shapes");
-    }
-    if (req.query.view != View::Value) return writeError(reply, Status::BadRequest, basePath, "subscriptions are on values");
-    Route route;
-    if (!this->route(route)) return writeError(reply, Status::Internal, basePath, "no endpoint");
-    Status allowed = api.subscriptionAllowed(req.subscriber);
-    if (allowed != Status::Ok) return writeError(reply, allowed, Reason::SubscriptionLimit, basePath, "too many subscriptions");
-
-    api_ = &api;
-    if (localPath_.empty()) localPath_.assign(base.data(), base.size() - rest.size());
-
-    Subscription sub;
-    sub.subscriber = req.subscriber;
-    sub.node = this;
-    sub.path.assign(base.data(), base.size());
-    sub.keys.assign(req.query.keys.data(), req.query.keys.size());
-    sub.exclude.assign(req.query.exclude.data(), req.query.exclude.size());
-    sub.depth = req.query.depth;
-    sub.interval = req.query.interval;
-    sub.changes = req.query.changes;
-    sub.events = req.query.events;
-    sub.remotes = req.query.remotes;
-    sub.forwarded = true;
-    sub.snapshot = req.query.snapshot;
-    // Shared only with subscribers at the same level, which the upstream
-    // subscription asks the remote for (docs/DESIGN.md section 13.1).
-    sub.access = req.client.level();
-    sub.ceiling = req.query.ceiling;
-    Access level = sub.access;
-
-    bool start = false, renew = false;
-    uint32_t interval = 0;
-    // What the upstream subscription must hold once this one joins.
-    Spec want = wanted(sub.path, level, &sub);
-    {
-        MutexGuard guard(mutex_);
-        Upstream* u = findUpstream(rest, level);
-        if (u && u->ready && covers(u->copySpec, specOf(sub))) {
-            // Shared: the snapshot comes from the copy, right away.
-            JsonWriter w(reply.begin(Status::Ok));
-            if (sub.snapshot) {
-                writeSnapshot(w, u->copy.as<JsonVariantConst>(), sub);
-            } else {
-                w.null();
-            }
-            detail::finishBody(reply, w, basePath);
-            api.addSubscription(std::move(sub));
-            return;
-        }
-        if (!online()) {
-            std::string localBase(base.substr(0, base.size() - rest.size()));
-            return writeError(reply, Status::Timeout, Reason::PeerOffline, localBase.empty() ? std::string_view("/") : localBase,
-                              "peer offline");
-        }
-        // A new or wider copy of the remote's state, and the snapshots
-        // rendered from it: only with room to spare above the heap floor.
-        if (!heapAbove(heapFloor())) {
-            return writeError(reply, Status::Busy, Reason::LowMemory, basePath, "not enough memory for another remote subscription");
-        }
-        if (!api.pendingBegin()) return writeError(reply, Status::Busy, Reason::PendingLimit, basePath, "too many pending calls");
-        Reply* detached = reply.detach();
-        if (!detached) {
-            api.pendingDone();
-            return writeError(reply, Status::NotAllowed, Reason::CannotWait, basePath, "this transport can't wait for remote nodes");
-        }
-        sub.waiting = detached;
-        if (!u) {
-            upstreams_.emplace_back(new Upstream());
-            u = upstreams_.back().get();
-            u->rest.assign(rest.data(), rest.size());
-            u->level = level;
-            // An events-only subscriber doesn't pace the others' changes.
-            u->interval = sub.changes ? req.query.interval : 0;
-        }
-        // A copy that doesn't hold what this one needs: subscribed again,
-        // wider; this one waits for that snapshot.
-        u->spec = want;
-        interval = u->interval;
-        if (!u->subscribing) {
-            u->subscribing = true;
-            u->lastSubscribeMs = route.endpoint->now();
-            start = true;
-            renew = u->ready;
-        }
-    }
-    std::string r(rest);
-    api.addSubscription(std::move(sub));  // waiting for the upstream snapshot
-    if (start && !sendUpstream(r, level, interval, renew)) upstreamReply(r, level, Status::Busy, JsonVariantConst());
-}
-
-RemoteNode::Spec RemoteNode::wanted(const std::string& local, Access level, const Subscription* extra) {
-    std::vector<Spec> specs;
-    if (extra) specs.push_back(specOf(*extra));
-    if (Api* api = api_) {
-        api->forwardedSubscriptions(this, [&](Subscription& sub) {
-            if (sub.path == local && sub.access == level) specs.push_back(specOf(sub));
-            return true;
-        });
-    }
-    return unionOf(specs);
+    upstream_.subscribe(*this, api, req, rest, base, reply);
 }
 
 void RemoteNode::narrowed(std::string_view localPath, Access level) {
     if (localPath.size() < localPath_.size()) return;
-    std::string rest(localPath.substr(localPath_.size()));
-    Spec want = wanted(std::string(localPath), level, nullptr);
-    uint32_t interval;
-    {
-        MutexGuard guard(mutex_);
-        Upstream* u = findUpstream(rest, level);
-        if (!u || u->spec == want) return;
-        u->spec = want;
-        // In flight: its reply sees the new spec and asks again.
-        if (u->subscribing || !u->ready) return;
-        u->subscribing = true;
-        interval = u->interval;
-    }
-    if (!sendUpstream(rest, level, interval, true)) {
-        MutexGuard guard(mutex_);
-        if (Upstream* u = findUpstream(rest, level)) u->subscribing = false;
-    }
+    upstream_.narrowed(*this, std::string(localPath.substr(localPath_.size())), localPath, level);
 }
 
 bool RemoteNode::upstreamSpec(std::string_view localPath, std::string& keys, std::string& exclude, int& depth,
                               Access level) const {
     if (localPath.size() < localPath_.size()) return false;
-    std::string_view rest = localPath.substr(localPath_.size());
-    MutexGuard guard(mutex_);
-    for (const auto& u : upstreams_) {
-        if (u->rest != rest || u->level != level) continue;
-        keys = u->sent.keys;
-        exclude = u->sent.exclude;
-        depth = u->sent.depth;
-        return true;
-    }
-    return false;
-}
-
-bool RemoteNode::sendUpstream(const std::string& rest, Access level, uint32_t interval, bool renew) {
-    Route r;
-    if (!route(r)) return false;
-    std::string path = remotePathOf(rest);
-    if (renew) {
-        Query unsub;
-        unsub.ceiling = level;
-        r.endpoint->request(
-            r.peer, Op::Unsubscribe, path, std::string_view(), [](Status, JsonVariantConst) {}, unsub, timeoutMs_,
-            this);
-    }
-    Spec spec;
-    {
-        MutexGuard guard(mutex_);
-        if (Upstream* u = findUpstream(rest, level)) {
-            u->sent = u->spec;
-            spec = u->spec;
-        }
-    }
-    // Only what the local subscribers need (keys, depth): a whole tree
-    // would cost the remote, the link and this node's heap.
-    Query q;
-    q.interval = interval;
-    q.keys = spec.keys;
-    q.exclude = spec.exclude;
-    q.depth = spec.depth;
-    q.ceiling = level;  // the remote filters as for these subscribers
-    return r.endpoint->request(
-        r.peer, Op::Subscribe, path, std::string_view(),
-        [this, rest, level](Status s, JsonVariantConst body) { upstreamReply(rest, level, s, body); }, q, timeoutMs_,
-        this);
-}
-
-void RemoteNode::upstreamReply(const std::string& rest, Access level, Status s, JsonVariantConst body) {
-    Api* api = api_;
-    if (!api) return;
-    bool again = false;
-    uint32_t interval = 0;
-    {
-        // Lock order: the API, then this node.
-        MutexGuard apiGuard(api->mutex());
-        MutexGuard guard(mutex_);
-        Upstream* u = findUpstream(rest, level);
-        if (!u) {
-            // Released while subscribing: drop the subscription it made.
-            Route r;
-            if (s == Status::Ok && route(r)) {
-                Query unsub;
-                unsub.ceiling = level;
-                r.endpoint->request(
-                    r.peer, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {},
-                    unsub, timeoutMs_, this);
-            }
-            return;
-        }
-        u->subscribing = false;
-        // A copy of the remote's state takes about twice its text: only
-        // above the heap floor; else as if the remote were busy (kept stale,
-        // tried again soon).
-        JsonDocument noRoom;
-        if (s == Status::Ok && !heapAbove(2 * measureJson(body))) {
-            noRoom["error"] = "busy";
-            noRoom["reason"] = "low_memory";
-            noRoom["path"] = remotePathOf(rest);
-            noRoom["message"] = "not enough memory for the remote's state";
-            s = Status::Busy;
-            body = noRoom.as<JsonVariantConst>();
-        }
-        bool wasReady = u->ready;
-        bool changedCopy = false;
-        bool reshaped = false;  // the copy now holds more or less, not newer state
-        if (s == Status::Ok) {
-            reshaped = wasReady && u->copySpec != u->sent;
-            // Compared in place: two serialized copies of a large state could
-            // exhaust a fragmented heap.
-            changedCopy = !wasReady || (!reshaped && u->copy.as<JsonVariantConst>() != body);
-            u->copy.set(body);
-            u->copySpec = u->sent;
-            u->ready = true;
-            u->stale = false;
-        } else if (wasReady) {
-            u->stale = true;  // keep the copy and the subscribers; retry soon
-        }
-
-        std::string localPath = localPath_ + rest;
-        std::string remoteBase = remotePath_ == "/" ? std::string() : remotePath_;
-        std::string localBase = localPath_;
-        bool anyLeft = false, stillWaiting = false;
-        JsonVariantConst copy = u->copy.as<JsonVariantConst>();
-        api->forwardedSubscriptions(this, [&](Subscription& sub) {
-            if (sub.path != localPath || sub.access != level) return true;
-            if (sub.waiting) {
-                if (s == Status::Ok && !covers(u->copySpec, specOf(sub))) {
-                    // Joined while a narrower request was in flight: next one.
-                    stillWaiting = true;
-                    anyLeft = true;
-                    return true;
-                }
-                if (s == Status::Ok) {
-                    JsonWriter w(sub.waiting->begin(Status::Ok));
-                    if (sub.snapshot) {
-                        writeSnapshot(w, copy, sub);
-                    } else {
-                        w.null();
-                    }
-                    detail::finishBody(*sub.waiting, w, sub.path);
-                } else {
-                    detail::writeMapped(*sub.waiting, s, body, localBase, remoteBase);
-                }
-                sub.waiting->release();
-                sub.waiting = nullptr;
-                api->pendingDone();
-                if (s != Status::Ok) return false;
-            } else if (s == Status::Ok && wasReady && changedCopy && sub.changes) {
-                // Renewed after the remote changed without telling us (it
-                // restarted, or notifications were lost): send the whole state.
-                notifyChange(sub, [&](JsonWriter& w) { writeSnapshot(w, copy, sub); });
-            }
-            anyLeft = true;
-            return true;
-        });
-        if (!anyLeft && !u->ready) {
-            for (size_t i = 0; i < upstreams_.size(); i++) {
-                if (upstreams_[i].get() == u) {
-                    upstreams_.erase(upstreams_.begin() + static_cast<std::ptrdiff_t>(i));
-                    break;
-                }
-            }
-            return;
-        }
-        // The subscribers' needs changed while it was in flight.
-        if (s == Status::Ok && (stillWaiting || u->spec != u->sent)) {
-            u->subscribing = true;
-            interval = u->interval;
-            again = true;
-        }
-    }
-    if (again && !sendUpstream(rest, level, interval, true)) {
-        MutexGuard guard(mutex_);
-        if (Upstream* u = findUpstream(rest, level)) {
-            u->subscribing = false;
-            u->stale = true;  // tick() tries again
-        }
-    }
-}
-
-bool RemoteNode::relayChange(std::string_view rest, Access level, JsonVariantConst patch) {
-    Api* api = api_;
-    if (!api) return false;
-    MutexGuard apiGuard(api->mutex());
-    MutexGuard guard(mutex_);
-    Upstream* u = findUpstream(rest, level);
-    if (!u || !u->ready) return false;
-    // Only within the budget (docs/DESIGN.md section 15): else the change
-    // isn't relayed, and the subscription is renewed soon, its subscribers
-    // getting the whole state if it differs.
-    Reservation room = memoryBudget().reserve(2 * measureJson(patch), 0, false);
-    if (!room) {
-        u->stale = true;  // renewed within 2 s
-        return true;
-    }
-    detail::mergeJson(u->copy.as<JsonVariant>(), patch);
-    std::string localPath = localPath_ + std::string(rest);
-    api->forwardedSubscriptions(this, [&](Subscription& sub) {
-        if (sub.path != localPath || sub.access != level || sub.waiting || !sub.changes) return true;
-        if (!patch.is<JsonObjectConst>()) {
-            notifyChange(sub, [&](JsonWriter& w) { w.variant(patch); });
-        } else if (hasChanges(patch, depthOf(sub), &sub)) {
-            notifyChange(sub, [&](JsonWriter& w) { writeChanges(w, patch, depthOf(sub), &sub); });
-        }
-        return true;
-    });
+    Spec sent;
+    if (!upstream_.sent(localPath.substr(localPath_.size()), level, sent)) return false;
+    keys = sent.keys;
+    exclude = sent.exclude;
+    depth = sent.depth;
     return true;
 }
 
 void RemoteNode::released(std::string_view localPath, Access level) {
     if (localPath.size() < localPath_.size()) return;
-    std::string rest(localPath.substr(localPath_.size()));
-    bool found = false;
-    {
-        MutexGuard guard(mutex_);
-        for (size_t i = 0; i < upstreams_.size(); i++) {
-            if (upstreams_[i]->rest != rest || upstreams_[i]->level != level) continue;
-            found = upstreams_[i]->ready;  // still subscribing: upstreamReply() unsubscribes
-            upstreams_.erase(upstreams_.begin() + static_cast<std::ptrdiff_t>(i));
-            break;
-        }
-    }
-    Route r;
-    if (found && route(r)) {
-        Query unsub;
-        unsub.ceiling = level;
-        r.endpoint->request(
-            r.peer, Op::Unsubscribe, remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {}, unsub,
-            timeoutMs_, this);
-    }
+    upstream_.released(*this, std::string(localPath.substr(localPath_.size())), level);
 }
 
 RemoteNode& Object::remote(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer,

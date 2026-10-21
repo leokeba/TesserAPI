@@ -20,6 +20,7 @@ set(TESSER_CORE_SRCS
     src/tesser/remote_relay.cpp
     src/tesser/remote_routes.cpp
     src/tesser/remote_stream.cpp
+    src/tesser/remote_upstream.cpp
     src/tesser/client.cpp
     src/tesser/file.cpp)
 

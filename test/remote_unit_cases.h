@@ -1,5 +1,6 @@
 // A remote node's units on their own, without a node, an endpoint or a link
-// (docs/DESIGN.md section 16): the streamed-set queue and the route table.
+// (docs/DESIGN.md section 16): the streamed-set queue, the route table, and
+// what shared upstream subscriptions ask for.
 #pragma once
 
 #include <string>
@@ -8,6 +9,8 @@
 #include "check.h"
 #include "tesser/detail/remote_routes.h"
 #include "tesser/detail/remote_stream.h"
+#include "tesser/detail/remote_upstream.h"
+#include "tesser/api.h"
 
 namespace remote_unit_cases {
 
@@ -207,6 +210,41 @@ TEST(unit_routes_switch_probes_and_replace) {
     CHECK(t.device() == l.mac);
     CHECK_EQ(t.setToken("secret").size(), 2u);
     CHECK_EQ(t.token(), "secret");
+}
+
+inline tesser::UpstreamSpec specOf(const char* keys, const char* exclude, int depth) {
+    tesser::Subscription sub;
+    sub.keys = keys;
+    sub.exclude = exclude;
+    sub.depth = depth;
+    return tesser::detail::specOf(sub);
+}
+
+TEST(unit_upstream_specs) {
+    using tesser::detail::covers;
+    using tesser::detail::unionOf;
+    // Lists sorted and without repeats; exclude only without keys.
+    tesser::UpstreamSpec a = specOf(" level, on,level", "", 1);
+    CHECK_EQ(a.keys, "level,on");
+    CHECK_EQ(specOf("on", "level", -1).exclude, "");
+    CHECK_EQ(specOf("", "b, a", -1).exclude, "a,b");
+
+    // Keys of all when all have keys, the deepest depth.
+    tesser::UpstreamSpec u = unionOf({a, specOf("color", "", 3)});
+    CHECK_EQ(u.keys, "color,level,on");
+    CHECK_EQ(u.depth, 3);
+    // One without keys: every child but what all of those leave out, less
+    // what the keyed ones ask for.
+    u = unionOf({specOf("", "a,b,c", 2), specOf("", "b,c", -1), specOf("c", "", 0)});
+    CHECK_EQ(u.keys, "");
+    CHECK_EQ(u.exclude, "b");
+    CHECK_EQ(u.depth, -1);
+    CHECK(unionOf({}) == tesser::UpstreamSpec());
+
+    CHECK(covers(u, specOf("a", "", 5)));
+    CHECK(!covers(u, specOf("b", "", 0)));
+    CHECK(covers(specOf("", "", -1), u));
+    CHECK(!covers(specOf("x", "", 2), specOf("x", "", 3)));
 }
 
 }  // namespace remote_unit_cases
