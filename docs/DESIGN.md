@@ -1212,6 +1212,10 @@ The layout follows NowTP:
 - The component's `Kconfig` selects `CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT` when WebSocket support is on (§10.5).
 - `library.properties` and `library.json` for Arduino and PlatformIO.
 
+**Source files.** A remote node (§14) is split into units, each in its own file:
+- `remote.cpp`: the node itself. It forwards requests, passes the peer's notifications on, presents tokens and calls the hooks.
+- `remote_relay.cpp`: relayed file transfers (`FileRelay`), which use only the node's public interface.
+
 The Bluetooth transport (§10.6) is a header that `TesserAPI.h` doesn't include, so that only the firmware using it compiles a BLE stack. On ESP-IDF, its source compiles to nothing unless NimBLE is enabled.
 
 The UDP transport (§10.7) needs only lwIP and `esp_netif`, which every ESP-IDF and Arduino-ESP32 3.x build has: it is always compiled, and linked when used. On ESP-IDF `esp_netif` is a private requirement.

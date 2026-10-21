@@ -17,6 +17,7 @@ set(TESSER_CORE_SRCS
     src/tesser/persistence.cpp
     src/tesser/storage.cpp
     src/tesser/remote.cpp
+    src/tesser/remote_relay.cpp
     src/tesser/client.cpp
     src/tesser/file.cpp)
 
