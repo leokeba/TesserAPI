@@ -481,16 +481,7 @@ private:
         std::string text;
         std::shared_ptr<Builder> rebuild;
     };
-    bool sendRequest(const PeerAddress& to, uint32_t id, std::string envelope, ResponseHandler done,
-                     uint32_t timeoutMs, const void* owner, bool internal = false, RawHandler raw = nullptr,
-                     std::shared_ptr<Builder> rebuild = nullptr, Bytes owned = Bytes());
-    // A held call's text, built again from its builder.
-    static std::string rebuilt(const Builder& build, uint32_t id);
-    bool takeRaw(const Incoming& msg);
-    uint32_t nextCallId();
-    PeerAuth* authLocked(const PeerAddress& peer);
-    void sendAuth(const PeerAddress& peer, const std::string& token);
-    void authDone(const PeerAddress& peer, Status status, JsonVariantConst body);
+    // ---- datagram.cpp: taking messages, serving peers ------------------------
     void handle(Incoming& msg);
     bool queue(Incoming&& msg);
     void handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply);
@@ -505,10 +496,27 @@ private:
     // allocated); empty, with a busy reply to a request, when refused.
     Reservation hold(const PeerAddress& from, std::string_view text, bool reliable, bool broadcast, bool heap);
     bool refusable(bool reliable, bool broadcast) const { return linkRefuses_ && reliable && !broadcast; }
+    Subscriber* subscriberFor(const PeerAddress& peer, bool create);
+    void handleFile(JsonObjectConst envelope, const Incoming& msg, const Client& client);
+    void dropFiles(const PeerAddress* peer, uint32_t now);
+
+    // ---- datagram_calls.cpp: calls to peers, tokens presented to them -------
+    bool sendRequest(const PeerAddress& to, uint32_t id, std::string envelope, ResponseHandler done,
+                     uint32_t timeoutMs, const void* owner, bool internal = false, RawHandler raw = nullptr,
+                     std::shared_ptr<Builder> rebuild = nullptr, Bytes owned = Bytes());
+    // A held call's text, built again from its builder.
+    static std::string rebuilt(const Builder& build, uint32_t id);
+    bool takeRaw(const Incoming& msg);
+    void handleResponse(JsonObjectConst envelope, const PeerAddress& from);
+    uint32_t nextCallId();
+    PeerAuth* authLocked(const PeerAddress& peer);
+    void sendAuth(const PeerAddress& peer, const std::string& token);
+    void authDone(const PeerAddress& peer, Status status, JsonVariantConst body);
     // `reason`: why the calls of a forgotten peer fail (None: a plain timeout).
     void expire(uint32_t now, bool all, const PeerAddress* peer, Reason reason = Reason::None);
     void failCall(uint32_t id, Status status, Reason reason, const char* message);
-    Subscriber* subscriberFor(const PeerAddress& peer, bool create);
+
+    // ---- datagram_peers.cpp: peers heard and lost, nodes routed and mounted --
     void dropPeer(const PeerAddress& peer, PeerLoss reason);
     void unreachable(const PeerAddress& peer);
     void applySeen(const Seen& seen);
@@ -519,8 +527,6 @@ private:
     Known* knownLocked(const PeerAddress& peer);
     Known& learnLocked(const PeerAddress& peer, uint32_t now);
     void checkAdvertisement(uint32_t now);
-    void handleFile(JsonObjectConst envelope, const Incoming& msg, const Client& client);
-    void dropFiles(const PeerAddress* peer, uint32_t now);
     bool deferLoss(const PeerAddress& peer);
     void dropDeferred(uint32_t now);
 

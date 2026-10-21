@@ -1219,6 +1219,11 @@ The layout follows NowTP:
 - `remote_upstream.cpp` (`detail::UpstreamCache`): what the node keeps of its peer's state. That is the mirrored copy and the upstream subscriptions its local subscribers share, with the union of what they ask for (`UpstreamSpec`). It uses the remote lock, after the API's. Its methods take the node they belong to: the unit keeps no pointer back to it, so a node is no larger.
 - `remote_stream.cpp` (`detail::SetStream`): the queue of streamed sets (§14.3), its merging and retries, under its own leaf lock. The node sends what the queue gives it.
 
+A datagram endpoint (`DatagramEndpoint`) is split by file but keeps one class and one lock (§9). Its calls, the tokens it presents, its peer table and its pins on remote nodes change together under that lock. For example, a call waiting for a token is let go in the same step that records the token's answer. With two locks, a call could wait until it timed out.
+- `datagram.cpp`: taking messages from the link, `process()`, and serving peers' requests, file transfers and tokens.
+- `datagram_calls.cpp`: calls to peers (requests, their replies, timeouts and link failures) and the tokens presented to peers.
+- `datagram_peers.cpp`: the peers heard and lost, their advertisements, the remote nodes routed through the endpoint, and the nodes it mounts for peers that announce themselves.
+
 The Bluetooth transport (§10.6) is a header that `TesserAPI.h` doesn't include, so that only the firmware using it compiles a BLE stack. On ESP-IDF, its source compiles to nothing unless NimBLE is enabled.
 
 The UDP transport (§10.7) needs only lwIP and `esp_netif`, which every ESP-IDF and Arduino-ESP32 3.x build has: it is always compiled, and linked when used. On ESP-IDF `esp_netif` is a private requirement.
