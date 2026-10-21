@@ -8,39 +8,17 @@
 #include <ArduinoJson.h>
 
 #include "tesser/datagram.h"
+#include "tesser/detail/remote_routes.h"
 #include "tesser/detail/remote_stream.h"
 #include "tesser/node.h"
 #include "tesser/platform.h"
 #include "tesser/request.h"
+#include "tesser/route.h"
 
 namespace tesser {
 
 class FileRelay;
 struct Subscription;
-
-// An entry of a route order (docs/DESIGN.md section 14.3): a transport, and
-// optionally the interface it leaves by. A bare transport (TransportKind::Udp
-// converts) matches its routes on any interface.
-struct RouteKind {
-    TransportKind transport = TransportKind::Local;
-    NetInterface iface = NetInterface::Any;
-
-    RouteKind() = default;
-    RouteKind(TransportKind t, NetInterface i = NetInterface::Any) : transport(t), iface(i) {}  // NOLINT: implicit
-    bool operator==(const RouteKind& o) const { return transport == o.transport && iface == o.iface; }
-    bool operator!=(const RouteKind& o) const { return !(*this == o); }
-    // This entry covers routes of `kind` leaving by `i`.
-    bool covers(TransportKind kind, NetInterface i) const {
-        return transport == kind && (iface == NetInterface::Any || iface == i);
-    }
-};
-// "udp", "udp/ethernet".
-std::string toString(const RouteKind& kind);
-// "udp/ethernet, nowtp" (commas, spaces allowed): false, with `out`
-// untouched, if an entry isn't a transport or transport/interface.
-bool parseRouteOrder(std::string_view text, std::vector<RouteKind>& out);
-// The other way round: "udp/ethernet, nowtp".
-std::string formatRouteOrder(const std::vector<RouteKind>& order);
 
 // Another node's tree grafted into this one (docs/DESIGN.md section 14):
 // requests below it are forwarded over a DatagramEndpoint (NowTP, ...), and
@@ -90,20 +68,9 @@ private:
 
 class RemoteNode : public Annotated<RemoteNode> {
 public:
-    // A way to reach the device.
-    struct Route {
-        DatagramEndpoint* endpoint = nullptr;
-        PeerAddress peer;
-        bool online = true;
-        uint32_t heardMs = 0;  // when a message last came this way (endpoint clock; 0: never)
-        uint32_t rttMs = 0;    // smoothed round trip of the calls made this way (0: none yet)
-        // The local interface it leaves by (UDP; Any when unknown or for
-        // NowTP), as the endpoint saw it when the route came online.
-        NetInterface iface = NetInterface::Any;
-        TransportKind kind() const;
-        // "nowtp", "udp/ethernet" (or "udp" when the interface is unknown).
-        std::string name() const { return toString(RouteKind(kind(), iface)); }
-    };
+    // A way to reach the device: its endpoint and address, whether it is
+    // online, when it was last heard, its round trip and interface.
+    using Route = RemoteRoute;
     // See onStateChange().
     using StateHandler = std::function<void(RemoteNode& node)>;
     // A streamed set that failed: `path` below the node, the status, and the
@@ -139,8 +106,7 @@ public:
     // the route is lost (default 5000; 0: never), and the wait doubles after
     // each one, up to a minute, so a device that is gone costs little.
     RemoteNode& probe(uint32_t ms) {
-        probeMs_ = ms;
-        probeWaitMs_ = ms;
+        routes_.setProbe(ms);
         return *this;
     }
 
@@ -215,7 +181,7 @@ public:
     // once every route is lost (DatagramEndpoint::forgetPeer()), true again
     // when one is heard from. Shown in the schema; a change marks the node
     // changed, so subscribers of its parent hear about it.
-    bool online() const { return online_.load(); }
+    bool online() const { return routes_.online(); }
     // Sets every route's state (tests, applications that know better).
     void setOnline(bool online);
     // One route's state; called by its endpoint.
@@ -356,22 +322,13 @@ private:
     };
     // The union of the needs of `local`'s subscribers at `level`, plus `extra`'s.
     Spec wanted(const std::string& local, Access level, const Subscription* extra);
-    struct RouteSlot {
-        Route route;
-        uint32_t added;  // tie-break: routes of the same rank keep this order
-    };
 
-    // Its Api's route order, else the process-wide default.
-    std::vector<RouteKind> inheritedOrder() const;
     bool localPath(std::string& out);
     Upstream* findUpstream(std::string_view rest, Access level);
     std::string remotePathOf(std::string_view rest) const;
     bool sendUpstream(const std::string& rest, Access level, uint32_t interval, bool renew);
     void upstreamReply(const std::string& rest, Access level, Status status, JsonVariantConst body);
     bool relayChange(std::string_view rest, Access level, JsonVariantConst patch);
-    // Under routesMutex_.
-    int activeLocked() const;
-    void updateOnlineLocked();
     void rerouted(const Route& from, uint32_t nowMs);
     // Sends the next streamed set if none is in flight.
     void pump();
@@ -380,7 +337,7 @@ private:
     std::string remotePath_;
     uint32_t timeoutMs_ = 0;
 
-    mutable Mutex routesMutex_{kRankLeaf, "remote routes"};  // a leaf: nothing is called while it is held
+    detail::RouteTable routes_;  // routes, order, device and token, under their own leaf lock
     // knownFile(): paths the peer's schema described, under the hash it
     // advertised then.
     struct KnownPath {
@@ -391,23 +348,8 @@ private:
     static constexpr size_t kKnownPaths = 8;
     mutable Mutex pathsMutex_{kRankLeaf, "remote paths"};
     std::vector<KnownPath> knownPaths_;
-    std::vector<RouteSlot> routes_;
-    std::vector<RouteKind> order_;
-    bool hasOrder_ = false;
-    uint32_t nextRoute_ = 0;
-    PeerAddress device_;
-    std::string token_;
-    // The route tick() last saw in use, to notice a switch.
-    DatagramEndpoint* lastEndpoint_ = nullptr;
-    PeerAddress lastPeer_;
-    bool lastOnline_ = true;
-    std::atomic<bool> announce_{false};
     bool autoMounted_ = false;
     std::atomic<int> relays_{0};
-    uint32_t probeMs_ = 5000;
-    uint32_t probeWaitMs_ = 5000;  // until the next probe; doubles up to kMaxProbeMs
-    uint32_t lastProbeMs_ = 0;
-    static constexpr uint32_t kMaxProbeMs = 60000;  // mounted, or a route added: tick() tells onStateChange()
 
     bool mirror_ = false;
     Access mirrorLevel_ = Access::Public;
@@ -423,12 +365,11 @@ private:
     std::atomic<uint32_t> apiLookupMs_{0};  // tick(): when api_ was last looked for
     std::string localPath_;
     std::vector<std::unique_ptr<Upstream>> upstreams_;  // guarded by mutex_
-    std::atomic<bool> online_{true};
     std::atomic<uint32_t> advertisedSchema_{0};
     std::atomic<uint8_t> protocol_{0};
     std::string ownedName_;
 
-    detail::SetStream stream_;  // streamed sets, under their own lock (a leaf like routesMutex_)
+    detail::SetStream stream_;  // streamed sets, under their own leaf lock
 };
 
 }  // namespace tesser

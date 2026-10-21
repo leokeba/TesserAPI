@@ -284,15 +284,7 @@ void writeMapped(Reply& reply, Status s, JsonVariantConst body, const std::strin
 
 namespace {
 
-// Routes: the library-wide order and state handler.
-Mutex& sharedMutex() {
-    static Mutex m;
-    return m;
-}
-std::vector<RouteKind>& sharedOrder() {
-    static std::vector<RouteKind> order;
-    return order;
-}
+Mutex& sharedMutex() { return detail::remoteSharedMutex(); }
 RemoteNode::StateHandler& sharedStateHandler() {
     static RemoteNode::StateHandler fn;
     return fn;
@@ -303,50 +295,6 @@ RemoteNode::AccessHandler& sharedAccessHandler() {
 }
 
 }  // namespace
-
-TransportKind RemoteNode::Route::kind() const { return endpoint ? endpoint->kind() : TransportKind::Local; }
-
-std::string toString(const RouteKind& kind) {
-    std::string s = toString(kind.transport);
-    if (kind.iface != NetInterface::Any) {
-        s += '/';
-        s += toString(kind.iface);
-    }
-    return s;
-}
-
-bool parseRouteOrder(std::string_view text, std::vector<RouteKind>& out) {
-    std::vector<RouteKind> order;
-    size_t pos = 0;
-    while (pos <= text.size()) {
-        size_t comma = text.find(',', pos);
-        if (comma == std::string_view::npos) comma = text.size();
-        std::string_view item = text.substr(pos, comma - pos);
-        while (!item.empty() && item.front() == ' ') item.remove_prefix(1);
-        while (!item.empty() && item.back() == ' ') item.remove_suffix(1);
-        pos = comma + 1;
-        if (item.empty()) {
-            if (comma == text.size() && order.empty()) break;  // "" is the empty order
-            return false;
-        }
-        size_t slash = item.find('/');
-        RouteKind k;
-        if (!parseTransportKind(item.substr(0, slash), k.transport)) return false;
-        if (slash != std::string_view::npos && !parseNetInterface(item.substr(slash + 1), k.iface)) return false;
-        order.push_back(k);
-    }
-    out = std::move(order);
-    return true;
-}
-
-std::string formatRouteOrder(const std::vector<RouteKind>& order) {
-    std::string s;
-    for (const RouteKind& k : order) {
-        if (!s.empty()) s += ", ";
-        s += toString(k);
-    }
-    return s;
-}
 
 RemoteNode::RemoteNode(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath)
     : Annotated(name, NodeType::Remote), remotePath_(std::move(remotePath)) {
@@ -363,16 +311,7 @@ RemoteNode::RemoteNode(std::string name, DatagramEndpoint& endpoint, const PeerA
 }
 
 RemoteNode::~RemoteNode() {
-    std::vector<DatagramEndpoint*> endpoints;
-    {
-        MutexGuard guard(routesMutex_);
-        for (const RouteSlot& r : routes_) {
-            bool known = false;
-            for (DatagramEndpoint* e : endpoints) known = known || e == r.route.endpoint;
-            if (!known) endpoints.push_back(r.route.endpoint);
-        }
-    }
-    for (DatagramEndpoint* e : endpoints) {
+    for (DatagramEndpoint* e : routes_.endpoints()) {
         e->removeRemote(this);
         e->cancelCalls(this);
     }
@@ -380,94 +319,36 @@ RemoteNode::~RemoteNode() {
 
 // ---- routes -----------------------------------------------------------------
 
-uint32_t RemoteNode::lastHeardMs() const {
-    MutexGuard guard(routesMutex_);
-    uint32_t last = 0;
-    for (const RouteSlot& r : routes_) {
-        if (r.route.heardMs && (!last || static_cast<int32_t>(r.route.heardMs - last) > 0)) last = r.route.heardMs;
-    }
-    return last;
-}
+uint32_t RemoteNode::lastHeardMs() const { return routes_.lastHeardMs(); }
 
-bool RemoteNode::onlyThrough(const DatagramEndpoint* endpoint) const {
-    MutexGuard guard(routesMutex_);
-    for (const RouteSlot& r : routes_) {
-        if (r.route.endpoint != endpoint) return false;
-    }
-    return true;
-}
+bool RemoteNode::onlyThrough(const DatagramEndpoint* endpoint) const { return routes_.onlyThrough(endpoint); }
 
-size_t RemoteNode::routeCount(const DatagramEndpoint* endpoint) const {
-    MutexGuard guard(routesMutex_);
-    size_t n = 0;
-    for (const RouteSlot& r : routes_) n += r.route.endpoint == endpoint;
-    return n;
-}
+size_t RemoteNode::routeCount(const DatagramEndpoint* endpoint) const { return routes_.count(endpoint); }
 
 bool RemoteNode::replaceOfflineRoute(DatagramEndpoint& endpoint, const PeerAddress& peer) {
-    {
-        MutexGuard guard(routesMutex_);
-        RouteSlot* oldest = nullptr;
-        for (RouteSlot& r : routes_) {
-            if (r.route.endpoint != &endpoint || r.route.online) continue;
-            if (!oldest || static_cast<int32_t>(r.route.heardMs - oldest->route.heardMs) < 0) oldest = &r;
-        }
-        if (!oldest) return false;
-        if (lastEndpoint_ == &endpoint && lastPeer_ == oldest->route.peer) lastPeer_ = peer;
-        oldest->route.peer = peer;
-        oldest->route.heardMs = 0;
-        oldest->route.rttMs = 0;
-        oldest->route.iface = endpoint.interfaceOf(peer);
-    }
+    if (!routes_.replaceOffline(endpoint, peer, endpoint.interfaceOf(peer))) return false;
     endpoint.routeAdded(this, peer);
     std::string token = this->token();
     if (!token.empty()) endpoint.setPeerToken(peer, token);
-    announce_ = true;
+    routes_.announce();
     return true;
 }
 
 void RemoteNode::addRoute(DatagramEndpoint& endpoint, const PeerAddress& peer) {
     bool registered = false;
-    NetInterface iface = endpoint.interfaceOf(peer);
-    {
-        MutexGuard guard(routesMutex_);
-        for (const RouteSlot& r : routes_) {
-            if (r.route.endpoint != &endpoint) continue;
-            if (r.route.peer == peer) return;
-            registered = true;
-        }
-        RouteSlot slot;
-        slot.route.endpoint = &endpoint;
-        slot.route.peer = peer;
-        slot.route.iface = iface;
-        slot.added = nextRoute_++;
-        routes_.push_back(slot);
-        if (!lastEndpoint_) {
-            lastEndpoint_ = &endpoint;
-            lastPeer_ = peer;
-        }
-    }
+    if (!routes_.add(endpoint, peer, endpoint.interfaceOf(peer), registered)) return;
     if (!registered) endpoint.addRemote(this);
     endpoint.routeAdded(this, peer);
     std::string token = this->token();
     if (!token.empty()) endpoint.setPeerToken(peer, token);
-    announce_ = true;
+    routes_.announce();  // mounted, or a route added: tick() tells onStateChange()
 }
 
 void RemoteNode::setToken(std::string_view token) {
-    std::vector<RouteSlot> routes;
-    {
-        MutexGuard guard(routesMutex_);
-        token_.assign(token.data(), token.size());
-        routes = routes_;
-    }
-    for (const RouteSlot& r : routes) r.route.endpoint->setPeerToken(r.route.peer, token);
+    for (const Route& r : routes_.setToken(token)) r.endpoint->setPeerToken(r.peer, token);
 }
 
-std::string RemoteNode::token() const {
-    MutexGuard guard(routesMutex_);
-    return token_;
-}
+std::string RemoteNode::token() const { return routes_.token(); }
 
 Access RemoteNode::access() const {
     Route r;
@@ -534,14 +415,6 @@ void RemoteHooks::accessAnswered(RemoteNode& node, Status status, Access level) 
 
 Api* RemoteNode::api() const { return api_.load(); }
 
-std::vector<RouteKind> RemoteNode::inheritedOrder() const {
-    if (Api* api = api_.load()) {
-        std::vector<RouteKind> order = api->remoteHooks().routeOrder();
-        if (!order.empty()) return order;
-    }
-    return defaultRouteOrder();
-}
-
 // ---- RemoteNode ----------------------------------------------------------------
 
 void RemoteNode::onAccess(AccessHandler fn) {
@@ -560,71 +433,16 @@ void RemoteNode::tokenAnswered(Status status, Access level) {
 }
 
 bool RemoteNode::hasRoute(const DatagramEndpoint* endpoint, const PeerAddress& peer) const {
-    MutexGuard guard(routesMutex_);
-    for (const RouteSlot& r : routes_) {
-        if (r.route.endpoint == endpoint && r.route.peer == peer) return true;
-    }
-    return false;
+    return routes_.has(endpoint, peer);
 }
 
 bool RemoteNode::routeUp(const DatagramEndpoint* endpoint, const PeerAddress& peer) const {
-    MutexGuard guard(routesMutex_);
-    for (const RouteSlot& r : routes_) {
-        if (r.route.endpoint == endpoint && r.route.peer == peer) return r.route.online;
-    }
-    return false;
+    return routes_.up(endpoint, peer);
 }
 
-// The index of the route in use: the best ranked online one, or the best
-// ranked one when none is online.
-int RemoteNode::activeLocked() const {
-    std::vector<RouteKind> order = hasOrder_ ? order_ : inheritedOrder();
-    auto rank = [&](const RouteSlot& r) {
-        size_t i = 0;
-        while (i < order.size() && !order[i].covers(r.route.kind(), r.route.iface)) i++;
-        return (uint64_t(i) << 32) | r.added;
-    };
-    int best = -1, bestOnline = -1;
-    for (size_t i = 0; i < routes_.size(); i++) {
-        int n = static_cast<int>(i);
-        if (best < 0 || rank(routes_[i]) < rank(routes_[static_cast<size_t>(best)])) best = n;
-        if (routes_[i].route.online &&
-            (bestOnline < 0 || rank(routes_[i]) < rank(routes_[static_cast<size_t>(bestOnline)]))) {
-            bestOnline = n;
-        }
-    }
-    return bestOnline >= 0 ? bestOnline : best;
-}
+std::vector<RemoteNode::Route> RemoteNode::routes() const { return routes_.list(api_.load()); }
 
-std::vector<RemoteNode::Route> RemoteNode::routes() const {
-    std::vector<RouteSlot> slots;
-    std::vector<RouteKind> order;
-    {
-        MutexGuard guard(routesMutex_);
-        slots = routes_;
-        order = hasOrder_ ? order_ : inheritedOrder();
-    }
-    auto rank = [&](const RouteSlot& r) {
-        size_t i = 0;
-        while (i < order.size() && !order[i].covers(r.route.kind(), r.route.iface)) i++;
-        return (uint64_t(i) << 32) | r.added;
-    };
-    // A handful of routes: insertion sort.
-    for (size_t i = 1; i < slots.size(); i++) {
-        for (size_t j = i; j > 0 && rank(slots[j]) < rank(slots[j - 1]); j--) std::swap(slots[j], slots[j - 1]);
-    }
-    std::vector<Route> out;
-    for (const RouteSlot& r : slots) out.push_back(r.route);
-    return out;
-}
-
-bool RemoteNode::route(Route& out) const {
-    MutexGuard guard(routesMutex_);
-    int i = activeLocked();
-    if (i < 0) return false;
-    out = routes_[static_cast<size_t>(i)].route;
-    return true;
-}
+bool RemoteNode::route(Route& out) const { return routes_.active(out, api_.load()); }
 
 DatagramEndpoint* RemoteNode::endpoint() const {
     Route r;
@@ -637,28 +455,17 @@ PeerAddress RemoteNode::peer() const {
 }
 
 RemoteNode& RemoteNode::routeOrder(std::vector<RouteKind> order) {
-    {
-        MutexGuard guard(routesMutex_);
-        hasOrder_ = !order.empty();
-        order_ = std::move(order);
-    }
+    routes_.setOrder(std::move(order));
     return *this;
 }
 
-std::vector<RouteKind> RemoteNode::routeOrder() const {
-    MutexGuard guard(routesMutex_);
-    return order_;
-}
+std::vector<RouteKind> RemoteNode::routeOrder() const { return routes_.order(); }
 
 void RemoteNode::setDefaultRouteOrder(std::vector<RouteKind> order) {
-    MutexGuard guard(sharedMutex());
-    sharedOrder() = std::move(order);
+    detail::RouteTable::setDefaultOrder(std::move(order));
 }
 
-std::vector<RouteKind> RemoteNode::defaultRouteOrder() {
-    MutexGuard guard(sharedMutex());
-    return sharedOrder();
-}
+std::vector<RouteKind> RemoteNode::defaultRouteOrder() { return detail::RouteTable::defaultOrder(); }
 
 void RemoteNode::onStateChange(StateHandler fn) {
     MutexGuard guard(sharedMutex());
@@ -675,66 +482,29 @@ RemoteNode* RemoteNode::byDevice(const Object& parent, const PeerAddress& device
     return nullptr;
 }
 
-PeerAddress RemoteNode::device() const {
-    MutexGuard guard(routesMutex_);
-    return device_;
-}
+PeerAddress RemoteNode::device() const { return routes_.device(); }
 
 void RemoteNode::setDevice(const PeerAddress& device) {
-    {
-        MutexGuard guard(routesMutex_);
-        if (device_ == device) return;
-        device_ = device;
-    }
-    changed();  // shown in the schema
+    if (routes_.setDevice(device)) changed();  // shown in the schema
 }
 
-// Under routesMutex_: online if any route is. True if that changed.
-void RemoteNode::updateOnlineLocked() {
-    bool any = false;
-    for (const RouteSlot& r : routes_) any = any || r.route.online;
-    // Shown in the schema, but not part of its hash (docs/DESIGN.md section
-    // 7): subscribers of the parent hear about it as a change.
-    if (online_.exchange(any) != any) changed();
-}
-
+// The node's online state is shown in the schema, but not part of its hash
+// (docs/DESIGN.md section 7): subscribers of the parent hear about it as a
+// change.
 void RemoteNode::setOnline(bool online) {
-    MutexGuard guard(routesMutex_);
-    for (RouteSlot& r : routes_) r.route.online = online;
-    updateOnlineLocked();
+    if (routes_.setAll(online)) changed();
 }
 
 void RemoteNode::setRouteOnline(const DatagramEndpoint* endpoint, const PeerAddress& peer, bool online,
                                 uint32_t nowMs) {
     // Back online: the interface may have changed (addresses come and go).
-    bool back = false;
-    if (online) {
-        MutexGuard guard(routesMutex_);
-        for (const RouteSlot& r : routes_) back = back || (r.route.endpoint == endpoint && r.route.peer == peer && !r.route.online);
-    }
+    bool back = online && routes_.down(endpoint, peer);
     NetInterface iface = back ? endpoint->interfaceOf(peer) : NetInterface::Any;
-    MutexGuard guard(routesMutex_);
-    for (RouteSlot& r : routes_) {
-        if (r.route.endpoint != endpoint || r.route.peer != peer) continue;
-        if (back) r.route.iface = iface;
-        if (r.route.online && !online) {
-            lastProbeMs_ = nowMs;  // the first probe waits probeMs
-            probeWaitMs_ = probeMs_;
-        }
-        r.route.online = online;
-        if (online && nowMs) r.route.heardMs = nowMs;
-    }
-    updateOnlineLocked();
+    if (routes_.setOnline(endpoint, peer, online, nowMs, back, iface)) changed();
 }
 
 void RemoteNode::routeRoundTrip(const DatagramEndpoint* endpoint, const PeerAddress& peer, uint32_t rttMs) {
-    if (!rttMs) rttMs = 1;
-    MutexGuard guard(routesMutex_);
-    for (RouteSlot& r : routes_) {
-        if (r.route.endpoint != endpoint || r.route.peer != peer) continue;
-        // Smoothed like TCP's: an eighth of each new sample.
-        r.route.rttMs = r.route.rttMs ? (r.route.rttMs * 7 + rttMs + 4) / 8 : rttMs;
-    }
+    routes_.roundTrip(endpoint, peer, rttMs);
 }
 
 void RemoteNode::setProtocol(uint8_t version) {
@@ -774,20 +544,7 @@ void RemoteNode::setAdvertisedSchema(uint32_t hash) {
 }
 
 void RemoteNode::detach(const DatagramEndpoint* endpoint) {
-    MutexGuard guard(routesMutex_);
-    for (size_t i = 0; i < routes_.size();) {
-        if (routes_[i].route.endpoint == endpoint) {
-            routes_.erase(routes_.begin() + static_cast<std::ptrdiff_t>(i));
-        } else {
-            i++;
-        }
-    }
-    if (lastEndpoint_ == endpoint) lastEndpoint_ = nullptr;
-    if (routes_.empty()) {
-        online_ = false;
-    } else {
-        updateOnlineLocked();
-    }
+    if (routes_.detach(endpoint)) changed();
 }
 
 // The route in use changed (`from` was it before): subscriptions move to the
@@ -873,34 +630,12 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
     // Every endpoint of the node ticks it; the one in use does the work.
     Route cur;
     if (!route(cur) || cur.endpoint != &by) return;
-    bool on = online();
-    bool switched = false, stateChanged = false;
-    Route from;
-    {
-        MutexGuard guard(routesMutex_);
-        if (!lastEndpoint_) {
-            lastEndpoint_ = cur.endpoint;
-            lastPeer_ = cur.peer;
-            lastOnline_ = on;
-        }
-        if (lastEndpoint_ != cur.endpoint || lastPeer_ != cur.peer) {
-            switched = true;
-            from.endpoint = lastEndpoint_;
-            from.peer = lastPeer_;
-            for (const RouteSlot& r : routes_) {
-                if (r.route.endpoint == from.endpoint && r.route.peer == from.peer) from.online = r.route.online;
-            }
-            lastEndpoint_ = cur.endpoint;
-            lastPeer_ = cur.peer;
-        }
-        stateChanged = switched || lastOnline_ != on || announce_.exchange(false);
-        lastOnline_ = on;
-    }
-    if (switched) {
+    detail::RouteTable::Observed seen = routes_.observe(cur, online());
+    if (seen.switched) {
         changed();  // the schema shows the route
-        rerouted(from, nowMs);
+        rerouted(seen.from, nowMs);
     }
-    if (stateChanged) {
+    if (seen.stateChanged) {
         StateHandler fn;
         {
             MutexGuard guard(sharedMutex());
@@ -911,21 +646,7 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
     }
 
     // Offline routes: does the device answer? Any reply puts the route back.
-    std::vector<Route> probes;
-    {
-        MutexGuard guard(routesMutex_);
-        if (probeMs_ && nowMs - lastProbeMs_ >= (probeWaitMs_ ? probeWaitMs_ : probeMs_)) {
-            for (const RouteSlot& r : routes_) {
-                if (!r.route.online) probes.push_back(r.route);
-            }
-            if (!probes.empty()) {
-                lastProbeMs_ = nowMs;
-                uint32_t base = probeWaitMs_ ? probeWaitMs_ : probeMs_;
-                probeWaitMs_ = base >= kMaxProbeMs / 2 ? kMaxProbeMs : base * 2;
-            }
-        }
-    }
-    for (const Route& r : probes) {
+    for (const Route& r : routes_.dueProbes(nowMs)) {
         Query q;
         q.depth = 0;
         r.endpoint->request(

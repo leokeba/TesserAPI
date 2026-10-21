@@ -1214,6 +1214,7 @@ The layout follows NowTP:
 
 **Source files.** A remote node (§14) is split into units, each in its own file. A unit holds its state and its lock (§9), and `test/remote_unit_cases.h` tests it without a node or a link:
 - `remote.cpp`: the node itself. It forwards requests, passes the peer's notifications on, presents tokens and calls the hooks.
+- `remote_routes.cpp` (`detail::RouteTable`): the routes (§14.3). This covers their order, the route in use and its switches, online state, probes, and the device and token that every route shares. It holds a leaf lock and calls nothing while holding it. `route.h` has the public types (`RouteKind`, `RemoteNode::Route`).
 - `remote_relay.cpp`: relayed file transfers (`FileRelay`), which use only the node's public interface.
 - `remote_stream.cpp` (`detail::SetStream`): the queue of streamed sets (§14.3), its merging and retries, under its own leaf lock. The node sends what the queue gives it.
 
