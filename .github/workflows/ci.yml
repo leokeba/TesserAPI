@@ -63,3 +63,20 @@ jobs:
             - source-path: ./
             - name: ArduinoJson
             - source-url: https://github.com/leokeba/NowTP.git
+
+  # Each push to main that passes becomes a release (DESIGN.md §16): a patch
+  # bump unless a commit since the last tag has a "Release: minor" or
+  # "Release: major" trailer. The manifests are stamped on a commit only the
+  # tag points at; main gets none.
+  release:
+    needs: [host-tests, esp-idf, arduino]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    uses: leokeba/TesserKIT/.github/workflows/firmware.yml@main
+    with:
+      version-command: jq -r .version library.json
+      stamp-command: python3 scripts/version.py "$VERSION"
