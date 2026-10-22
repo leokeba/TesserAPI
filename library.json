@@ -21,6 +21,6 @@
     "flags": ["-std=gnu++17"]
   },
   "export": {
-    "exclude": ["test", "build", ".github"]
+    "exclude": ["test", "build", ".github", "scripts"]
   }
 }

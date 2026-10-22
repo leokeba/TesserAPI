@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Check that the manifests state one version
+        run: python3 scripts/version.py
       - name: Build and run tests (ASan + UBSan)
         run: |
           cmake -S . -B build
