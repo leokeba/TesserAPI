@@ -54,14 +54,17 @@ uint32_t hashOf(const Node& n) {
     return sink.hash;
 }
 
-// `skip(n)`: a value left out (at its default).
+// `skip(n)`: a value left out (at its default). `backup`: nodes marked
+// backup(false) are left out, with their subtrees.
 template <class Skip>
-void writePersisted(const Object& o, bool inherited, detail::LazyPatch& lp, JsonWriter& w, const Skip& skip) {
+void writePersisted(const Object& o, bool inherited, bool backup, detail::LazyPatch& lp, JsonWriter& w,
+                    const Skip& skip) {
     for (const Node* c = o.first(); c; c = c->next()) {
+        if (backup && !c->backedUp()) continue;
         bool p = inherited || c->persisted();
         if (c->type() == NodeType::Object) {
             if (!lp.enter(c->name())) continue;
-            writePersisted(static_cast<const Object&>(*c), p, lp, w, skip);
+            writePersisted(static_cast<const Object&>(*c), p, backup, lp, w, skip);
             lp.leave();
         } else if (p && isLeaf(*c) && !skip(*c)) {
             lp.key(c->name());
@@ -76,7 +79,7 @@ template <class Skip>
 void writeRecord(const Node& top, bool inherited, JsonWriter& w, const Skip& skip, bool& any) {
     if (top.type() == NodeType::Object) {
         detail::LazyPatch lp(w);
-        writePersisted(static_cast<const Object&>(top), inherited || top.persisted(), lp, w, skip);
+        writePersisted(static_cast<const Object&>(top), inherited || top.persisted(), false, lp, w, skip);
         any = lp.finish();
     } else {
         any = !skip(top);
@@ -126,6 +129,7 @@ constexpr const char* kVersionKey = "@version";  // no node can be named so
 // what it applies changed (a restore at run time; a boot load needn't).
 struct Applier {
     bool notify = false;
+    bool backup = false;  // a restore: nodes marked backup(false) are left alone
     std::vector<std::string>* skipped = nullptr;
     std::string path;
 
@@ -138,6 +142,7 @@ struct Applier {
     void apply(Node* c, JsonVariantConst value, bool inherited) {
         bool p = c && (inherited || c->persisted());
         if (!c) return skip("no longer exists");
+        if (backup && !c->backedUp()) return;  // an older backup's copy of a key: ignored
         if (c->type() == NodeType::Object) {
             if (!value.is<JsonObjectConst>()) return skip("is now an object");
             for (JsonPairConst kv : value.as<JsonObjectConst>()) {
@@ -282,7 +287,8 @@ std::string Api::persistedState() {
     }
     // Every value, defaults included, unlike the records: a restore must
     // bring back the backed-up state whatever changed since, defaults too.
-    writePersisted(*this, persisted(), lp, w, [](const Node&) { return false; });
+    // Nodes marked backup(false) (keys) stay on this device.
+    writePersisted(*this, persisted(), true, lp, w, [](const Node&) { return false; });
     if (!lp.finish()) out = "{}";
     return out;
 }
@@ -384,6 +390,7 @@ Status Api::restore(std::string_view json, std::vector<std::string>* skipped) {
     }
     Applier a;
     a.notify = true;
+    a.backup = true;
     a.skipped = skipped;
     a.apply(this, doc.as<JsonVariantConst>(), persisted());
     if (storage_) {

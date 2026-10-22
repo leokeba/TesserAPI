@@ -388,6 +388,53 @@ TEST(persist_restore_is_exact) {
     CHECK_EQ(s.brightness, 7);
 }
 
+// A key persisted on the device but kept out of backups: a backup restored
+// on another device mustn't clone it, and an older backup carrying it
+// leaves the current one alone.
+TEST(persist_not_in_backups) {
+    MemoryStorage storage;
+    std::string key = "k1", fleet = "f1";
+    int level = 1;
+    {
+        Settings s(&storage);
+        auto& sys = s.api.object("sys").persist();
+        sys.value("key", key).secret().backup(false);
+        auto& peers = sys.object("peers").backup(false);  // a subtree
+        peers.value("password", fleet).secret();
+        sys.value("level", level);
+        s.api.persistence(storage);  // defaults of the nodes declared since
+        cases::set(s.api, "/sys", "{\"key\":\"k2\",\"peers\":{\"password\":\"f2\"},\"level\":3}");
+        CHECK(s.api.save());
+        CHECK_EQ(storage.records["sys"], "{\"key\":\"k2\",\"peers\":{\"password\":\"f2\"},\"level\":3}");
+        std::string backup = s.api.persistedState();
+        CHECK(backup.find("k2") == std::string::npos);
+        CHECK(backup.find("f2") == std::string::npos);
+        CHECK(backup.find("\"sys\":{\"level\":3}") != std::string::npos);
+
+        // An older backup's key is ignored, not listed as skipped.
+        std::vector<std::string> skipped;
+        CHECK_EQ(s.api.restore("{\"sys\":{\"key\":\"old\",\"peers\":{\"password\":\"old\"},\"level\":2}}", &skipped),
+                 Status::Ok);
+        CHECK_EQ(key, "k2");
+        CHECK_EQ(fleet, "f2");
+        CHECK_EQ(level, 2);
+        CHECK_EQ(skipped.size(), 0u);
+        CHECK_EQ(storage.records["sys"], "{\"key\":\"k2\",\"peers\":{\"password\":\"f2\"},\"level\":2}");
+    }
+    // Loaded from storage as usual.
+    key = fleet = "";
+    Settings fresh(&storage);
+    auto& sys = fresh.api.object("sys").persist();
+    sys.value("key", key).backup(false);
+    sys.object("peers").backup(false).value("password", fleet);
+    sys.value("level", level);
+    CHECK(fresh.api.load());
+    CHECK_EQ(key, "k2");
+    CHECK_EQ(fleet, "f2");
+    CHECK(sys.child("key")->backedUp() == false);
+    CHECK(sys.backup(true).backedUp());
+}
+
 // Stored state from before a version goes through the migration first:
 // TesserKIT drops values its devices froze at old defaults.
 TEST(persist_migration) {

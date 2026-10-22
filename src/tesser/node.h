@@ -129,6 +129,8 @@ public:
     Node* next() const { return next_.load(std::memory_order_acquire); }
     const NodeMeta* meta() const { return meta_; }
     bool persisted() const { return flags_ & kPersist; }
+    // False for a node left out of backups (backup(false)).
+    bool backedUp() const { return !(flags_ & kNoBackup); }
     bool watched() const { return flags_ & kWatch; }
     // Levels this node itself requires (docs/DESIGN.md section 13); a node
     // also requires its ancestors'.
@@ -154,6 +156,7 @@ protected:
         kWatch = 16,
         kSecret = 32,
         kTemporary = 64,  // part of a temporary object (list element, prototype)
+        kNoBackup = 128,
     };
 
     // Records a schema change (see schemaRevision()).
@@ -238,6 +241,17 @@ public:
     // call actions in it.
     Self& writeAccess(Access a) {
         setAccess(readAccess(), a > readAccess() ? a : readAccess());
+        return self();
+    }
+    // backup(false): this node and its subtree stay out of backups
+    // (Api::persistedState()), and a restore leaves them as they are; they
+    // are persisted to storage as usual. For a signing key or a fleet
+    // password that a backup would clone onto another device.
+    Self& backup(bool included) {
+        if (included)
+            flags_ = static_cast<uint8_t>(flags_ & ~kNoBackup);
+        else
+            flags_ |= kNoBackup;
         return self();
     }
 
