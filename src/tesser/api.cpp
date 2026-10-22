@@ -63,6 +63,7 @@ const char* toString(TransportKind kind) {
         case TransportKind::NowTP: return "nowtp";
         case TransportKind::WebSocket: return "websocket";
         case TransportKind::Udp: return "udp";
+        case TransportKind::Ble: return "ble";
     }
     return "local";
 }
@@ -93,8 +94,9 @@ std::string Api::deviceIdHex() const {
 }
 
 bool parseTransportKind(std::string_view s, TransportKind& out) {
-    static const TransportKind all[] = {TransportKind::Local,     TransportKind::Serial, TransportKind::Http,
-                                        TransportKind::NowTP,     TransportKind::WebSocket, TransportKind::Udp};
+    static const TransportKind all[] = {TransportKind::Local, TransportKind::Serial,    TransportKind::Http,
+                                        TransportKind::NowTP, TransportKind::WebSocket, TransportKind::Udp,
+                                        TransportKind::Ble};
     for (TransportKind k : all) {
         if (s == toString(k)) {
             out = k;
@@ -1500,10 +1502,15 @@ void Api::authenticate(TokenCheck fn) {
     tokenCheck_ = std::move(fn);
 }
 
+void Api::authenticate(std::function<Access(std::string_view token)> fn) {
+    if (!fn) return authenticate(TokenCheck());
+    authenticate([fn = std::move(fn)](std::string_view token, const Client&) { return fn(token); });
+}
+
 // Under the API lock: checks typically read keys or users from the tree.
-Access Api::tokenAccess(std::string_view token) const {
+Access Api::tokenAccess(std::string_view token, const Client& client) const {
     MutexGuard guard(mutex_);
-    return tokenCheck_ ? tokenCheck_(token) : Access::Public;
+    return tokenCheck_ ? tokenCheck_(token, client) : Access::Public;
 }
 
 bool Api::belowRemote(std::string_view path) const {

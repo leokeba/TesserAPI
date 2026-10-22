@@ -43,6 +43,9 @@ public:
     // gives its token, like an HTTP request's: the empty token until the
     // client sends {"op":"auth","token":"..."} (docs/DESIGN.md section 10.4).
     void setAuthenticated(bool authenticated) { authenticated_ = authenticated; }
+    // The transport its clients are shown with (Client::transport), for the
+    // token check and the authorizer: Serial by default, Ble on Bluetooth.
+    void setTransport(TransportKind kind) { kind_ = kind; }
 
     // The line's client is gone (a Bluetooth disconnection): drops its
     // subscriptions, any partial line, its token and its file transfer.
@@ -84,6 +87,7 @@ private:
     bool starved_ = false;  // discarding_ because the heap couldn't hold the line
     bool damaged_ = false;  // lineDamaged(): bytes of this line were lost
     bool authenticated_ = true;
+    TransportKind kind_ = TransportKind::Serial;
     std::string token_;  // from the last "auth" envelope
     FileSession files_;
     size_t overflows_ = 0;

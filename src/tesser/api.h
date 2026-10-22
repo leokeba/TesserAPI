@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -83,9 +84,12 @@ void handleNested(Api& api, const Request& request, Reply& reply);
 using Authorizer = std::function<bool(const Client& client, Op op, const Node& node)>;
 
 // Gives the access level of a token presented by a client (HTTP and
-// WebSocket: "Authorization: Bearer" or ?token=); empty when it presented
-// none. See Api::authenticate().
-using TokenCheck = std::function<Access(std::string_view token)>;
+// WebSocket: "Authorization: Bearer" or ?token=; lines and datagram peers:
+// an "auth" envelope); empty when it presented none. `client` is who
+// presents it, as far as its transport knows (transport, address, device),
+// before its level is decided: a check can open a device without accounts
+// to some clients and not to others. See Api::authenticate().
+using TokenCheck = std::function<Access(std::string_view token, const Client& client)>;
 // Whether a presented secret (a token, a password's hash) equals the
 // expected one, in a time that depends only on their lengths, not on how
 // much of a guess was right: a client timing replies can't find a token a
@@ -165,11 +169,16 @@ public:
     const Authorizer& authorizer() const { return authorizer_; }
 
     // Token authentication (docs/DESIGN.md section 13): transports that carry
-    // tokens ask `fn` for each client's level. Without it, only a transport's
-    // own token (HttpServer::setToken) authenticates.
+    // tokens ask `fn` for each client's level, under the API lock. Without
+    // it, only a transport's own token (HttpServer::setToken) authenticates.
     void authenticate(TokenCheck fn);
-    // The level `fn` gives `token`; Public without a check.
-    Access tokenAccess(std::string_view token) const;
+    // The same, for a check that doesn't look at the client.
+    void authenticate(std::function<Access(std::string_view token)> fn);
+    void authenticate(std::nullptr_t) { authenticate(TokenCheck()); }
+    // The level the check gives `token` presented by `client`; Public
+    // without a check. Without a client: as a local one's.
+    Access tokenAccess(std::string_view token, const Client& client) const;
+    Access tokenAccess(std::string_view token) const { return tokenAccess(token, Client()); }
 
     // Persistence (docs/DESIGN.md section 12): values and objects marked
     // persist() are saved to `storage` by poll(), debounceMs after the last

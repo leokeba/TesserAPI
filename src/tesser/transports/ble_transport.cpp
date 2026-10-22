@@ -46,6 +46,7 @@ BleTransport::BleTransport(Api& api)
     // Anyone in range can connect: unlike a serial line, a connection proves
     // nothing (docs/DESIGN.md section 13.2).
     line_.setAuthenticated(false);
+    line_.setTransport(TransportKind::Ble);
 }
 
 esp_err_t BleTransport::begin(const char* name, uint32_t stackSize, UBaseType_t priority) {

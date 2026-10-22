@@ -59,6 +59,7 @@ public:
         // Anyone in range can connect: unlike a serial line, a connection
         // proves nothing (docs/DESIGN.md section 13.2).
         line_.setAuthenticated(false);
+        line_.setTransport(TransportKind::Ble);
     }
 
     // Starts the BLE stack under this name (unless the sketch did), the

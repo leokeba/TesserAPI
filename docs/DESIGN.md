@@ -903,7 +903,7 @@ Every client has an access level, and every node may require one:
 ```cpp
 api.object("net").writeAccess(tesser::Access::Admin);      // anyone reads, admins write
 api.object("users").readAccess(tesser::Access::Admin);     // only admins read (and write)
-api.authenticate([](std::string_view token) { return users.check(token); });   // token → level
+api.authenticate([](std::string_view token, const tesser::Client& client) { return users.check(token, client); });
 ```
 
 - **Levels** are ordered: `public` < `user` < `admin` (`tesser::Access`).
@@ -916,7 +916,8 @@ api.authenticate([](std::string_view token) { return users.check(token); });   /
 **A client's level** (`Client::level()`) comes from its transport:
 - A transport that knows levels sets `Client::access`.
 - A transport that only knows "authenticated" (`Client::authenticated`, below) gives an authenticated client `admin` and any other `public`. That is the case of trusted NowTP peers, and of serial lines unless they are unauthenticated (below). A `LocalClient` is `admin` by default; `setAccess(level)` gives it any level (§14.2).
-- HTTP and WebSocket clients present a token. The transport's own token (`HttpServer::setToken`) gives `admin`. Any other token, or none (an empty token), goes to the API's token check, `api.authenticate(fn)`, whose answer is the client's level; without a check, `public`. Secrets are compared in constant time (`secretEquals(presented, expected)`: its time depends only on their lengths), so a client timing replies can't find a token a byte at a time; a token check should use it too. A WebSocket connection's level is decided once, from its handshake.
+- HTTP and WebSocket clients present a token. The transport's own token (`HttpServer::setToken`) gives `admin`. Any other token, or none (an empty token), goes to the API's token check, `api.authenticate(fn)`, whose answer is the client's level; without a check, `public`.
+- **The check sees the client:** `fn(token, client)` is given who presents the token, as far as its transport knows: its transport (`http`, `websocket`, `serial`, `ble`, `nowtp`, `udp`), its address (IP, or MAC for NowTP) and device, before its level is decided (`access` is `public`, `authenticated` false). So a policy can differ by client: a device without accounts can be open over its cable and its own access point, but not to UDP, NowTP or Bluetooth strangers. The check runs under the API lock. `authenticate(fn(token))`, the older form, still works, for checks that don't look at the client; `authenticate(nullptr)` removes the check. `api.tokenAccess(token, client)` asks it. Secrets are compared in constant time (`secretEquals(presented, expected)`: its time depends only on their lengths), so a client timing replies can't find a token a byte at a time; a token check should use it too. A WebSocket connection's level is decided once, from its handshake.
 - Unauthenticated lines (Bluetooth) present a token with an `auth` envelope (§10.4), checked the same way for every request; until then, the empty token.
 - Untrusted NowTP and UDP peers present a token with an `auth` envelope (§10.4), held per peer address until the next one or until the peer is forgotten (§10.7); until then, the empty token, as an HTTP request without one: `public` unless the check opens the device to anyone. Their level is at least the endpoint's `setPeerAccess(level)` (default `public`), so a LAN can let anyone use a device short of its admin nodes.
 - **Gateways:** a client never gets more through a gateway than its own level on the gateway. The remote node sees the gateway as its client (a trusted peer, or one that signed in, is often `admin`), so the gateway hands the client's level on as a ceiling (§10.1): the remote acts at the lower of the gateway's level and the client's. Otherwise a gateway signed in to its peers as an admin would let an anonymous browser read and write their admin nodes.
@@ -939,9 +940,9 @@ api.authenticate([](std::string_view token) { return users.check(token); });   /
 | NowTP | The sender is in `NowTpTransport::trustPeers({...})`, or `DatagramEndpoint::trust(fn)` accepts it (`admin`), or its level is above `public`: the token check's for its token (`auth`, or the empty one), or `setPeerAccess()`. ESP-NOW frames carry no proof of origin, so trust is in MAC addresses; combine it with encrypted NowTP peers when that matters. |
 | UDP | As NowTP: `trust(fn)` on the endpoint, a token sent with `auth`, or `setPeerAccess()`. Trust is in IP addresses, which anyone on the LAN can use. |
 | Serial | Always (physical access), unless `LineTransport::setAuthenticated(false)`: then as Bluetooth LE |
-| Bluetooth LE | When the API's token check gives the line's token (`auth`, §10.4), or the empty one, a level above `public`; always with `BleTransport::setAuthenticated(true)` |
+| Bluetooth LE | When the API's token check gives the line's token (`auth`, §10.4), or the empty one, a level above `public`; always with `BleTransport::setAuthenticated(true)`. Its clients are `ble` (`LineTransport::setTransport()`; a plain line's are `serial`). |
 
-- `Client` also carries the transport kind and the address (IP or MAC), for authorizers that need more.
+- `Client` also carries the transport kind and the address (IP or MAC), for authorizers and token checks that need more.
 - Hiding nodes from the schema is not access control: the authorizer runs on every access.
 - TLS is the application's choice of server.
 

@@ -392,6 +392,23 @@ TEST(udp_peer_access_and_tokens) {
     CHECK_EQ(p.call(tesser::Op::Get, "/sys/secret").status, Status::Unauthorized);
 }
 
+// The token check is given the peer: transport and address.
+TEST(udp_token_check_sees_peer) {
+    Pair p;
+    p.dev.api.object("user").writeAccess(tesser::Access::User).value("x", p.dev.gain);
+    tesser::Client last;
+    p.dev.api.authenticate([&](std::string_view, const tesser::Client& client) {
+        last = client;
+        // Open to one address only.
+        return client.addressLength == ip(1).length && memcmp(client.address, ip(1).bytes, ip(1).length) == 0
+                   ? tesser::Access::User
+                   : tesser::Access::Public;
+    });
+    CHECK_EQ(p.call(tesser::Op::Set, "/user/x", "1").status, Status::Ok);
+    CHECK(last.transport == tesser::TransportKind::Udp);
+    CHECK(!last.authenticated && last.access == tesser::Access::Public);  // not decided yet
+}
+
 TEST(udp_discovery) {
     cases::Device lamp, fan;
     tesser::Api gateway;

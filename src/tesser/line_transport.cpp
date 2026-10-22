@@ -146,7 +146,7 @@ void LineTransport::handleLine() {
         writeError(reply, s, reason, std::string_view(), message);
         return;
     }
-    req.client.transport = TransportKind::Serial;
+    req.client.transport = kind_;
     req.client.access = level();
     req.client.authenticated = req.client.access != Access::Public;
     if (file) {
@@ -157,7 +157,12 @@ void LineTransport::handleLine() {
     api_.handle(req, reply);
 }
 
-Access LineTransport::level() const { return authenticated_ ? Access::Admin : api_.tokenAccess(token_); }
+Access LineTransport::level() const {
+    if (authenticated_) return Access::Admin;
+    Client client;
+    client.transport = kind_;
+    return api_.tokenAccess(token_, client);
+}
 
 // {"op":"auth","token":"..."} sets the line's token until the next one or
 // reset(); an empty or missing token signs out. The reply gives the level.

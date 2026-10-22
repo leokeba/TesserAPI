@@ -123,7 +123,7 @@ private:
     bool wsSend(int fd, const std::string& message);
     bool wsSend(int fd, std::string&& message);
     bool wsSendShared(int fd, std::shared_ptr<const std::string> message);
-    Access access(httpd_req_t* req) const;
+    Access access(httpd_req_t* req, const Client& client) const;
     esp_err_t serveStream(httpd_req_t* req, const Request& request, Reply& reply);
     bool streamSend(Stream* stream, const std::string& piece);
     static void freeStream(void* ctx);

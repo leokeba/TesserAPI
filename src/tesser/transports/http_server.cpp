@@ -536,14 +536,27 @@ std::string requestToken(httpd_req_t* req) {
     }
     return token;
 }
+// The address of the client on socket `fd`, IPv4 or IPv6.
+void peerAddress(int fd, Client& client) {
+    struct sockaddr_in6 addr = {};
+    socklen_t addrLen = sizeof(addr);
+    if (fd < 0 || getpeername(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen) != 0) return;
+    if (addr.sin6_family == AF_INET) {
+        memcpy(client.address, &reinterpret_cast<struct sockaddr_in*>(&addr)->sin_addr.s_addr, 4);
+        client.addressLength = 4;
+    } else {
+        memcpy(client.address, &addr.sin6_addr, 16);
+        client.addressLength = 16;
+    }
+}
 }  // namespace
 
 // The transport's own token gives full access; any other goes to the API's
-// token check (Api::authenticate()).
-Access HttpServer::access(httpd_req_t* req) const {
+// token check (Api::authenticate()), with the client.
+Access HttpServer::access(httpd_req_t* req, const Client& client) const {
     std::string token = requestToken(req);
     if (token_ && *token_ && secretEquals(token, token_)) return Access::Admin;
-    return api_.tokenAccess(token);
+    return api_.tokenAccess(token, client);
 }
 
 void HttpServer::onClose(httpd_handle_t server, int fd) {
@@ -561,7 +574,10 @@ esp_err_t HttpServer::onWebSocket(httpd_req_t* req) {
 // also called the WebSocket handler with the handshake's GET.
 esp_err_t HttpServer::onWebSocketHandshake(httpd_req_t* req) {
     auto* self = static_cast<HttpServer*>(req->user_ctx);
-    self->wsClient(httpd_req_to_sockfd(req), true)->access = self->access(req);
+    Client client;
+    client.transport = TransportKind::WebSocket;
+    peerAddress(httpd_req_to_sockfd(req), client);
+    self->wsClient(httpd_req_to_sockfd(req), true)->access = self->access(req, client);
     return ESP_OK;
 }
 
@@ -610,12 +626,7 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
 
     Client client;
     client.transport = TransportKind::WebSocket;
-    struct sockaddr_in6 addr = {};
-    socklen_t addrLen = sizeof(addr);
-    if (getpeername(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen) == 0 && addr.sin6_family == AF_INET) {
-        memcpy(client.address, &reinterpret_cast<struct sockaddr_in*>(&addr)->sin_addr.s_addr, 4);
-        client.addressLength = 4;
-    }
+    peerAddress(fd, client);
     WsClient* ws = wsClient(fd, false);
     if (!ws) {
         // The handshake went unseen, so its token can't count.
@@ -903,21 +914,9 @@ esp_err_t HttpServer::serve(httpd_req_t* req, bool inWorker) {
     request.op = req->method == HTTP_GET ? Op::Get : Op::Set;
     request.path = path;
     request.client.transport = TransportKind::Http;
-    request.client.access = access(req);
+    peerAddress(httpd_req_to_sockfd(req), request.client);
+    request.client.access = access(req, request.client);
     request.client.authenticated = request.client.access != Access::Public;
-    int fd = httpd_req_to_sockfd(req);
-    struct sockaddr_in6 addr = {};
-    socklen_t addrLen = sizeof(addr);
-    if (fd >= 0 && getpeername(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen) == 0) {
-        if (addr.sin6_family == AF_INET) {
-            auto* a4 = reinterpret_cast<struct sockaddr_in*>(&addr);
-            memcpy(request.client.address, &a4->sin_addr.s_addr, 4);
-            request.client.addressLength = 4;
-        } else {
-            memcpy(request.client.address, &addr.sin6_addr, 16);
-            request.client.addressLength = 16;
-        }
-    }
 
     // Query options.
     char* query = nullptr;

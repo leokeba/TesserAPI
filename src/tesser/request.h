@@ -63,9 +63,9 @@ struct Query {
     Access ceiling = Access::Admin;
 };
 
-enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket, Udp };
+enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket, Udp, Ble };
 
-// "local" / "serial" / "http" / "nowtp" / "websocket" / "udp".
+// "local" / "serial" / "http" / "nowtp" / "websocket" / "udp" / "ble".
 const char* toString(TransportKind kind);
 bool parseTransportKind(std::string_view s, TransportKind& out);
 

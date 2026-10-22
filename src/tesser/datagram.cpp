@@ -505,14 +505,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
         stats_.requests++;
     }
     Request req;
-    req.client.transport = kind_;
-    memcpy(req.client.address, msg.from.bytes, msg.from.length < 16 ? msg.from.length : 16);
-    req.client.addressLength = msg.from.length < 16 ? msg.from.length : 16;
-    PeerAddress device = deviceOf(msg.from);
-    if (device.length == 6) {
-        memcpy(req.client.device, device.bytes, 6);
-        req.client.deviceLength = 6;
-    }
+    req.client = clientOf(msg.from);
     // A trusted peer is admin; any other is where the token check puts its
     // token, like an HTTP request's, and at least at setPeerAccess().
     if (trust_ && trust_(msg.from)) {
@@ -574,6 +567,19 @@ void DatagramEndpoint::handle(Incoming& msg) {
     }
 }
 
+Client DatagramEndpoint::clientOf(const PeerAddress& peer) const {
+    Client client;
+    client.transport = kind_;
+    memcpy(client.address, peer.bytes, peer.length < 16 ? peer.length : 16);
+    client.addressLength = peer.length < 16 ? peer.length : 16;
+    PeerAddress device = deviceOf(peer);
+    if (device.length == 6) {
+        memcpy(client.device, device.bytes, 6);
+        client.deviceLength = 6;
+    }
+    return client;
+}
+
 Access DatagramEndpoint::levelOf(const PeerAddress& peer) {
     std::string token;
     {
@@ -582,7 +588,7 @@ Access DatagramEndpoint::levelOf(const PeerAddress& peer) {
             if (t.first == peer) token = t.second;
         }
     }
-    Access level = api_->tokenAccess(token);
+    Access level = api_->tokenAccess(token, clientOf(peer));
     Access least = peerAccess_.load();
     return level > least ? level : least;
 }

@@ -268,4 +268,47 @@ TEST(access_line_tokens) {
     CHECK_EQ(line(setPort), "{\"status\":\"ok\",\"body\":81}");
 }
 
+// The token check sees who presents the token: a device without accounts
+// can be open to a cable and not to anyone in Bluetooth range.
+TEST(access_token_check_sees_client) {
+    Device d;
+    std::vector<tesser::TransportKind> seen;
+    d.api.authenticate([&](std::string_view token, const tesser::Client& client) {
+        seen.push_back(client.transport);
+        if (token == "a") return Access::Admin;
+        return token.empty() && client.transport == tesser::TransportKind::Serial ? Access::Admin : Access::Public;
+    });
+    tesser::Client local;
+    CHECK(d.api.tokenAccess("") == Access::Public);
+    local.transport = tesser::TransportKind::Serial;
+    CHECK(d.api.tokenAccess("", local) == Access::Admin);
+
+    cases::Lines lines;
+    auto line = [&](tesser::LineTransport& t, const char* text) {
+        lines.out.clear();
+        t.feed(text, strlen(text));
+        t.feed('\n');
+        return lines.out.size() == 1 ? lines.out[0] : "<" + std::to_string(lines.out.size()) + " lines>";
+    };
+    const char* setPort = "{\"op\":\"set\",\"path\":\"/net/port\",\"body\":81}";
+    tesser::LineTransport cable(d.api, [&](const char* data, size_t n) { lines.add(data, n); });
+    cable.setAuthenticated(false);
+    tesser::LineTransport radio(d.api, [&](const char* data, size_t n) { lines.add(data, n); });
+    radio.setAuthenticated(false);
+    radio.setTransport(tesser::TransportKind::Ble);
+    seen.clear();
+    CHECK_EQ(line(cable, setPort), "{\"status\":\"ok\",\"body\":81}");
+    CHECK(line(radio, setPort).find("unauthorized") != std::string::npos);
+    CHECK(seen.size() == 2 && seen[0] == tesser::TransportKind::Serial && seen[1] == tesser::TransportKind::Ble);
+    CHECK_EQ(line(radio, "{\"op\":\"auth\",\"token\":\"a\"}"), "{\"status\":\"ok\",\"body\":{\"access\":\"admin\"}}");
+    CHECK_EQ(line(radio, setPort), "{\"status\":\"ok\",\"body\":81}");
+    CHECK_EQ(std::string(tesser::toString(tesser::TransportKind::Ble)), "ble");
+
+    // The older form, and none.
+    d.api.authenticate([](std::string_view token) { return token == "u" ? Access::User : Access::Public; });
+    CHECK(d.api.tokenAccess("u", local) == Access::User);
+    d.api.authenticate(nullptr);
+    CHECK(d.api.tokenAccess("u", local) == Access::Public);
+}
+
 }  // namespace access_cases

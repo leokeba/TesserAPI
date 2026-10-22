@@ -487,6 +487,9 @@ private:
     void handle(Incoming& msg);
     bool queue(Incoming&& msg);
     void handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply);
+    // A request's client from `peer`: transport, address and device, before
+    // its level is decided.
+    Client clientOf(const PeerAddress& peer) const;
     Access levelOf(const PeerAddress& peer);
     void reject(const PeerAddress& from, std::string_view text, bool broadcast, Status status, Reason reason,
                 const char* message);
