@@ -157,4 +157,40 @@ TEST(stream_refusals) {
     }
 }
 
+// A stream whose token was revoked (Api::tokensChanged()) loses its
+// subscription when it was made above the new level, and is closed.
+TEST(stream_token_revoked) {
+    Fixture f;
+    f.device.api.object("sys").readAccess(tesser::Access::Admin).value("level", f.device.lamp.brightness);
+    bool valid = true;
+    f.device.api.authenticate([&](std::string_view token, const tesser::Client& client) {
+        return valid && token == "t" && client.addressLength == 4 ? tesser::Access::Admin : tesser::Access::Public;
+    });
+    tesser::Request req;
+    req.path = "/sys";
+    req.client.addressLength = 4;
+    req.client.access = tesser::Access::Admin;
+    f.stream.presented("t", false);
+    tesser::StringReply error;
+    CHECK_EQ(f.stream.open(req, error), Status::Ok);
+    f.device.api.tokensChanged();
+    CHECK_EQ(f.device.api.subscriptionCount(), 1u);
+    CHECK(!f.stream.takeRevoked());
+    valid = false;
+    f.device.api.tokensChanged();
+    CHECK_EQ(f.device.api.subscriptionCount(), 0u);
+    CHECK(!f.stream.isOpen());
+    CHECK(f.stream.takeRevoked());
+    CHECK(!f.stream.takeRevoked());  // once
+
+    // The server's own token: kept.
+    Fixture g;
+    g.device.api.authenticate([](std::string_view) { return tesser::Access::Public; });
+    g.stream.presented("own", true);
+    tesser::StringReply error2;
+    CHECK_EQ(g.open("/", eventsOnly(), error2), Status::Ok);
+    g.device.api.tokensChanged();
+    CHECK_EQ(g.device.api.subscriptionCount(), 1u);
+}
+
 }  // namespace stream_sub_cases

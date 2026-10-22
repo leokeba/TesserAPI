@@ -37,7 +37,21 @@ public:
     // it without the API lock. Once per stream.
     Status open(Request request, Reply& error);
 
+    // The token the stream's client presented (none: empty), which
+    // Api::tokensChanged() checks again; `fixed`: its level doesn't come
+    // from the token check (the transport's own token). Before open().
+    // Without it, the stream keeps its level.
+    void presented(std::string_view token, bool fixed) {
+        token_.assign(token.data(), token.size());
+        fixed_ = fixed;
+    }
+
     bool notify(const std::string& message, Delivery delivery) override;
+    bool recheckLevel(Access& level) override;
+    void levelLowered() override;
+    // Its level fell below its subscription's (levelLowered()): the
+    // transport closes the stream. True once.
+    bool takeRevoked() { return revoked_.exchange(false); }
 
     // Call regularly (every idleMs / 3, say): sends "\n" once nothing has
     // gone out for `idleMs`. False if that send failed.
@@ -54,6 +68,10 @@ private:
     Send send_;
     std::atomic<bool> open_{false};
     std::atomic<bool> sent_{false};
+    std::atomic<bool> revoked_{false};
+    std::string token_;
+    bool fixed_ = true;
+    Client client_;  // as it opened, for the token check
     bool opened_ = false;
     bool ticked_ = false;  // keepAlive() state, in the caller's task
     uint32_t lastMs_ = 0;

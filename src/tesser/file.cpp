@@ -636,6 +636,7 @@ std::string_view text(JsonVariantConst v) {
 struct FileSession::State {
     explicit State(Api& api) : transfer(api) {}
     FileTransfer transfer;
+    Access level = Access::Public;  // the client's when it opened
     bool upload = false;
     std::string path;  // normalized
     // Download.
@@ -706,6 +707,10 @@ void FileSession::handle(JsonObjectConst envelope, const Client& from, Reply& re
     splitOp(text(envelope["op"]), op, ceiling);
     Client client = from;
     client.cap(ceiling);
+    // The client's level fell since the transfer opened (its token was
+    // revoked, Api::tokensChanged()): the transfer ends, and this envelope
+    // is taken as the next one's.
+    if (state_ && client.level() < state_->level) state_.reset();
     const char* message = nullptr;
     Reason reason = Reason::None;
     Status strict = checkStrict(envelope, {"v", "id", "op", "path", "offset", "size", "filename", "data", "length", "crc32"},
@@ -852,6 +857,7 @@ void FileSession::upload(JsonObjectConst envelope, std::string_view raw, std::st
         if (o == FileTransfer::Open::NotFile) writeError(reply, Status::NotAllowed, path, "not a file");
         if (o != FileTransfer::Open::Ok && o != FileTransfer::Open::Remote) return;
         state->upload = true;
+        state->level = client.level();
         state->size = static_cast<int64_t>(size.as<uint64_t>());
         state->path.assign(path.data(), path.size());
         state_ = std::move(state);
@@ -937,6 +943,7 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
         if (o == FileTransfer::Open::NotFile) writeError(reply, Status::NotAllowed, path, "not a file");
         if (o != FileTransfer::Open::Ok && o != FileTransfer::Open::Remote) return;
         state->path.assign(path.data(), path.size());
+        state->level = client.level();
         state->size = state->transfer.size();
         state_ = std::move(state);
         if (o == FileTransfer::Open::Remote) return relayDownload(true, 0, length, max, crc, reply);

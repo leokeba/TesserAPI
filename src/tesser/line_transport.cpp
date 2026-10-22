@@ -16,6 +16,13 @@ LineTransport::~LineTransport() { api_.dropSubscriber(this); }
 
 bool LineTransport::notify(const std::string& message, Delivery) { return send(message, true); }
 
+// Api::tokensChanged(): an unauthenticated line's level comes from its token.
+bool LineTransport::recheckLevel(Access& out) {
+    if (authenticated_) return false;
+    out = level();
+    return true;
+}
+
 void LineTransport::feed(const char* data, size_t len) {
     for (size_t i = 0; i < len; i++) feed(data[i]);
 }
@@ -181,7 +188,10 @@ void LineTransport::handleAuth(JsonObjectConst envelope, const EnvelopeId& id) {
     }
     Access before = level();
     JsonString t = token.as<JsonString>();
-    token_.assign(t.c_str() ? t.c_str() : "", t.size());
+    {
+        MutexGuard guard(api_.mutex());  // recheckLevel() reads it from another task
+        token_.assign(t.c_str() ? t.c_str() : "", t.size());
+    }
     Access after = level();
     // Subscriptions keep the level they were made at: drop them rather than
     // show the client what it can no longer read.
@@ -200,7 +210,10 @@ void LineTransport::reset() {
     line_.clear();
     line_.shrink_to_fit();
     discarding_ = starved_ = damaged_ = false;
-    token_.clear();
+    {
+        MutexGuard guard(api_.mutex());
+        token_.clear();
+    }
     files_.reset();
 }
 

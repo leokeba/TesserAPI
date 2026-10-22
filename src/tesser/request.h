@@ -124,6 +124,18 @@ public:
     virtual bool notifyShared(const std::shared_ptr<const std::string>& message, Delivery delivery) {
         return notify(*message, delivery);
     }
+    // Asked by Api::tokensChanged(), under the API lock: the client's level
+    // now, from the token check given again the token it presented (none:
+    // the empty one). False when its level doesn't come from the check (a
+    // trusted peer, a line with physical access): its subscriptions stay.
+    virtual bool recheckLevel(Access& level) {
+        (void)level;
+        return false;
+    }
+    // Api::tokensChanged() ended subscriptions of this client made above its
+    // new level. Under the API lock. A transport whose client can't tell
+    // otherwise closes the connection.
+    virtual void levelLowered() {}
     // Set when a notification was lost (by the core when notify() fails, or by
     // the transport when a queued one fails later). The next notification
     // carries "overflow": true so the client knows to re-read.

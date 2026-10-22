@@ -410,6 +410,12 @@ private:
             if (ep_.options_.maxMessage && message.size() > ep_.options_.maxMessage) return false;
             return ep_.send_ && ep_.send_(peer, message, delivery);
         }
+        // Api::tokensChanged(): a peer that isn't trusted is at its token's level.
+        bool recheckLevel(Access& level) override {
+            if (ep_.trust_ && ep_.trust_(peer)) return false;
+            level = ep_.levelOf(peer);
+            return true;
+        }
 
     private:
         DatagramEndpoint& ep_;

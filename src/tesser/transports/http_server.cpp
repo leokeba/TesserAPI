@@ -359,10 +359,25 @@ private:
 class HttpServer::WsClient : public Subscriber {
 public:
     WsClient(HttpServer& server, int socket) : server_(server), fd(socket), files(server.api_) {}
+    // Decided at the handshake, from its token; asked again when the token
+    // check's answers change (Api::tokensChanged()).
     Access access = Access::Public;
+    std::string token;      // the handshake's, set before any request
+    Client client;          // the handshake's
+    bool checked = false;   // access comes from the token check
+    uint32_t generation = 0;  // Api::tokenGeneration() when access was decided
     bool notify(const std::string& message, Delivery) override { return server_.wsSend(fd, message); }
     bool notifyShared(const std::shared_ptr<const std::string>& message, Delivery) override {
         return server_.wsSendShared(fd, message);
+    }
+    bool recheckLevel(Access& level) override {
+        if (!checked) return false;
+        level = server_.api_.tokenAccess(token, client);
+        return true;
+    }
+    // Subscriptions ended: closed, so the client notices and connects again.
+    void levelLowered() override {
+        if (server_.server_) httpd_sess_trigger_close(server_.server_, fd);
     }
 
 private:
@@ -574,10 +589,15 @@ esp_err_t HttpServer::onWebSocket(httpd_req_t* req) {
 // also called the WebSocket handler with the handshake's GET.
 esp_err_t HttpServer::onWebSocketHandshake(httpd_req_t* req) {
     auto* self = static_cast<HttpServer*>(req->user_ctx);
-    Client client;
-    client.transport = TransportKind::WebSocket;
-    peerAddress(httpd_req_to_sockfd(req), client);
-    self->wsClient(httpd_req_to_sockfd(req), true)->access = self->access(req, client);
+    WsClient* ws = self->wsClient(httpd_req_to_sockfd(req), true);
+    ws->client.transport = TransportKind::WebSocket;
+    peerAddress(httpd_req_to_sockfd(req), ws->client);
+    ws->generation = self->api_.tokenGeneration();
+    ws->token = requestToken(req);
+    // The server's own token is admin, whatever the check says.
+    ws->checked = !(self->token_ && *self->token_ && secretEquals(ws->token, self->token_));
+    if (!ws->checked) ws->token.clear();
+    ws->access = ws->checked ? self->api_.tokenAccess(ws->token, ws->client) : Access::Admin;
     return ESP_OK;
 }
 
@@ -636,6 +656,12 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
                        "for token authentication");
         }
         ws = wsClient(fd, true);
+    }
+    // The token check's answers changed since: asked again.
+    uint32_t generation = api_.tokenGeneration();
+    if (ws->checked && ws->generation != generation) {
+        ws->generation = generation;
+        ws->access = api_.tokenAccess(ws->token, ws->client);
     }
     client.access = ws->access;
     client.authenticated = ws->access != Access::Public;
@@ -1290,7 +1316,14 @@ void HttpServer::onKeepAlive(void* arg) {
     auto* self = static_cast<HttpServer*>(arg);
     MutexGuard guard(self->streamsMutex_);
     uint32_t now = millis32();
-    for (Stream* s : self->streams_) s->subscriber.keepAlive(now, self->keepAliveMs_);
+    for (Stream* s : self->streams_) {
+        // Its subscription ended (Api::tokensChanged()): closed.
+        if (s->subscriber.takeRevoked()) {
+            if (s->server.load()) httpd_sess_trigger_close(s->handle, s->fd);
+            continue;
+        }
+        s->subscriber.keepAlive(now, self->keepAliveMs_);
+    }
 }
 
 esp_err_t HttpServer::serveStream(httpd_req_t* req, const Request& request, Reply& reply) {
@@ -1315,6 +1348,8 @@ esp_err_t HttpServer::serveStream(httpd_req_t* req, const Request& request, Repl
         }
     }
     auto* stream = new Stream(*this, req->handle, httpd_req_to_sockfd(req));
+    std::string token = requestToken(req);
+    stream->subscriber.presented(token, token_ && *token_ && secretEquals(token, token_));
     {
         MutexGuard guard(streamsMutex_);
         streams_.push_back(stream);

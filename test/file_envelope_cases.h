@@ -345,6 +345,34 @@ TEST(file_envelope_session_lifetime) {
           std::string::npos);
 }
 
+// A transfer opened at a level the client lost (its token revoked,
+// Api::tokensChanged()) ends at its next chunk.
+TEST(file_envelope_token_revoked) {
+    Fixture f;
+    bool valid = true;
+    f.api.authenticate([&](std::string_view token) {
+        return valid && token == "t" ? tesser::Access::Admin : tesser::Access::Public;
+    });
+    Line line(f.api);
+    line.t.setAuthenticated(false);
+    CHECK(line.send("{\"op\":\"auth\",\"token\":\"t\"}").find("admin") != std::string::npos);
+    CHECK(line.send("{\"op\":\"upload\",\"path\":\"/sys/firmware\",\"size\":8,\"data\":\"YWJjZA==\"}")
+              .find("\"received\":4") != std::string::npos);
+    valid = false;
+    f.api.tokensChanged();
+    CHECK(line.send("{\"op\":\"upload\",\"path\":\"/sys/firmware\",\"offset\":4,\"data\":\"YWJjZA==\"}")
+              .find("no upload in progress") != std::string::npos);
+    CHECK_EQ(f.ram.aborted, 1);
+    // Valid again: a transfer opened since goes on.
+    valid = true;
+    CHECK(line.send("{\"op\":\"upload\",\"path\":\"/sys/firmware\",\"size\":8,\"data\":\"YWJjZA==\"}")
+              .find("\"received\":4") != std::string::npos);
+    f.api.tokensChanged();
+    CHECK(line.send("{\"op\":\"upload\",\"path\":\"/sys/firmware\",\"offset\":4,\"data\":\"YWJjZA==\"}")
+              .find("\"error\"") == std::string::npos);  // finished
+    CHECK_EQ(f.ram.aborted, 1);
+}
+
 TEST(file_envelope_idle_takeover) {
     Fixture f;
     Line a(f.api), b(f.api);

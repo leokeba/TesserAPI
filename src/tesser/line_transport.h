@@ -33,6 +33,7 @@ public:
     ~LineTransport() override;
 
     bool notify(const std::string& message, Delivery delivery) override;
+    bool recheckLevel(Access& level) override;
 
     void feed(const char* data, size_t len);
     void feed(char c);
@@ -88,7 +89,7 @@ private:
     bool damaged_ = false;  // lineDamaged(): bytes of this line were lost
     bool authenticated_ = true;
     TransportKind kind_ = TransportKind::Serial;
-    std::string token_;  // from the last "auth" envelope
+    std::string token_;  // from the last "auth" envelope; written under the API lock
     FileSession files_;
     size_t overflows_ = 0;
     size_t overruns_ = 0;

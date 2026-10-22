@@ -253,6 +253,42 @@ void Api::forwardedSubscriptions(const Node* node, const std::function<bool(Subs
     }
 }
 
+void Api::tokensChanged() {
+    MutexGuard guard(mutex_);
+    tokenGeneration_++;
+    // Each client's level, asked once; admin for those whose level doesn't
+    // come from the check.
+    std::vector<std::pair<Subscriber*, Access>> levels;
+    auto levelOf = [&levels](Subscriber* s) {
+        for (const auto& l : levels) {
+            if (l.first == s) return l.second;
+        }
+        return Access::Admin;
+    };
+    for (const Subscription& s : subs_) {
+        bool seen = false;
+        for (const auto& l : levels) seen = seen || l.first == s.subscriber;
+        Access level = Access::Admin;
+        if (!seen && s.subscriber->recheckLevel(level)) levels.emplace_back(s.subscriber, level);
+    }
+    // Subscriptions keep the level they were made at: those above the new
+    // one end, as when a line signs out.
+    std::vector<Subscription> gone;
+    std::vector<Subscriber*> lowered;
+    for (size_t i = 0; i < subs_.size();) {
+        Subscriber* s = subs_[i].subscriber;
+        if (subs_[i].access <= levelOf(s)) {
+            i++;
+            continue;
+        }
+        if (std::find(lowered.begin(), lowered.end(), s) == lowered.end()) lowered.push_back(s);
+        gone.push_back(std::move(subs_[i]));
+        subs_.erase(subs_.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+    subscriptionsRemoved(gone, false);
+    for (Subscriber* s : lowered) s->levelLowered();
+}
+
 void Api::dropSubscriber(Subscriber* subscriber) {
     {
         // Queued requests from this client can't be answered any more. One

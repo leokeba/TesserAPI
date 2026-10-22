@@ -392,6 +392,30 @@ TEST(udp_peer_access_and_tokens) {
     CHECK_EQ(p.call(tesser::Op::Get, "/sys/secret").status, Status::Unauthorized);
 }
 
+// Api::tokensChanged(): a peer's token is checked again; a trusted peer
+// keeps its subscriptions.
+TEST(udp_tokens_changed) {
+    Pair p;
+    p.dev.api.object("sys").readAccess(tesser::Access::Admin).value("secret", p.dev.level);
+    bool valid = true;
+    p.dev.api.authenticate([&](std::string_view token) {
+        return valid && token == "root" ? tesser::Access::Admin : tesser::Access::Public;
+    });
+    Result r;
+    p.client.endpoint().requestFields(ip(2), "\"op\":\"auth\",\"token\":\"root\"", capture(r));
+    p.net.run();
+    CHECK_EQ(r.body, "{\"access\":\"admin\"}");
+    CHECK_EQ(p.call(tesser::Op::Subscribe, "/sys").status, Status::Ok);
+    valid = false;
+    p.dev.api.tokensChanged();
+    CHECK_EQ(p.dev.api.subscriptionCount(), 0u);
+    CHECK_EQ(p.call(tesser::Op::Get, "/sys/secret").status, Status::Unauthorized);
+    p.server.endpoint().trust([](const PeerAddress&) { return true; });
+    CHECK_EQ(p.call(tesser::Op::Subscribe, "/sys").status, Status::Ok);
+    p.dev.api.tokensChanged();
+    CHECK_EQ(p.dev.api.subscriptionCount(), 1u);
+}
+
 // The token check is given the peer: transport and address.
 TEST(udp_token_check_sees_peer) {
     Pair p;

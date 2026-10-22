@@ -117,6 +117,7 @@ Status StreamSubscriber::open(Request request, Reply& error) {
         return Status::NotAllowed;
     }
     opened_ = true;
+    client_ = request.client;
     request.op = Op::Subscribe;
     request.subscriber = this;
     while (path.size() > 1 && path.back() == '/') path.remove_suffix(1);
@@ -175,6 +176,19 @@ bool StreamSubscriber::send(const std::string& piece) {
 bool StreamSubscriber::notify(const std::string& message, Delivery) {
     if (!open_) return true;  // closed: nobody to tell
     return send(message + "\n");
+}
+
+bool StreamSubscriber::recheckLevel(Access& level) {
+    if (fixed_) return false;
+    level = api_.tokenAccess(token_, client_);
+    return true;
+}
+
+// Its one subscription ended: nothing more goes out, and the transport
+// closes the stream, so its client notices and opens it again.
+void StreamSubscriber::levelLowered() {
+    open_ = false;
+    revoked_ = true;
 }
 
 bool StreamSubscriber::keepAlive(uint32_t nowMs, uint32_t idleMs) {

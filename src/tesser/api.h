@@ -179,6 +179,18 @@ public:
     // without a check. Without a client: as a local one's.
     Access tokenAccess(std::string_view token, const Client& client) const;
     Access tokenAccess(std::string_view token) const { return tokenAccess(token, Client()); }
+    // The check's answers changed: a token revoked (signing everyone out,
+    // an account removed, a password or role changed) or an account created.
+    // Every client whose level came from the check is checked again with the
+    // token it presented: its subscriptions made above its new level end
+    // (a WebSocket or an HTTP stream that loses some is closed), and its
+    // next request or file chunk is at the new level (docs/DESIGN.md
+    // section 13.4). Any task.
+    void tokensChanged();
+    // Moves with every tokensChanged(): a transport that keeps a client's
+    // level (a WebSocket's, from its handshake) asks the check again when it
+    // did.
+    uint32_t tokenGeneration() const { return tokenGeneration_.load(); }
 
     // Persistence (docs/DESIGN.md section 12): values and objects marked
     // persist() are saved to `storage` by poll(), debounceMs after the last
@@ -321,6 +333,7 @@ private:
     uint32_t lastWatchMs_ = 0;
     Authorizer authorizer_;
     TokenCheck tokenCheck_;
+    std::atomic<uint32_t> tokenGeneration_{0};
     std::unique_ptr<RemoteHooks> remoteHooks_;
     Storage* storage_ = nullptr;
     uint32_t debounceMs_ = 2000;

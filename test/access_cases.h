@@ -268,6 +268,62 @@ TEST(access_line_tokens) {
     CHECK_EQ(line(setPort), "{\"status\":\"ok\",\"body\":81}");
 }
 
+// Api::tokensChanged(): clients whose level came from the token check are
+// checked again; their subscriptions above the new level end.
+TEST(access_tokens_changed) {
+    Device d;
+    bool open = true;  // no admin account yet
+    d.api.authenticate([&](std::string_view token) {
+        if (open || token == "a") return Access::Admin;
+        return token == "u" ? Access::User : Access::Public;
+    });
+    cases::Lines lines;
+    auto line = [&](tesser::LineTransport& t, const char* text) {
+        lines.out.clear();
+        t.feed(text, strlen(text));
+        t.feed('\n');
+        return lines.out.size() == 1 ? lines.out[0] : "<" + std::to_string(lines.out.size()) + " lines>";
+    };
+    tesser::LineTransport guest(d.api, [&](const char* data, size_t n) { lines.add(data, n); });
+    guest.setAuthenticated(false);
+    tesser::LineTransport user(d.api, [&](const char* data, size_t n) { lines.add(data, n); });
+    user.setAuthenticated(false);
+    tesser::LineTransport cable(d.api, [&](const char* data, size_t n) { lines.add(data, n); });  // physical access
+    CHECK(line(user, "{\"op\":\"auth\",\"token\":\"u\"}").find("admin") != std::string::npos);
+    const char* subUsers = "{\"op\":\"sub\",\"path\":\"/users\"}";
+    const char* subAll = "{\"op\":\"sub\",\"path\":\"/\",\"changes\":false}";
+    CHECK_EQ(line(guest, subUsers), "{\"status\":\"ok\",\"body\":{\"admin\":null}}");
+    CHECK(line(user, subUsers).find("\"ok\"") != std::string::npos);
+    CHECK(line(cable, subUsers).find("\"ok\"") != std::string::npos);
+    CHECK_EQ(d.api.subscriptionCount(), 3u);
+    uint32_t generation = d.api.tokenGeneration();
+
+    // An admin account is created: the device isn't open any more.
+    open = false;
+    d.api.tokensChanged();
+    CHECK(d.api.tokenGeneration() != generation);
+    CHECK_EQ(d.api.subscriptionCount(), 1u);  // the cable's
+    CHECK(line(guest, "{\"op\":\"set\",\"path\":\"/net/port\",\"body\":81}").find("unauthorized") !=
+          std::string::npos);
+    lines.out.clear();
+    d.login->emit("root");
+    d.api.poll(500);
+    CHECK_EQ(lines.out.size(), 1u);  // to the cable only
+
+    // Subscriptions at or below the new level stay.
+    CHECK(line(guest, subAll).find("\"ok\"") != std::string::npos);
+    CHECK(line(user, subAll).find("\"ok\"") != std::string::npos);
+    d.api.tokensChanged();
+    CHECK_EQ(d.api.subscriptionCount(), 3u);
+    // The user's token is revoked: its user-level subscription ends too.
+    CHECK(line(user, "{\"op\":\"auth\",\"token\":\"u\"}").find("user") != std::string::npos);
+    CHECK(line(user, "{\"op\":\"sub\",\"path\":\"/brightness\"}").find("\"ok\"") != std::string::npos);
+    CHECK_EQ(d.api.subscriptionCount(), 4u);
+    d.api.authenticate([](std::string_view token) { return token == "a" ? Access::Admin : Access::Public; });
+    d.api.tokensChanged();
+    CHECK_EQ(d.api.subscriptionCount(), 2u);  // the guest's and the cable's: the user's were made as a user
+}
+
 // The token check sees who presents the token: a device without accounts
 // can be open to a cable and not to anyone in Bluetooth range.
 TEST(access_token_check_sees_client) {
