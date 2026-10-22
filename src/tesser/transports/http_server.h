@@ -7,7 +7,10 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <cstddef>
+#include <functional>
 #include <memory>
+#include <string_view>
 
 #include <string>
 #include <vector>
@@ -45,6 +48,31 @@ public:
     // Adds Access-Control-Allow-* headers and answers OPTIONS preflights.
     // Call before begin()/attach().
     void enableCors(const char* origin = "*") { corsOrigin_ = origin; }
+
+    // Hardening against pages in the browsers of the same network
+    // (docs/DESIGN.md section 10.2): off by default.
+    struct StrictOptions {
+        // Sets and actions with a body need "Content-Type: application/json"
+        // (uploads to file nodes keep their own types): another site's page
+        // can't send one without a CORS preflight. Else 415.
+        bool jsonBodies = true;
+        // A request, preflight or WebSocket handshake that carries Origin
+        // must come from the CORS origin (enableCors(); "*": any) or from
+        // the device's own page (the Origin's host and port are the Host
+        // header's). Else 403.
+        bool checkOrigin = true;
+        // The names the device answers to (its name.local, its addresses,
+        // its access point's): a request whose Host is another is refused
+        // with 421, against DNS rebinding. Given the host without its port.
+        // Requests without Host (HTTP/1.0 tools) pass. Null: any host. Runs
+        // in the httpd task, without the API lock.
+        std::function<bool(std::string_view host)> allowHost;
+    };
+    // Turns the strict mode on, or changes its options; strict(nullptr)
+    // turns it off. Any time, from any task: a request sees the options it
+    // started with.
+    void strict(StrictOptions options);
+    void strict(std::nullptr_t);
 
     // Serves the JSON envelope protocol, including subscriptions, over
     // WebSocket at `uri` (one more handler slot). Needs
@@ -124,6 +152,10 @@ private:
     bool wsSend(int fd, std::string&& message);
     bool wsSendShared(int fd, std::shared_ptr<const std::string> message);
     Access access(httpd_req_t* req, const Client& client) const;
+    std::shared_ptr<const StrictOptions> strictOptions() const;
+    // The strict mode's Host and Origin checks: false, with the refusal sent,
+    // when the request mustn't go on.
+    bool admitted(httpd_req_t* req, const StrictOptions& strict);
     esp_err_t serveStream(httpd_req_t* req, const Request& request, Reply& reply);
     bool streamSend(Stream* stream, const std::string& piece);
     static void freeStream(void* ctx);
@@ -145,6 +177,8 @@ private:
     const char* corsOrigin_ = nullptr;
     const char* wsUri_ = nullptr;
     const char* token_ = nullptr;
+    mutable Mutex strictMutex_{kRankLeaf, "http strict"};
+    std::shared_ptr<const StrictOptions> strict_;  // null: off
     mutable Mutex wsMutex_;
     std::vector<WsClient*> wsClients_;
     bool wsAuthWarned_ = false;

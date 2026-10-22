@@ -18,6 +18,7 @@
 #include "sdkconfig.h"
 #include "tesser/envelope.h"
 #include "tesser/file.h"
+#include "tesser/http_checks.h"
 #include "tesser/stream_subscriber.h"
 
 // mDNS (advertise()): Arduino-ESP32 ships the component; on ESP-IDF, the
@@ -551,6 +552,27 @@ std::string requestToken(httpd_req_t* req) {
     }
     return token;
 }
+// A request header's value; empty when it is absent.
+std::string header(httpd_req_t* req, const char* name) {
+    size_t len = httpd_req_get_hdr_value_len(req, name);
+    if (!len) return std::string();
+    std::string value(len + 1, '\0');
+    if (httpd_req_get_hdr_value_str(req, name, &value[0], value.size()) != ESP_OK) return std::string();
+    value.resize(len);
+    return value;
+}
+
+// A refusal of the strict mode, with an error body like any other.
+void refuse(httpd_req_t* req, const char* statusLine, Status status, Reason reason, const char* message,
+            const char* corsOrigin) {
+    StringReply body;
+    writeError(body, status, reason, std::string_view(), message);
+    httpd_resp_set_status(req, statusLine);
+    httpd_resp_set_type(req, "application/json");
+    if (corsOrigin) httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", corsOrigin);
+    httpd_resp_send(req, body.body.data(), static_cast<ssize_t>(body.body.size()));
+}
+
 // The address of the client on socket `fd`, IPv4 or IPv6.
 void peerAddress(int fd, Client& client) {
     struct sockaddr_in6 addr = {};
@@ -565,6 +587,39 @@ void peerAddress(int fd, Client& client) {
     }
 }
 }  // namespace
+
+void HttpServer::strict(StrictOptions options) {
+    auto shared = std::make_shared<const StrictOptions>(std::move(options));
+    MutexGuard guard(strictMutex_);
+    strict_ = std::move(shared);
+}
+
+void HttpServer::strict(std::nullptr_t) {
+    std::shared_ptr<const StrictOptions> old;
+    MutexGuard guard(strictMutex_);
+    old.swap(strict_);  // freed after the guard: a leaf
+}
+
+std::shared_ptr<const HttpServer::StrictOptions> HttpServer::strictOptions() const {
+    MutexGuard guard(strictMutex_);
+    return strict_;
+}
+
+bool HttpServer::admitted(httpd_req_t* req, const StrictOptions& strict) {
+    std::string host = header(req, "Host");
+    if (!host.empty() && strict.allowHost && !strict.allowHost(http::hostName(host))) {
+        refuse(req, "421 Misdirected Request", Status::Unauthorized, Reason::NotAuthorized, "unknown host", nullptr);
+        return false;
+    }
+    if (strict.checkOrigin) {
+        std::string origin = header(req, "Origin");
+        if (!origin.empty() && !http::originAllowed(origin, corsOrigin_, host)) {
+            refuse(req, "403 Forbidden", Status::Unauthorized, Reason::NotAuthorized, "origin not allowed", nullptr);
+            return false;
+        }
+    }
+    return true;
+}
 
 // The transport's own token gives full access; any other goes to the API's
 // token check (Api::authenticate()), with the client.
@@ -589,6 +644,9 @@ esp_err_t HttpServer::onWebSocket(httpd_req_t* req) {
 // also called the WebSocket handler with the handshake's GET.
 esp_err_t HttpServer::onWebSocketHandshake(httpd_req_t* req) {
     auto* self = static_cast<HttpServer*>(req->user_ctx);
+    // Refused: answered, and the connection closes without switching.
+    std::shared_ptr<const StrictOptions> strict = self->strictOptions();
+    if (strict && !self->admitted(req, *strict)) return ESP_FAIL;
     WsClient* ws = self->wsClient(httpd_req_to_sockfd(req), true);
     ws->client.transport = TransportKind::WebSocket;
     peerAddress(httpd_req_to_sockfd(req), ws->client);
@@ -859,6 +917,8 @@ void HttpServer::addCorsHeaders(httpd_req_t* req) {
 
 esp_err_t HttpServer::onOptions(httpd_req_t* req) {
     auto* self = static_cast<HttpServer*>(req->user_ctx);
+    std::shared_ptr<const StrictOptions> strict = self->strictOptions();
+    if (strict && !self->admitted(req, *strict)) return ESP_OK;
     httpd_resp_set_status(req, "204 No Content");
     self->addCorsHeaders(req);
     return httpd_resp_send(req, nullptr, 0);
@@ -919,6 +979,8 @@ void HttpServer::remoteTask(void* arg) {
 }
 
 esp_err_t HttpServer::serve(httpd_req_t* req, bool inWorker) {
+    std::shared_ptr<const StrictOptions> strict = strictOptions();
+    if (strict && !inWorker && !admitted(req, *strict)) return ESP_OK;
     HttpReply reply(*this, req);
     const Config& cfg = api_.config();
 
@@ -1040,7 +1102,14 @@ esp_err_t HttpServer::serve(httpd_req_t* req, bool inWorker) {
         }
     }
 
-    // Body.
+    // Body. JSON only, in the strict mode: a form or text/plain needs no
+    // preflight.
+    if (strict && strict->jsonBodies && request.op == Op::Set && req->content_len > 0 &&
+        !http::isJsonType(header(req, "Content-Type"))) {
+        refuse(req, "415 Unsupported Media Type", Status::BadRequest, Reason::None, "the body must be application/json",
+               corsOrigin_);
+        return ESP_OK;
+    }
     if (req->content_len > cfg.maxRequestBody) {
         writeError(reply, Status::TooLarge, path, "request body too large");
         return ESP_OK;

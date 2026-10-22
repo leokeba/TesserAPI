@@ -6,6 +6,7 @@
 
 #include "core_cases.h"
 #include "remote_cases.h"
+#include "tesser/http_checks.h"
 #include "subscription_cases.h"
 
 namespace protocol_cases {
@@ -155,6 +156,50 @@ TEST(protocol_secret_equals) {
     CHECK(!tesser::secretEquals("test-token1", "test-token"));  // longer
     CHECK(!tesser::secretEquals("", "test-token"));
     CHECK(!tesser::secretEquals(std::string_view("a\0", 2), "a"));  // trailing NUL counts
+}
+
+// HttpServer's strict mode (docs/DESIGN.md section 10.2): the header checks.
+TEST(protocol_http_strict_checks) {
+    using namespace tesser::http;
+    CHECK(hostName("dev.local:8080") == "dev.local");
+    CHECK(hostName("dev.local") == "dev.local");
+    CHECK(hostName("192.168.4.1:80") == "192.168.4.1");
+    CHECK(hostName("[fe80::1]:80") == "[fe80::1]");
+    CHECK(hostName("[fe80::1]") == "[fe80::1]");
+
+    // The device's own page.
+    CHECK(sameOrigin("http://192.168.1.59", "192.168.1.59"));
+    CHECK(sameOrigin("http://Dev.Local", "dev.local:80"));
+    CHECK(sameOrigin("http://dev.local:80", "dev.local"));
+    CHECK(sameOrigin("http://dev.local:8080", "dev.local:8080"));
+    CHECK(sameOrigin("https://dev.local", "dev.local:443"));
+    CHECK(!sameOrigin("http://dev.local:8080", "dev.local"));
+    CHECK(!sameOrigin("http://evil.example", "dev.local"));
+    CHECK(!sameOrigin("http://dev.local.evil.example", "dev.local"));
+    CHECK(!sameOrigin("null", "dev.local"));
+    CHECK(!sameOrigin("file://", "dev.local"));
+    CHECK(!sameOrigin("http://dev.local", ""));
+    CHECK(sameOrigin("http://[fe80::1]", "[fe80::1]:80"));
+
+    // The CORS origin, any with "*", or the device's own page.
+    const char* launcher = "https://leokeba.github.io";
+    CHECK(originAllowed("https://leokeba.github.io", launcher, "192.168.1.59"));
+    CHECK(originAllowed("http://192.168.1.59", launcher, "192.168.1.59"));
+    CHECK(!originAllowed("https://leokeba.github.io.evil.example", launcher, "192.168.1.59"));
+    CHECK(!originAllowed("http://evil.example", launcher, "192.168.1.59"));
+    CHECK(!originAllowed("null", launcher, "192.168.1.59"));
+    CHECK(!originAllowed("http://evil.example", nullptr, "192.168.1.59"));
+    CHECK(originAllowed("http://evil.example", "*", "192.168.1.59"));
+    CHECK(originAllowed("null", "*", ""));
+
+    CHECK(isJsonType("application/json"));
+    CHECK(isJsonType("Application/JSON; charset=utf-8"));
+    CHECK(isJsonType(" application/json ;charset=utf-8"));
+    CHECK(!isJsonType("text/plain"));
+    CHECK(!isJsonType("application/x-www-form-urlencoded"));
+    CHECK(!isJsonType("multipart/form-data; boundary=x"));
+    CHECK(!isJsonType("application/jsonx"));
+    CHECK(!isJsonType(""));
 }
 
 }  // namespace protocol_cases
