@@ -18,8 +18,24 @@ inline size_t probe() { return g_largest; }
 inline size_t g_free = SIZE_MAX;
 inline size_t freeProbe() { return g_free; }
 
+// A chip without PSRAM, whatever this one has, while it lives (and any
+// other lives); budget_cases::Psram, made after it, gives one PSRAM.
+inline int g_noPsram = 0;
+struct NoPsram {
+    NoPsram() {
+        g_noPsram++;
+        tesser::setPsramProbe([] { return false; });
+    }
+    ~NoPsram() {
+        if (--g_noPsram == 0) tesser::setPsramProbe(nullptr);
+    }
+    NoPsram(const NoPsram&) = delete;
+    NoPsram& operator=(const NoPsram&) = delete;
+};
+
 // A heap floor and the free heap the library sees; restored after.
 struct Floor {
+    NoPsram noPsram;
     size_t before = tesser::heapFloor();
     Floor(size_t floor, size_t free) {
         g_free = free;
@@ -35,6 +51,7 @@ struct Floor {
 
 // Sets the largest free block the library sees, and restores the platform's.
 struct Heap {
+    NoPsram noPsram;
     explicit Heap(size_t largest) {
         g_largest = largest;
         tesser::setLargestFreeBlockProbe(&probe);

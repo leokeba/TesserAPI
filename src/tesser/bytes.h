@@ -6,12 +6,14 @@
 
 #include <string_view>
 
+#include "tesser/platform.h"
+
 namespace tesser {
 
-// A message in a malloc()ed buffer, which a link can take over whole
+// A message in a buffer free() frees, which a link can take over whole
 // (release()) rather than copy: NowTP's sendBuffer() (docs/DESIGN.md section
-// 15). Grows with realloc(); a growth the heap can't give fails instead of
-// aborting. Move-only.
+// 15). From Pool::Large (PSRAM when the chip has it) unless told otherwise;
+// a growth the heap can't give fails instead of aborting. Move-only.
 class Bytes {
 public:
     Bytes() = default;
@@ -37,10 +39,11 @@ public:
     bool empty() const { return len_ == 0; }
     std::string_view view() const { return std::string_view(data_ ? data_ : "", len_); }
 
-    // At least `cap` bytes of room: false, unchanged, if the heap can't.
-    bool reserve(size_t cap) {
+    // At least `cap` bytes of room, in `pool`: false, unchanged, if the
+    // heap can't.
+    bool reserve(size_t cap, Pool pool = Pool::Large) {
         if (cap <= cap_) return true;
-        char* p = static_cast<char*>(realloc(data_, cap));
+        char* p = static_cast<char*>(reallocate(data_, cap, pool));
         if (!p) return false;
         data_ = p;
         cap_ = cap;

@@ -41,7 +41,8 @@ size_t ApiClient::process() {
         inbox_->notifications = 0;
     }
     for (ClientInbox::Item& item : items) {
-        JsonDocument doc;
+        // A whole tree or schema: in PSRAM when the chip has it.
+        JsonDocument doc(jsonAllocator(item.json.size() > 1024 ? Pool::Large : Pool::Internal));
         bool parsed = item.json.empty() || !deserializeJson(doc, item.json, DeserializationOption::NestingLimit(kWrittenNesting));
         if (item.notification) {
             if (onNotification_ && parsed && doc.is<JsonObjectConst>()) onNotification_(doc.as<JsonObjectConst>());

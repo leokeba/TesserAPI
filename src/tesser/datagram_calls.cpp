@@ -204,6 +204,7 @@ class BytesOut : public DatagramEndpoint::EnvelopeOut {
 public:
     BytesOut(Bytes& b, size_t slack) : b_(b), slack_(slack) {}
     bool reserve(size_t bytes) override { return b_.reserve(bytes + slack_); }
+    Pool pool(size_t) const override { return Pool::Large; }
     void append(const char* data, size_t len) override {
         if (!b_.append(data, len) && b_.reserve(b_.size() + len + slack_)) b_.append(data, len);
     }
@@ -482,7 +483,7 @@ bool DatagramEndpoint::requestFields(const PeerAddress& to, std::string_view fie
     // One allocation of its exact size, if the heap can spare it (docs/DESIGN.md
     // section 15): a relayed file chunk is several KB.
     size_t size = static_cast<size_t>(n) + fields.size() + 1;
-    Reservation room = memoryBudget().reserve(size, 0, true);
+    Reservation room = memoryBudget().reserve(size, 0, true, true, mallocPool(size));
     if (!room) return false;
     std::string text;
     text.reserve(size);

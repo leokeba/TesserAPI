@@ -586,8 +586,8 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
     // and the payload is read and dropped a piece at a time, so the
     // connection stays. httpd holds no bytes of it ahead: only an HTTP
     // request's parser does.
-    Reservation room = memoryBudget().reserve(frame.len + 1, 0, false);
-    if (room && frame.len + 1 > 1024 && largestFreeBlock() < frame.len + 1 + 256) room.release();
+    Reservation room = memoryBudget().reserve(frame.len + 1, 0, false, true, mallocPool(frame.len + 1));
+    if (room && frame.len + 1 > 1024 && largestFreeBlock(room.pool()) < frame.len + 1 + 256) room.release();
     if (!room) {
         EnvelopeId noId;
         EnvelopeReply reply(noId, 0, [this, fd](std::string& m) { wsSend(fd, std::move(m)); });
@@ -1103,7 +1103,7 @@ bool HttpServer::streamSend(Stream* stream, const std::string& piece) {
     int n = snprintf(size, sizeof(size), "%x\r\n", static_cast<unsigned>(piece.size()));
     // The chunk, built in one allocation and counted until sent.
     size_t len = static_cast<size_t>(n) + piece.size() + 2;
-    Reservation held = queued_.reserve(len, static_cast<uintptr_t>(stream->fd) + 1, true, true);
+    Reservation held = queued_.reserve(len, static_cast<uintptr_t>(stream->fd) + 1, true, true, mallocPool(len));
     if (!held) {
         workRefused_++;
         return false;

@@ -108,7 +108,7 @@ uintptr_t budgetKey(const PeerAddress& p) {
 
 Reservation DatagramEndpoint::hold(const PeerAddress& from, std::string_view text, bool reliable, bool broadcast,
                                    bool heap) {
-    Reservation r = incoming_.reserve(text.size(), budgetKey(from), true, heap);
+    Reservation r = incoming_.reserve(text.size(), budgetKey(from), true, heap, mallocPool(text.size()));
     if (!r) {
         {
             MutexGuard guard(mutex_);
@@ -436,8 +436,9 @@ void DatagramEndpoint::handle(Incoming& msg) {
     std::string_view text = msg.view();
     Reservation parsing;  // the document, about as large as the text
     if (text.size() > 1024) {
-        // An upload's document leaves its data out: small.
-        parsing = memoryBudget().reserve(isUploadEnvelope(text) ? 512 : 2 * text.size(), 0, false);
+        // An upload's document leaves its data out: small. In PSRAM when
+        // the chip has it: a remote's whole tree or schema, say.
+        parsing = memoryBudget().reserve(isUploadEnvelope(text) ? 512 : 2 * text.size(), 0, false, true, Pool::Large);
         if (!parsing) {
             {
                 MutexGuard guard(mutex_);
@@ -449,7 +450,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
     }
     // Responses and notifications nest as deep as the peer wrote them;
     // requests are held to the same limit as on other transports below.
-    JsonDocument doc;
+    JsonDocument doc(jsonAllocator(parsing ? parsing.pool() : Pool::Internal));
     // An upload's data is read from the text, not copied into the document.
     DeserializationError err =
         isUploadEnvelope(text)

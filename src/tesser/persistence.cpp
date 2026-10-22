@@ -98,7 +98,7 @@ Record record(const Node& top, bool inherited, const Skip& skip, std::string& ou
         writeRecord(top, inherited, w, skip, any);
     }
     if (!any) return Record::Empty;
-    held = memoryBudget().reserve(counter.count + 1, 0, true);
+    held = memoryBudget().reserve(counter.count + 1, 0, true, true, mallocPool(counter.count + 1));
     if (!held) return Record::NoRoom;
     out.clear();
     out.reserve(counter.count + 1);
@@ -346,7 +346,7 @@ bool Api::load() {
         if (!holdsPersisted(*c, persisted())) continue;
         data.clear();
         if (!storage_->load(c->name(), data) || data == "null") continue;
-        JsonDocument doc;
+        JsonDocument doc(jsonAllocator(Pool::Large));  // a whole subtree: PSRAM when the chip has it
         a.path = "/";
         a.path += c->name();
         if (deserializeJson(doc, data, DeserializationOption::NestingLimit(kWrittenNesting))) {
@@ -366,7 +366,7 @@ bool Api::load() {
 
 Status Api::restore(std::string_view json, std::vector<std::string>* skipped) {
     MutexGuard guard(mutex_);
-    JsonDocument doc;
+    JsonDocument doc(jsonAllocator(Pool::Large));  // a whole backup: PSRAM when the chip has it
     if (deserializeJson(doc, json.data(), json.size(), DeserializationOption::NestingLimit(kWrittenNesting)) ||
         !doc.is<JsonObjectConst>()) {
         return Status::BadRequest;

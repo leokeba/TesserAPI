@@ -198,6 +198,8 @@ public:
         // Room for `bytes` in all; false if the heap can't give it.
         virtual bool reserve(size_t bytes) = 0;
         virtual void append(const char* data, size_t len) = 0;
+        // The pool `bytes` of it come from, to reserve them in.
+        virtual Pool pool(size_t bytes) const { return mallocPool(bytes); }
         void append(std::string_view s) { append(s.data(), s.size()); }
     };
     // Sends the envelope `build` writes for the call's id into `out`, which

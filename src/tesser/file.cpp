@@ -47,7 +47,8 @@ public:
     // heap can't.
     bool reserve(uint64_t size) {
         if (size <= 256) return true;
-        Reservation room = memoryBudget().reserve(static_cast<size_t>(size));
+        Reservation room = memoryBudget().reserve(static_cast<size_t>(size), 0, true, true,
+                                                  mallocPool(static_cast<size_t>(size)));
         if (!room) return false;
         reserveExactly(text_, static_cast<size_t>(size));
         return true;
@@ -258,7 +259,7 @@ Status waitForChunk(FileRelay& relay, uint64_t offset, JsonDocument& body, std::
         w->body.set(b);
         if (s == Status::Ok) {
             size_t n = text.size() / 4 * 3;
-            Reservation room = memoryBudget().reserve(n, 0, true);
+            Reservation room = memoryBudget().reserve(n, 0, true, true, mallocPool(n));
             if (!room) {
                 w->status = Status::Busy;
                 w->body.clear();
@@ -416,7 +417,7 @@ bool FileTransfer::write(const uint8_t* data, size_t len, Reply& reply) {
         // its exact need within the byte budget (docs/DESIGN.md section 15).
         size_t need = relayBuf_.size() + len;
         if (need > relayBuf_.capacity()) {
-            Reservation room = memoryBudget().reserve(need, 0, true);
+            Reservation room = memoryBudget().reserve(need, 0, true, true, mallocPool(need));
             if (!room) {
                 close();
                 writeError(reply, Status::Busy, Reason::LowMemory, path_, "not enough memory to relay the upload");

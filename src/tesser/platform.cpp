@@ -18,6 +18,7 @@
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 #include "tesser/api.h"
 #else
 #include <chrono>
@@ -49,33 +50,95 @@ void logv(char level, const char* fmt, va_list ap) {
 }  // namespace
 
 namespace {
-size_t (*g_probe)() = nullptr;
-size_t (*g_freeProbe)() = nullptr;
+// Per pool: [0] internal RAM, [1] PSRAM.
+size_t (*g_probe[2])() = {nullptr, nullptr};
+size_t (*g_freeProbe[2])() = {nullptr, nullptr};
+bool (*g_psramProbe)() = nullptr;
 #if defined(ESP_PLATFORM)
-std::atomic<size_t> g_floor{8192};
+std::atomic<size_t> g_floor[2] = {{8192}, {16384}};
 #else
-std::atomic<size_t> g_floor{0};
+std::atomic<size_t> g_floor[2] = {{0}, {0}};
+#endif
+#if defined(ESP_PLATFORM) && defined(CONFIG_SPIRAM_USE_MALLOC)
+std::atomic<size_t> g_mallocPsramAbove{CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL};
+#else
+std::atomic<size_t> g_mallocPsramAbove{SIZE_MAX};
+#endif
+
+size_t slot(Pool pool) { return pool == Pool::Large ? 1 : 0; }
+
+#if defined(ESP_PLATFORM)
+uint32_t capsOf(Pool pool) {
+    return pool == Pool::Large ? MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT : MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+}
 #endif
 }  // namespace
 
-void setLargestFreeBlockProbe(size_t (*probe)()) { g_probe = probe; }
-void setFreeHeapProbe(size_t (*probe)()) { g_freeProbe = probe; }
-void setHeapFloor(size_t bytes) { g_floor = bytes; }
-size_t heapFloor() { return g_floor.load(); }
+void setPsramProbe(bool (*probe)()) { g_psramProbe = probe; }
 
-size_t freeHeap() {
-    if (g_freeProbe) return g_freeProbe();
+bool hasPsram() {
+    if (g_psramProbe) return g_psramProbe();
 #if defined(ESP_PLATFORM)
-    return heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    // Found at run time: an image built with CONFIG_SPIRAM_IGNORE_NOTFOUND
+    // runs without it.
+    return heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+#else
+    return false;
+#endif
+}
+
+Pool poolOf(Pool pool) { return pool == Pool::Large && hasPsram() ? Pool::Large : Pool::Internal; }
+
+Pool mallocPool(size_t bytes) { return bytes > g_mallocPsramAbove.load() ? poolOf(Pool::Large) : Pool::Internal; }
+void setMallocPsramAbove(size_t bytes) { g_mallocPsramAbove = bytes; }
+size_t mallocPsramAbove() { return g_mallocPsramAbove.load(); }
+
+void* allocate(size_t bytes, Pool pool) {
+#if defined(ESP_PLATFORM)
+    // Without PSRAM (or with it full), from internal RAM, as malloc() would.
+    if (pool == Pool::Large) {
+        if (void* p = heap_caps_malloc(bytes, capsOf(Pool::Large))) return p;
+    }
+    return heap_caps_malloc(bytes, capsOf(Pool::Internal));
+#else
+    (void)pool;
+    return malloc(bytes);
+#endif
+}
+
+void* reallocate(void* p, size_t bytes, Pool pool) {
+#if defined(ESP_PLATFORM)
+    if (!p) return allocate(bytes, pool);
+    // Moved between pools if it isn't in the one asked for.
+    if (pool == Pool::Large) {
+        if (void* q = heap_caps_realloc(p, bytes, capsOf(Pool::Large))) return q;
+    }
+    return heap_caps_realloc(p, bytes, capsOf(Pool::Internal));
+#else
+    (void)pool;
+    return realloc(p, bytes);
+#endif
+}
+
+void setLargestFreeBlockProbe(size_t (*probe)(), Pool pool) { g_probe[slot(pool)] = probe; }
+void setFreeHeapProbe(size_t (*probe)(), Pool pool) { g_freeProbe[slot(pool)] = probe; }
+void setHeapFloor(size_t bytes, Pool pool) { g_floor[slot(pool)] = bytes; }
+size_t heapFloor(Pool pool) { return g_floor[slot(poolOf(pool))].load(); }
+
+size_t freeHeap(Pool pool) {
+    pool = poolOf(pool);
+    if (size_t (*probe)() = g_freeProbe[slot(pool)]) return probe();
+#if defined(ESP_PLATFORM)
+    return heap_caps_get_free_size(capsOf(pool));
 #else
     return SIZE_MAX;
 #endif
 }
 
-bool heapAbove(size_t bytes) {
-    size_t floor = heapFloor();
+bool heapAbove(size_t bytes, Pool pool) {
+    size_t floor = heapFloor(pool);
     if (!floor) return true;
-    size_t free = freeHeap();
+    size_t free = freeHeap(pool);
     return free >= floor && free - floor >= bytes;
 }
 
@@ -223,10 +286,11 @@ bool background(std::function<void()> work) {
     return true;
 }
 
-size_t largestFreeBlock() {
-    if (g_probe) return g_probe();
+size_t largestFreeBlock(Pool pool) {
+    pool = poolOf(pool);
+    if (size_t (*probe)() = g_probe[slot(pool)]) return probe();
 #if defined(ESP_PLATFORM)
-    return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    return heap_caps_get_largest_free_block(capsOf(pool));
 #else
     return SIZE_MAX;
 #endif
@@ -258,10 +322,11 @@ bool growFor(std::string& s, size_t need) {
         // The heap as a whole: the growth and a copy further down, and the
         // floor left to everything else, after what other tasks' buffers
         // are about to take (the accountant, docs/DESIGN.md section 15).
+        // In the pool malloc() takes it from.
         held = Reservation();
-        held = memoryBudget().reserve(capacity - s.capacity() + need, 0, false);
+        held = memoryBudget().reserve(capacity - s.capacity() + need, 0, false, true, mallocPool(capacity));
         // One block that size, a copy further down, and headroom.
-        return held && (capacity <= 1024 || largestFreeBlock() >= capacity + need + 1024);
+        return held && (capacity <= 1024 || largestFreeBlock(held.pool()) >= capacity + need + 1024);
     };
     size_t capacity = grown > need && fits(grown) ? grown : fits(need) ? need : 0;
     if (!capacity) return false;
@@ -275,13 +340,14 @@ bool growFor(Bytes& b, size_t need) {
     Reservation held;
     auto fits = [&](size_t capacity) {
         if (capacity <= 256) return true;
-        // realloc() may need the new block while the old one is held.
+        // realloc() may need the new block while the old one is held. In
+        // PSRAM when the chip has it, unless that is short.
         held = Reservation();
-        held = memoryBudget().reserve(capacity, 0, false);
-        return held && (capacity <= 1024 || largestFreeBlock() >= capacity + 1024);
+        held = memoryBudget().reserve(capacity, 0, false, true, Pool::Large);
+        return held && (capacity <= 1024 || largestFreeBlock(held.pool()) >= capacity + 1024);
     };
     size_t capacity = grown > need && fits(grown) ? grown : fits(need) ? need : 0;
-    return capacity && b.reserve(capacity);
+    return capacity && b.reserve(capacity, held ? held.pool() : Pool::Large);
 }
 
 bool stationMac(uint8_t mac[6]) {

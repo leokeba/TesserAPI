@@ -443,7 +443,7 @@ void UdpLink::dropPartials(const PeerAddress& from) {
 Reservation UdpLink::makeRoom(const PeerAddress& from, size_t bytes) {
     for (;;) {
         // About to be allocated: the heap floor and one block too.
-        Reservation r = reassembly_.reserve(bytes, budgetKey(from), true, true);
+        Reservation r = reassembly_.reserve(bytes, budgetKey(from), true, true, mallocPool(bytes));
         if (r || partials_.empty()) return r;
         // The sender's own oldest first, so one peer can't push out others.
         size_t oldest = partials_.size();

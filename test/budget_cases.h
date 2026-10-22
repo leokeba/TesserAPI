@@ -286,4 +286,192 @@ TEST(budget_growth_falls_back_to_the_need) {
     CHECK_EQ(b.capacity(), 3150u);
 }
 
+// A chip with PSRAM: its free heap, largest block and floor, as the
+// library sees them, and how large a buffer malloc() puts there; restored
+// after (the chip's own, or none within memory_cases::NoPsram).
+inline size_t g_psramFree = SIZE_MAX;
+inline size_t g_psramLargest = SIZE_MAX;
+struct Psram {
+    size_t before = tesser::heapFloor(tesser::Pool::Large);
+    size_t mallocBefore = tesser::mallocPsramAbove();
+    Psram(size_t floor, size_t free, size_t mallocAbove = SIZE_MAX) {
+        g_psramFree = free;
+        g_psramLargest = SIZE_MAX;
+        tesser::setPsramProbe([] { return true; });
+        tesser::setFreeHeapProbe([] { return g_psramFree; }, tesser::Pool::Large);
+        tesser::setLargestFreeBlockProbe([] { return g_psramLargest; }, tesser::Pool::Large);
+        tesser::setHeapFloor(floor, tesser::Pool::Large);
+        tesser::setMallocPsramAbove(mallocAbove);
+    }
+    ~Psram() {
+        if (memory_cases::g_noPsram) {
+            tesser::setPsramProbe([] { return false; });
+        } else {
+            tesser::setPsramProbe(nullptr);
+        }
+        tesser::setFreeHeapProbe(nullptr, tesser::Pool::Large);
+        tesser::setLargestFreeBlockProbe(nullptr, tesser::Pool::Large);
+        tesser::setHeapFloor(before, tesser::Pool::Large);
+        tesser::setMallocPsramAbove(mallocBefore);
+    }
+    void free(size_t bytes) { g_psramFree = bytes; }
+    void largest(size_t bytes) { g_psramLargest = bytes; }
+};
+
+TEST(budget_pools_without_psram) {
+    // Pool::Large is internal RAM: the same probes, floor and accounting.
+    using tesser::Pool;
+    memory_cases::Floor floor(8000, 10000);
+    CHECK(!tesser::hasPsram());
+    CHECK_EQ(tesser::heapFloor(Pool::Large), 8000u);
+    CHECK_EQ(tesser::freeHeap(Pool::Large), 10000u);
+    CHECK(tesser::mallocPool(100000) == Pool::Internal);
+    Reservation a = tesser::reserveBytes(1500, false, Pool::Large);
+    CHECK(!!a);
+    CHECK(a.pool() == Pool::Internal);
+    CHECK_EQ(tesser::unsettledBytes(), 1500u);
+    CHECK(!tesser::reserveBytes(1500));
+    CHECK_EQ(tesser::heapRoom(false, Pool::Large), 500u);
+}
+
+TEST(budget_pools_count_apart) {
+    // With PSRAM, the internal floor counts internal RAM only: megabytes of
+    // PSRAM don't hide a short internal heap, and PSRAM's reservations
+    // don't take from it.
+    using tesser::Pool;
+    memory_cases::Floor floor(8000, 10000);
+    Psram psram(16000, 1000000);
+    CHECK(tesser::hasPsram());
+    CHECK(!tesser::reserveBytes(5000));  // 2000 above the internal floor
+    Reservation big = tesser::reserveBytes(500000, false, Pool::Large);
+    CHECK(!!big);
+    CHECK(big.pool() == Pool::Large);
+    CHECK_EQ(tesser::unsettledBytes(Pool::Large), 500000u);
+    CHECK_EQ(tesser::unsettledBytes(), 0u);
+    Reservation small = tesser::reserveBytes(1500);
+    CHECK(!!small);
+    CHECK(small.pool() == Pool::Internal);
+    CHECK_EQ(tesser::heapRoom(false, Pool::Large), 1000000u - 16000u - 500000u);
+    CHECK_EQ(tesser::heapRoom(), 500u);
+    // One block, in its own pool.
+    psram.largest(3000);
+    CHECK(!tesser::reserveBytes(2500, true, Pool::Large));
+    CHECK(!!tesser::reserveBytes(1500, true, Pool::Large));
+    psram.largest(SIZE_MAX);
+    // PSRAM short: internal RAM, as malloc() falls back; refused if that
+    // is short too.
+    psram.free(17000);
+    small.release();
+    big.release();
+    Reservation fell = tesser::reserveBytes(1500, false, Pool::Large);
+    CHECK(!!fell);
+    CHECK(fell.pool() == Pool::Internal);
+    CHECK_EQ(tesser::unsettledBytes(), 1500u);
+    CHECK(!tesser::reserveBytes(1500, false, Pool::Large));
+    fell.release();
+    // A reservation grows in the pool its buffer is in.
+    psram.free(1000000);
+    Reservation grown = tesser::reserveBytes(1000, false, Pool::Large);
+    CHECK(grown.pool() == Pool::Large);
+    psram.free(17500);
+    CHECK(!grown.resize(3000));  // internal RAM has room, but the buffer is in PSRAM
+    CHECK(grown.resize(1400));
+    CHECK_EQ(tesser::unsettledBytes(Pool::Large), 1400u);
+    CHECK_EQ(tesser::unsettledBytes(), 0u);
+}
+
+TEST(budget_malloc_pool) {
+    // Where malloc() puts a buffer: PSRAM above its threshold, with PSRAM.
+    using tesser::Pool;
+    {
+        Psram psram(0, 1000000, 4096);
+        CHECK(tesser::mallocPool(4096) == Pool::Internal);
+        CHECK(tesser::mallocPool(4097) == Pool::Large);
+    }
+    {
+        memory_cases::NoPsram none;
+        size_t before = tesser::mallocPsramAbove();
+        tesser::setMallocPsramAbove(4096);
+        CHECK(tesser::mallocPool(5000) == Pool::Internal);
+        tesser::setMallocPsramAbove(before);
+    }
+    // A document from either pool works the same.
+    for (Pool pool : {Pool::Internal, Pool::Large}) {
+        JsonDocument doc(tesser::jsonAllocator(pool));
+        CHECK(!deserializeJson(doc, "{\"a\":[1,2,3],\"b\":\"text long enough to be stored apart\"}"));
+        CHECK_EQ(doc["a"][2].as<int>(), 3);
+    }
+}
+
+TEST(budget_large_reply_in_psram) {
+    // A short internal heap refuses a 3 KB reply on a chip without PSRAM;
+    // with it, malloc() puts the reply there, and it goes.
+    udp_cases::Pair p;
+    std::string big(3000, 'x');
+    p.dev.api.value("big", big);
+    memory_cases::Heap heap(5000);
+    CHECK_EQ(p.call(tesser::Op::Get, "/big").status, Status::Busy);
+    {
+        Psram psram(16000, 1000000, 1024);
+        udp_cases::Result r = p.call(tesser::Op::Get, "/big");
+        CHECK_EQ(r.status, Status::Ok);
+        CHECK_EQ(r.body.size(), 3002u);
+        // PSRAM itself short: refused again.
+        psram.largest(2000);
+        CHECK_EQ(p.call(tesser::Op::Get, "/big").status, Status::Busy);
+    }
+    CHECK_EQ(tesser::unsettledBytes(tesser::Pool::Large), 0u);
+}
+
+TEST(budget_large_message_parsed_in_psram) {
+    // A received message over 1 KB is parsed only with room for twice its
+    // size: in PSRAM when the chip has it, so a short internal heap doesn't
+    // refuse it.
+    cases::Device dev;
+    datagram_cases::Net net;
+    tesser::DatagramEndpoint ep(&dev.api, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(2)),
+                                net.clockFn());
+    std::string req = "{\"id\":1,\"op\":\"get\",\"path\":\"/lamp\",\"pad\":\"" + std::string(1500, 'p') + "\"}";
+    memory_cases::Floor floor(8000, 10000);  // room for the copy, not for twice it
+    ep.receive(datagram_cases::addr(1), req.data(), req.size(), true);
+    ep.process();
+    CHECK_EQ(net.frames.size(), 1u);
+    if (!net.frames.empty()) CHECK(net.frames[0].text.find("\"reason\":\"low_memory\"") != std::string::npos);
+    net.frames.clear();
+    Psram psram(16000, 1000000);
+    ep.receive(datagram_cases::addr(1), req.data(), req.size(), true);
+    ep.process();
+    CHECK_EQ(net.frames.size(), 1u);
+    if (!net.frames.empty()) CHECK(net.frames[0].text.find("\"status\":\"ok\"") != std::string::npos);
+}
+
+TEST(budget_owned_reply_in_psram) {
+    // A reply built in a buffer the link takes over (NowTP's) is in PSRAM
+    // when the chip has it, whatever malloc()'s threshold: a short internal
+    // heap doesn't refuse it.
+    cases::Device d;
+    std::string big(3000, 'x');
+    d.api.value("big", big);
+    datagram_cases::Net net;
+    tesser::DatagramEndpoint ep(&d.api, tesser::TransportKind::NowTP, net.sender(datagram_cases::addr(2)),
+                                net.clockFn());
+    std::string got;
+    ep.setOwnedSend(
+        [&](const tesser::PeerAddress&, tesser::Bytes m, tesser::Delivery) {
+            got.assign(m.data(), m.size());
+            return true;
+        },
+        32);
+    std::string req = "{\"id\":1,\"op\":\"get\",\"path\":\"/big\"}";
+    memory_cases::Heap heap(2000);
+    ep.receive(datagram_cases::addr(1), req.data(), req.size(), true);
+    ep.process();
+    CHECK(got.find("\"reason\":\"low_memory\"") != std::string::npos);
+    Psram psram(16000, 1000000);
+    ep.receive(datagram_cases::addr(1), req.data(), req.size(), true);
+    ep.process();
+    CHECK(got.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK_EQ(got.size(), 3032u);  // {"id":1,"status":"ok","body":"…"}
+}
+
 }  // namespace budget_cases

@@ -307,8 +307,8 @@ void UpstreamCache::refreshMirror(RemoteNode& node, const RemoteRoute& cur, uint
             UpstreamCache& c = node.upstream_;
             c.subscribing_ = false;
             // A document takes up to about three times its text in small
-            // values.
-            Reservation room = memoryBudget().reserve(3 * text.size(), 0, false);
+            // values, in PSRAM when the chip has it.
+            Reservation room = memoryBudget().reserve(3 * text.size(), 0, false, true, Pool::Large);
             if (!room) return;  // retried in 2 s
             {
                 MutexGuard guard(c.mutex_);
@@ -362,7 +362,7 @@ bool UpstreamCache::notified(RemoteNode& node, std::string_view rest, Access lev
             // Merged, the change takes about twice its text more in the
             // copy: only within the budget (docs/DESIGN.md section 15). Else
             // the copy goes, and is taken again whole within 2 s.
-            Reservation room = memoryBudget().reserve(2 * measureJson(envelope["body"]), 0, false);
+            Reservation room = memoryBudget().reserve(2 * measureJson(envelope["body"]), 0, false, true, Pool::Large);
             if (!room) {
                 copy_.clear();
                 hasCopy_ = false;
@@ -459,8 +459,10 @@ void UpstreamCache::subscribe(RemoteNode& node, Api& api, const Request& req, st
                               "peer offline");
         }
         // A new or wider copy of the remote's state, and the snapshots
-        // rendered from it: only with room to spare above the heap floor.
-        if (!heapAbove(heapFloor())) {
+        // rendered from it: only with room to spare above the heap floor,
+        // in internal RAM and in PSRAM, where the copy goes when the chip
+        // has it.
+        if (!heapAbove(heapFloor()) || !heapAbove(heapFloor(Pool::Large), Pool::Large)) {
             return writeError(reply, Status::Busy, Reason::LowMemory, basePath, "not enough memory for another remote subscription");
         }
         if (!api.pendingBegin()) return writeError(reply, Status::Busy, Reason::PendingLimit, basePath, "too many pending calls");
@@ -597,7 +599,7 @@ void UpstreamCache::answered(RemoteNode& node, const std::string& rest, Access l
         // above the heap floor; else as if the remote were busy (kept stale,
         // tried again soon).
         JsonDocument noRoom;
-        if (s == Status::Ok && !heapAbove(2 * measureJson(body))) {
+        if (s == Status::Ok && !heapAbove(2 * measureJson(body), Pool::Large)) {
             noRoom["error"] = "busy";
             noRoom["reason"] = "low_memory";
             noRoom["path"] = node.remotePathOf(rest);
@@ -693,7 +695,7 @@ bool UpstreamCache::relayChange(RemoteNode& node, std::string_view rest, Access 
     // Only within the budget (docs/DESIGN.md section 15): else the change
     // isn't relayed, and the subscription is renewed soon, its subscribers
     // getting the whole state if it differs.
-    Reservation room = memoryBudget().reserve(2 * measureJson(patch), 0, false);
+    Reservation room = memoryBudget().reserve(2 * measureJson(patch), 0, false, true, Pool::Large);
     if (!room) {
         u->stale = true;  // renewed within 2 s
         return true;

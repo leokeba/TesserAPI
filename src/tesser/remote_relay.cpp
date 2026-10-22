@@ -173,7 +173,7 @@ public:
                 pending_ = std::move(data);  // taken over, not copied
                 data.clear();
             } else if (need > pending_.capacity()) {
-                Reservation growth = memoryBudget().reserve(need, 0, true);
+                Reservation growth = memoryBudget().reserve(need, 0, true, true, mallocPool(need));
                 room = static_cast<bool>(growth);
                 if (room) pending_.reserve(need);
             }
@@ -429,7 +429,7 @@ private:
                         // radio's: about twice it, measured on DEVKIT-V3), not
                         // held here; without, the part goes again at half the
                         // size (smaller()).
-                        Reservation room = memoryBudget().reserve(size + 32, 0, true);
+                        Reservation room = memoryBudget().reserve(size + 32, 0, true, true, out.pool(size));
                         Reservation link = room ? memoryBudget().reserve(2 * size, 0, false) : Reservation();
                         self->noRoom_ = !room || !link || !out.reserve(size);
                         if (self->noRoom_) return false;

@@ -16,6 +16,7 @@
 
 #include <ArduinoJson.h>
 
+#include "tesser/budget.h"
 #include "tesser/platform.h"
 #include "tesser/request.h"
 #include "tesser/route.h"
@@ -89,7 +90,7 @@ private:
     struct Upstream {
         std::string rest;  // below the node; "" for the node itself
         Access level = Access::Admin;  // its subscribers': the ceiling it asks for
-        JsonDocument copy;  // the remote's state, kept with its notifications
+        JsonDocument copy{jsonAllocator(Pool::Large)};  // the remote's state, kept with its notifications
         bool ready = false;
         bool subscribing = false;
         bool stale = false;  // a renewal failed: retry soon
@@ -115,7 +116,7 @@ private:
     std::atomic<bool> subscribing_{false};
     bool subscribedOnce_ = false;
     mutable Mutex mutex_{kRankRemote, "remote"};  // after the API lock
-    JsonDocument copy_;
+    JsonDocument copy_{jsonAllocator(Pool::Large)};  // the mirror's: PSRAM when the chip has it
     bool hasCopy_ = false;
     std::vector<std::unique_ptr<Upstream>> upstreams_;  // guarded by mutex_
 };

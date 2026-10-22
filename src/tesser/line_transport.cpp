@@ -34,7 +34,7 @@ bool growLine(std::string& s) {
     if (capacity < 64) capacity = 64;
     Reservation room;
     if (capacity > 256) {
-        room = memoryBudget().reserve(capacity, 0, true);
+        room = memoryBudget().reserve(capacity, 0, true, true, mallocPool(capacity));
         if (!room) return false;
     }
     reserveExactly(s, capacity);

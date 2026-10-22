@@ -185,25 +185,53 @@ void setBackgroundStack(uint32_t bytes);
 // Milliseconds since boot (wraps after ~49 days).
 uint32_t millis32();
 
-// The largest block the heap can allocate now (bytes; SIZE_MAX off target).
-// Large buffers check it first, so a fragmented heap refuses a reply instead
-// of aborting the device (docs/DESIGN.md section 15).
-size_t largestFreeBlock();
+// Where a buffer's bytes come from (docs/DESIGN.md section 15). Internal
+// RAM is what runs out: Wi-Fi, lwIP, DMA and task stacks need it. Large is
+// PSRAM on a chip that has it (found at run time), else internal RAM too.
+enum class Pool : uint8_t { Internal, Large };
+// The chip has PSRAM in its heap, so Pool::Large is a pool of its own
+// (false off target).
+bool hasPsram();
+// Replaces it (tests: a chip with PSRAM, or without, whatever this one
+// has); null restores the platform's.
+void setPsramProbe(bool (*probe)());
+// The pool `pool` draws from: Pool::Large only with PSRAM.
+Pool poolOf(Pool pool);
+// Where malloc() puts `bytes` (std::string, std::vector): in PSRAM, with
+// CONFIG_SPIRAM_USE_MALLOC, above CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL;
+// else internal RAM. Reservations for such buffers ask this pool.
+Pool mallocPool(size_t bytes);
+// The size above which malloc() takes PSRAM first, for an application that
+// changed it with heap_caps_malloc_extmem_enable(), and for tests; SIZE_MAX:
+// never.
+void setMallocPsramAbove(size_t bytes);
+size_t mallocPsramAbove();
+// `bytes` from `pool` (Pool::Large: PSRAM, else internal RAM), and grown
+// there; free() frees them. Null if the heap can't.
+void* allocate(size_t bytes, Pool pool);
+void* reallocate(void* p, size_t bytes, Pool pool);
+
+// The largest block the heap can allocate now in `pool` (bytes; SIZE_MAX
+// off target). Large buffers check it first, so a fragmented heap refuses
+// a reply instead of aborting the device (docs/DESIGN.md section 15).
+size_t largestFreeBlock(Pool pool = Pool::Internal);
 // Replaces the probe (tests); null restores the platform's.
-void setLargestFreeBlockProbe(size_t (*probe)());
-// The heap free in all (bytes; SIZE_MAX off target), and its probe.
-size_t freeHeap();
-void setFreeHeapProbe(size_t (*probe)());
+void setLargestFreeBlockProbe(size_t (*probe)(), Pool pool = Pool::Internal);
+// The heap free in all in `pool` (bytes; SIZE_MAX off target), and its
+// probe.
+size_t freeHeap(Pool pool = Pool::Internal);
+void setFreeHeapProbe(size_t (*probe)(), Pool pool = Pool::Internal);
 // What guarded buffers leave free (docs/DESIGN.md section 15): growing one
 // past 256 bytes must leave this much of the heap, or replies answer busy
 // and notifications wait, before the heap is so short that some small
 // allocation elsewhere aborts. Forwarded subscriptions needing a new copy
-// of a remote's state want twice as much. 8 KB on target by default, 0
-// (off) elsewhere. Any task.
-void setHeapFloor(size_t bytes);
-size_t heapFloor();
-// Free heap is at least `bytes` above the floor (always without a floor).
-bool heapAbove(size_t bytes);
+// of a remote's state want twice as much. Internal RAM: 8 KB on target by
+// default; PSRAM's own: 16 KB; 0 (off) elsewhere. Any task.
+void setHeapFloor(size_t bytes, Pool pool = Pool::Internal);
+size_t heapFloor(Pool pool = Pool::Internal);
+// Free heap in `pool` is at least `bytes` above its floor (always without
+// a floor).
+bool heapAbove(size_t bytes, Pool pool = Pool::Internal);
 
 // The chip's Wi-Fi station MAC, the device id UDP advertises and NowTP
 // addresses (false off target).
