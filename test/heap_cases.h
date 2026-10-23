@@ -155,6 +155,7 @@ TEST(heap_notifications_on_an_exhausted_heap) {
     for (size_t above : {size_t(0), size_t(64), size_t(512), kFloor - 1}) {
         cases::Device d;
         tesser::EventNode& pressed = d.api.object("button").event("pressed");
+        pressed.emit();  // finds its path (a string), once, as at boot
         subscription_cases::FakeSubscriber sub;
         subscription_cases::subscribe(d.api, &sub, "/");
         d.lamp.brightness = 7;
