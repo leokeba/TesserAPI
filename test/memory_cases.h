@@ -219,6 +219,42 @@ TEST(memory_heap_floor) {
     CHECK_EQ(p.call(tesser::Op::Get, "/mid").status, Status::Ok);
 }
 
+TEST(memory_small_growth_needs_the_heap) {
+    // Under 256 bytes, a growth skips the floor (error replies always go),
+    // but not a heap that can't hold it: there the allocation would abort.
+    Floor floor(0, 1100);
+    std::string s;
+    CHECK(!tesser::growFor(s, 140));
+    CHECK(s.capacity() < 140);
+    floor.free(1200);
+    CHECK(tesser::growFor(s, 140));
+    CHECK(s.capacity() >= 140);
+}
+
+TEST(memory_notifications_wait_under_the_floor) {
+    // Under the floor, even small notifications wait: their allocations
+    // would live on what the network stack can take whole in a burst.
+    // Measured on a Gledopto (classic ESP32) running TesserKIT under sACN
+    // multicast before this: a 140-byte event's growth aborted it.
+    cases::Device d;
+    tesser::EventNode& pressed = d.api.object("button").event("pressed");
+    subscription_cases::FakeSubscriber sub;
+    CHECK_EQ(subscription_cases::subscribe(d.api, &sub, "/").status, Status::Ok);
+    Floor floor(8000, 7000);
+    pressed.emit();
+    CHECK(sub.messages.empty());
+    CHECK(sub.missed.load());
+    d.lamp.brightness = 7;
+    d.api.changed("/lamp/brightness");
+    d.api.poll(100);
+    CHECK(sub.messages.empty());  // put off
+    floor.free(20000);
+    d.api.poll(200);
+    CHECK_EQ(sub.last(), "{\"op\":\"change\",\"path\":\"/\",\"body\":{\"lamp\":{\"brightness\":7}},\"overflow\":true}");
+    pressed.emit();
+    CHECK_EQ(sub.last(), "{\"op\":\"event\",\"path\":\"/button/pressed\",\"body\":null}");
+}
+
 TEST(memory_remote_subscription_admission) {
     // A forwarded subscription that needs its own copy of the remote's
     // state wants twice the floor free; one the shared copy covers doesn't.

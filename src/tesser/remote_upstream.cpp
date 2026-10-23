@@ -131,6 +131,12 @@ void writeChanges(JsonWriter& w, JsonVariantConst v, int depth, const Subscripti
 
 // Sends one change notification to a forwarded subscriber.
 void notifyChange(Subscription& sub, const std::function<void(JsonWriter&)>& body) {
+    // Under the floor, even a small one: its allocations, unchecked under
+    // 256 bytes, are what aborts on a heap taken by something else.
+    if (!heapAbove(0)) {
+        sub.subscriber->missed = true;
+        return;
+    }
     std::string msg;
     StringSink sink(msg, 0, true);
     JsonWriter m(sink);

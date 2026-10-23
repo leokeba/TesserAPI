@@ -19,8 +19,9 @@ public:
 // Grows `s` to hold `need` bytes, by half again at a time, unless the heap
 // can't give a block that size and leave room for one copy of the message
 // further down (a link's own buffer) plus a little headroom, or past 256
-// bytes, unless it leaves the heap floor free (setHeapFloor()): false
-// then, and `s` is untouched.
+// bytes, unless it leaves the heap floor free (setHeapFloor()); up to
+// 256, unless the free heap holds it and 1 KB more: false then, and `s` is
+// untouched.
 bool growFor(std::string& s, size_t need);
 // Gives `s` room for exactly `capacity` bytes, keeping its content. With
 // libstdc++ (ESP-IDF's, GCC's), reserve() on a string that has allocated

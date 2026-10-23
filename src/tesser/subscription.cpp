@@ -382,12 +382,27 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
         sub.subscriber->missed = true;
     }
 
+    // Put off: `since` stays, so the changes go with a later flush, merged
+    // with newer ones; not at the next poll() but after a wait that grows,
+    // rather than build the same notification every few milliseconds
+    // while it can't go (docs/DESIGN.md section 15).
+    auto putOff = [&] {
+        sub.backoffMs = sub.backoffMs ? std::min<uint32_t>(sub.backoffMs * 2, kNotifyBackoffMaxMs) : kNotifyBackoffMs;
+        sub.retryAtMs = nowMs + sub.backoffMs;
+    };
+    // Under the floor, even a small one waits: its allocations, unchecked
+    // under 256 bytes, are what aborts on a heap taken by something else.
+    if (!heapAbove(0)) {
+        putOff();
+        return;
+    }
+
     // Rendered straight into the envelope (no separate body to copy), and
     // refused, to be tried again at the next flush, if the heap can't hold
     // it: an abort would take the device down.
     std::string msg;
     {
-        StringSink head(msg);
+        StringSink head(msg, 0, true);
         JsonWriter m(head);
         m.beginObject();
         m.key("op");
@@ -395,6 +410,10 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
         m.key("path");
         m.string(sub.path.empty() ? std::string_view("/") : std::string_view(sub.path));
         m.key("body");
+        if (head.lowMemory) {
+            putOff();
+            return;
+        }
     }
     StringSink sink(msg, 0, true);
     JsonWriter w(sink);
@@ -412,14 +431,6 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
         detail::writeLeaf(w, n, options);
         any = true;
     }
-    // Put off: `since` stays, so the changes go with a later flush, merged
-    // with newer ones; not at the next poll() but after a wait that grows,
-    // rather than build the same notification every few milliseconds
-    // while it can't go (docs/DESIGN.md section 15).
-    auto putOff = [&] {
-        sub.backoffMs = sub.backoffMs ? std::min<uint32_t>(sub.backoffMs * 2, kNotifyBackoffMaxMs) : kNotifyBackoffMs;
-        sub.retryAtMs = nowMs + sub.backoffMs;
-    };
     if (sink.lowMemory) {
         putOff();
         return;
@@ -455,22 +466,30 @@ void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter
                     const std::function<bool(const Subscription&)>& accept) {
     MutexGuard guard(mutex_);
     if (subs_.empty()) return;
+    // Under the floor, not even a small event goes: its allocations
+    // (buffers under 256 bytes, the shared message, the lists below) would
+    // live on what is left, which the network stack can take whole in a
+    // burst. The subscribers it was for are marked missed.
+    bool room = heapAbove(0);
 
     std::string base;
     StringSink sink(base, 0, true);  // guarded: refused on a short heap
     JsonWriter w(sink);
-    w.beginObject();
-    w.key("op");
-    w.string("event");
-    w.key("path");
-    w.string(path);
-    w.key("body");
-    if (write) {
-        write(w);
-    } else {
-        w.null();
+    bool built = false;
+    if (room) {
+        w.beginObject();
+        w.key("op");
+        w.string("event");
+        w.key("path");
+        w.string(path);
+        w.key("body");
+        if (write) {
+            write(w);
+        } else {
+            w.null();
+        }
+        built = w.ok();
     }
-    bool built = w.ok();
 
     Access need = readNeed(*this, path);
 
@@ -490,8 +509,9 @@ void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter
         for (const Variant& v : variants) {
             if (v.ceiling == ceiling && v.overflow == overflow) return v.message;
         }
+        if (!built) return nullptr;
         auto held = std::make_shared<Held>();
-        if (!built || !growFor(held->text, base.size() + 48)) return nullptr;
+        if (!growFor(held->text, base.size() + 48)) return nullptr;
         held->text = base;
         closeEnvelope(held->text, overflow, ceiling);
         held->bytes = memoryBudget().reserve(held->text.capacity(), 0, false, false);
@@ -521,6 +541,10 @@ void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter
             int segments = 1;
             for (char c : rest) segments += c == '/';
             if (sub.depth >= 0 && segments > sub.depth) continue;
+        }
+        if (!room) {
+            sub.subscriber->missed = true;
+            continue;
         }
         bool seen = false;
         for (const auto& n : notified) seen = seen || (n.first == sub.subscriber && n.second == sub.ceiling);

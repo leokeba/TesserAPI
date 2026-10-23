@@ -296,6 +296,9 @@ size_t largestFreeBlock(Pool pool) {
 #endif
 }
 
+// What a small buffer's growth leaves of the heap.
+constexpr size_t kSmallGrowthSlack = 1024;
+
 // A buffer grows by half again at a time; short of room for that, by just
 // what it needs (a reply nearly its full size: measured on DEVKIT-R1, a 4 KB
 // download chunk's reply was refused for growing to 5.9 KB). The growth stays
@@ -316,9 +319,13 @@ bool growFor(std::string& s, size_t need) {
     size_t grown = s.capacity() + s.capacity() / 2;
     Reservation held;
     auto fits = [&](size_t capacity) {
-        // Small buffers (error replies) always go: refusing them would leave
-        // the client with nothing at all.
-        if (capacity <= 256) return true;
+        // Small buffers (error replies) go without the floor: refusing them
+        // would leave the client with nothing at all. Not on a heap that
+        // can't even hold them, though (taken by the network stack in a
+        // burst, say), where the allocation would abort the device: the free
+        // heap there, a counter, as the largest block costs a walk of the
+        // heap.
+        if (capacity <= 256) return freeHeap(mallocPool(capacity)) >= capacity + kSmallGrowthSlack;
         // The heap as a whole: the growth and a copy further down, and the
         // floor left to everything else, after what other tasks' buffers
         // are about to take (the accountant, docs/DESIGN.md section 15).

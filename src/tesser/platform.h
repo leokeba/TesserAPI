@@ -222,9 +222,9 @@ void setLargestFreeBlockProbe(size_t (*probe)(), Pool pool = Pool::Internal);
 size_t freeHeap(Pool pool = Pool::Internal);
 void setFreeHeapProbe(size_t (*probe)(), Pool pool = Pool::Internal);
 // What guarded buffers leave free (docs/DESIGN.md section 15): growing one
-// past 256 bytes must leave this much of the heap, or replies answer busy
-// and notifications wait, before the heap is so short that some small
-// allocation elsewhere aborts. Forwarded subscriptions needing a new copy
+// past 256 bytes must leave this much of the heap, or replies answer busy;
+// notifications of any size wait while the heap is under it, before the
+// heap is so short that some small allocation elsewhere aborts. Forwarded subscriptions needing a new copy
 // of a remote's state want twice as much. Internal RAM: 8 KB on target by
 // default; PSRAM's own: 16 KB; 0 (off) elsewhere. Any task.
 void setHeapFloor(size_t bytes, Pool pool = Pool::Internal);

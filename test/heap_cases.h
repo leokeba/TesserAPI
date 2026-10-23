@@ -148,6 +148,29 @@ TEST(heap_subscriptions) {
     });
 }
 
+// Events and change notifications on a heap taken by something else (the
+// network stack in a burst): nothing left above the floor, or almost
+// nothing at all. They wait rather than abort.
+TEST(heap_notifications_on_an_exhausted_heap) {
+    for (size_t above : {size_t(0), size_t(64), size_t(512), kFloor - 1}) {
+        cases::Device d;
+        tesser::EventNode& pressed = d.api.object("button").event("pressed");
+        subscription_cases::FakeSubscriber sub;
+        subscription_cases::subscribe(d.api, &sub, "/");
+        d.lamp.brightness = 7;
+        d.api.changed("/lamp/brightness");
+        {
+            Tight tight(above, kFloor);
+            pressed.emit();
+            d.api.poll(1000);
+        }
+        CHECK(sub.messages.empty());
+        CHECK(sub.missed.load());
+        d.api.poll(2000);
+        CHECK_EQ(sub.messages.size(), 1u);
+    }
+}
+
 // A client of a gateway subscribed below a remote node: the gateway
 // forwards the subscription and relays the device's changes, holding a
 // copy of its state. Two nodes on this heap, as for the relay.
