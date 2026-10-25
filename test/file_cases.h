@@ -120,10 +120,11 @@ inline std::string upload(Api& api, const char* path, const std::string& data, c
     return std::string(tesser::toString(reply.status)) + " " + reply.body;
 }
 
-inline std::string download(Api& api, const char* path, const tesser::Client& client, std::string* name = nullptr) {
+inline std::string download(Api& api, const char* path, const tesser::Client& client, std::string* name = nullptr,
+                            std::string_view filename = std::string_view()) {
     FileTransfer t(api);
     tesser::StringReply reply;
-    FileTransfer::Open o = t.openDownload(path, client, reply);
+    FileTransfer::Open o = t.openDownload(path, client, reply, filename);
     if (o == FileTransfer::Open::NotFile) return "not a file";
     if (o == FileTransfer::Open::Failed) return reply.body;
     if (name) *name = t.filename();
@@ -360,6 +361,26 @@ struct Dir {
             }
             return std::unique_ptr<tesser::FileSink>(new Sink(*this, r.filename));
         });
+        // Any file, both ways, by the name the client gave.
+        dir.file("file")
+            .download([this](tesser::FileRequest& r) -> std::unique_ptr<tesser::FileSource> {
+                std::string* f = find(r.filename);
+                if (!f) {
+                    r.refuse(r.filename.empty() ? Status::InvalidValue : Status::NotFound,
+                             r.filename.empty() ? "the file has no name" : "no such file");
+                    return nullptr;
+                }
+                auto* src = new Source();
+                src->data = *f;
+                return std::unique_ptr<tesser::FileSource>(src);
+            })
+            .upload([this](tesser::FileRequest& r) -> std::unique_ptr<tesser::FileSink> {
+                if (r.filename.empty() || r.filename.find('/') != std::string::npos) {
+                    r.refuse(Status::InvalidValue, "bad file name");
+                    return nullptr;
+                }
+                return std::unique_ptr<tesser::FileSink>(new Sink(*this, r.filename));
+            });
     }
 };
 
@@ -446,6 +467,30 @@ TEST(file_upload_name) {
     std::string name;
     download(f.api, "/sys/config", tesser::Client(), &name);
     CHECK_EQ(name, "config");
+    // Or the name the handler sets, whatever the client gave.
+    download(f.api, "/sys/coredump", tesser::Client(), &name, "x.bin");
+    CHECK_EQ(name, "core.elf");
+}
+
+TEST(file_download_name) {
+    // One node transfers any file, by the name the client gives, both ways.
+    Api api;
+    Dir dir(api);
+    tesser::Client admin;
+    admin.authenticated = true;
+    std::string name;
+    CHECK_EQ(download(api, "/files/file", admin, &name, "notes.txt"), "hello");
+    CHECK_EQ(name, "notes.txt");  // the client's, which the handler left
+    CHECK_EQ(upload(api, "/files/file", "abc", admin, 8, "b.txt"), "ok \"b.txt\"");
+    CHECK_EQ(download(api, "/files/file", admin, &name, "b.txt"), "abc");
+    CHECK_EQ(download(api, "/files/file", admin, nullptr, "nope.txt"),
+             "{\"error\":\"not_found\",\"path\":\"/files/file\",\"message\":\"no such file\"}");
+    // None given is empty.
+    CHECK(download(api, "/files/file", admin).find("the file has no name") != std::string::npos);
+    // A node that names nothing suggests its own name.
+    api.file("plain").text([] { return std::string("p"); }, nullptr);
+    CHECK_EQ(download(api, "/plain", admin, &name), "p");
+    CHECK_EQ(name, "plain");
 }
 
 }  // namespace file_cases

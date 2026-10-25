@@ -25,6 +25,7 @@ using tesser::Status;
 // trees holding remote nodes that use them.
 struct Rig {
     file_cases::Fixture device;
+    std::unique_ptr<file_cases::Dir> dir;  // the device's /files, for the tests that add it
     std::string big;
     std::string got;
     datagram_cases::Net net;
@@ -515,6 +516,25 @@ TEST(relay_envelope_download) {
     CHECK_EQ(r.gateway.pending(), 0);
 }
 
+TEST(relay_download_name) {
+    // The client's filename goes on with the download's opening chunk, as
+    // an upload's does, and only with it.
+    Rig r;
+    r.dir.reset(new file_cases::Dir(r.device.api));
+    CHECK_EQ(r.ask("{\"id\":1,\"op\":\"download\",\"path\":\"/dev/files/file\",\"filename\":\"cal.json\","
+                   "\"length\":2}"),
+             "{\"id\":1,\"status\":\"ok\",\"body\":{\"size\":7,\"filename\":\"cal.json\",\"contentType\":"
+             "\"application/octet-stream\",\"chunk\":576,\"offset\":0,\"data\":\"eyI=\",\"end\":false}}");
+    CHECK_EQ(r.ask("{\"id\":2,\"op\":\"download\",\"path\":\"/dev/files/file\",\"offset\":2}"),
+             "{\"id\":2,\"status\":\"ok\",\"body\":{\"offset\":2,\"data\":\"ayI6MX0=\",\"end\":true}}");
+    CHECK_EQ(r.ask("{\"id\":3,\"op\":\"download\",\"path\":\"/dev/files/file\",\"filename\":\"nope\"}"),
+             "{\"id\":3,\"status\":\"not_found\",\"body\":{\"error\":\"not_found\",\"path\":\"/dev/files/file\","
+             "\"message\":\"no such file\"}}");
+    CHECK(r.ask("{\"op\":\"download\",\"path\":\"/dev/files/file\"}").find("the file has no name") !=
+          std::string::npos);
+    CHECK_EQ(r.gateway.pending(), 0);
+}
+
 TEST(relay_one_transfer_per_peer) {
     Rig r;
     tesser::LineTransport other(r.gateway, [&r](const char* d, size_t n) { r.lines.add(d, n); });
@@ -724,6 +744,23 @@ TEST(relay_waiting) {
         while ((n = f.read(buf, sizeof(buf))) > 0) out.append(reinterpret_cast<char*>(buf), static_cast<size_t>(n));
         CHECK_EQ(n, 0);
         CHECK_EQ(out, r.big);
+    }
+    {
+        // A name the client gave (HTTP: ?filename=) reaches the device.
+        {
+            std::lock_guard<std::recursive_mutex> lock(t.mutex);  // the pump stays out of the device
+            r.dir.reset(new file_cases::Dir(r.device.api));
+        }
+        FileTransfer f(r.gateway, FileTransfer::Remotes::Wait);
+        tesser::StringReply reply;
+        CHECK(f.openDownload("/dev/files/file", admin, reply, "notes.txt") == FileTransfer::Open::Ok);
+        CHECK_EQ(f.filename(), "notes.txt");
+        uint8_t buf[16];
+        CHECK_EQ(f.read(buf, sizeof(buf)), 5);
+        CHECK_EQ(std::string(reinterpret_cast<char*>(buf), 5), "hello");
+        CHECK(f.openDownload("/dev/files/file", admin, reply, "nope") == FileTransfer::Open::Failed);
+        CHECK_EQ(reply.body, "{\"error\":\"not_found\",\"path\":\"/dev/files/file\",\"message\":\"no such file\"}");
+        f.cancel();
     }
     {
         // The request says nothing about files: the device's node decides.

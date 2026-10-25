@@ -675,8 +675,9 @@ struct FileRequest {
     explicit FileRequest(const Client& c) : client(c) {}
     const Client& client;
     uint64_t size = 0;  // upload: the bytes announced (Content-Length)
-    // Download: the name to suggest (default: the node's). Upload: the name
-    // the client gave (HTTP: ?filename=), empty if none; unchecked.
+    // The name the client gave (HTTP: ?filename=), empty if none; unchecked.
+    // A download may change it: it is the name suggested to save the file
+    // under, the node's if left empty.
     std::string filename;
     Status status = Status::Ok;
     const char* message = nullptr;

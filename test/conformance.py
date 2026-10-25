@@ -162,6 +162,12 @@ def run_files(send, label, report, size=12000):
     status, body = send({'op': 'download', 'path': '/files/entries/notes.txt/content'})
     check('download from a list element', status == 'ok' and base64.b64decode(body['data']) == b'hello' and
           body.get('filename') == 'notes.txt', (status, body))
+    # Any file through one node, by the name the client gives (FileRequest::filename).
+    status, body = send({'op': 'download', 'path': '/files/file', 'filename': 'notes.txt'})
+    check('download with a filename', status == 'ok' and base64.b64decode(body['data']) == b'hello' and
+          body.get('filename') == 'notes.txt', (status, body))
+    status, body = send({'op': 'download', 'path': '/files/file'})
+    check('download without a filename', status == 'invalid_value', (status, body))
 
     status, body = send({'op': 'download', 'path': '/lamp/on'})
     check('not a file', status == 'not_allowed', (status, body))

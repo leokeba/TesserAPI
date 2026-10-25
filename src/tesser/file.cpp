@@ -189,12 +189,12 @@ FileTransfer::Open FileTransfer::openLocal(FileNode& file, const Client& client,
     claimed_ = true;
     FileRequest r(client);
     r.size = size;
+    r.filename.assign(filename.data(), filename.size());
     if (upload) {
-        r.filename.assign(filename.data(), filename.size());
         sink_ = node->openUpload(r);
     } else {
-        r.filename = node->name();
         source_ = node->openDownload(r);
+        if (r.filename.empty()) r.filename = node->name();
     }
     if (!sink_ && !source_) {
         close();
@@ -297,6 +297,7 @@ FileTransfer::Open FileTransfer::openRelay(Op op, uint64_t size, std::string_vie
     expected_ = size;
     received_ = 0;
     activeMs_ = millis32();
+    if (op == Op::Get) relay_->downloadName(filename);
     if (remotes_ == Remotes::Return) {
         if (!relay_->claim(reply)) {
             close();
@@ -397,8 +398,9 @@ FileTransfer::Open FileTransfer::openUpload(std::string_view path, const Client&
     return open(path, client, Op::Set, size, filename, reply);
 }
 
-FileTransfer::Open FileTransfer::openDownload(std::string_view path, const Client& client, Reply& reply) {
-    return open(path, client, Op::Get, 0, std::string_view(), reply);
+FileTransfer::Open FileTransfer::openDownload(std::string_view path, const Client& client, Reply& reply,
+                                              std::string_view filename) {
+    return open(path, client, Op::Get, 0, filename, reply);
 }
 
 bool FileTransfer::write(const uint8_t* data, size_t len, Reply& reply) {
@@ -930,6 +932,11 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
     bool crc = wantCrc.as<bool>();
     bool opening = offset == 0;
     if (opening) {
+        JsonVariantConst filename = envelope["filename"];
+        if (!filename.isNull() && !filename.is<const char*>()) {
+            writeError(reply, Status::BadRequest, path, "filename must be a string");
+            return;
+        }
         // Offset 0 starts a new download, ending whatever was in progress.
         state_.reset();
         // The transfer's state, only with room for it.
@@ -939,7 +946,8 @@ void FileSession::download(JsonObjectConst envelope, std::string_view path, uint
             return;
         }
         auto state = std::unique_ptr<State>(new State(api_));
-        FileTransfer::Open o = state->transfer.openDownload(path, client, reply);
+        std::string_view name = filename.isNull() ? std::string_view() : text(filename);
+        FileTransfer::Open o = state->transfer.openDownload(path, client, reply, name);
         if (o == FileTransfer::Open::NotFile) writeError(reply, Status::NotAllowed, path, "not a file");
         if (o != FileTransfer::Open::Ok && o != FileTransfer::Open::Remote) return;
         state->path.assign(path.data(), path.size());

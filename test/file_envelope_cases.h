@@ -166,6 +166,30 @@ TEST(file_envelope_download) {
              "{\"status\":\"bad_request\",\"body\":{\"error\":\"bad_request\",\"path\":\"/\",\"message\":\"id must be a scalar\"}}");
 }
 
+TEST(file_envelope_download_name) {
+    // The opening envelope's filename goes to the handler
+    // (FileRequest::filename), as an upload's does.
+    Api api;
+    file_cases::Dir dir(api);
+    Line line(api);
+    CHECK_EQ(line.send("{\"id\":1,\"op\":\"download\",\"path\":\"/files/file\",\"filename\":\"notes.txt\"}"),
+             "{\"id\":1,\"status\":\"ok\",\"body\":{\"size\":5,\"filename\":\"notes.txt\",\"contentType\":"
+             "\"application/octet-stream\",\"chunk\":4096,\"offset\":0,\"data\":\"aGVsbG8=\",\"end\":true}}");
+    CHECK_EQ(line.send("{\"id\":2,\"op\":\"download\",\"path\":\"/files/file\",\"filename\":\"nope\"}"),
+             "{\"id\":2,\"status\":\"not_found\",\"body\":{\"error\":\"not_found\",\"path\":\"/files/file\","
+             "\"message\":\"no such file\"}}");
+    CHECK(line.send("{\"op\":\"download\",\"path\":\"/files/file\"}").find("the file has no name") !=
+          std::string::npos);
+    CHECK_EQ(line.send("{\"op\":\"download\",\"path\":\"/files/file\",\"filename\":3}"),
+             "{\"status\":\"bad_request\",\"body\":{\"error\":\"bad_request\",\"path\":\"/files/file\","
+             "\"message\":\"filename must be a string\"}}");
+    // Only the opening envelope's counts: a later one's is ignored.
+    CHECK(line.send("{\"op\":\"download\",\"path\":\"/files/file\",\"filename\":\"cal.json\",\"length\":2}")
+              .find("\"data\":\"eyI=\"") != std::string::npos);
+    CHECK(line.send("{\"op\":\"download\",\"path\":\"/files/file\",\"filename\":\"notes.txt\",\"offset\":2}")
+              .find("\"data\":\"ayI6MX0=\"") != std::string::npos);
+}
+
 TEST(file_envelope_chunk_limits) {
     Fixture f;
     Line line(f.api);

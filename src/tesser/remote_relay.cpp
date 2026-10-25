@@ -161,6 +161,11 @@ public:
              });
     }
 
+    void downloadName(std::string_view filename) override {
+        MutexGuard guard(mutex_);
+        downloadName_.assign(filename.data(), filename.size());
+    }
+
     void write(std::vector<uint8_t> data, Done done) override {
         bool room = true;
         {
@@ -188,9 +193,11 @@ public:
         // the remote's reply is held here whole, and in the remote's own
         // reply buffer (docs/DESIGN.md section 14).
         size_t cap = FileSession::uploadChunk(api_.config());
+        std::string name;  // the opening chunk's
         {
             MutexGuard guard(mutex_);
             if (limit_ && cap > limit_) cap = limit_;
+            if (!offset) name = downloadName_;
         }
         if (!length || length > cap) length = cap;
         // A reply this link takes.
@@ -249,6 +256,10 @@ public:
                  if (offset) {
                      w.key("offset");
                      w.uinteger(offset);
+                 }
+                 if (!name.empty()) {
+                     w.key("filename");
+                     w.string(name);
                  }
                  if (length) {
                      w.key("length");
@@ -582,6 +593,7 @@ private:
     uint64_t size_ = 0;
     uint64_t received_ = 0;
     std::vector<uint8_t> pending_;  // upload bytes from received_ on
+    std::string downloadName_;      // the client's, for the download's opening chunk
     std::atomic<bool> noRoom_{false};  // the last envelope had no room (pump()'s builder)
 };
 

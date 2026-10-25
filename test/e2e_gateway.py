@@ -168,6 +168,8 @@ def main():
     down = len(blob) / 1024 / (time.time() - t0)
     check(f'relayed HTTP download ({down:.1f} KB/s)', code == 200 and data == blob and
           headers.get('Content-Length') == str(len(blob)), (code, len(data), headers))
+    code, data, _, _ = a.raw('GET', base + '/files/file', {'filename': 'cal.json'}, ABSENT, token)
+    check('relayed HTTP download with ?filename=', code == 200 and data == b'{"k":1}', (code, data))
     code, data, _, _ = a.raw('PUT', base + '/files/blob', None, os.urandom(40000), token)
     check('relayed refusal mapped', code == 413 and json.loads(data)['path'] == base + '/files/blob', (code, data))
     code, data, _, _ = a.raw('PUT', base + '/lamp/label', None, 'relay')

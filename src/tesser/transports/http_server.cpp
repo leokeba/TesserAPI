@@ -1060,7 +1060,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req, bool inWorker) {
         } else {
             shapeText.clear();
         }
-        // An upload's file name, as the client gave it (FileRequest::filename).
+        // The file name the client gave, for a transfer (FileRequest::filename).
         filename.resize(queryLen + 1);
         if (queryParam(query, "filename", &filename[0], filename.size(), len, bad)) {
             filename.resize(len);
@@ -1089,7 +1089,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req, bool inWorker) {
         FileTransfer& file = *owned;
         FileTransfer::Open o = request.op == Op::Set
                                    ? file.openUpload(path, request.client, req->content_len, reply, filename)
-                                   : file.openDownload(path, request.client, reply);
+                                   : file.openDownload(path, request.client, reply, filename);
         if (o == FileTransfer::Open::Ok) {
             // Relayed to a remote node, it waits for each chunk's reply: off
             // the httpd task (docs/DESIGN.md section 14).

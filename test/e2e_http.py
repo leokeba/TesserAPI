@@ -111,7 +111,7 @@ def main():
         'type': 'file', 'readable': True, 'writable': True, 'maxSize': 32768,
         'contentType': 'application/octet-stream', 'accept': '.bin'}, data)
     r = h.call('get', '/files', {}, ABSENT)
-    # Only the directory listing: blob, backup and upload are file nodes.
+    # Only the directory listing: blob, backup, upload and file are file nodes.
     check('file left out of values', r[0] == 'ok' and list(r[1]) == ['entries'], r)
     # A directory listing: file nodes in a read-only keyed list's elements,
     # uploads named by ?filename=. Idempotent: the directory lives in RAM.
@@ -127,6 +127,11 @@ def main():
     check('download of a non-ASCII name', got == 200 and data == b'new bytes' and
           headers.get('Content-Disposition') ==
           'attachment; filename="r__ _x_.txt"; filename*=UTF-8\'\'r%C3%A9%20%22x%22.txt', (got, data, headers))
+    got, data, headers, _ = h.raw('GET', '/files/file', {'filename': name})
+    check('download with ?filename=', got == 200 and data == b'new bytes' and
+          'filename*=UTF-8\'\'r%C3%A9%20%22x%22.txt' in headers.get('Content-Disposition', ''), (got, data, headers))
+    got, data, _, _ = h.raw('GET', '/files/file')
+    check('download without a name -> 422', got == 422 and b'the file has no name' in data, (got, data))
     got, data, _, _ = h.raw('PUT', '/files/upload', None, b'x')
     check('upload without a name -> 422', got == 422 and b'bad file name' in data, (got, data))
     r = h.call('get', '/files/entries', {}, ABSENT)

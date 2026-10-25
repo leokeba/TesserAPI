@@ -68,6 +68,9 @@ public:
     // Upload: opens it, without data. `done` gets {"received": 0, "chunk": n},
     // or the upload's reply when `size` is 0.
     virtual void openUpload(uint64_t size, std::string_view filename, Done done) = 0;
+    // Download: the name the client gave (FileRequest::filename), sent with
+    // the chunk that opens it (offset 0). Set before the first download().
+    virtual void downloadName(std::string_view filename) = 0;
     // Upload: sends `data`, the bytes from received() on, in the peer's
     // chunks. `done` gets the last reply: {"received": n}, or the upload's
     // reply once all `size` bytes are in (finished()).
@@ -135,8 +138,10 @@ public:
     // (empty if none: FileRequest::filename).
     Open openUpload(std::string_view path, const Client& client, uint64_t size, Reply& reply,
                     std::string_view filename = std::string_view());
-    // A download of `path`.
-    Open openDownload(std::string_view path, const Client& client, Reply& reply);
+    // A download of `path`, under the name the client gave (empty if none:
+    // FileRequest::filename).
+    Open openDownload(std::string_view path, const Client& client, Reply& reply,
+                      std::string_view filename = std::string_view());
 
     // Upload: the next bytes. On failure the error is written to `reply`
     // and the upload is over.
