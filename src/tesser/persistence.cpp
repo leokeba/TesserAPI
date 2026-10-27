@@ -289,10 +289,8 @@ bool Api::atDefault(const Node& n) const {
     return at != defaults_.end() && at->first == &n && at->second == hashOf(n);
 }
 
-std::string Api::persistedState() {
-    MutexGuard guard(mutex_);
-    std::string out;
-    StringSink sink(out);
+// Writes the backup to `sink`.
+void Api::writePersistedState(Sink& sink) {
     JsonWriter w(sink);
     detail::LazyPatch lp(w);
     if (persistVersion_) {
@@ -303,8 +301,34 @@ std::string Api::persistedState() {
     // bring back the backed-up state whatever changed since, defaults too.
     // Nodes marked backup(false) (keys) stay on this device.
     writePersisted(*this, persisted(), true, lp, w, [](const Node&) { return false; });
-    if (!lp.finish()) out = "{}";
+    if (!lp.finish()) w.raw("{}");
+}
+
+std::string Api::persistedState() {
+    std::string out;
+    Reservation unused;
+    persistedState(out, unused, false);
     return out;
+}
+
+bool Api::persistedState(std::string& out, Reservation& held) { return persistedState(out, held, true); }
+
+bool Api::persistedState(std::string& out, Reservation& held, bool reserve) {
+    out.clear();
+    MutexGuard guard(mutex_);
+    // Measured, then written once at that size: grown by doubling, the text
+    // took one block of up to twice its size.
+    CountingSink counted;
+    writePersistedState(counted);
+    if (reserve) {
+        held = memoryBudget().reserve(counted.count + 1, 0, true, true, mallocPool(counted.count + 1));
+        if (!held) return false;
+    }
+    reserveExactly(out, counted.count);
+    StringSink sink(out);
+    writePersistedState(sink);
+    held.settle();
+    return true;
 }
 
 bool Api::saveRecords(bool all, std::vector<std::string>* written) {

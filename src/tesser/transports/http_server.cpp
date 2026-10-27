@@ -374,6 +374,7 @@ public:
     bool checked = false;   // access comes from the token check
     uint32_t generation = 0;  // Api::tokenGeneration() when access was decided
     bool notify(const std::string& message, Delivery) override { return server_.wsSend(fd, message); }
+    bool notifyOwned(std::string&& message, Delivery) override { return server_.wsSend(fd, std::move(message)); }
     bool notifyShared(const std::shared_ptr<const std::string>& message, Delivery) override {
         return server_.wsSendShared(fd, message);
     }

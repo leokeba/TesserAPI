@@ -414,6 +414,10 @@ private:
             if (ep_.options_.maxMessage && message.size() > ep_.options_.maxMessage) return false;
             return ep_.send_ && ep_.send_(peer, message, delivery);
         }
+        bool notifyOwned(std::string&& message, Delivery delivery) override {
+            if (ep_.options_.maxMessage && message.size() > ep_.options_.maxMessage) return false;
+            return ep_.send_ && ep_.send_(peer, std::move(message), delivery);
+        }
         // Api::tokensChanged(): a peer that isn't trusted is at its token's level.
         bool recheckLevel(Access& level) override {
             if (ep_.trust_ && ep_.trust_(peer)) return false;

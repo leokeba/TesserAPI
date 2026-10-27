@@ -130,6 +130,10 @@ public:
     virtual bool notifyShared(const std::shared_ptr<const std::string>& message, Delivery delivery) {
         return notify(*message, delivery);
     }
+    // Same, for a message the caller has no more use for (a change
+    // notification): a transport that keeps it takes it rather than copying
+    // it before its bytes are reserved (docs/DESIGN.md section 15).
+    virtual bool notifyOwned(std::string&& message, Delivery delivery) { return notify(message, delivery); }
     // Asked by Api::tokensChanged(), under the API lock: the client's level
     // now, from the token check given again the token it presented (none:
     // the empty one). False when its level doesn't come from the check (a

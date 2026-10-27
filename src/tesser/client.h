@@ -124,6 +124,7 @@ public:
 
     // Subscriber
     bool notify(const std::string& message, Delivery delivery) override;
+    bool notifyOwned(std::string&& message, Delivery delivery) override;
 
 private:
     Api& api_;

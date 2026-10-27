@@ -39,6 +39,30 @@ struct Settings {
     }
 };
 
+// A backup's text is measured before it is written: one allocation of its
+// size (grown by doubling, it took up to twice that), reserved first when
+// the caller asks for that.
+TEST(persist_state_sized_once) {
+    Settings s(nullptr);
+    std::string expected = s.api.persistedState();
+    CHECK(expected.capacity() < expected.size() + 24);
+    std::string out = "old";
+    tesser::Reservation held;
+    CHECK(s.api.persistedState(out, held));
+    CHECK_EQ(out, expected);
+    CHECK(held && held.bytes() > out.size());
+    held = tesser::Reservation();
+    // Without room in the budget: refused, nothing allocated.
+    tesser::ByteBudget& root = tesser::memoryBudget();
+    root.setLimit(root.used() + 16);
+    CHECK(!s.api.persistedState(out, held));
+    CHECK(out.empty() && !held);
+    root.setLimit(0);
+    // An Api with nothing persisted gives an empty object, as before.
+    tesser::Api empty;
+    CHECK_EQ(empty.persistedState(), "{}");
+}
+
 TEST(persist_state_and_roundtrip) {
     MemoryStorage storage;
     {

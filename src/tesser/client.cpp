@@ -121,6 +121,7 @@ bool LocalClient::request(Op op, std::string_view path, std::string_view bodyJso
 }
 
 bool LocalClient::notify(const std::string& message, Delivery) { return inbox_->notification(message); }
+bool LocalClient::notifyOwned(std::string&& message, Delivery) { return inbox_->notification(std::move(message)); }
 
 // ---- PeerClient -------------------------------------------------------------
 

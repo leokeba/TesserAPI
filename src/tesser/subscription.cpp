@@ -462,7 +462,7 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
     }
     bool overflow = sub.subscriber->missed.exchange(false);
     closeEnvelope(msg, overflow, sub.ceiling);
-    if (sub.subscriber->notify(msg, Delivery::Reliable)) {
+    if (sub.subscriber->notifyOwned(std::move(msg), Delivery::Reliable)) {
         sub.since = gen;
         sub.lastFlushMs = nowMs;
         sub.backoffMs = 0;

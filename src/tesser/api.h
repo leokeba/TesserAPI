@@ -219,8 +219,13 @@ public:
     // The whole persisted state as one JSON document (the records under
     // their names, and "@version" when persistVersion() set one), secrets
     // included: a backup. Unlike the records, it holds every value, defaults
-    // included, so restoring it gives exactly that state.
+    // included, so restoring it gives exactly that state. Measured first, so
+    // the text is allocated once at its size.
     std::string persistedState();
+    // Same, with the text's bytes reserved from the byte budget before it is
+    // allocated (docs/DESIGN.md section 15), kept in `held` while the caller
+    // uses it: false, and `out` empty, without room.
+    bool persistedState(std::string& out, Reservation& held);
     // Applies a document like persistedState()'s (a backup), leniently like
     // load(): what doesn't fit the tree is skipped and its path added to
     // `skipped`. An older one goes through the migration first. What is
@@ -327,6 +332,8 @@ private:
     // Writes the records of top-level nodes (all, or those changed since
     // the last save); the names of those written go to `written`.
     bool saveRecords(bool all, std::vector<std::string>* written = nullptr);
+    void writePersistedState(Sink& sink);
+    bool persistedState(std::string& out, Reservation& held, bool reserve);
     // After a migration: every record rewritten under this version, then
     // the version. A rewrite that fails partway records which records it
     // rewrote (a later boot doesn't migrate them again), and poll() tries
