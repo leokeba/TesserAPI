@@ -47,6 +47,12 @@ BleTransport::BleTransport(Api& api)
     // nothing (docs/DESIGN.md section 13.2).
     line_.setAuthenticated(false);
     line_.setTransport(TransportKind::Ble);
+    // Notifications and deferred replies are written by the request task,
+    // without the API lock: a full NimBLE pool waits up to 2 s per piece.
+    line_.queueOutput([this] {
+        MutexGuard guard(stateMutex_);
+        if (task_) xTaskNotifyGive(task_);
+    });
 }
 
 esp_err_t BleTransport::begin(const char* name, uint32_t stackSize, UBaseType_t priority) {
@@ -303,6 +309,7 @@ void BleTransport::taskEntry(void* arg) {
         }
         if (!in.empty()) self->line_.feed(in.data(), in.size());
         in.clear();
+        self->line_.flush();
     }
     vTaskDelete(nullptr);
 }

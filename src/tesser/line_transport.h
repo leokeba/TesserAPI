@@ -52,6 +52,17 @@ public:
     // subscriptions, any partial line, its token and its file transfer.
     void reset();
 
+    // For an output that may wait (Bluetooth waits for room): whole messages
+    // (notifications and deferred replies, which come from other tasks,
+    // under the API lock) wait in a queue, `wake` is called, and the
+    // transport's own task writes them with flush(), without the lock
+    // (docs/DESIGN.md section 9). Without it, they are written in the
+    // caller's task. Before the first feed().
+    void queueOutput(std::function<void()> wake) { wake_ = std::move(wake); }
+    // Writes what waits. From the task that feeds the line only, between
+    // feed() calls.
+    void flush();
+
     // Lines dropped for exceeding the limit (Config::maxRequestBody + 256).
     size_t overflows() const { return overflows_; }
 
@@ -84,6 +95,7 @@ private:
     Mutex outputMutex_{kRankLeaf, "line output"};
     bool streaming_ = false;
     std::string waiting_;
+    std::function<void()> wake_;  // queueOutput()
     bool discarding_ = false;
     bool starved_ = false;  // discarding_ because the heap couldn't hold the line
     bool damaged_ = false;  // lineDamaged(): bytes of this line were lost

@@ -241,20 +241,38 @@ bool LineTransport::sendPiece(const char* data, size_t len, bool first, bool fin
 
 bool LineTransport::send(const std::string& message, bool mayDrop) {
     if (!output_) return true;
-    MutexGuard guard(outputMutex_);
-    if (streaming_) {
-        // A notification beyond 2 KB waiting is dropped (its subscriber is
-        // told "overflow" next); a deferred reply always waits.
-        if (mayDrop && (waiting_.size() + message.size() > 2048 ||
+    bool wake = false;
+    {
+        MutexGuard guard(outputMutex_);
+        if (!streaming_ && !wake_) {
+            output_(message.data(), message.size());
+            output_("\n", 1);
+            return true;
+        }
+        // A notification that would take more than 2 KB waiting is dropped
+        // (its subscriber is told "overflow" next), unless it would wait
+        // alone; a deferred reply always waits.
+        if (mayDrop && ((!waiting_.empty() && waiting_.size() + message.size() > 2048) ||
                         !growFor(waiting_, waiting_.size() + message.size() + 1)))
             return false;
         waiting_ += message;
         waiting_ += '\n';
-        return true;
+        wake = !streaming_;  // else the reply's end writes it
     }
-    output_(message.data(), message.size());
-    output_("\n", 1);
+    if (wake && wake_) wake_();
     return true;
+}
+
+void LineTransport::flush() {
+    std::string out;
+    {
+        MutexGuard guard(outputMutex_);
+        if (streaming_ || waiting_.empty()) return;
+        out.swap(waiting_);
+    }
+    // Without the lock: only this task writes meanwhile (a reply it streams
+    // comes after), and other tasks' messages wait for the next flush().
+    if (output_) output_(out.data(), out.size());
 }
 
 }  // namespace tesser

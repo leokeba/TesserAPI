@@ -60,6 +60,9 @@ public:
         // proves nothing (docs/DESIGN.md section 13.2).
         line_.setAuthenticated(false);
         line_.setTransport(TransportKind::Ble);
+        // Notifications and deferred replies wait for poll(), which writes
+        // them without the API lock (docs/DESIGN.md section 9).
+        line_.queueOutput([] {});
     }
 
     // Starts the BLE stack under this name (unless the sketch did), the
@@ -88,8 +91,9 @@ public:
     }
 
     // Handles what the client wrote, in the caller's task (loop()), under
-    // the API lock. After a disconnection, drops the client's subscriptions
-    // and token, and advertises again.
+    // the API lock, then writes the notifications that wait. After a
+    // disconnection, drops the client's subscriptions and token, and
+    // advertises again.
     void poll() {
         if (dropped_.exchange(false)) {
             line_.reset();  // subscriptions, a line cut short, the token
@@ -103,6 +107,7 @@ public:
             in.swap(inbox_);
         }
         if (!in.empty()) line_.feed(in.data(), in.size());
+        line_.flush();
     }
 
     // Stops the BLE stack and gives its memory back (BLEDevice::deinit(false),

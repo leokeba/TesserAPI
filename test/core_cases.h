@@ -801,6 +801,34 @@ TEST(line_transport_overrun) {
     if (lines.out.size() == 2) CHECK_EQ(lines.out[1], "{\"id\":8,\"status\":\"ok\",\"body\":128}");
 }
 
+TEST(line_transport_queued_output) {
+    // queueOutput(): notifications made under the API lock, in another task,
+    // wait for the line's own task to flush() them, without the lock.
+    Device d;
+    Lines lines;
+    bool notifying = false;
+    tesser::LineTransport t(d.api, [&](const char* data, size_t n) {
+        CHECK(!notifying);  // not from the notifying task, under the API lock
+        lines.add(data, n);
+    });
+    int woken = 0;
+    t.queueOutput([&woken] { woken++; });
+    const char* sub = "{\"id\":1,\"op\":\"sub\",\"path\":\"/lamp\",\"snapshot\":false}\n";
+    t.feed(sub, strlen(sub));
+    CHECK_EQ(lines.out.size(), 1u);  // the reply, streamed by this task
+    set(d.api, "/lamp/brightness", "7");
+    notifying = true;
+    d.api.poll(100000);
+    notifying = false;
+    CHECK_EQ(woken, 1);
+    CHECK_EQ(lines.out.size(), 1u);
+    t.flush();
+    CHECK_EQ(lines.out.size(), 2u);
+    if (lines.out.size() == 2) CHECK_EQ(lines.out[1], "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"brightness\":7}}");
+    t.flush();
+    CHECK_EQ(lines.out.size(), 2u);
+}
+
 TEST(line_transport_framing) {
     Device d;
     Lines lines;
