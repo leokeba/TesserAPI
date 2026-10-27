@@ -86,6 +86,38 @@ RemoteNode::AccessHandler& sharedAccessHandler() {
     return fn;
 }
 
+// A forwarded request's detached reply and pending slot, shared by the
+// call's two handlers: answered once, by whichever runs. If the endpoint
+// drops the call without running either (the node or the endpoint
+// destroyed), the last copy to go answers it, so the client hears and the
+// slot comes back.
+class Forwarded {
+public:
+    Forwarded(Reply* detached, Api* api, std::string path) : detached_(detached), api_(api), path_(std::move(path)) {}
+    ~Forwarded() { fail(Status::Internal, Reason::None, "the call to the remote node was dropped"); }
+    Forwarded(const Forwarded&) = delete;
+    Forwarded& operator=(const Forwarded&) = delete;
+
+    // The reply, once: null if it went already. finish() after writing.
+    Reply* take() { return answered_.exchange(true) ? nullptr : detached_; }
+    void finish() {
+        detached_->release();
+        api_->pendingDone();
+    }
+    void fail(Status s, Reason reason, const char* message) {
+        Reply* r = take();
+        if (!r) return;
+        writeError(*r, s, reason, path_, message);
+        finish();
+    }
+
+private:
+    Reply* detached_;
+    Api* api_;
+    std::string path_;
+    std::atomic<bool> answered_{false};
+};
+
 }  // namespace
 
 RemoteNode::RemoteNode(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer, std::string remotePath)
@@ -453,16 +485,19 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
         return writeError(reply, Status::NotAllowed, Reason::CannotWait, basePath, "this transport can't wait for remote nodes");
     }
     std::string remoteBase = remotePath_ == "/" ? std::string() : remotePath_;
-    Api* a = &api;
-    auto done = [detached, a, localBase, remoteBase](Status s, JsonVariantConst body) {
+    std::string okPath = localBase.empty() ? std::string("/") : localBase;
+    auto call = std::make_shared<Forwarded>(detached, &api, std::string(basePath));
+    auto done = [call, localBase, remoteBase](Status s, JsonVariantConst body) {
+        Reply* detached = call->take();
+        if (!detached) return;
         detail::writeMapped(*detached, s, body, localBase, remoteBase);
-        detached->release();
-        a->pendingDone();
+        call->finish();
     };
     // An "ok" body goes on as the remote wrote it: parsed and rewritten, a
     // large one would be on the heap twice.
-    std::string okPath = localBase.empty() ? std::string("/") : localBase;
-    auto raw = [detached, a, okPath](std::string_view json) {
+    auto raw = [call, okPath](std::string_view json) {
+        Reply* detached = call->take();
+        if (!detached) return;
         Sink& out = detached->begin(Status::Ok);
         if (!out.write(json.data(), json.size()) && detached->rollback()) {
             if (detached->outOfMemory()) {
@@ -473,17 +508,14 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
         } else {
             detached->end();
         }
-        detached->release();
-        a->pendingDone();
+        call->finish();
     };
     // No more than the client may (docs/DESIGN.md section 13.1).
     Query q = request.query;
     q.ceiling = request.client.level();
     if (!r.endpoint->requestRaw(r.peer, request.op, remotePathOf(rest), request.body, raw, done, q, timeoutMs_,
                                 this)) {
-        writeError(*detached, Status::Busy, Reason::Unreachable, basePath, "couldn't send to the remote node");
-        detached->release();
-        api.pendingDone();
+        call->fail(Status::Busy, Reason::Unreachable, "couldn't send to the remote node");
     }
 }
 

@@ -280,4 +280,31 @@ TEST(datagram_queued_subscribe_keeps_subscriber) {
     CHECK_EQ(server.peerSubscribers(), 1u);
 }
 
+TEST(datagram_dropped_forward_answers) {
+    // A forwarded request in flight when its remote node's endpoint is
+    // destroyed: the call goes without its handlers running, yet the client
+    // hears, and the pending slot comes back.
+    cases::Device gw;
+    Net net;
+    DatagramEndpoint client(nullptr, tesser::TransportKind::NowTP, net.sender(addr(1)), net.clockFn());
+    DatagramEndpoint server(&gw.api, tesser::TransportKind::NowTP, net.sender(addr(2)), net.clockFn());
+    auto* far = new DatagramEndpoint(
+        nullptr, tesser::TransportKind::NowTP,
+        [](const tesser::PeerAddress&, std::string, tesser::Delivery) { return true; }, net.clockFn());
+    net.nodes = {{addr(1), &client}, {addr(2), &server}};
+    {
+        tesser::Lock lock(gw.api);
+        gw.api.object("peers").remote("far", *far, addr(9));
+    }
+    Result r;
+    CHECK(client.request(addr(2), tesser::Op::Get, "/peers/far/x", std::string_view(), capture(r)));
+    net.run();
+    CHECK_EQ(gw.api.pending(), 1);
+    delete far;
+    CHECK_EQ(gw.api.pending(), 0);
+    net.run();
+    CHECK(r.called);
+    CHECK_EQ(r.status, Status::Internal);
+}
+
 }  // namespace datagram_cases

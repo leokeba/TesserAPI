@@ -64,9 +64,10 @@ size_t DatagramEndpoint::replyLimitFor(const PeerAddress& peer) const {
 // Pending handlers are dropped without being called: whatever they capture
 // may already be gone. (A captured Pending still answers its own client.)
 DatagramEndpoint::~DatagramEndpoint() {
+    std::vector<CallSlot> dropped;  // destroyed after the lock, as by cancelCalls()
     {
         MutexGuard guard(mutex_);
-        calls_.clear();
+        dropped.swap(calls_);
         for (RemoteNode* r : remotes_) r->detach(this);
         remotes_.clear();
     }

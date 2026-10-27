@@ -522,9 +522,13 @@ bool DatagramEndpoint::broadcast(const PeerAddress& to, Op op, std::string_view 
 }
 
 void DatagramEndpoint::cancelCalls(const void* owner) {
+    // Destroyed after the lock: a handler's captures may answer a client
+    // or take other locks as they go (a forwarded request's, a relay's).
+    std::vector<CallSlot> dropped;
     MutexGuard guard(mutex_);
     for (size_t i = 0; i < calls_.size();) {
         if (calls_[i].owner == owner) {
+            dropped.push_back(std::move(calls_[i]));
             calls_.erase(calls_.begin() + static_cast<std::ptrdiff_t>(i));
         } else {
             i++;
