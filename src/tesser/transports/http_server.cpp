@@ -1115,13 +1115,27 @@ esp_err_t HttpServer::serve(httpd_req_t* req, bool inWorker) {
         return ESP_OK;
     }
     std::string body;
+    Reservation bodyRoom;
     if (req->content_len > 0) {
+        // Room first (docs/DESIGN.md section 15): on a short heap the client
+        // hears busy, and the body is read and dropped.
+        bodyRoom = memoryBudget().reserve(req->content_len + 1, 0, true, true, mallocPool(req->content_len + 1));
+        if (!bodyRoom) {
+            writeError(reply, Status::Busy, Reason::LowMemory, path, "not enough memory for the request body");
+            return drain(req, req->content_len) ? ESP_OK : ESP_FAIL;
+        }
         body.resize(req->content_len);
+        bodyRoom.settle();
         size_t got = 0;
+        int timeouts = 0;
         while (got < body.size()) {
             int n = httpd_req_recv(req, &body[got], body.size() - got);
-            if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            // A client that stalls is given up on, as by drain(): before
+            // any token is checked, it would hold the httpd task, and every
+            // other client, for good.
+            if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 4) continue;
             if (n <= 0) return ESP_FAIL;
+            timeouts = 0;
             got += static_cast<size_t>(n);
         }
     }
