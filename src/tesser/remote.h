@@ -33,7 +33,10 @@ struct Subscription;
 // Created with Object::remote(); lives as long as the tree (one mounted for
 // an announced peer may be evicted: DatagramEndpoint::Options::maxMounted).
 // Either may be destroyed first: a destroyed endpoint detaches its routes, and a node left
-// without one answers "no endpoint".
+// without one answers "no endpoint". Destroy a node outside the API lock, and not from a
+// call into it: its destructor waits for another task's call into it to end, and that
+// task may be waiting for the lock (docs/DESIGN.md section 9). Destroy an endpoint, or a
+// node, only while no relayed file transfer is open through it (relays()).
 // What an application hears from the remote nodes of one Api, and the
 // order their routes are tried in (docs/DESIGN.md section 14.3): each Api
 // has its own (Api::remoteHooks()), so two applications in one program

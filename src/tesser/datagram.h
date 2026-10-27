@@ -232,7 +232,8 @@ public:
     // Used by RemoteNode: a node with a route through this endpoint, and
     // that route (`peer`), so it gets the peer's advertised hash.
     // removeRemote() (its destructor) waits while another task calls the
-    // node from this endpoint (process(), a token's answer).
+    // node from this endpoint (process(), a token's answer): a node mustn't
+    // be destroyed under the API lock, which that call may be waiting for.
     void addRemote(RemoteNode* remote);
     void removeRemote(RemoteNode* remote);
     void routeAdded(RemoteNode* remote, const PeerAddress& peer);

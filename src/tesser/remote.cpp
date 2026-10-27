@@ -427,9 +427,21 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
 }
 
 bool RemoteNode::localPath(std::string& out) {
-    if (!api_.load()) api_ = Api::owner(*this, localPath_);
+    out.clear();
+    Api* api = api_.load();
+    if (!api) {
+        // Found without a lock (Api::owner() walks trees only appended to),
+        // into a local: localPath_ is written and read under the API lock.
+        std::string path;
+        api = Api::owner(*this, path);
+        if (!api) return false;
+        MutexGuard guard(api->mutex());
+        if (localPath_.empty()) localPath_ = std::move(path);
+        api_ = api;
+    }
+    MutexGuard guard(api->mutex());
     out = localPath_;
-    return api_ != nullptr;
+    return true;
 }
 
 bool RemoteNode::handleNotification(const DatagramEndpoint& by, const PeerAddress& from, JsonObjectConst envelope) {

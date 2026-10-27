@@ -120,8 +120,13 @@ void NowTpTransport::installOwnedSend(T& now) {
                 nowtp::SendOptions opts;
                 opts.reliable = delivery == Delivery::Reliable && !mac.isBroadcast();
                 opts.latestOnly = delivery == Delivery::LatestOnly;
+                // The call's id read before the buffer goes to NowTP: a
+                // relayed part it refuses fails at once (docs/DESIGN.md
+                // section 10.3), not after its timeouts.
                 nowtp::CompletionHandler done;
-                if (opts.reliable) done = completion(to, 0);
+                if (opts.reliable) {
+                    done = completion(to, DatagramEndpoint::callIdOf(std::string_view(message.data(), message.size())));
+                }
                 size_t len = message.size(), capacity = message.capacity();
                 auto* buffer = reinterpret_cast<uint8_t*>(message.release());
                 return now.sendBuffer(mac, port_, buffer, len, capacity, opts, std::move(done)) == nowtp::Status::Ok;
