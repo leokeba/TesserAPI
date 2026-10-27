@@ -166,6 +166,7 @@ void DatagramEndpoint::handleResponse(JsonObjectConst env, const PeerAddress& fr
                     }
                     break;
                 }
+                if (s == Status::Unauthorized && a && a->state == PeerAuth::Done) a->state = PeerAuth::Idle;
                 done = std::move(calls_[i].done);
                 if (done) {
                     // The round trip, for the routes through this peer:
@@ -262,10 +263,14 @@ bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, std::stri
         CallSlot slot{id, to, now + (timeoutMs ? timeoutMs : options_.timeoutMs), std::move(done), owner, nullptr, now,
                       std::move(raw), std::string(), nullptr, false, false};
         if (PeerAuth* a = internal ? nullptr : authLocked(to)) {
-            // Kept to go again: its builder, or a copy.
+            // Kept to go again: its builder, or a copy, while it waits for
+            // the token's answer, or if small. A large one to a peer that took
+            // the token isn't kept (up to 4 KB until the reply): if the peer
+            // forgot the token, the call answers "unauthorized", and the
+            // token is presented again before the next one.
             if (rebuild) {
                 slot.rebuild = std::move(rebuild);
-            } else {
+            } else if (a->state != PeerAuth::Done || envelope.size() <= kKeptEnvelope) {
                 slot.text = envelope;
             }
             if (a->state != PeerAuth::Done) {

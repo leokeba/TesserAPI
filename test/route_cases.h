@@ -500,6 +500,30 @@ TEST(route_tokens) {
     CHECK_EQ(r.level, 7);
     CHECK_EQ(n.streamStats().failed, 2u);
     RemoteNode::onAccess(nullptr);
+
+    // A large request to a device that took the token isn't kept to go
+    // again: if the device forgot the token unseen, it answers
+    // "unauthorized", and the token is presented before the next one.
+    udp_cases::Result set8;
+    r.gwUdp.endpoint().request(ip(20), tesser::Op::Set, "/out/level", "8" + std::string(600, ' '),
+                               udp_cases::capture(set8));
+    r.run();
+    CHECK_EQ(set8.status, Status::Ok);
+    CHECK_EQ(r.level, 8);
+    r.devUdp.endpoint().forgetPeer(ip(1));
+    r.run();
+    udp_cases::Result set9;
+    r.gwUdp.endpoint().request(ip(20), tesser::Op::Set, "/out/level", "9" + std::string(600, ' '),
+                               udp_cases::capture(set9));
+    r.run();
+    CHECK_EQ(set9.status, Status::Unauthorized);
+    CHECK_EQ(r.level, 8);
+    udp_cases::Result set10;
+    r.gwUdp.endpoint().request(ip(20), tesser::Op::Set, "/out/level", "10" + std::string(600, ' '),
+                               udp_cases::capture(set10));
+    r.run();
+    CHECK_EQ(set10.status, Status::Ok);
+    CHECK_EQ(r.level, 10);
 }
 
 TEST(route_probe_backoff) {

@@ -457,6 +457,9 @@ private:
         uint32_t usedMs;
     };
 
+    // A request to a peer with a token is kept, to go again after
+    // "unauthorized", up to this size (unless it waits for the token).
+    static constexpr size_t kKeptEnvelope = 512;
     struct CallSlot {
         uint32_t id;
         PeerAddress to;
