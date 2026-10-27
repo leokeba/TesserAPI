@@ -209,6 +209,10 @@ struct Background {
     TaskHandle_t task = nullptr;
 };
 
+// How long the task waits for another job before it exits, giving its stack
+// back: sign-ins come in bursts, far apart.
+constexpr uint32_t kBackgroundIdleMs = 5000;
+
 void backgroundLoop(void* arg) {
     auto* b = static_cast<Background*>(arg);
     for (;;) {
@@ -222,10 +226,17 @@ void backgroundLoop(void* arg) {
         }
         if (job) {
             job();
-        } else {
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        } else if (!ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kBackgroundIdleMs))) {
+            // A job queued meanwhile was queued for this task, under the
+            // mutex: it stays. Otherwise the next background() starts another.
+            MutexGuard guard(b->mutex);
+            if (b->jobs.empty()) {
+                b->task = nullptr;
+                break;
+            }
         }
     }
+    vTaskDelete(nullptr);
 }
 #else
 struct Background {
@@ -261,6 +272,7 @@ bool background(std::function<void()> work) {
     if (!work) return false;
     Background& b = backgroundState();
 #if defined(ESP_PLATFORM)
+    TaskHandle_t task;
     {
         MutexGuard guard(b.mutex);
         if (b.jobs.size() >= kBackgroundJobs) return false;
@@ -269,8 +281,9 @@ bool background(std::function<void()> work) {
             return false;
         }
         b.jobs.push_back(std::move(work));
+        task = b.task;  // can't exit before it has run the job
     }
-    xTaskNotifyGive(b.task);
+    xTaskNotifyGive(task);
 #else
     {
         std::lock_guard<std::mutex> lock(b.mutex);

@@ -176,8 +176,8 @@ private:
 // Runs `work` on the library's background task, without the API lock
 // (docs/DESIGN.md section 9): slow work that an action defers (a key
 // derivation at sign-in) and answers through its Pending, so the API stays
-// free meanwhile. One task, created on first use, runs the jobs in turn;
-// false if 8 are already waiting.
+// free meanwhile. One task, created when needed, runs the jobs in turn and
+// exits after 5 s without one; false if 8 are already waiting.
 bool background(std::function<void()> work);
 // Its stack, before the first background() (default 6144 bytes on target).
 void setBackgroundStack(uint32_t bytes);
