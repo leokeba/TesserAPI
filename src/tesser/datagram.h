@@ -28,9 +28,13 @@ class Object;
 class RemoteNode;
 struct ClientInbox;
 
-// Address of a peer on a datagram link: a MAC for NowTP, IP and port for UDP.
+// Address of a peer on a datagram link: a MAC for NowTP, an IPv4 address
+// and port for UDP. Six bytes: peer tables hold many, so there is no room
+// for IPv6 (which the UDP transport doesn't speak), and longer addresses are
+// cut short.
 struct PeerAddress {
-    uint8_t bytes[18] = {};
+    static constexpr uint8_t kMaxLength = 6;
+    uint8_t bytes[kMaxLength] = {};
     uint8_t length = 0;
 
     static PeerAddress fromBytes(const uint8_t* b, uint8_t len) {

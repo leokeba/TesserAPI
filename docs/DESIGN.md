@@ -791,7 +791,7 @@ udp.broadcastSet(tesser::PeerAddress(), "/sequencer/play", "true");   // every n
 
 The §10.1 envelopes between nodes and clients on a LAN, Ethernet or Wi-Fi, through the same `DatagramEndpoint` as NowTP: serving, client calls, remote nodes and forwarding, forwarded subscriptions, file transfers, `*` fan-out (§6.5) and discovered peers all work as over NowTP. Two things are new: broadcast writes, and a least level for peers with tokens sent in `auth` envelopes.
 
-- **Addresses:** IPv4 and port, a 6-byte `PeerAddress`: the address bytes in order, then the port, most significant byte first. `udpAddress(192, 168, 1, 59, 8484)`, `parseUdpAddress("192.168.1.59:8484", defaultPort, out)` and `formatUdpAddress(a)` convert. A request's `Client::address` holds the same 6 bytes. An empty `PeerAddress` means every local network (below).
+- **Addresses:** IPv4 and port, a 6-byte `PeerAddress` (it holds at most 6 bytes, a MAC or this: peer tables, calls and routes hold many, and 18 bytes of room for IPv6 cost about 12 bytes each; a route is 24 bytes): the address bytes in order, then the port, most significant byte first. `udpAddress(192, 168, 1, 59, 8484)`, `parseUdpAddress("192.168.1.59:8484", defaultPort, out)` and `formatUdpAddress(a)` convert. A request's `Client::address` holds the same 6 bytes. An empty `PeerAddress` means every local network (below).
 - **Datagrams:** each starts with a 20-byte header, multi-byte fields little-endian:
 
   | Offset | Size | Field |
