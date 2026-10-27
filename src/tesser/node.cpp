@@ -339,6 +339,11 @@ Mutex& treeWalkMutex() {
 }  // namespace detail
 
 void Object::remove(Node* child) {
+    if (!unlink(child)) return;
+    delete child;
+}
+
+bool Object::unlink(Node* child) {
     {
         // A walk without the API lock holds this for its whole length: once
         // the node is unlinked under it, no walk reaches it any more.
@@ -349,7 +354,7 @@ void Object::remove(Node* child) {
             prev = n;
             n = n->next_.load(std::memory_order_acquire);
         }
-        if (!n) return;
+        if (!n) return false;
         Node* next = n->next_.load(std::memory_order_acquire);
         if (prev) {
             prev->next_.store(next, std::memory_order_release);
@@ -358,8 +363,8 @@ void Object::remove(Node* child) {
         }
         if (last_ == n) last_ = prev;
     }
-    delete child;
     touch();  // the schema changed
+    return true;
 }
 
 void Object::link(Node* node) {

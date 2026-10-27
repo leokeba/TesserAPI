@@ -6,6 +6,8 @@
 #include <chrono>
 #include <string>
 #include <thread>
+#include <utility>
+#include <functional>
 
 #include "datagram_cases.h"
 #include "remote_cases.h"
@@ -173,6 +175,49 @@ TEST(caps_node_in_use_not_evicted) {
     r.seen(13, "d");
     CHECK_EQ(r.names(), "{\"b\":null,\"c\":null,\"d\":null}");
     CHECK_EQ(r.gatewayEnd.stats().evicted, 1u);
+}
+
+// Lets go of the API lock between children, as streamed replies do; the
+// first time, another peer is mounted meanwhile.
+class YieldingReply : public tesser::Reply {
+public:
+    explicit YieldingReply(std::function<void()> meanwhile) : meanwhile_(std::move(meanwhile)), sink_(body) {}
+    tesser::Sink& begin(Status) override { return sink_; }
+    void end() override {}
+    bool wantsDrain() const override { return true; }
+    void drain() override {
+        if (meanwhile_) std::exchange(meanwhile_, nullptr)();
+    }
+    std::string body;
+
+private:
+    std::function<void()> meanwhile_;
+    tesser::StringSink sink_;
+};
+
+TEST(caps_eviction_during_yielded_read) {
+    // A streamed read of /peers lets go of the lock after each child; a mount
+    // meanwhile evicts the node it just rendered. The node stays until no
+    // reply has let go (poll()), so the read walks on past it.
+    Rig r;
+    r.seen(10, "a");
+    r.seen(11, "b");
+    r.seen(12, "c");
+    r.lost(10);
+    r.lost(11);
+    r.lost(12);
+    YieldingReply reply([&r] { r.seen(13, "d"); });
+    tesser::Request req;
+    req.op = tesser::Op::Get;
+    req.path = "/peers";
+    req.client.authenticated = true;
+    r.gateway.handle(req, reply);
+    CHECK_EQ(r.gatewayEnd.stats().evicted, 1u);
+    CHECK(reply.body.find("\"b\"") != std::string::npos);
+    CHECK(reply.body.find("\"c\"") != std::string::npos);
+    CHECK_EQ(r.names(), "{\"b\":null,\"c\":null,\"d\":null}");
+    r.gateway.poll(r.net.clock);  // frees it
+    CHECK_EQ(r.names(), "{\"b\":null,\"c\":null,\"d\":null}");
 }
 
 TEST(caps_routes_per_node) {

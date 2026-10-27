@@ -1292,6 +1292,10 @@ protected:
     // Unlinks `child` and destroys it, under the API lock. Only for nodes
     // nothing else points to (docs/DESIGN.md section 14.1).
     void remove(Node* child);
+    // Unlinks `child` without destroying it, under the API lock; false if
+    // it isn't one. Its own next() still leads on to its old siblings, so a
+    // walk standing on it carries on (Api::retire()).
+    bool unlink(Node* child);
 
 private:
     std::atomic<Node*> first_{nullptr};  // see Node::next_

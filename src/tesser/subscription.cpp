@@ -125,6 +125,8 @@ Api::Api() : Object("") {
 Api::~Api() {
     {
         MutexGuard guard(mutex_);
+        for (Node* n : retired_) delete n;
+        retired_.clear();
         for (Subscription& s : subs_) {
             if (s.waiting) s.waiting->release();
         }
@@ -337,11 +339,23 @@ bool Api::subscribedLocked(const Node& node) const {
     return false;
 }
 
+void Api::retire(Node* node) {
+    if (yielded_) {
+        retired_.push_back(node);
+    } else {
+        delete node;
+    }
+}
+
 void Api::poll() { poll(millis32()); }
 
 void Api::poll(uint32_t nowMs) {
     runQueued();
     MutexGuard guard(mutex_);
+    if (!yielded_ && !retired_.empty()) {
+        for (Node* n : retired_) delete n;
+        retired_.clear();
+    }
     if (persistHook_) persistHook_(*this, nowMs);
     if (subs_.empty()) return;
     if (nowMs - lastWatchMs_ >= config_.watchIntervalMs) {

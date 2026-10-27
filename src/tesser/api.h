@@ -287,6 +287,15 @@ public:
     bool claimTransfer(std::string_view path, TransferHolder* holder);
     void releaseTransfer(std::string_view path);
 
+    // Under the API lock. A handler that lets go of the lock mid-reply
+    // (docs/DESIGN.md section 9) brackets the release with these; a node
+    // unlinked from the tree meanwhile goes to retire(), which destroys it
+    // at once when no handler has let go, and otherwise from poll() once
+    // none has: the handler may still stand on it when it comes back.
+    void yieldBegin() { yielded_++; }
+    void yieldEnd() { yielded_--; }
+    void retire(Node* node);
+
     // Requests waiting for poll() in queued mode.
     size_t queuedRequests() const;
 
@@ -350,6 +359,8 @@ private:
     void (*persistHook_)(Api& api, uint32_t nowMs) = nullptr;
     mutable Mutex queueMutex_{kRankLeaf, "api queue"};  // a leaf: runQueued() takes it under the API lock
     std::vector<QueuedRequest*> queue_;  // a vector: an empty deque allocates
+    int yielded_ = 0;               // under mutex_: handlers that let go of it
+    std::vector<Node*> retired_;    // under mutex_: unlinked, destroyed by poll()
     Api* nextApi_ = nullptr;  // registry used by EventNode
     const Client* current_ = nullptr;  // under mutex_: see currentClient()
     uint8_t deviceId_[6] = {};

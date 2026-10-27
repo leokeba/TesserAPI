@@ -719,8 +719,12 @@ private:
     // back may be newer than what it rendered before.
     void yieldPoint() {
         if (req_.op != Op::Get || !temps_.empty() || inList_ || !reply_.wantsDrain()) return;
-        MutexRelease release(api_.mutex());
-        if (release.released()) reply_.drain();
+        api_.yieldBegin();
+        {
+            MutexRelease release(api_.mutex());
+            if (release.released()) reply_.drain();
+        }
+        api_.yieldEnd();
     }
 
     // Out of line, like schemaAttributes, so renders without a shape don't

@@ -565,7 +565,12 @@ bool DatagramEndpoint::roomToMount() {
         }
         unlistLocked(evict);
     }
-    evictParent->remove(evict);
+    // A reply that let go of the API lock may still stand on it: it leaves
+    // this endpoint now, and is destroyed once no reply has (Api::retire()).
+    evictParent->unlink(evict);
+    cancelCalls(evict);
+    evict->detach(this);
+    api_->retire(evict);
     MutexGuard guard(mutex_);
     stats_.evicted++;
     return true;
