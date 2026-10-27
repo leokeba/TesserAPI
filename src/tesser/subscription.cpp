@@ -572,8 +572,20 @@ void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter
 }
 
 void EventNode::emitWith(const std::function<void(JsonWriter&)>& write) {
-    if (!api_) api_ = Api::owner(*this, path_);
-    if (api_) api_->emitEvent(path_, write);
+    Api* api = api_.load(std::memory_order_acquire);
+    if (!api) {
+        // Two tasks may emit first at once: each finds the path into its
+        // own string, and the first to take the lock publishes it.
+        std::string path;
+        api = Api::owner(*this, path);
+        if (!api) return;
+        MutexGuard guard(api->mutex());
+        if (!api_.load(std::memory_order_relaxed)) {
+            path_ = std::move(path);
+            api_.store(api, std::memory_order_release);
+        }
+    }
+    api->emitEvent(path_, write);
 }
 
 void EventNode::emit() { emitWith(nullptr); }

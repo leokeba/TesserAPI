@@ -516,7 +516,9 @@ public:
     void emitWith(const std::function<void(JsonWriter&)>& write);
 
 private:
-    Api* api_ = nullptr;  // found on the first emit()
+    // Found on the first emit(): path_ is written once, before api_ is
+    // published, and only read after.
+    std::atomic<Api*> api_{nullptr};
     std::string path_;
 };
 

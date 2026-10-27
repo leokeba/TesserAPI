@@ -653,9 +653,14 @@ esp_err_t HttpServer::onWebSocketHandshake(httpd_req_t* req) {
     // Refused: answered, and the connection closes without switching.
     std::shared_ptr<const StrictOptions> strict = self->strictOptions();
     if (strict && !self->admitted(req, *strict)) return ESP_FAIL;
-    WsClient* ws = self->wsClient(httpd_req_to_sockfd(req), true);
+    // A new connection: with attach(), whose server's close_fn isn't ours, a
+    // closed socket's client may still be there under the reused descriptor,
+    // with its subscriptions and level.
+    int fd = httpd_req_to_sockfd(req);
+    self->dropWsClient(fd);
+    WsClient* ws = self->wsClient(fd, true);
     ws->client.transport = TransportKind::WebSocket;
-    peerAddress(httpd_req_to_sockfd(req), ws->client);
+    peerAddress(fd, ws->client);
     ws->generation = self->api_.tokenGeneration();
     ws->token = requestToken(req);
     // The server's own token is admin, whatever the check says.

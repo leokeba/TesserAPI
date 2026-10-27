@@ -63,7 +63,10 @@ esp_err_t BleTransport::begin(const char* name, uint32_t stackSize, UBaseType_t 
         name_ = name;
     }
     if (!confirmed_) confirmed_ = xSemaphoreCreateBinary();
-    if (!confirmed_) return ESP_ERR_NO_MEM;
+    if (!confirmed_) {
+        instance = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
         instance = nullptr;
@@ -88,7 +91,15 @@ esp_err_t BleTransport::begin(const char* name, uint32_t stackSize, UBaseType_t 
     svcs[0].type = BLE_GATT_SVC_TYPE_PRIMARY;
     svcs[0].uuid = &kService.u;
     svcs[0].characteristics = chrs;
-    if (ble_gatts_count_cfg(svcs) != 0 || ble_gatts_add_svcs(svcs) != 0) return ESP_FAIL;
+    // On a failure from here, NimBLE (and the controller's memory, on the
+    // short heap that likely caused it) is given back, so begin() can be
+    // tried again and end() isn't needed.
+    auto unwind = [](esp_err_t e) {
+        nimble_port_deinit();
+        instance = nullptr;
+        return e;
+    };
+    if (ble_gatts_count_cfg(svcs) != 0 || ble_gatts_add_svcs(svcs) != 0) return unwind(ESP_FAIL);
 
     {
         // After end(), the request task may not have exited yet: it stays.
@@ -96,7 +107,7 @@ esp_err_t BleTransport::begin(const char* name, uint32_t stackSize, UBaseType_t 
         exit_ = false;
         if (!task_ && xTaskCreate(&BleTransport::taskEntry, "tesser_ble", stackSize, this, priority, &task_) != pdPASS) {
             task_ = nullptr;
-            return ESP_ERR_NO_MEM;
+            return unwind(ESP_ERR_NO_MEM);
         }
     }
     up_ = true;
