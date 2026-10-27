@@ -296,6 +296,10 @@ bool DatagramEndpoint::pinned(const RemoteNode* node) const {
 }
 
 void DatagramEndpoint::Pinned::all() {
+    if (nodes.empty() && !scratch_ && !endpoint_.pinScratchBusy_) {
+        nodes.swap(endpoint_.pinScratch_);
+        endpoint_.pinScratchBusy_ = scratch_ = true;
+    }
     for (RemoteNode* r : endpoint_.remotes_) add(r);
 }
 
@@ -305,7 +309,8 @@ void DatagramEndpoint::Pinned::add(RemoteNode* node) {
 }
 
 DatagramEndpoint::Pinned::~Pinned() {
-    if (nodes.empty()) return;
+    if (nodes.empty() && !scratch_) return;
+    bool any = !nodes.empty();
     {
         MutexGuard guard(endpoint_.mutex_);
         std::vector<RemoteNode*>& pinned = endpoint_.pinned_;
@@ -317,8 +322,13 @@ DatagramEndpoint::Pinned::~Pinned() {
                 }
             }
         }
+        if (scratch_) {
+            nodes.clear();
+            nodes.swap(endpoint_.pinScratch_);
+            endpoint_.pinScratchBusy_ = false;
+        }
     }
-    endpoint_.unpinned_.give();
+    if (any) endpoint_.unpinned_.give();
 }
 
 void DatagramEndpoint::forgetPeer(const PeerAddress& peer, PeerLoss reason) {

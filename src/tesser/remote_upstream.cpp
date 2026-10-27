@@ -310,7 +310,7 @@ void UpstreamCache::refreshMirror(RemoteNode& node, const RemoteRoute& cur, uint
     bool sent = cur.endpoint->requestRaw(
         cur.peer, Op::Subscribe, node.remotePath_, JsonVariantConst(),
         [&node](std::string_view text) {
-            UpstreamCache& c = node.upstream_;
+            UpstreamCache& c = node.upstream();
             c.subscribing_ = false;
             // A document takes up to about three times its text in small
             // values, in PSRAM when the chip has it.
@@ -573,7 +573,7 @@ bool UpstreamCache::send(RemoteNode& node, const std::string& rest, Access level
     q.ceiling = level;  // the remote filters as for these subscribers
     return r.endpoint->request(
         r.peer, Op::Subscribe, path, std::string_view(),
-        [&node, rest, level](Status s, JsonVariantConst body) { node.upstream_.answered(node, rest, level, s, body); },
+        [&node, rest, level](Status s, JsonVariantConst body) { node.upstream().answered(node, rest, level, s, body); },
         q, node.timeoutMs(), &node);
 }
 

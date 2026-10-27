@@ -26,10 +26,17 @@ namespace detail {
 // Guards what remote nodes share process-wide: the default route order and
 // RemoteNode's process-wide handlers (one mutex: each costs RAM on ESP32).
 Mutex& remoteSharedMutex();
+// Bumped whenever a route order changes (a node's, an Api's, the default),
+// so tables recompute the order in effect only then.
+void routeOrderChanged();
 
 class RouteTable {
 public:
     using Route = RemoteRoute;
+
+    // `mutex`: the node's leaf lock, which the table shares with its other
+    // parts; nothing is called while it is held.
+    explicit RouteTable(Mutex& mutex) : mutex_(mutex) {}
 
     // ---- the routes ---------------------------------------------------------
     // Adds `peer` through `endpoint`, leaving by `iface`: false if it has it.
@@ -102,14 +109,21 @@ private:
         Route route;
         uint32_t added;  // tie-break: routes of the same rank keep this order
     };
-    std::vector<RouteKind> orderLocked(Api* api) const;
-    int activeLocked(Api* api) const;
+    // Makes effective_ the order in effect for a node in `api`, if it isn't:
+    // the inherited order is read before taking mutex_.
+    void ensureOrder(Api* api) const;
+    int activeLocked() const;
     bool updateOnlineLocked();
 
-    mutable Mutex mutex_{kRankLeaf, "remote routes"};  // a leaf: nothing is called while it is held
+    Mutex& mutex_;
     std::vector<Slot> routes_;
     std::vector<RouteKind> order_;
     bool hasOrder_ = false;
+    // The order routes are ranked by, as of routeOrderChanged()'s count
+    // effectiveRev_, for a node in effectiveApi_.
+    mutable std::vector<RouteKind> effective_;
+    mutable uint32_t effectiveRev_ = 0;
+    mutable Api* effectiveApi_ = nullptr;
     uint32_t nextRoute_ = 0;
     PeerAddress device_;
     std::string token_;

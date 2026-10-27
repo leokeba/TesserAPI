@@ -24,7 +24,8 @@ inline ArduinoJson::JsonDocument parsed(const char* json) {
 }
 
 TEST(unit_stream_merges_and_orders) {
-    SetStream s;
+    tesser::Mutex m{tesser::kRankLeaf, "test"};
+    SetStream s(m);
     CHECK_EQ(s.push("out", parsed("{\"level\":1}")), Status::Ok);  // "out" is "/out"
     CHECK_EQ(s.push("/out/", parsed("{\"on\":true}")), Status::Ok);  // merged
     CHECK_EQ(s.push("/out/level", parsed("2")), Status::Ok);  // below it: queued after
@@ -51,7 +52,8 @@ TEST(unit_stream_merges_and_orders) {
 }
 
 TEST(unit_stream_limit_and_retries) {
-    SetStream s;
+    tesser::Mutex m{tesser::kRankLeaf, "test"};
+    SetStream s(m);
     s.setLimit(2);
     CHECK_EQ(s.push("/a", parsed("{\"x\":1}")), Status::Ok);
     CHECK_EQ(s.push("/b", parsed("{\"x\":1}")), Status::Ok);
@@ -108,7 +110,8 @@ struct TwoLinks {
 
 TEST(unit_routes_order_and_failover) {
     TwoLinks l;
-    tesser::detail::RouteTable t;
+    tesser::Mutex m{tesser::kRankLeaf, "test"};
+    tesser::detail::RouteTable t(m);
     bool registered = true;
     CHECK(t.add(l.udp, l.a, tesser::NetInterface::Any, registered));
     CHECK(!registered);
@@ -170,7 +173,8 @@ TEST(unit_routes_order_and_failover) {
 
 TEST(unit_routes_switch_probes_and_replace) {
     TwoLinks l;
-    tesser::detail::RouteTable t;
+    tesser::Mutex m{tesser::kRankLeaf, "test"};
+    tesser::detail::RouteTable t(m);
     bool registered;
     t.add(l.udp, l.a, tesser::NetInterface::Any, registered);
     t.add(l.nowtp, l.mac, tesser::NetInterface::Any, registered);

@@ -598,11 +598,16 @@ private:
 
     private:
         DatagramEndpoint& endpoint_;
+        bool scratch_ = false;  // `nodes` is the endpoint's pinScratch_, given back when done
     };
     bool pinnedLocked(const RemoteNode* node) const;
     bool pinned(const RemoteNode* node) const;
     void unlistLocked(const RemoteNode* remote);  // out of remotes_
     std::vector<RemoteNode*> pinned_;  // one entry per pin; guarded by mutex_
+    // A Pinned's list, kept with its capacity so process() doesn't allocate
+    // each tick; one Pinned at a time has it. Guarded by mutex_.
+    std::vector<RemoteNode*> pinScratch_;
+    bool pinScratchBusy_ = false;
     Signal unpinned_;                  // given as pins go, for removeRemote()
     std::vector<PeerFiles> files_;      // used in process() only
     std::vector<std::pair<PeerAddress, std::shared_ptr<ClientInbox>>> clients_;  // guarded by mutex_

@@ -66,6 +66,12 @@ Mutex& remoteSharedMutex() {
     return m;
 }
 
+namespace {
+std::atomic<uint32_t> g_orderRevision{1};
+}  // namespace
+
+void routeOrderChanged() { g_orderRevision.fetch_add(1); }
+
 // ---- the routes -----------------------------------------------------------------
 
 bool RouteTable::add(DatagramEndpoint& endpoint, const PeerAddress& peer, NetInterface iface, bool& registered) {
@@ -128,19 +134,33 @@ bool RouteTable::down(const DatagramEndpoint* endpoint, const PeerAddress& peer)
     return back;
 }
 
-std::vector<RouteKind> RouteTable::orderLocked(Api* api) const {
-    if (hasOrder_) return order_;
-    if (api) {
-        std::vector<RouteKind> order = api->remoteHooks().routeOrder();
-        if (!order.empty()) return order;
+void RouteTable::ensureOrder(Api* api) const {
+    uint32_t rev = g_orderRevision.load();
+    {
+        MutexGuard guard(mutex_);
+        if (effectiveRev_ == rev && effectiveApi_ == api) return;
+        if (hasOrder_) {
+            effective_ = order_;
+            effectiveRev_ = rev;
+            effectiveApi_ = api;
+            return;
+        }
     }
-    return defaultOrder();
+    // Inherited: read under the hooks' and the shared locks, not under ours.
+    std::vector<RouteKind> order;
+    if (api) order = api->remoteHooks().routeOrder();
+    if (order.empty()) order = defaultOrder();
+    MutexGuard guard(mutex_);
+    if (hasOrder_) return;  // given its own meanwhile: the next call takes it
+    effective_ = std::move(order);
+    effectiveRev_ = rev;  // read first: a change since then is seen next time
+    effectiveApi_ = api;
 }
 
 // The index of the route in use: the best ranked online one, or the best
 // ranked one when none is online.
-int RouteTable::activeLocked(Api* api) const {
-    std::vector<RouteKind> order = orderLocked(api);
+int RouteTable::activeLocked() const {
+    const std::vector<RouteKind>& order = effective_;
     auto rank = [&](const Slot& r) {
         size_t i = 0;
         while (i < order.size() && !order[i].covers(r.route.kind(), r.route.iface)) i++;
@@ -159,12 +179,13 @@ int RouteTable::activeLocked(Api* api) const {
 }
 
 std::vector<RouteTable::Route> RouteTable::list(Api* api) const {
+    ensureOrder(api);
     std::vector<Slot> slots;
     std::vector<RouteKind> order;
     {
         MutexGuard guard(mutex_);
         slots = routes_;
-        order = orderLocked(api);
+        order = effective_;
     }
     auto rank = [&](const Slot& r) {
         size_t i = 0;
@@ -181,8 +202,9 @@ std::vector<RouteTable::Route> RouteTable::list(Api* api) const {
 }
 
 bool RouteTable::active(Route& out, Api* api) const {
+    ensureOrder(api);
     MutexGuard guard(mutex_);
-    int i = activeLocked(api);
+    int i = activeLocked();
     if (i < 0) return false;
     out = routes_[static_cast<size_t>(i)].route;
     return true;
@@ -282,9 +304,12 @@ void RouteTable::roundTrip(const DatagramEndpoint* endpoint, const PeerAddress& 
 // ---- order ------------------------------------------------------------------------
 
 void RouteTable::setOrder(std::vector<RouteKind> order) {
-    MutexGuard guard(mutex_);
-    hasOrder_ = !order.empty();
-    order_ = std::move(order);
+    {
+        MutexGuard guard(mutex_);
+        hasOrder_ = !order.empty();
+        order_ = std::move(order);
+    }
+    routeOrderChanged();
 }
 
 std::vector<RouteKind> RouteTable::order() const {
@@ -293,8 +318,11 @@ std::vector<RouteKind> RouteTable::order() const {
 }
 
 void RouteTable::setDefaultOrder(std::vector<RouteKind> order) {
-    MutexGuard guard(remoteSharedMutex());
-    sharedOrder() = std::move(order);
+    {
+        MutexGuard guard(remoteSharedMutex());
+        sharedOrder() = std::move(order);
+    }
+    routeOrderChanged();
 }
 
 std::vector<RouteKind> RouteTable::defaultOrder() {

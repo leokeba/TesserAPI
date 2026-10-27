@@ -176,9 +176,9 @@ public:
     PeerAddress peer() const;
     const std::string& remotePath() const { return remotePath_; }
     uint32_t timeoutMs() const { return timeoutMs_; }
-    bool mirrored() const { return upstream_.mirrored(); }
+    bool mirrored() const { return upstreamIf() && upstreamIf()->mirrored(); }
     // The level the mirrored copy is read at (see mirror()).
-    Access mirrorLevel() const { return upstream_.mirrorLevel(); }
+    Access mirrorLevel() const { return upstreamIf() ? upstreamIf()->mirrorLevel() : Access::Public; }
     bool hasCopy() const;
 
     // Whether the device is reachable, as far as the endpoints know: false
@@ -244,7 +244,7 @@ public:
     Status stream(std::string_view path, std::string_view bodyJson);
     // Sets that may wait (default 8).
     RemoteNode& streamLimit(size_t entries) {
-        stream_.setLimit(entries);
+        sets().setLimit(entries);
         return *this;
     }
     // Called, in an endpoint's process() and without the API lock, for each
@@ -316,7 +316,11 @@ private:
     std::string remotePath_;
     uint32_t timeoutMs_ = 0;
 
-    detail::RouteTable routes_;  // routes, order, device and token, under their own leaf lock
+    // One leaf lock for the routes, the known paths and the streamed sets,
+    // which never call anything while holding it (a FreeRTOS mutex costs
+    // about 90 bytes, so not one each).
+    mutable Mutex leaf_{kRankLeaf, "remote node"};
+    detail::RouteTable routes_{leaf_};  // routes, order, device and token
     // knownFile(): paths the peer's schema described, under the hash it
     // advertised then.
     struct KnownPath {
@@ -325,12 +329,15 @@ private:
         bool file;
     };
     static constexpr size_t kKnownPaths = 8;
-    mutable Mutex pathsMutex_{kRankLeaf, "remote paths"};
-    std::vector<KnownPath> knownPaths_;
+    std::vector<KnownPath> knownPaths_;  // under leaf_
     bool autoMounted_ = false;
     std::atomic<int> relays_{0};
 
-    detail::UpstreamCache upstream_;  // the mirror and shared subscriptions, under the remote lock
+    // The mirror and shared subscriptions, made by the first mirror() or
+    // subscription and kept until the node goes; null until then.
+    std::atomic<detail::UpstreamCache*> upstream_{nullptr};
+    detail::UpstreamCache& upstream();
+    detail::UpstreamCache* upstreamIf() const { return upstream_.load(std::memory_order_acquire); }
     std::atomic<Api*> api_{nullptr};  // the Api it is mounted in, once known (localPath())
     std::atomic<uint32_t> apiLookupMs_{0};  // tick(): when api_ was last looked for
     std::string localPath_;
@@ -338,7 +345,11 @@ private:
     std::atomic<uint8_t> protocol_{0};
     std::string ownedName_;
 
-    detail::SetStream stream_;  // streamed sets, under their own leaf lock
+    // Streamed sets, made by the first stream() or onStreamError(); null
+    // until then.
+    std::atomic<detail::SetStream*> stream_{nullptr};
+    detail::SetStream& sets();
+    detail::SetStream* setsIf() const { return stream_.load(std::memory_order_acquire); }
 };
 
 }  // namespace tesser

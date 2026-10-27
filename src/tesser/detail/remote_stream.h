@@ -22,6 +22,8 @@ namespace detail {
 
 class SetStream {
 public:
+    // `mutex`: the node's leaf lock; handlers are called without it.
+    explicit SetStream(Mutex& mutex) : mutex_(mutex) {}
     struct Stats {
         uint32_t queued = 0;  // sets accepted
         uint32_t merged = 0;  // sets merged into one still queued
@@ -60,7 +62,7 @@ private:
     };
     static void requeue(std::vector<Pending>& queue, Pending p);
 
-    mutable Mutex mutex_{kRankLeaf, "remote stream"};  // a leaf: handlers are called without it
+    Mutex& mutex_;
     std::vector<Pending> queue_;
     Pending flying_;
     bool inFlight_ = false;

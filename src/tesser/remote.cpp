@@ -139,6 +139,34 @@ RemoteNode::~RemoteNode() {
         e->removeRemote(this);
         e->cancelCalls(this);
     }
+    delete upstreamIf();
+    delete setsIf();
+}
+
+detail::UpstreamCache& RemoteNode::upstream() {
+    detail::UpstreamCache* p = upstreamIf();
+    if (!p) {
+        auto* made = new detail::UpstreamCache();
+        if (upstream_.compare_exchange_strong(p, made, std::memory_order_acq_rel)) {
+            p = made;
+        } else {
+            delete made;  // another task's came first: `p` is it
+        }
+    }
+    return *p;
+}
+
+detail::SetStream& RemoteNode::sets() {
+    detail::SetStream* p = setsIf();
+    if (!p) {
+        auto* made = new detail::SetStream(leaf_);
+        if (stream_.compare_exchange_strong(p, made, std::memory_order_acq_rel)) {
+            p = made;
+        } else {
+            delete made;
+        }
+    }
+    return *p;
 }
 
 // ---- routes -----------------------------------------------------------------
@@ -206,8 +234,11 @@ void RemoteHooks::remove(Id id) {
 }
 
 void RemoteHooks::setRouteOrder(std::vector<RouteKind> order) {
-    MutexGuard guard(mutex_);
-    order_ = std::move(order);
+    {
+        MutexGuard guard(mutex_);
+        order_ = std::move(order);
+    }
+    detail::routeOrderChanged();
 }
 
 std::vector<RouteKind> RemoteHooks::routeOrder() const {
@@ -338,7 +369,7 @@ void RemoteNode::setProtocol(uint8_t version) {
 bool RemoteNode::knownFile(std::string_view remotePath, bool& isFile) const {
     uint32_t hash = advertisedSchema_.load();
     if (!hash) return false;
-    MutexGuard guard(pathsMutex_);
+    MutexGuard guard(leaf_);
     for (const KnownPath& k : knownPaths_) {
         if (k.schemaHash == hash && k.path == remotePath) {
             isFile = k.file;
@@ -351,7 +382,7 @@ bool RemoteNode::knownFile(std::string_view remotePath, bool& isFile) const {
 void RemoteNode::learnedFile(std::string_view remotePath, bool isFile) {
     uint32_t hash = advertisedSchema_.load();
     if (!hash) return;  // nothing would tell it went stale
-    MutexGuard guard(pathsMutex_);
+    MutexGuard guard(leaf_);
     for (KnownPath& k : knownPaths_) {
         if (k.path == remotePath) {
             k.schemaHash = hash;
@@ -372,13 +403,19 @@ void RemoteNode::detach(const DatagramEndpoint* endpoint) {
 }
 
 RemoteNode& RemoteNode::mirror(uint32_t intervalMs, uint32_t refreshMs, Access level) {
-    upstream_.mirror(intervalMs, refreshMs, level);
+    upstream().mirror(intervalMs, refreshMs, level);
     touch();
     return *this;
 }
-bool RemoteNode::hasCopy() const { return upstream_.hasCopy(); }
-size_t RemoteNode::upstreamCount() const { return upstream_.count(); }
-void RemoteNode::writeCopy(JsonWriter& w, int depth) const { upstream_.writeCopy(w, depth); }
+bool RemoteNode::hasCopy() const { return upstreamIf() && upstreamIf()->hasCopy(); }
+size_t RemoteNode::upstreamCount() const { return upstreamIf() ? upstreamIf()->count() : 0; }
+void RemoteNode::writeCopy(JsonWriter& w, int depth) const {
+    if (detail::UpstreamCache* u = upstreamIf()) {
+        u->writeCopy(w, depth);
+    } else {
+        w.null();
+    }
+}
 std::string RemoteNode::remotePathOf(std::string_view rest) const {
     std::string p = remotePath_ == "/" ? std::string() : remotePath_;
     p.append(rest.data(), rest.size());
@@ -400,7 +437,7 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
     detail::RouteTable::Observed seen = routes_.observe(cur, online());
     if (seen.switched) {
         changed();  // the schema shows the route
-        upstream_.rerouted(*this, seen.from, nowMs);
+        if (detail::UpstreamCache* u = upstreamIf()) u->rerouted(*this, seen.from, nowMs);
     }
     if (seen.stateChanged) {
         StateHandler fn;
@@ -420,10 +457,11 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
             r.peer, Op::Get, remotePath_, std::string_view(), [](Status, JsonVariantConst) {}, q, timeoutMs_, this);
     }
 
-    upstream_.renew(*this, nowMs);
+    detail::UpstreamCache* u = upstreamIf();
+    if (u) u->renew(*this, nowMs);
     // Streamed sets that couldn't be sent (no call slot, a busy peer).
     pump();
-    upstream_.refreshMirror(*this, cur, nowMs);
+    if (u) u->refreshMirror(*this, cur, nowMs);
 }
 
 bool RemoteNode::localPath(std::string& out) {
@@ -463,7 +501,8 @@ bool RemoteNode::handleNotification(const DatagramEndpoint& by, const PeerAddres
     Access level = Access::Admin;
     if (envelope["as"].is<const char*>() && !parseAccess(envelope["as"].as<const char*>(), level)) return false;
     std::string_view op(envelope["op"] | "");
-    return upstream_.notified(*this, rest, level, op, envelope);
+    detail::UpstreamCache* u = upstreamIf();
+    return u && u->notified(*this, rest, level, op, envelope);
 }
 
 void RemoteNode::forward(Api& api, const Request& request, std::string_view rest, std::string_view base,
@@ -539,16 +578,16 @@ Status RemoteNode::stream(std::string_view path, std::string_view bodyJson) {
     if (deserializeJson(body, bodyJson.data(), bodyJson.size(), DeserializationOption::NestingLimit(kWrittenNesting))) {
         return Status::BadRequest;
     }
-    Status s = stream_.push(path, std::move(body));
+    Status s = sets().push(path, std::move(body));
     if (s == Status::Ok) pump();
     return s;
 }
 
-void RemoteNode::onStreamError(StreamErrorHandler fn) { stream_.onError(std::move(fn)); }
+void RemoteNode::onStreamError(StreamErrorHandler fn) { sets().onError(std::move(fn)); }
 
-RemoteNode::StreamStats RemoteNode::streamStats() const { return stream_.stats(); }
+RemoteNode::StreamStats RemoteNode::streamStats() const { return setsIf() ? setsIf()->stats() : StreamStats(); }
 
-size_t RemoteNode::streaming() const { return stream_.size(); }
+size_t RemoteNode::streaming() const { return setsIf() ? setsIf()->size() : 0; }
 
 uint32_t RemoteNode::streamTimeoutMs() const {
     // Longer than the link takes to give up on a message (UDP's sendTimeoutMs
@@ -565,36 +604,39 @@ uint32_t RemoteNode::streamTimeoutMs() const {
 // Sends the next streamed set if none is in flight; drops them all if the
 // node is offline.
 void RemoteNode::pump() {
+    detail::SetStream* stream = setsIf();
+    if (!stream || !stream->size()) return;
     Route r;
     bool reachable = route(r) && online();
     std::string path, body;
-    if (!stream_.next(reachable, path, body)) return;
+    if (!stream->next(reachable, path, body)) return;
     bool sent = r.endpoint->request(
         r.peer, Op::Set, remotePathOf(path), std::string_view(body),
-        [this](Status s, JsonVariantConst reply) {
-            if (stream_.done(s, reply)) pump();
+        [this, stream](Status s, JsonVariantConst reply) {
+            if (stream->done(s, reply)) pump();
         },
         Query(), streamTimeoutMs(), this);
-    if (!sent) stream_.unsent();  // tick() tries again
+    if (!sent) stream->unsent();  // tick() tries again
 }
 
 // ---- forwarded subscriptions ------------------------------------------------
 
 void RemoteNode::subscribe(Api& api, const Request& req, std::string_view rest, std::string_view base,
                            Reply& reply) {
-    upstream_.subscribe(*this, api, req, rest, base, reply);
+    upstream().subscribe(*this, api, req, rest, base, reply);
 }
 
 void RemoteNode::narrowed(std::string_view localPath, Access level) {
     if (localPath.size() < localPath_.size()) return;
-    upstream_.narrowed(*this, std::string(localPath.substr(localPath_.size())), localPath, level);
+    if (detail::UpstreamCache* u = upstreamIf()) u->narrowed(*this, std::string(localPath.substr(localPath_.size())), localPath, level);
 }
 
 bool RemoteNode::upstreamSpec(std::string_view localPath, std::string& keys, std::string& exclude, int& depth,
                               Access level) const {
     if (localPath.size() < localPath_.size()) return false;
     Spec sent;
-    if (!upstream_.sent(localPath.substr(localPath_.size()), level, sent)) return false;
+    detail::UpstreamCache* u = upstreamIf();
+    if (!u || !u->sent(localPath.substr(localPath_.size()), level, sent)) return false;
     keys = sent.keys;
     exclude = sent.exclude;
     depth = sent.depth;
@@ -603,7 +645,7 @@ bool RemoteNode::upstreamSpec(std::string_view localPath, std::string& keys, std
 
 void RemoteNode::released(std::string_view localPath, Access level) {
     if (localPath.size() < localPath_.size()) return;
-    upstream_.released(*this, std::string(localPath.substr(localPath_.size())), level);
+    if (detail::UpstreamCache* u = upstreamIf()) u->released(*this, std::string(localPath.substr(localPath_.size())), level);
 }
 
 RemoteNode& Object::remote(const char* name, DatagramEndpoint& endpoint, const PeerAddress& peer,
