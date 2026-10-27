@@ -171,7 +171,10 @@ struct HttpServer::DeferredState {
     SemaphoreHandle_t done = xSemaphoreCreateBinary();
     std::atomic<int> refs{2};
     Status status = Status::Internal;
-    std::string body;
+    std::string body;  // the reply's: written by it, read once it ended
+    // The timeout's answer, apart: a reply arriving at the same moment may
+    // still be writing `body` from another task.
+    std::string timeoutBody;
     // Async (docs/DESIGN.md section 10.2): set before asyncReady.
     httpd_req_t* async = nullptr;
     HttpServer* server = nullptr;
@@ -195,6 +198,8 @@ public:
     using DeferredState = HttpServer::DeferredState;
     DeferredHttpReply(DeferredState* st, size_t limit) : st_(st), sink_(st->body, limit, true) {}
     Sink& begin(Status s) override {
+        // Timed out already: nobody reads it.
+        if (st_->answered.load()) return discard_;
         st_->status = s;
         st_->body.clear();
         sink_.lowMemory = false;
@@ -222,6 +227,7 @@ public:
 private:
     DeferredState* st_;
     StringSink sink_;
+    CountingSink discard_;
 };
 
 }  // namespace
@@ -1358,16 +1364,17 @@ void HttpServer::answerAsync(DeferredState* st, bool timedOut) {
     if (timedOut) {
         StringReply r;
         writeError(r, Status::Timeout, Reason::NoAnswer, st->path, "deferred call timed out");
-        st->status = r.status;
-        st->body = std::move(r.body);
+        st->timeoutBody = std::move(r.body);
     }
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
     auto work = [](void* arg) {
         auto* s = static_cast<DeferredState*>(arg);
-        httpd_resp_set_status(s->async, statusLine(s->status));
+        bool late = !s->timeoutBody.empty();  // written only on a timeout, before this was queued
+        const std::string& body = late ? s->timeoutBody : s->body;
+        httpd_resp_set_status(s->async, statusLine(late ? Status::Timeout : s->status));
         httpd_resp_set_type(s->async, "application/json");
         s->server->addCorsHeaders(s->async);
-        httpd_resp_send(s->async, s->body.data(), static_cast<ssize_t>(s->body.size()));
+        httpd_resp_send(s->async, body.data(), static_cast<ssize_t>(body.size()));
         httpd_req_async_handler_complete(s->async);
         s->unref();
     };
