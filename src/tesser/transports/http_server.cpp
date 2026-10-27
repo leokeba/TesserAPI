@@ -579,18 +579,22 @@ void refuse(httpd_req_t* req, const char* statusLine, Status status, Reason reas
     httpd_resp_send(req, body.body.data(), static_cast<ssize_t>(body.body.size()));
 }
 
-// The address of the client on socket `fd`, IPv4 or IPv6.
+// The address of the client on socket `fd`, IPv4 or IPv6 (IPv4 only when lwIP is built without
+// IPv6, CONFIG_LWIP_IPV6=n).
 void peerAddress(int fd, Client& client) {
-    struct sockaddr_in6 addr = {};
+    struct sockaddr_storage addr = {};
     socklen_t addrLen = sizeof(addr);
     if (fd < 0 || getpeername(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen) != 0) return;
-    if (addr.sin6_family == AF_INET) {
+    if (addr.ss_family == AF_INET) {
         memcpy(client.address, &reinterpret_cast<struct sockaddr_in*>(&addr)->sin_addr.s_addr, 4);
         client.addressLength = 4;
-    } else {
-        memcpy(client.address, &addr.sin6_addr, 16);
+    }
+#if LWIP_IPV6
+    else if (addr.ss_family == AF_INET6) {
+        memcpy(client.address, &reinterpret_cast<struct sockaddr_in6*>(&addr)->sin6_addr, 16);
         client.addressLength = 16;
     }
+#endif
 }
 }  // namespace
 

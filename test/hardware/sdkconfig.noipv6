@@ -1,0 +1,3 @@
+# Overlay for CI: lwIP without IPv6 (about 15 KB of flash), which applications
+# that only use IPv4 may choose. The library must keep building with it.
+CONFIG_LWIP_IPV6=n

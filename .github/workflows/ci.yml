@@ -32,6 +32,14 @@ jobs:
           esp_idf_version: ${{ matrix.idf }}
           target: ${{ matrix.target }}
           path: test/hardware
+      - name: Build on-target test without IPv6
+        if: matrix.idf == 'latest'
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ matrix.idf }}
+          target: ${{ matrix.target }}
+          path: test/hardware
+          command: idf.py -B build-noipv6 -DSDKCONFIG=build-noipv6/sdkconfig -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.noipv6" build
       - name: Build HTTP example
         uses: espressif/esp-idf-ci-action@v1
         with:
