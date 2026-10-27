@@ -197,8 +197,13 @@ bool NowTpTransport::begin(bool runTask, uint32_t stackSize, UBaseType_t priorit
 void NowTpTransport::end() {
     if (!running_) return;
     now_.listen(port_, nullptr);
+    // As UDP's end(): every peer is forgotten (calls fail, subscriptions and
+    // transfers are dropped, remote nodes show offline and go by another
+    // route), in the worker's last process(), or the application's next.
+    endpoint_.forgetAll(PeerLoss::Stopped);
     running_ = false;
-    if (task_) {
+    // From a request the worker handles, it finishes on its own.
+    if (task_ && task_ != xTaskGetCurrentTaskHandle()) {
         xTaskNotifyGive(task_);
         while (task_) vTaskDelay(pdMS_TO_TICKS(5));
     }
@@ -214,6 +219,7 @@ void NowTpTransport::taskEntry(void* arg) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
         self->endpoint_.process();
     }
+    self->endpoint_.process();  // the peers end() forgot
     self->task_ = nullptr;
     vTaskDelete(nullptr);
 }

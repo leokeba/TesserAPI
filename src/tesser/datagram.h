@@ -263,6 +263,9 @@ public:
     // its remote nodes show it offline. Safe from any task, including link callbacks: the
     // work happens in the next process(). `reason` goes to onPeerLost().
     void forgetPeer(const PeerAddress& peer, PeerLoss reason = PeerLoss::Lost);
+    // forgetPeer() for every peer it knows: heard from, called, or holding
+    // a subscription. For a link that stops (PeerLoss::Stopped).
+    void forgetAll(PeerLoss reason);
 
     // The link stopped hearing the peer (NowTP's discovery lost it: no
     // announcement for a while). A peer this endpoint heard from within

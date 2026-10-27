@@ -329,6 +329,31 @@ void DatagramEndpoint::forgetPeer(const PeerAddress& peer, PeerLoss reason) {
     if (onQueued_) onQueued_();
 }
 
+void DatagramEndpoint::forgetAll(PeerLoss reason) {
+    std::vector<PeerAddress> peers;
+    auto add = [&peers](const PeerAddress& p) {
+        if (!p.length) return;
+        for (const PeerAddress& q : peers) {
+            if (q == p) return;
+        }
+        peers.push_back(p);
+    };
+    {
+        MutexGuard guard(mutex_);
+        for (const Known& k : known_) add(k.peer);
+        for (const CallSlot& c : calls_) add(c.to);
+    }
+    {
+        MutexGuard guard(subscribersMutex_);
+        for (const PeerSubscriber* s : subscribers_) add(s->peer);
+    }
+    {
+        MutexGuard guard(mutex_);
+        for (const PeerAddress& p : peers) lostPeers_.emplace_back(p, reason);
+    }
+    if (onQueued_) onQueued_();
+}
+
 void DatagramEndpoint::linkLost(const PeerAddress& peer) {
     {
         MutexGuard guard(mutex_);

@@ -307,4 +307,33 @@ TEST(datagram_dropped_forward_answers) {
     CHECK_EQ(r.status, Status::Internal);
 }
 
+TEST(datagram_forget_all) {
+    // A link that stops forgets every peer it knows: heard from, called,
+    // holding a subscription. Calls fail and each lost peer is reported.
+    cases::Device dev;
+    Net net;
+    DatagramEndpoint server(&dev.api, tesser::TransportKind::NowTP, net.sender(addr(2)), net.clockFn());
+    DatagramEndpoint client(nullptr, tesser::TransportKind::NowTP, net.sender(addr(1)), net.clockFn());
+    net.nodes = {{addr(1), &client}, {addr(2), &server}};
+    Result sub;
+    CHECK(client.request(addr(2), tesser::Op::Subscribe, "/lamp", std::string_view(), capture(sub)));
+    net.run();
+    CHECK_EQ(dev.api.subscriptionCount(), 1u);
+    std::vector<tesser::PeerLoss> lost;
+    client.onPeerLost([&](const tesser::PeerAddress&, const tesser::PeerAddress&, tesser::PeerLoss why) { lost.push_back(why); });
+    Result call;
+    net.dropAll = true;
+    CHECK(client.request(addr(2), tesser::Op::Get, "/lamp", std::string_view(), capture(call)));
+    client.forgetAll(tesser::PeerLoss::Stopped);
+    server.forgetAll(tesser::PeerLoss::Stopped);
+    client.process();
+    server.process();
+    CHECK(call.called);
+    CHECK(call.status != Status::Ok);
+    CHECK_EQ(lost.size(), 1u);
+    if (!lost.empty()) CHECK(lost[0] == tesser::PeerLoss::Stopped);
+    CHECK_EQ(dev.api.subscriptionCount(), 0u);
+    CHECK_EQ(server.peerSubscribers(), 0u);
+}
+
 }  // namespace datagram_cases
