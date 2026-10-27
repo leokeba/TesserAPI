@@ -131,7 +131,10 @@ bool UdpTransport::allowed(const PeerAddress& peer) const {
 
 UdpTransport::UdpTransport(Api* api, UdpLink::Options options, DatagramEndpoint::Options endpointOptions)
     : link_(
-          api, [this](const PeerAddress& to, const uint8_t* data, size_t len) { return sendTo(to, data, len); },
+          api,
+          [this](const PeerAddress& to, const uint8_t* head, size_t headLen, const uint8_t* body, size_t bodyLen) {
+              return sendTo(to, head, headLen, body, bodyLen);
+          },
           &nowMs, options, endpointOptions) {
     link_.endpoint().classifyInterfaces([this](const PeerAddress& p) { return interfaceOf(p); });
 }
@@ -165,29 +168,41 @@ std::vector<PeerAddress> UdpTransport::broadcastAddresses(uint16_t port, uint8_t
     return out;
 }
 
-bool UdpTransport::sendTo(const PeerAddress& to, const uint8_t* data, size_t len) {
-    std::vector<PeerAddress> targets;
+bool UdpTransport::sendTo(const PeerAddress& to, const uint8_t* head, size_t headLen, const uint8_t* body,
+                          size_t bodyLen) {
+    std::vector<PeerAddress> targets;  // broadcasts only: a unicast doesn't allocate
     NetInterface bound = bound_.load();
     if (to.length == 0) {
         targets = broadcastAddresses(port_, bound != NetInterface::Any ? interfaceBit(bound) : interfaces_.load());
-    } else if (to.length == 6 && allowed(to)) {
-        targets.push_back(to);
+        if (targets.empty()) return false;
+    } else if (to.length != 6 || !allowed(to)) {
+        return false;
     }
-    bool ok = !targets.empty();
+    iovec parts[2];
+    parts[0].iov_base = const_cast<uint8_t*>(head);
+    parts[0].iov_len = headLen;
+    parts[1].iov_base = const_cast<uint8_t*>(body);
+    parts[1].iov_len = bodyLen;
     MutexGuard guard(socketMutex_);
     int s = socket_.load();
     if (s < 0) return false;
-    for (const PeerAddress& t : targets) {
+    // Tried once: Wi-Fi refuses bursts with ENOMEM while its buffers are
+    // full, and sleeping here held the link's lock (often the API's) and
+    // stopped the receive task, so lwIP's mailbox overflowed. A refused
+    // reliable fragment goes again by the retransmission timer; an
+    // acknowledgement is asked for again by its sender's.
+    auto sendOne = [&](const PeerAddress& t) {
         sockaddr_in a = toSockaddr(t);
-        bool sent = false;
-        // Wi-Fi refuses bursts with ENOMEM while its buffers are full.
-        for (int attempt = 0; attempt < 20 && !sent; attempt++) {
-            sent = sendto(s, data, len, 0, reinterpret_cast<sockaddr*>(&a), sizeof(a)) >= 0;
-            if (!sent && errno != ENOMEM && errno != EAGAIN) break;
-            if (!sent) vTaskDelay(1);
-        }
-        ok = ok && sent;
-    }
+        msghdr m = {};
+        m.msg_name = &a;
+        m.msg_namelen = sizeof(a);
+        m.msg_iov = parts;
+        m.msg_iovlen = bodyLen ? 2 : 1;
+        return sendmsg(s, &m, 0) >= 0;
+    };
+    if (targets.empty()) return sendOne(to);
+    bool ok = true;
+    for (const PeerAddress& t : targets) ok = sendOne(t) && ok;
     return ok;
 }
 

@@ -154,7 +154,18 @@ std::string formatUdpAddress(const PeerAddress& a) {
     return s;
 }
 
-UdpLink::UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock, Options options,
+UdpLink::PartsFn UdpLink::joined(PacketFn send) {
+    if (!send) return PartsFn();
+    return [send](const PeerAddress& to, const uint8_t* head, size_t headLen, const uint8_t* body, size_t bodyLen) {
+        if (!bodyLen) return send(to, head, headLen);
+        std::vector<uint8_t> datagram(headLen + bodyLen);
+        memcpy(datagram.data(), head, headLen);
+        memcpy(datagram.data() + headLen, body, bodyLen);
+        return send(to, datagram.data(), datagram.size());
+    };
+}
+
+UdpLink::UdpLink(Api* api, PartsFn send, DatagramEndpoint::ClockFn clock, Options options,
                  DatagramEndpoint::Options endpointOptions)
     : send_(std::move(send)),
       clock_(clock),
@@ -170,7 +181,6 @@ UdpLink::UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock, Optio
     if (!options_.maxPeers) options_.maxPeers = endpointOptions.maxMounted + 8;
     size_t most = size_t(options_.fragmentSize) * kMaxFragments;
     if (options_.maxMessage > most) options_.maxMessage = most;
-    scratch_.resize(kHeader + options_.fragmentSize);
 }
 
 UdpLink::~UdpLink() { running_ = false; }
@@ -243,9 +253,14 @@ void UdpLink::mountPeers(Object& parent, uint32_t mirrorIntervalMs) {
     if (running_) sendAdvert(PeerAddress(), kQuery);
 }
 
-bool UdpLink::sendDatagram(const PeerAddress& to, const uint8_t* data, size_t len) {
-    bool ok = send_ && send_(to, data, len);
-    if (ok) stats_.sent++;  // refused ones (an interface UDP mustn't use, a full buffer) don't count
+bool UdpLink::sendDatagram(const PeerAddress& to, const uint8_t* head, size_t headLen, const uint8_t* body,
+                           size_t bodyLen) {
+    bool ok = send_ && send_(to, head, headLen, body, bodyLen);
+    if (ok) {
+        stats_.sent++;
+    } else {
+        stats_.refused++;
+    }
     return ok;
 }
 
@@ -287,9 +302,14 @@ void UdpLink::transmit(const PeerAddress& to, uint32_t id, const std::string& da
         h.length = static_cast<uint32_t>(data.size());
         size_t offset = i * size;
         size_t n = data.size() - offset < size ? data.size() - offset : size;
-        writeHeader(scratch_.data(), h);
-        if (n) memcpy(scratch_.data() + kHeader, data.data() + offset, n);
-        sendDatagram(to, scratch_.data(), kHeader + n);
+        uint8_t head[kHeader];
+        writeHeader(head, h);
+        // Refused (the network stack's buffers are full): the rest would be
+        // too. The retransmission timer sends what is missing, rather than
+        // retrying here under the link's lock, often the API's too.
+        if (!sendDatagram(to, head, kHeader, reinterpret_cast<const uint8_t*>(data.data()) + offset, n) &&
+            (flags & kReliable))
+            break;
     }
 }
 

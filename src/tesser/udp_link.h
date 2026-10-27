@@ -40,6 +40,12 @@ std::string formatUdpAddress(const PeerAddress& address);
 class UdpLink {
 public:
     using PacketFn = std::function<bool(const PeerAddress& to, const uint8_t* data, size_t len)>;
+    // Same, the datagram in two parts to send as one (a header, then a
+    // fragment of the message, sent without copying them together: sendmsg()
+    // with two iovecs). False when the datagram wasn't sent (a full buffer:
+    // reliable fragments go again by the retransmission timer).
+    using PartsFn = std::function<bool(const PeerAddress& to, const uint8_t* head, size_t headLen,
+                                       const uint8_t* body, size_t bodyLen)>;
 
     struct Options {
         uint16_t fragmentSize = 1400;     // message bytes per datagram (plus a 20-byte header)
@@ -74,6 +80,7 @@ public:
         uint32_t failed = 0;       // reliable messages never acknowledged
         uint32_t duplicates = 0;   // messages received again (acknowledged, not delivered)
         uint32_t dropped = 0;      // malformed datagrams, refused or evicted messages, new peers without room
+        uint32_t refused = 0;      // datagrams the adapter didn't send (its buffers full, an interface UDP mustn't use)
     };
 
     // The endpoint options the link uses by default: a deeper queue (a
@@ -87,12 +94,19 @@ public:
     }
 
     // `api` may be null for a client-only node.
-    UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock, Options options,
+    UdpLink(Api* api, PartsFn send, DatagramEndpoint::ClockFn clock, Options options,
             DatagramEndpoint::Options endpointOptions);
-    UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock, Options options)
+    UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock, Options options,
+            DatagramEndpoint::Options endpointOptions)
+        : UdpLink(api, joined(std::move(send)), std::move(clock), options, endpointOptions) {}
+    UdpLink(Api* api, PartsFn send, DatagramEndpoint::ClockFn clock, Options options)
         : UdpLink(api, std::move(send), std::move(clock), options, endpointOptions()) {}
-    UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock)
+    UdpLink(Api* api, PartsFn send, DatagramEndpoint::ClockFn clock)
         : UdpLink(api, std::move(send), std::move(clock), Options(), endpointOptions()) {}
+    UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock, Options options)
+        : UdpLink(api, joined(std::move(send)), std::move(clock), options, endpointOptions()) {}
+    UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock)
+        : UdpLink(api, joined(std::move(send)), std::move(clock), Options(), endpointOptions()) {}
     ~UdpLink();
     UdpLink(const UdpLink&) = delete;
     UdpLink& operator=(const UdpLink&) = delete;
@@ -199,7 +213,10 @@ private:
                   uint8_t flags);
     void sendAck(const PeerAddress& to, uint32_t id, uint8_t status, uint64_t got);
     void sendAdvert(const PeerAddress& to, uint8_t flags);
-    bool sendDatagram(const PeerAddress& to, const uint8_t* data, size_t len);
+    bool sendDatagram(const PeerAddress& to, const uint8_t* head, size_t headLen, const uint8_t* body = nullptr,
+                      size_t bodyLen = 0);
+    // A PacketFn as a PartsFn: the parts copied into one datagram.
+    static PartsFn joined(PacketFn send);
     // Null when the table is full of peers it must keep. `forgotten` is set
     // to an advertised peer it made room by forgetting.
     Peer* peerFor(const PeerAddress& from, uint32_t nonce, uint32_t now, bool& restarted, PeerAddress& forgotten);
@@ -221,7 +238,7 @@ private:
     Reservation makeRoom(const PeerAddress& from, size_t bytes);
     uint32_t now() const { return clock_ ? clock_() : 0; }
 
-    PacketFn send_;
+    PartsFn send_;
     DatagramEndpoint::ClockFn clock_;
     Options options_;
     // Before the messages holding their reservations.
@@ -238,7 +255,6 @@ private:
     std::vector<Outgoing> outgoing_;
     std::vector<Partial> partials_;
     std::vector<PeerAddress> lost_;  // peers to forget in tick()
-    std::vector<uint8_t> scratch_;
     Stats stats_;
     // discovery
     std::string name_;

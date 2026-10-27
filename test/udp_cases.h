@@ -36,8 +36,25 @@ struct Net {
     // Changes a datagram on its way, before lose.
     std::function<void(Datagram&)> alter;
     int lost = 0;
+    // Returns true for the sender's adapter to refuse a datagram (its
+    // buffers full): the link sees false, nothing goes on the air.
+    std::function<bool(const PeerAddress& from)> refuse;
+    int refused = 0;
 
-    UdpLink::PacketFn sender(PeerAddress self) {
+    UdpLink::PartsFn sender(PeerAddress self) {
+        return [this, self](const PeerAddress& to, const uint8_t* h, size_t hn, const uint8_t* b, size_t bn) {
+            if (refuse && refuse(self)) {
+                refused++;
+                return false;
+            }
+            Datagram d{self, to, std::vector<uint8_t>(h, h + hn)};
+            d.data.insert(d.data.end(), b, b + bn);
+            air.push_back(std::move(d));
+            return true;
+        };
+    }
+    // The same through a PacketFn, whole datagrams (the parts joined).
+    UdpLink::PacketFn wholeSender(PeerAddress self) {
         return [this, self](const PeerAddress& to, const uint8_t* d, size_t n) {
             air.push_back(Datagram{self, to, std::vector<uint8_t>(d, d + n)});
             return true;
@@ -170,6 +187,52 @@ TEST(udp_fragments) {
     r = p.call(tesser::Op::Set, "/config/owner", label.c_str());
     CHECK_EQ(r.status, Status::Ok);
     CHECK_EQ(p.dev.owner, label.substr(1, label.size() - 2));
+}
+
+// An adapter that refuses datagrams (Wi-Fi's ENOMEM while its buffers are
+// full): the link doesn't wait for it, stops the burst at the first refusal,
+// and the retransmission timer sends what is missing.
+TEST(udp_refused_datagrams_go_again) {
+    UdpLink::Options o;
+    o.fragmentSize = 64;
+    Pair p(o);
+    tesser::StringReply local;
+    tesser::Request req;
+    req.path = "/";
+    req.query = cases::schema();
+    p.dev.api.handle(req, local);
+    // The server's adapter refuses everything for a while: the reply's
+    // first fragment, and nothing after it is tried.
+    bool full = true;
+    p.net.refuse = [&](const PeerAddress& from) { return full && from == ip(2); };
+    Result r;
+    p.client.endpoint().request(ip(2), tesser::Op::Get, "/", "", capture(r), cases::schema());
+    p.net.run();
+    CHECK_EQ(r.calls, 0);
+    // The request's acknowledgement and the reply's first fragment, of
+    // more than local.body.size() / 64 the reply takes.
+    CHECK_EQ(p.net.refused, 2);
+    CHECK_EQ(p.server.stats().refused, 2u);
+    // Room again: the timer sends the reply.
+    full = false;
+    p.net.advance(1500);
+    CHECK_EQ(r.calls, 1);
+    CHECK_EQ(r.status, Status::Ok);
+    CHECK_EQ(r.body, local.body);
+    CHECK_EQ(p.client.stats().failed + p.server.stats().failed, 0u);
+
+    // A link given whole-datagram sends gets its parts joined.
+    cases::Device dev;
+    Net net;
+    UdpLink server(&dev.api, net.wholeSender(ip(2)), net.clockFn(), o);
+    UdpLink client(nullptr, net.wholeSender(ip(1)), net.clockFn(), o);
+    net.nodes = {{ip(1), &client}, {ip(2), &server}};
+    net.start();
+    Result whole;
+    client.endpoint().request(ip(2), tesser::Op::Get, "/", "", capture(whole), cases::schema());
+    net.run();
+    CHECK_EQ(whole.status, Status::Ok);
+    CHECK_EQ(whole.body, local.body);
 }
 
 TEST(udp_losses_and_repeats) {

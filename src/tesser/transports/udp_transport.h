@@ -122,7 +122,7 @@ public:
 private:
     static void receiveEntry(void* arg);
     static void workEntry(void* arg);
-    bool sendTo(const PeerAddress& to, const uint8_t* data, size_t len);
+    bool sendTo(const PeerAddress& to, const uint8_t* head, size_t headLen, const uint8_t* body, size_t bodyLen);
     void receiveWaiting();
     // The interfaces (bits) whose subnet holds `peer`; the bound one's.
     uint8_t candidates(const PeerAddress& peer) const;
