@@ -18,6 +18,7 @@
 #include "esp_http_server.h"
 #include "tesser/api.h"
 #include "tesser/budget.h"
+#include "tesser/stream_subscriber.h"
 
 struct esp_timer;  // esp_timer.h, kept out of applications' include path
 
@@ -157,7 +158,7 @@ private:
     // when the request mustn't go on.
     bool admitted(httpd_req_t* req, const StrictOptions& strict);
     esp_err_t serveStream(httpd_req_t* req, const Request& request, Reply& reply);
-    bool streamSend(Stream* stream, const std::string& piece);
+    bool streamSend(Stream* stream, const StreamSubscriber::Piece& piece);
     static void freeStream(void* ctx);
     static void onKeepAlive(void* arg);
     void watchAsync(DeferredState* st);

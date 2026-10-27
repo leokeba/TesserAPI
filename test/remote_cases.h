@@ -245,8 +245,8 @@ TEST(remote_streamed_subscription_waits) {
     // remote's snapshot, as a forwarded get does, then streams.
     Rig r;
     std::vector<std::string> lines;
-    tesser::StreamSubscriber stream(r.gateway, [&](const std::string& piece) {
-        lines.push_back(piece);
+    tesser::StreamSubscriber stream(r.gateway, [&](const tesser::StreamSubscriber::Piece& piece) {
+        lines.push_back(piece.str());
         return true;
     });
     // The remote answers from another task while open() waits; it starts
@@ -277,8 +277,8 @@ TEST(remote_streamed_subscription_waits) {
     r.gateway.config().deferTimeoutMs = 50;
     r.net.dropAll = true;
     std::vector<std::string> none;
-    tesser::StreamSubscriber silent(r.gateway, [&](const std::string& piece) {
-        none.push_back(piece);
+    tesser::StreamSubscriber silent(r.gateway, [&](const tesser::StreamSubscriber::Piece& piece) {
+        none.push_back(piece.str());
         return true;
     });
     tesser::Request other;

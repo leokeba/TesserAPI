@@ -15,14 +15,16 @@ struct Fixture {
     cases::Device device;
     tesser::EventNode& pressed;
     std::vector<std::string> pieces;
+    std::vector<size_t> parts;  // each piece's
     bool fail = false;
     tesser::StreamSubscriber stream;
 
     Fixture()
         : pressed(device.api.object("button").event("pressed")),
-          stream(device.api, [this](const std::string& p) {
+          stream(device.api, [this](const tesser::StreamSubscriber::Piece& p) {
               if (fail) return false;
-              pieces.push_back(p);
+              pieces.push_back(p.str());
+              parts.push_back(p.count);
               return true;
           }) {}
 
@@ -97,11 +99,15 @@ TEST(stream_snapshot_and_changes) {
     if (!f.pieces.empty()) {
         CHECK_EQ(f.pieces[0],
                  "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"on\":false,\"brightness\":128,\"label\":\"desk\"}}\n");
+        // In parts: the body isn't copied into a line before the transport's
+        // own buffer (docs/DESIGN.md section 15).
+        CHECK_EQ(f.parts[0], 3u);
     }
     cases::set(f.device.api, "/lamp/brightness", "9");
     f.device.api.poll(100000);
     CHECK_EQ(f.pieces.size(), 2u);
     if (f.pieces.size() == 2) CHECK_EQ(f.pieces[1], "{\"op\":\"change\",\"path\":\"/lamp\",\"body\":{\"brightness\":9}}\n");
+    if (f.parts.size() == 2) CHECK_EQ(f.parts[1], 2u);
     // A failed send is a lost notification: the next one says so.
     f.fail = true;
     cases::set(f.device.api, "/lamp/brightness", "10");

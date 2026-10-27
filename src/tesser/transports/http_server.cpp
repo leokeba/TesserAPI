@@ -398,7 +398,7 @@ public:
         : server(&owner),
           handle(httpd),
           fd(socket),
-          subscriber(owner.api_, [this](const std::string& piece) {
+          subscriber(owner.api_, [this](const StreamSubscriber::Piece& piece) {
               HttpServer* s = this->server.load();
               return s && s->streamSend(this, piece);
           }) {}
@@ -1206,7 +1206,7 @@ struct StreamWork {
 
 // Like WebSocket frames, chunks are written only from the httpd task
 // (httpd_queue_work), so writes from other tasks never interleave.
-bool HttpServer::streamSend(Stream* stream, const std::string& piece) {
+bool HttpServer::streamSend(Stream* stream, const StreamSubscriber::Piece& piece) {
     char size[12];
     int n = snprintf(size, sizeof(size), "%x\r\n", static_cast<unsigned>(piece.size()));
     // The chunk, built in one allocation and counted until sent.
@@ -1220,7 +1220,7 @@ bool HttpServer::streamSend(Stream* stream, const std::string& piece) {
     chunk.reserve(len);
     held.settle();
     chunk.append(size, static_cast<size_t>(n));
-    chunk += piece;
+    piece.appendTo(chunk);
     chunk += "\r\n";
     auto* work = new StreamWork{this, stream->handle, stream, stream->fd, std::move(chunk), std::move(held)};
     esp_err_t err = httpd_queue_work(

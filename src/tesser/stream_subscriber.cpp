@@ -127,8 +127,10 @@ Status StreamSubscriber::open(Request request, Reply& error) {
     OpenReply reply(error, api_.config().maxResponse, [this, p, snapshot](const std::string& body) {
         open_ = true;
         if (!snapshot || body == "null") return;
-        std::string line;
-        StringSink sink(line);
+        // The body isn't copied into a line (8 KB, doubled by its last
+        // byte): the transport joins the parts into its chunk.
+        std::string head;
+        StringSink sink(head);
         JsonWriter w(sink);
         w.beginObject();
         w.key("op");
@@ -136,10 +138,7 @@ Status StreamSubscriber::open(Request request, Reply& error) {
         w.key("path");
         w.string(p);
         w.key("body");
-        w.raw(body);
-        w.endObject();
-        line += '\n';
-        send(line);
+        send(head, body, "}\n");
     });
     api_.handle(request, reply);
     if (std::shared_ptr<OpenState> later = reply.later) {
@@ -168,14 +167,18 @@ Status StreamSubscriber::open(Request request, Reply& error) {
     return reply.status;
 }
 
-bool StreamSubscriber::send(const std::string& piece) {
+bool StreamSubscriber::send(std::string_view a, std::string_view b, std::string_view c) {
     sent_ = true;
+    Piece piece;
+    for (std::string_view part : {a, b, c}) {
+        if (!part.empty()) piece.parts[piece.count++] = part;
+    }
     return send_ && send_(piece);
 }
 
 bool StreamSubscriber::notify(const std::string& message, Delivery) {
     if (!open_) return true;  // closed: nobody to tell
-    return send(message + "\n");
+    return send(message, "\n");
 }
 
 bool StreamSubscriber::recheckLevel(Access& level) {
@@ -200,7 +203,9 @@ bool StreamSubscriber::keepAlive(uint32_t nowMs, uint32_t idleMs) {
     }
     if (nowMs - lastMs_ < idleMs) return true;
     lastMs_ = nowMs;
-    return send_ && send_("\n");
+    Piece piece;
+    piece.parts[piece.count++] = "\n";
+    return send_ && send_(piece);
 }
 
 void StreamSubscriber::close() {

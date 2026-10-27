@@ -5,6 +5,7 @@
 #include <atomic>
 #include <functional>
 #include <string>
+#include <string_view>
 
 #include "tesser/request.h"
 
@@ -21,8 +22,29 @@ class Api;
 // "\n" keeps an idle stream alive.
 class StreamSubscriber : public Subscriber {
 public:
+    // One piece of the stream, in parts: the transport joins them into the
+    // one buffer it sends from, reserved (docs/DESIGN.md section 15), rather
+    // than the subscriber building a copy first. A snapshot is its head,
+    // the body and "}\n"; a notification, the message and "\n".
+    struct Piece {
+        std::string_view parts[3];
+        size_t count = 0;
+        size_t size() const {
+            size_t n = 0;
+            for (size_t i = 0; i < count; i++) n += parts[i].size();
+            return n;
+        }
+        void appendTo(std::string& out) const {
+            for (size_t i = 0; i < count; i++) out.append(parts[i].data(), parts[i].size());
+        }
+        std::string str() const {
+            std::string s;
+            appendTo(s);
+            return s;
+        }
+    };
     // Queues one piece of the stream, in order; false if it couldn't.
-    using Send = std::function<bool(const std::string& piece)>;
+    using Send = std::function<bool(const Piece& piece)>;
 
     StreamSubscriber(Api& api, Send send);
     ~StreamSubscriber() override;
@@ -62,7 +84,7 @@ public:
     bool isOpen() const { return open_.load(); }
 
 private:
-    bool send(const std::string& piece);
+    bool send(std::string_view a, std::string_view b = std::string_view(), std::string_view c = std::string_view());
 
     Api& api_;
     Send send_;
