@@ -61,6 +61,18 @@ Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth,
                               DeserializationOption::NestingLimit(envelopeNesting(maxDepth)))
             : deserializeJson(doc, text.data(), text.size(),
                               DeserializationOption::NestingLimit(envelopeNesting(maxDepth)));
+    if (err == DeserializationError::NoMemory) {
+        // Not the client's fault: busy, under its id if the text has one,
+        // so it sends the request again.
+        std::string_view raw;
+        if (jsonMember(text, "id", raw) && raw.size() <= EnvelopeId::kMax) {
+            memcpy(id.json, raw.data(), raw.size());
+            id.length = raw.size();
+        }
+        message = "not enough memory for the request";
+        if (reason) *reason = Reason::LowMemory;
+        return Status::Busy;
+    }
     if (err) {
         message = err == DeserializationError::TooDeep ? "envelope nested too deeply" : "malformed JSON";
         return Status::BadRequest;

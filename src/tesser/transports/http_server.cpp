@@ -1154,6 +1154,10 @@ esp_err_t HttpServer::serve(httpd_req_t* req, bool inWorker) {
     if (!json.empty()) {
         DeserializationError err = deserializeJson(doc, json.data(), json.size(),
                                                    DeserializationOption::NestingLimit(requestNesting(cfg.maxDepth)));
+        if (err == DeserializationError::NoMemory) {
+            writeError(reply, Status::Busy, Reason::LowMemory, path, "not enough memory for the request body");
+            return ESP_OK;
+        }
         if (err) {
             writeError(reply, Status::BadRequest, path, "malformed JSON body");
             return ESP_OK;

@@ -202,4 +202,26 @@ TEST(protocol_http_strict_checks) {
     CHECK(!isJsonType(""));
 }
 
+// An allocator with no memory: the document's first allocation fails.
+struct NoMemory : ArduinoJson::Allocator {
+    void* allocate(size_t) override { return nullptr; }
+    void deallocate(void*) override {}
+    void* reallocate(void*, size_t) override { return nullptr; }
+};
+
+TEST(envelope_no_memory_is_busy) {
+    // A request the heap can't parse is busy (low_memory), under its id so
+    // the client sends it again, not bad_request "malformed JSON".
+    NoMemory none;
+    JsonDocument doc(&none);
+    tesser::Request req;
+    tesser::EnvelopeId id;
+    const char* message = nullptr;
+    tesser::Reason reason = tesser::Reason::None;
+    std::string text = "{\"id\":42,\"op\":\"get\",\"path\":\"/lamp\"}";
+    CHECK_EQ(tesser::parseEnvelope(text, doc, 8, req, id, message, &reason), Status::Busy);
+    CHECK(reason == tesser::Reason::LowMemory);
+    CHECK_EQ(std::string(id.json, id.length), "42");
+}
+
 }  // namespace protocol_cases

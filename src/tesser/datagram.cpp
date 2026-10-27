@@ -460,8 +460,12 @@ void DatagramEndpoint::handle(Incoming& msg) {
                               DeserializationOption::NestingLimit(kWrittenNesting))
             : deserializeJson(doc, text.data(), text.size(), DeserializationOption::NestingLimit(kWrittenNesting));
     if (err || !doc.is<JsonObjectConst>()) {
-        MutexGuard guard(mutex_);
-        stats_.dropped++;
+        {
+            MutexGuard guard(mutex_);
+            stats_.dropped++;
+        }
+        // The heap, not the message: answered busy (or its call failed).
+        if (err == DeserializationError::NoMemory) refuse(msg.from, text, msg.broadcast, Reason::LowMemory);
         return;
     }
     JsonObjectConst env = doc.as<JsonObjectConst>();
