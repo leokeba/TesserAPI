@@ -372,14 +372,14 @@ void Api::sampleWatched(Node& node) {
         for (Node* c = static_cast<Object&>(node).first(); c; c = c->next()) sampleWatched(*c);
         return;
     }
-    if (node.type() != NodeType::Value || !node.watched() || !node.meta_) return;
+    NodeMeta::Extra* m = node.meta_ ? node.meta_->extra() : nullptr;
+    if (node.type() != NodeType::Value || !node.watched() || !m) return;
     HashSink sink;
     JsonWriter w(sink);
     static_cast<ValueNode&>(node).write(w);
-    NodeMeta& m = *node.meta_;
-    if (m.hashed && m.hash != sink.hash) node.changed();
-    m.hash = sink.hash;
-    m.hashed = true;
+    if (m->hashed && m->hash != sink.hash) node.changed();
+    m->hash = sink.hash;
+    m->hashed = true;
 }
 
 void Api::flush(Subscription& sub, uint32_t nowMs) {

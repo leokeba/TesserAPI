@@ -35,42 +35,79 @@ enum class NodeType : uint8_t { Object, Value, Action, Event, Custom, List, Remo
 
 // A presentation hint (docs/DESIGN.md section 7.1): a key and a string,
 // number or `true`, emitted in the schema under "ui" and never interpreted.
+// False when there is none.
 struct UiHint {
     enum class Kind : uint8_t { Flag, String, Number };
-    const char* key;
+    const char* key = nullptr;
     union {
-        const char* str;
+        const char* str = nullptr;
         float num;
     };
-    Kind kind;
-    UiHint* next = nullptr;
+    Kind kind = Kind::Flag;
+    explicit operator bool() const { return key != nullptr; }
 };
 
-// Presentation metadata, allocated only when a node has some.
-struct UiMeta {
-    const char* label = nullptr;
-    const char* unit = nullptr;
-    float step = 0;  // 0: none
-    UiHint* hints = nullptr;
-    ~UiMeta();
-};
+// Optional per-node metadata, allocated only when a modifier needs it: one
+// block holding just the fields the node has (a 4-byte header, then a slot
+// of pointer size per field, the range's two doubles, the hints), so a label
+// costs 8 bytes on 32-bit targets. Read through the accessors; nodes edit it.
+class alignas(sizeof(void*)) NodeMeta {
+public:
+    Access readAccess() const { return read_; }
+    Access writeAccess() const { return write_; }
+    // Null (0 for the step) when not set.
+    const char* doc() const { return pointer(kDoc); }
+    const char* label() const { return pointer(kLabel); }
+    const char* unit() const { return pointer(kUnit); }
+    float step() const;
+    bool hasRange() const { return present_ & kRange; }
+    double min() const { return bound(0); }
+    double max() const { return bound(1); }
+    // Hints in declaration order; hint(key) is false when the node has none.
+    size_t hintCount() const { return count_; }
+    UiHint hint(size_t i) const;
+    UiHint hint(const char* key) const;
 
-// Optional per-node metadata, allocated only when a modifier needs it.
-struct NodeMeta {
-    double min = 0;
-    double max = 0;
-    bool hasRange = false;
-    bool hashed = false;  // watch(): `hash` holds the last sample
-    Access readAccess = Access::Public;
-    Access writeAccess = Access::Public;
-    const char* doc = nullptr;
-    uint32_t hash = 0;
-    UiMeta* ui = nullptr;
-    std::function<Check(JsonVariantConst)>* validator = nullptr;  // ValueNode::validate()
-    ~NodeMeta() {
-        delete ui;
-        delete validator;
-    }
+private:
+    friend class Node;
+    friend class ValueNode;
+    friend class Api;
+    // Fields in the order they are laid out in the block.
+    enum Field : uint8_t {
+        kDoc = 1,
+        kLabel = 2,
+        kUnit = 4,
+        kStep = 8,
+        kExtra = 16,
+        kRange = 32,
+        kHints = 64,  // a slot of 2-bit kinds, then a key and a value per hint
+    };
+    // What few nodes have.
+    struct Extra {
+        std::function<Check(JsonVariantConst)> validator;  // ValueNode::validate()
+        uint32_t hash = 0;  // watch(): the last sample
+        bool hashed = false;
+    };
+    using Slot = void*;
+    static constexpr size_t kMaxHints = 16;
+
+    NodeMeta() = default;
+    static size_t slotsOf(Field f, size_t hints);
+    size_t offset(Field f) const;  // in slots, after the header
+    size_t slots() const;
+    Slot* slot(Field f) const { return reinterpret_cast<Slot*>(const_cast<NodeMeta*>(this) + 1) + offset(f); }
+    const char* pointer(Field f) const { return present_ & f ? static_cast<const char*>(*slot(f)) : nullptr; }
+    double bound(size_t i) const;
+    Extra* extra() const { return present_ & kExtra ? static_cast<Extra*>(*slot(kExtra)) : nullptr; }
+    // A copy of `old` (which may be null) with room for `f` (or one more
+    // hint); `old` is freed.
+    static NodeMeta* grow(NodeMeta* old, Field f);
+    static void destroy(NodeMeta* m);
+
+    Access read_ = Access::Public;
+    Access write_ = Access::Public;
+    uint8_t present_ = 0;  // Field bits
+    uint8_t count_ = 0;    // hints
 };
 
 // Change tracking: a global 32-bit generation counter, stamped on nodes as
@@ -134,8 +171,8 @@ public:
     bool watched() const { return flags_ & kWatch; }
     // Levels this node itself requires (docs/DESIGN.md section 13); a node
     // also requires its ancestors'.
-    Access readAccess() const { return meta_ ? meta_->readAccess : Access::Public; }
-    Access writeAccess() const { return meta_ ? meta_->writeAccess : Access::Public; }
+    Access readAccess() const { return meta_ ? meta_->readAccess() : Access::Public; }
+    Access writeAccess() const { return meta_ ? meta_->writeAccess() : Access::Public; }
 
     // Marks this node (for an object: every value below it) as changed, so
     // subscribers get it on the next Api::poll(). Writes through the API do
@@ -166,9 +203,14 @@ protected:
         touch();
     }
 
-    NodeMeta& editMeta();
-    UiMeta* editUi();  // null when compiled out (TESSER_NO_UI)
+    // The metadata's slot for `f`, added if the node hasn't one yet.
+    NodeMeta::Slot* metaSlot(NodeMeta::Field f);
+    NodeMeta::Extra& editExtra();
     void setDoc(const char* text);
+    // Compiled out with TESSER_NO_UI.
+    void setLabel(const char* text);
+    void setUnit(const char* text);
+    void setStep(double s);
     void setRange(double min, double max);
     void addHint(const char* key, UiHint::Kind kind, const char* str, float num);
     void setAccess(Access read, Access write);
@@ -203,17 +245,17 @@ public:
     // Human-readable name, for user interfaces. The rest of this group is
     // compiled out with TESSER_NO_UI.
     Self& label(const char* text) {
-        if (UiMeta* m = editUi()) m->label = text;
+        setLabel(text);
         return self();
     }
     // Unit of a value or of an action's argument: "%", "°C", "ms".
     Self& unit(const char* text) {
-        if (UiMeta* m = editUi()) m->unit = text;
+        setUnit(text);
         return self();
     }
     // Input granularity. A hint: writes are not rounded or checked against it.
     Self& step(double s) {
-        if (UiMeta* m = editUi()) m->step = static_cast<float>(s);
+        setStep(s);
         return self();
     }
     // Presentation hints for renderers: ui("advanced") is a flag,
@@ -302,7 +344,8 @@ protected:
     virtual bool canWrite() const = 0;
     // The validator, for check() once the type and range passed.
     Check validated(JsonVariantConst v) const {
-        return meta_ && meta_->validator ? (*meta_->validator)(v) : Check::ok();
+        NodeMeta::Extra* e = meta_ ? meta_->extra() : nullptr;
+        return e && e->validator ? e->validator(v) : Check::ok();
     }
 
 private:
@@ -890,7 +933,7 @@ public:
     ValueKind itemKind() const override { return ValueTraits<T>::kind; }
     std::unique_ptr<ValueNode> element(size_t i) override {
         std::unique_ptr<ValueNode> e(new RefValue<std::conditional_t<std::is_const<C>::value, const T, T>>(nullptr, items_[i]));
-        if (const NodeMeta* m = meta(); m && m->hasRange) e->range(m->min, m->max);
+        if (const NodeMeta* m = meta(); m && m->hasRange()) e->range(m->min(), m->max());
         if (!writable()) e->readOnly();
         return e;
     }

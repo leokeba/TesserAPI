@@ -788,11 +788,11 @@ private:
                     w.key("writable");
                     w.boolean(true);
                 }
-                if (const NodeMeta* m = v.meta(); m && m->hasRange) {
+                if (const NodeMeta* m = v.meta(); m && m->hasRange()) {
                     w.key("min");
-                    w.number(m->min);
+                    w.number(m->min());
                     w.key("max");
-                    w.number(m->max);
+                    w.number(m->max());
                 }
                 if (v.maxLength()) {
                     w.key("maxLength");
@@ -821,11 +821,11 @@ private:
                     w.key("params");
                     renderSchema(w, *params, api_.config().maxDepth, Filter());
                 }
-                if (const NodeMeta* m = a.meta(); m && m->hasRange) {
+                if (const NodeMeta* m = a.meta(); m && m->hasRange()) {
                     w.key("min");
-                    w.number(m->min);
+                    w.number(m->min());
                     w.key("max");
-                    w.number(m->max);
+                    w.number(m->max());
                 }
                 if (a.returnKind()) {
                     w.key("returns");
@@ -882,11 +882,11 @@ private:
                 w.beginObject();
                 w.key("type");
                 w.string(kindName(a.itemKind()));
-                if (const NodeMeta* m = a.meta(); m && m->hasRange) {
+                if (const NodeMeta* m = a.meta(); m && m->hasRange()) {
                     w.key("min");
-                    w.number(m->min);
+                    w.number(m->min());
                     w.key("max");
-                    w.number(m->max);
+                    w.number(m->max());
                 }
                 w.endObject();
                 break;
@@ -952,35 +952,36 @@ private:
             w.key("access");
             w.string(toString(n.writeAccess()));
         }
-        if (const NodeMeta* m = n.meta(); m && m->doc) {
-            w.key("description");
-            w.string(m->doc);
-        }
-        if (const NodeMeta* m = n.meta(); m && m->ui) renderUi(w, *m->ui);
+        if (const NodeMeta* m = n.meta()) renderMeta(w, *m);
     }
 
-    static void renderUi(JsonWriter& w, const UiMeta& m) {
-        if (m.label) {
+    static void renderMeta(JsonWriter& w, const NodeMeta& m) {
+        if (m.doc()) {
+            w.key("description");
+            w.string(m.doc());
+        }
+        if (m.label()) {
             w.key("label");
-            w.string(m.label);
+            w.string(m.label());
         }
-        if (m.unit) {
+        if (m.unit()) {
             w.key("unit");
-            w.string(m.unit);
+            w.string(m.unit());
         }
-        if (m.step != 0) {
+        if (m.step() != 0) {
             w.key("step");
-            w.number(static_cast<double>(m.step), 7);
+            w.number(static_cast<double>(m.step()), 7);
         }
-        if (!m.hints) return;
+        if (!m.hintCount()) return;
         w.key("ui");
         w.beginObject();
-        for (const UiHint* h = m.hints; h; h = h->next) {
-            w.key(h->key);
-            switch (h->kind) {
+        for (size_t i = 0; i < m.hintCount(); i++) {
+            UiHint h = m.hint(i);
+            w.key(h.key);
+            switch (h.kind) {
                 case UiHint::Kind::Flag: w.boolean(true); break;
-                case UiHint::Kind::String: w.string(h->str ? h->str : ""); break;
-                case UiHint::Kind::Number: w.number(static_cast<double>(h->num), 7); break;
+                case UiHint::Kind::String: w.string(h.str ? h.str : ""); break;
+                case UiHint::Kind::Number: w.number(static_cast<double>(h.num), 7); break;
             }
         }
         w.endObject();

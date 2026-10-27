@@ -483,7 +483,7 @@ m.value("pidKp", kp).ui("advanced");
 | `.ui("key", "text")`, `.ui("key", n)` | `ui: {"key": ...}` | A string or number hint. Setting a key again replaces it. |
 
 - **Vocabulary:** the keys under `ui` are defined by the renderers (TesserUI's specification), not by TesserAPI. Clients ignore keys they don't know.
-- **Cost:** all of it is string literals and one optional allocation per annotated node: 16 bytes, plus 16 bytes per `ui` hint (32-bit targets, before heap overhead). Nodes without presentation metadata pay nothing.
+- **Cost:** all of it is string literals, in one optional block per annotated node holding only the fields the node has (`NodeMeta`): on 32-bit targets, a 4-byte header, 4 bytes per description, label, unit or step, 16 for a range, and 4 bytes plus 8 per hint for the `ui` hints, before the heap's overhead (one block). A label alone is 8 bytes. Nodes without metadata pay nothing. Measured with TesserKIT's `/sys` shape (251 annotated nodes, 243 hints) on the host: 745 blocks before this layout, 251 after; 17.9 KB of 32-bit data before, 4.8 KB after. At most 16 hints per node (a declaration error beyond). Read it through `node.meta()`: `label()`, `unit()`, `step()`, `doc()`, `hasRange()`, `min()`, `max()`, `hint(key)` and `hint(i)` up to `hintCount()`.
 - **Hash:** presentation metadata is part of the schema, so it changes `schemaHash()`.
 - `TESSER_NO_UI` compiles it out: the modifiers remain and do nothing.
 
@@ -1153,7 +1153,7 @@ Targets to be measured on a classic ESP32 and a C3, and enforced in CI:
 | Item | Target |
 |---|---|
 | Flash, core + HTTP transport | ≤ 40 KB above the application's baseline, ArduinoJson included (measured below: 45.5 KB) |
-| RAM per value leaf | ≤ 32 B with a bound variable, ≤ 60 B with a getter and setter, + 28 B with a range or description |
+| RAM per value leaf | ≤ 32 B with a bound variable, ≤ 60 B with a getter and setter, + 20 B with a range, 8 B with a description or label (§7.1) |
 | RAM per object node | ≤ 36 B |
 | Request handling | Request body document (bounded by `maxRequestBody`) + a streamed reply's window, up to 2 KB (1 KB on serial and Bluetooth lines; HTTP, WebSocket; it waits there to be sent without the API lock, §9), or the response buffer (NowTP and deferred replies, bounded by `maxResponse`) |
 | Stack | Rendering depth bounded by `maxDepth` (default 16). JSON parsing: request bodies nest at most `maxDepth` + 1 levels (one more for an envelope); responses, notifications and stored records up to 65, the most a node's JSON writer produces, since a schema nests two or three levels per tree level and the writing peer's `maxDepth` may differ. On Xtensa with `-Og` (ESP-IDF's default), each tree level costs about 230 B of stack to render a schema or apply a patch, and each JSON level about 96 B to parse (6.2 KB at 65) |
@@ -1205,7 +1205,7 @@ Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware
 | Value bound to a variable | 32 B |
 | Value with getter and setter (small captures) | 60 B |
 | Object | 36 B |
-| Value with a range | 68 B (32 B node + 36 B metadata) |
+| Value with a range | 32 B node + 20 B metadata (from `sizeof`; 40 B in one block and 16 per hint in blocks of their own before 2026-10-28) |
 | List of any length | one node; elements are built per request |
 | Full GET of a 13-leaf tree (227 B response) | 0.43 ms |
 | Envelope parse + keyed GET + reply | 0.9 ms |

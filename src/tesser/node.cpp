@@ -1,6 +1,7 @@
 #include "tesser/node.h"
 
 #include <atomic>
+#include <new>
 
 #include "tesser/platform.h"
 
@@ -84,73 +85,194 @@ void Node::changed() {
     }
 }
 
-Node::~Node() { delete meta_; }
+Node::~Node() { NodeMeta::destroy(meta_); }
 
-NodeMeta& Node::editMeta() {
+// ---- metadata ---------------------------------------------------------
+
+size_t NodeMeta::slotsOf(Field f, size_t hints) {
+    switch (f) {
+        case kRange: return (2 * sizeof(double) + sizeof(Slot) - 1) / sizeof(Slot);
+        case kHints: return 1 + 2 * hints;
+        default: return 1;
+    }
+}
+
+size_t NodeMeta::offset(Field f) const {
+    size_t at = 0;
+    for (uint8_t bit = 1; bit < f; bit = static_cast<uint8_t>(bit << 1)) {
+        if (present_ & bit) at += slotsOf(static_cast<Field>(bit), count_);
+    }
+    return at;
+}
+
+size_t NodeMeta::slots() const { return offset(static_cast<Field>(128)); }
+
+float NodeMeta::step() const {
+    if (!(present_ & kStep)) return 0;
+    float v;
+    memcpy(&v, slot(kStep), sizeof(v));
+    return v;
+}
+
+double NodeMeta::bound(size_t i) const {
+    if (!(present_ & kRange)) return 0;
+    double v;
+    memcpy(&v, reinterpret_cast<const char*>(slot(kRange)) + i * sizeof(double), sizeof(v));
+    return v;
+}
+
+UiHint NodeMeta::hint(size_t i) const {
+    UiHint h;
+    if (i >= count_) return h;
+    Slot* at = slot(kHints);
+    uint32_t kinds;
+    memcpy(&kinds, at, sizeof(kinds));
+    h.kind = static_cast<UiHint::Kind>((kinds >> (2 * i)) & 3);
+    h.key = static_cast<const char*>(at[1 + 2 * i]);
+    if (h.kind == UiHint::Kind::Number) {
+        memcpy(&h.num, &at[2 + 2 * i], sizeof(h.num));
+    } else {
+        h.str = static_cast<const char*>(at[2 + 2 * i]);
+    }
+    return h;
+}
+
+UiHint NodeMeta::hint(const char* key) const {
+    for (size_t i = 0; key && i < count_; i++) {
+        UiHint h = hint(i);
+        if (strcmp(h.key, key) == 0) return h;
+    }
+    return UiHint();
+}
+
+NodeMeta* NodeMeta::grow(NodeMeta* old, Field f) {
+    NodeMeta header;
+    if (old) header = *old;
+    size_t before = old ? old->slots() : 0;
+    size_t at = old ? old->offset(f) : 0;  // where the new slots go
+    size_t added = 0;
+    if (!f) {
+        // the header alone
+    } else if (f == kHints && (header.present_ & kHints)) {
+        at += slotsOf(kHints, header.count_);  // after the last hint
+        added = 2;
+        header.count_++;
+    } else {
+        header.present_ |= f;
+        added = slotsOf(f, 0);
+    }
+    auto* m = new (::operator new(sizeof(NodeMeta) + (before + added) * sizeof(Slot))) NodeMeta(header);
+    Slot* to = reinterpret_cast<Slot*>(m + 1);
+    if (old) {
+        const Slot* from = reinterpret_cast<const Slot*>(old + 1);
+        memcpy(to, from, at * sizeof(Slot));
+        memcpy(to + at + added, from + at, (before - at) * sizeof(Slot));
+        ::operator delete(old);  // the Extra, if any, moved
+    }
+    memset(to + at, 0, added * sizeof(Slot));
+    return m;
+}
+
+void NodeMeta::destroy(NodeMeta* m) {
+    if (!m) return;
+    delete m->extra();
+    ::operator delete(m);
+}
+
+NodeMeta::Slot* Node::metaSlot(NodeMeta::Field f) {
     touch();  // a modifier is changing the node's schema
-    if (!meta_) meta_ = new NodeMeta();
-    return *meta_;
+    if (!meta_ || !(meta_->present_ & f)) meta_ = NodeMeta::grow(meta_, f);
+    return meta_->slot(f);
+}
+
+NodeMeta::Extra& Node::editExtra() {
+    NodeMeta::Slot* s = metaSlot(NodeMeta::kExtra);
+    if (!*s) *s = new NodeMeta::Extra();
+    return *static_cast<NodeMeta::Extra*>(*s);
 }
 
 void Node::setDoc(const char* text) {
 #if !defined(TESSER_NO_DESCRIPTIONS)
-    editMeta().doc = text;
+    *metaSlot(NodeMeta::kDoc) = const_cast<char*>(text);
 #else
     (void)text;
 #endif
 }
 
-UiMeta::~UiMeta() {
-    while (hints) {
-        UiHint* next = hints->next;
-        delete hints;
-        hints = next;
-    }
+void Node::setLabel(const char* text) {
+#if !defined(TESSER_NO_UI)
+    *metaSlot(NodeMeta::kLabel) = const_cast<char*>(text);
+#else
+    (void)text;
+#endif
 }
 
-UiMeta* Node::editUi() {
+void Node::setUnit(const char* text) {
 #if !defined(TESSER_NO_UI)
-    NodeMeta& m = editMeta();
-    if (!m.ui) m.ui = new UiMeta();
-    return m.ui;
+    *metaSlot(NodeMeta::kUnit) = const_cast<char*>(text);
 #else
-    return nullptr;
+    (void)text;
+#endif
+}
+
+void Node::setStep(double s) {
+#if !defined(TESSER_NO_UI)
+    float v = static_cast<float>(s);
+    memcpy(metaSlot(NodeMeta::kStep), &v, sizeof(v));
+#else
+    (void)s;
 #endif
 }
 
 void Node::addHint(const char* key, UiHint::Kind kind, const char* str, float num) {
-    UiMeta* m = editUi();
-    if (!m || !key) return;
+#if !defined(TESSER_NO_UI)
+    if (!key) return;
     // Setting a key again replaces it; otherwise hints keep declaration order.
-    UiHint** at = &m->hints;
-    for (; *at; at = &(*at)->next) {
-        if (strcmp((*at)->key, key) == 0) break;
-    }
-    UiHint* h = *at;
-    if (!h) {
-        h = new UiHint();
-        h->key = key;
-        *at = h;
-    }
-    h->kind = kind;
-    if (kind == UiHint::Kind::Number) {
-        h->num = num;
+    size_t i = 0;
+    size_t count = meta_ ? meta_->count_ : 0;
+    while (i < count && strcmp(meta_->hint(i).key, key) != 0) i++;
+    if (i == count) {
+        if (count == NodeMeta::kMaxHints) {
+            g_declarationErrors++;
+            logError("\"%s\" has more than %u ui hints", name_ ? name_ : "(element)",
+                     static_cast<unsigned>(NodeMeta::kMaxHints));
+            return;
+        }
+        metaSlot(NodeMeta::kHints);
+        if (meta_->count_ == count) meta_ = NodeMeta::grow(meta_, NodeMeta::kHints);
     } else {
-        h->str = str;
+        touch();
     }
+    NodeMeta::Slot* at = meta_->slot(NodeMeta::kHints);
+    uint32_t kinds;
+    memcpy(&kinds, at, sizeof(kinds));
+    kinds = (kinds & ~(uint32_t(3) << (2 * i))) | (uint32_t(kind) << (2 * i));
+    memcpy(at, &kinds, sizeof(kinds));
+    at[1 + 2 * i] = const_cast<char*>(key);
+    at[2 + 2 * i] = nullptr;
+    if (kind == UiHint::Kind::Number) {
+        memcpy(&at[2 + 2 * i], &num, sizeof(num));
+    } else {
+        at[2 + 2 * i] = const_cast<char*>(str);
+    }
+#else
+    (void)key;
+    (void)kind;
+    (void)str;
+    (void)num;
+#endif
 }
 
 void Node::setAccess(Access read, Access write) {
-    NodeMeta& m = editMeta();
-    m.readAccess = read;
-    m.writeAccess = write;
+    touch();
+    if (!meta_) meta_ = NodeMeta::grow(nullptr, NodeMeta::Field(0));
+    meta_->read_ = read;
+    meta_->write_ = write;
 }
 
 void Node::setRange(double min, double max) {
-    NodeMeta& m = editMeta();
-    m.min = min;
-    m.max = max;
-    m.hasRange = true;
+    double bounds[2] = {min, max};
+    memcpy(metaSlot(NodeMeta::kRange), bounds, sizeof(bounds));
 }
 
 ValueNode& ValueNode::range(double min, double max) {
@@ -180,9 +302,7 @@ void ValueNode::setValidator(std::function<Check(JsonVariantConst)> v, const Val
                  kindName(kind()));
         return;
     }
-    NodeMeta& m = editMeta();
-    delete m.validator;
-    m.validator = new std::function<Check(JsonVariantConst)>(std::move(v));
+    editExtra().validator = std::move(v);
 }
 
 void EnumNode::write(JsonWriter& w) const {
@@ -215,12 +335,12 @@ size_t EnumNode::index(const char* s) const {
 
 ValueNode& ValueNode::watch() {
     setFlag(kWatch);
-    editMeta();
+    editExtra();
     return *this;
 }
 
 Check Node::checkRange(double v) const {
-    if (meta_ && meta_->hasRange && (v < meta_->min || v > meta_->max)) {
+    if (meta_ && meta_->hasRange() && (v < meta_->min() || v > meta_->max())) {
         return Check::fail(Status::InvalidValue, "out of range");
     }
     return Check::ok();

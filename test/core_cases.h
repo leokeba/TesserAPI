@@ -356,6 +356,51 @@ TEST(schema_presentation) {
     CHECK_EQ(get(api, "/motor/level3", schema()).body, "{\"type\":\"integer\",\"writable\":true,\"step\":0.1}");
 }
 
+// Metadata is one block holding just the fields a node has: fields added in
+// any order land in their place, and the ones after them move along.
+TEST(schema_metadata_any_order) {
+    Api api;
+    int x = 0;
+    auto& v = api.value("x", x);
+    v.ui("advanced").ui("precision", 2).label("X").ui("widget", "knob");
+    v.validate([](int n) { return n % 2 ? tesser::Check::fail(tesser::Status::InvalidValue, "odd") : tesser::Check::ok(); });
+    v.unit("mm").range(-4, 1e12).doc("Where it is").step(0.25).watch().ui("precision", 3).label("Position");
+    const tesser::NodeMeta* m = v.meta();
+    CHECK(m != nullptr);
+    CHECK_EQ(std::string(m->label()), "Position");
+    CHECK_EQ(std::string(m->unit()), "mm");
+    CHECK_EQ(std::string(m->doc()), "Where it is");
+    CHECK_EQ(m->step(), 0.25f);
+    CHECK(m->hasRange());
+    CHECK_EQ(m->min(), -4.0);
+    CHECK_EQ(m->max(), 1e12);
+    CHECK_EQ(m->hintCount(), size_t(3));
+    CHECK(!m->hint("missing"));
+    CHECK(m->hint("precision").kind == tesser::UiHint::Kind::Number);
+    CHECK_EQ(m->hint("precision").num, 3.0f);
+    CHECK_EQ(std::string(m->hint(2).str), "knob");
+    CHECK_EQ(get(api, "/x", schema()).body,
+             "{\"type\":\"integer\",\"writable\":true,\"min\":-4,\"max\":1000000000000,"
+             "\"description\":\"Where it is\",\"label\":\"Position\",\"unit\":\"mm\",\"step\":0.25,"
+             "\"ui\":{\"advanced\":true,\"precision\":3,\"widget\":\"knob\"}}");
+    // The validator and the range still apply.
+    CHECK_EQ(set(api, "/x", "3").status, Status::InvalidValue);
+    CHECK_EQ(set(api, "/x", "-6").status, Status::InvalidValue);
+    CHECK_EQ(set(api, "/x", "8").status, Status::Ok);
+    // At most 16 hints: the 17th is a declaration error.
+    char keys[17][4];
+    int errors = tesser::declarationErrors();
+    auto& w = api.value("w", x).writeAccess(tesser::Access::Admin);
+    for (int i = 0; i < 17; i++) {
+        snprintf(keys[i], sizeof(keys[i]), "k%d", i);
+        w.ui(keys[i], i);
+    }
+    CHECK_EQ(tesser::declarationErrors(), errors + 1);
+    CHECK_EQ(w.meta()->hintCount(), size_t(16));
+    CHECK_EQ(w.meta()->hint("k15").num, 15.0f);
+    CHECK(w.meta()->writeAccess() == tesser::Access::Admin);  // the header moves with the block
+}
+
 // ---- set ---------------------------------------------------------------
 
 TEST(set_values) {
