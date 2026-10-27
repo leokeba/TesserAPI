@@ -123,6 +123,19 @@ void persistedLeaves(const Node& n, bool inherited, std::vector<const Node*>& ou
 }
 
 constexpr const char* kVersionKey = "@version";  // no node can be named so
+// "<version>:<name>,<name>": the records a migration to that version
+// rewrote before its rewrite failed (Api::finishMigration()).
+constexpr const char* kMigratedKey = "@migrated";
+
+bool inList(std::string_view list, std::string_view name) {
+    while (!list.empty()) {
+        size_t comma = list.find(',');
+        if (list.substr(0, comma) == name) return true;
+        if (comma == std::string_view::npos) break;
+        list.remove_prefix(comma + 1);
+    }
+    return false;
+}
 
 // Applies stored state leniently: whatever doesn't fit the current tree is
 // skipped, so renamed or removed fields never break a boot. `notify` marks
@@ -293,7 +306,7 @@ std::string Api::persistedState() {
     return out;
 }
 
-bool Api::saveRecords(bool all) {
+bool Api::saveRecords(bool all, std::vector<std::string>* written) {
     if (!storage_) return false;
     uint32_t gen = currentGeneration();
     bool ok = true;
@@ -314,6 +327,8 @@ bool Api::saveRecords(bool all) {
                 if (!storage_->remove(c->name())) {
                     logError("removing state %s failed", c->name());
                     ok = false;
+                } else if (written) {
+                    written->push_back(c->name());
                 }
                 break;
             case Record::NoRoom:
@@ -324,6 +339,8 @@ bool Api::saveRecords(bool all) {
                 if (!storage_->save(c->name(), text)) {
                     logError("saving state %s failed", c->name());
                     ok = false;
+                } else if (written) {
+                    written->push_back(c->name());
                 }
                 break;
         }
@@ -346,6 +363,14 @@ bool Api::load() {
     std::string data;
     if (storage_->load(kVersionKey, data)) stored = static_cast<uint32_t>(strtoul(data.c_str(), nullptr, 10));
     bool older = stored != persistVersion_;
+    // Records an unfinished migration to this version rewrote already.
+    std::string rewritten;
+    if (older && storage_->load(kMigratedKey, data)) {
+        size_t colon = data.find(':');
+        if (colon != std::string::npos && strtoul(data.c_str(), nullptr, 10) == persistVersion_) {
+            rewritten = data.substr(colon + 1);
+        }
+    }
     bool any = false;
     Applier a;
     for (Node* c = first(); c; c = c->next()) {
@@ -361,13 +386,36 @@ bool Api::load() {
         }
         any = true;
         // Stored under another version: brought up to this one first.
-        if (older && migrate_ && !migrate_(c->name(), stored, doc.as<JsonVariant>())) continue;
+        if (older && migrate_ && !inList(rewritten, c->name()) && !migrate_(c->name(), stored, doc.as<JsonVariant>())) {
+            continue;
+        }
         a.apply(c, doc.as<JsonVariantConst>(), persisted());
     }
     // Rewritten under this version: migrated, and sparse.
-    if (older && saveRecords(true)) storage_->save(kVersionKey, std::to_string(persistVersion_));
+    if (older) finishMigration(rewritten);
     savedGen_ = seenGen_ = currentGeneration();
     return any;
+}
+
+void Api::finishMigration(const std::string& rewritten) {
+    std::vector<std::string> written;
+    if (saveRecords(true, &written)) {
+        storage_->save(kVersionKey, std::to_string(persistVersion_));
+        storage_->remove(kMigratedKey);
+        migrating_ = false;
+        migrated_.clear();
+        return;
+    }
+    // Some records are in this version's shape now, the others still in
+    // the old one: which is which, for the next boot.
+    if (migrated_.empty()) migrated_ = rewritten;
+    for (const std::string& n : written) {
+        if (inList(migrated_, n)) continue;
+        if (!migrated_.empty()) migrated_ += ',';
+        migrated_ += n;
+    }
+    storage_->save(kMigratedKey, std::to_string(persistVersion_) + ":" + migrated_);
+    migrating_ = true;
 }
 
 Status Api::restore(std::string_view json, std::vector<std::string>* skipped) {
@@ -404,6 +452,10 @@ void Api::checkPersistence(uint32_t nowMs) {
     // A walk over the tree: at most every 50 ms.
     if (nowMs - lastPersistCheckMs_ < 50) return;
     lastPersistCheckMs_ = nowMs;
+    if (migrating_ && nowMs - migrateTryMs_ >= debounceMs_) {
+        migrateTryMs_ = nowMs;
+        finishMigration(migrated_);
+    }
     uint32_t gen = currentGeneration();
     uint32_t newest = 0;
     newestPersisted(*this, persisted(), savedGen_, gen, newest);

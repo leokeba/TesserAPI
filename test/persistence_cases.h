@@ -485,6 +485,58 @@ TEST(persist_migration) {
     CHECK_EQ(again.brightness, 5);
 }
 
+// Refuses to save one key while `failing`.
+struct RefusingStorage : MemoryStorage {
+    std::string refused;
+    bool failing = true;
+    bool save(std::string_view key, const std::string& data) override {
+        if (failing && key == refused) return false;
+        return MemoryStorage::save(key, data);
+    }
+};
+
+TEST(persist_migration_partly_saved) {
+    // The rewrite after a migration fails for one record: the records it
+    // rewrote aren't migrated again at the next boot, and poll() finishes
+    // the rewrite once the storage takes it.
+    RefusingStorage storage;
+    storage.records["config"] = "{\"brightness\":128,\"label\":\"desk\"}";
+    storage.records["calibration"] = "3";
+    storage.refused = "calibration";
+    std::vector<std::string> seen;
+    auto migrate = [&](std::string_view record, uint32_t version, JsonVariant value) {
+        seen.push_back(std::string(record) + "@" + std::to_string(version));
+        if (record == "config" && value["label"].is<const char*>()) {
+            value["name"] = value["label"];
+            value.as<JsonObject>().remove("label");
+        }
+        return true;
+    };
+    {
+        Settings s;
+        s.api.persistVersion(1, migrate);
+        s.api.persistence(storage);
+        CHECK(s.api.load());
+        CHECK_EQ(storage.records.count("@version"), 0u);
+        CHECK_EQ(storage.records["config"], "{\"name\":\"desk\"}");
+        CHECK_EQ(storage.records["@migrated"], "1:config");
+    }
+    // Rebooted before it could finish: config is in the new shape already.
+    seen.clear();
+    Settings s;
+    s.api.persistVersion(1, migrate);
+    s.api.persistence(storage);
+    CHECK(s.api.load());
+    CHECK_EQ(seen.size(), 1u);
+    if (!seen.empty()) CHECK_EQ(seen[0], "calibration@0");
+    CHECK_EQ(std::string(s.name), "desk");
+    storage.failing = false;
+    s.api.poll(100000);
+    CHECK_EQ(storage.records["@version"], "1");
+    CHECK_EQ(storage.records.count("@migrated"), 0u);
+    CHECK_EQ(storage.records["calibration"], "3");
+}
+
 inline size_t g_free = SIZE_MAX;
 inline size_t freeProbe() { return g_free; }
 

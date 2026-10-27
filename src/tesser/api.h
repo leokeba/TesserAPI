@@ -325,8 +325,13 @@ private:
     void subscriptionsRemoved(std::vector<Subscription>& gone, bool clientGone);
     void checkPersistence(uint32_t nowMs);
     // Writes the records of top-level nodes (all, or those changed since
-    // the last save).
-    bool saveRecords(bool all);
+    // the last save); the names of those written go to `written`.
+    bool saveRecords(bool all, std::vector<std::string>* written = nullptr);
+    // After a migration: every record rewritten under this version, then
+    // the version. A rewrite that fails partway records which records it
+    // rewrote (a later boot doesn't migrate them again), and poll() tries
+    // again.
+    void finishMigration(const std::string& rewritten);
     // Records the defaults of persisted values not yet recorded.
     void captureDefaults();
     // Whether `n` holds its default (as captureDefaults() saw it).
@@ -356,6 +361,9 @@ private:
     uint32_t seenGen_ = 0;   // newest persisted change seen by poll()
     uint32_t changedAtMs_ = 0;
     uint32_t lastPersistCheckMs_ = 0;
+    bool migrating_ = false;      // finishMigration() to try again
+    uint32_t migrateTryMs_ = 0;
+    std::string migrated_;        // records rewritten by it so far, comma-separated
     // Set by persistence(): poll() reaches the persistence code through it,
     // so applications that don't persist don't link it.
     void (*persistHook_)(Api& api, uint32_t nowMs) = nullptr;
