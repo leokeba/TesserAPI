@@ -258,6 +258,7 @@ void Api::persistence(Storage& storage, uint32_t debounceMs) {
     storage_ = &storage;
     debounceMs_ = debounceMs;
     persistHook_ = [](Api& api, uint32_t nowMs) { api.checkPersistence(nowMs); };
+    unsavedHook_ = [](Api& api, uint32_t before) { api.unsavedSet(before); };
     savedGen_ = seenGen_ = currentGeneration();
     captureDefaults();
 }
@@ -446,6 +447,14 @@ Status Api::restore(std::string_view json, std::vector<std::string>* skipped) {
         if (persistVersion_) storage_->save(kVersionKey, std::to_string(persistVersion_));
     }
     return Status::Ok;
+}
+
+// Under the API lock. A save due already (a persisted change before the
+// set) takes the set's change along: the records hold current values.
+void Api::unsavedSet(uint32_t before) {
+    uint32_t newest = 0;
+    newestPersisted(*this, persisted(), savedGen_, before, newest);
+    if (!newest) savedGen_ = seenGen_ = currentGeneration();
 }
 
 void Api::checkPersistence(uint32_t nowMs) {

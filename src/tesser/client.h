@@ -68,8 +68,10 @@ public:
     bool get(std::string_view path, ResponseHandler done, const Query& query = Query()) {
         return request(Op::Get, path, std::string_view(), std::move(done), query);
     }
-    bool set(std::string_view path, std::string_view bodyJson, ResponseHandler done = nullptr) {
-        return request(Op::Set, path, bodyJson, std::move(done));
+    // `query.persist` false: the change isn't saved (Query::persist).
+    bool set(std::string_view path, std::string_view bodyJson, ResponseHandler done = nullptr,
+             const Query& query = Query()) {
+        return request(Op::Set, path, bodyJson, std::move(done), query);
     }
     bool subscribe(std::string_view path, ResponseHandler done, const Query& query = Query()) {
         return request(Op::Subscribe, path, std::string_view(), std::move(done), query);

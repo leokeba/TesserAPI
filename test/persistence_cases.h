@@ -485,6 +485,34 @@ TEST(persist_migration) {
     CHECK_EQ(again.brightness, 5);
 }
 
+TEST(persist_unsaved_set) {
+    // A set with Query::persist false (a DMX input driving a persisted
+    // value) changes the value and notifies, but doesn't rewrite the record.
+    MemoryStorage storage;
+    Settings s(&storage);
+    tesser::LocalClient local(s.api);
+    tesser::Query q;
+    q.persist = false;
+    Status got = Status::Internal;
+    auto done = [&got](Status st, JsonVariantConst) { got = st; };
+    for (int i = 0; i < 20; i++) {
+        CHECK(local.set("/config/brightness", std::to_string(i), done, q));
+        s.api.poll(uint32_t(1000 + 100 * i));
+    }
+    local.process();
+    CHECK_EQ(got, Status::Ok);
+    CHECK_EQ(s.brightness, 19);
+    s.api.poll(10000);
+    CHECK_EQ(storage.saves, 0);
+    // A save due already takes it along: the record holds current values.
+    CHECK_EQ(cases::set(s.api, "/config/name", "\"desk\"").status, Status::Ok);
+    CHECK(local.request(tesser::Op::Set, "/config/brightness", "5", done, q));
+    s.api.poll(20000);
+    s.api.poll(30000);
+    CHECK_EQ(storage.saves, 1);
+    CHECK_EQ(storage.records["config"], "{\"brightness\":5,\"name\":\"desk\"}");
+}
+
 // Refuses to save one key while `failing`.
 struct RefusingStorage : MemoryStorage {
     std::string refused;

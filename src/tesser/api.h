@@ -367,6 +367,11 @@ private:
     // Set by persistence(): poll() reaches the persistence code through it,
     // so applications that don't persist don't link it.
     void (*persistHook_)(Api& api, uint32_t nowMs) = nullptr;
+    // Also: after a set with Query::persist false (handleNow()).
+    void (*unsavedHook_)(Api& api, uint32_t before) = nullptr;
+    // What that set changed counts as saved, unless a save was due already
+    // (`before`: the generation before it).
+    void unsavedSet(uint32_t before);
     mutable Mutex queueMutex_{kRankLeaf, "api queue"};  // a leaf: runQueued() takes it under the API lock
     std::vector<QueuedRequest*> queue_;  // a vector: an empty deque allocates
     int yielded_ = 0;               // under mutex_: handlers that let go of it

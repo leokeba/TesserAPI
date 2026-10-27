@@ -1584,7 +1584,9 @@ void Api::handleNow(const Request& request, Reply& reply) {
         MutexGuard guard(mutex_);
         const Client* outer = current_;
         current_ = &request.client;
+        uint32_t before = currentGeneration();
         Handler(*this, request, reply).run();
+        if (request.op == Op::Set && !request.query.persist && unsavedHook_) unsavedHook_(*this, before);
         current_ = outer;
     }
     // What a streamed reply still holds goes out without the lock, unless
