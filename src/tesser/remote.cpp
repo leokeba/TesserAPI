@@ -500,25 +500,25 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
     std::string okPath = localBase.empty() ? std::string("/") : localBase;
     auto call = std::make_shared<Forwarded>(detached, &api, std::string(basePath));
     auto done = [call, localBase, remoteBase](Status s, JsonVariantConst body) {
-        Reply* detached = call->take();
-        if (!detached) return;
-        detail::writeMapped(*detached, s, body, localBase, remoteBase);
+        Reply* to = call->take();
+        if (!to) return;
+        detail::writeMapped(*to, s, body, localBase, remoteBase);
         call->finish();
     };
     // An "ok" body goes on as the remote wrote it: parsed and rewritten, a
     // large one would be on the heap twice.
     auto raw = [call, okPath](std::string_view json) {
-        Reply* detached = call->take();
-        if (!detached) return;
-        Sink& out = detached->begin(Status::Ok);
-        if (!out.write(json.data(), json.size()) && detached->rollback()) {
-            if (detached->outOfMemory()) {
-                writeError(*detached, Status::Busy, Reason::LowMemory, okPath, "not enough memory for the response");
+        Reply* to = call->take();
+        if (!to) return;
+        Sink& out = to->begin(Status::Ok);
+        if (!out.write(json.data(), json.size()) && to->rollback()) {
+            if (to->outOfMemory()) {
+                writeError(*to, Status::Busy, Reason::LowMemory, okPath, "not enough memory for the response");
             } else {
-                writeError(*detached, Status::TooLarge, okPath, "response too large");
+                writeError(*to, Status::TooLarge, okPath, "response too large");
             }
         } else {
-            detached->end();
+            to->end();
         }
         call->finish();
     };
