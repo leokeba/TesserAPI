@@ -32,6 +32,10 @@ constexpr uint8_t kBroadcast = 0x04;
 // advertisement flags
 constexpr uint8_t kQuery = 0x01;
 constexpr uint8_t kBye = 0x02;
+// acknowledgement and advertisement flag: this node keeps a peer's
+// broadcasts and its other messages in separate windows, so the peer may
+// number its messages to this node on their own
+constexpr uint8_t kSplitIds = 0x80;
 // acknowledgement status
 constexpr uint8_t kComplete = 0;
 constexpr uint8_t kPartial = 1;
@@ -304,7 +308,7 @@ bool UdpLink::sendMessage(const PeerAddress& to, std::string message, Delivery d
         held = outgoingBytes_.reserve(message.size(), budgetKey(to), true, false);
         if (!held) return false;
     }
-    uint32_t id = nextId_++;
+    uint32_t id = takeId(to, broadcast);
     if (!reliable) {
         // Copies of a broadcast keep its id: receivers apply the first.
         uint8_t copies = broadcast && options_.broadcastCopies ? options_.broadcastCopies : 1;
@@ -321,10 +325,36 @@ bool UdpLink::sendMessage(const PeerAddress& to, std::string message, Delivery d
     return true;
 }
 
+// A receiver's window holds the 64 ids behind the newest message it
+// completed. Numbered from one counter, a peer's messages to us would leave
+// gaps for those it sends to others (64 go by in 200 ms on a gateway
+// notifying 15 peers at 20 Hz): a later message completing first would push
+// one awaiting its retransmission out of the window, and it would be taken
+// for a repeat. So a peer that keeps broadcasts apart (the only messages it
+// gets from us on another counter) gets its own count; one that doesn't,
+// an older node, would take that count's ids, below the broadcasts', for
+// repeats, and gets the common one.
+uint32_t UdpLink::takeId(const PeerAddress& to, bool broadcast) {
+    Peer* peer = nullptr;
+    if (!broadcast) {
+        for (Peer& p : peers_) {
+            if (p.address == to) peer = &p;
+        }
+    }
+    if (!peer || !peer->split) return nextId_++;
+    // From the common count at first, so it lies above every id already
+    // used, even after the peer was forgotten.
+    if (!peer->nextId) peer->nextId = nextId_;
+    uint32_t id = peer->nextId++;
+    if (static_cast<int32_t>(peer->nextId - nextId_) > 0) nextId_ = peer->nextId;
+    return id;
+}
+
 void UdpLink::sendAck(const PeerAddress& to, uint32_t id, uint8_t status, uint64_t got) {
     uint8_t buf[kHeader + 8];
     Header h;
     h.type = kAck;
+    h.flags = kSplitIds;
     h.index = status;
     h.nonce = nonce_;
     h.id = id;
@@ -365,7 +395,7 @@ void UdpLink::sendAdvert(const PeerAddress& to, uint8_t flags) {
     std::vector<uint8_t> buf(kHeader + payload.size());
     Header h;
     h.type = kAdvert;
-    h.flags = flags;
+    h.flags = static_cast<uint8_t>(flags | kSplitIds);
     h.nonce = nonce_;
     writeHeader(buf.data(), h);
     if (!payload.empty()) memcpy(buf.data() + kHeader, payload.data(), payload.size());
@@ -381,8 +411,10 @@ UdpLink::Peer* UdpLink::peerFor(const PeerAddress& from, uint32_t nonce, uint32_
         if (p.nonce != nonce) {
             restarted = true;
             p.nonce = nonce;
-            p.any = false;
-            p.window = 0;
+            p.unicast = Window();
+            p.broadcast = Window();
+            p.nextId = 0;
+            p.split = false;
         }
         p.heardMs = t;
         return &p;
@@ -404,29 +436,29 @@ UdpLink::Peer* UdpLink::peerFor(const PeerAddress& from, uint32_t nonce, uint32_
 
 // Message ids grow by one per message; a 64-message window behind the newest
 // one completed remembers which arrived. Older ones count as repeats.
-bool UdpLink::seen(const Peer& p, uint32_t id) {
-    if (!p.any) return false;
-    int32_t d = static_cast<int32_t>(p.newest - id);
+bool UdpLink::seen(const Window& w, uint32_t id) {
+    if (!w.any) return false;
+    int32_t d = static_cast<int32_t>(w.newest - id);
     if (d < 0) return false;
     if (d >= 64) return true;
-    return (p.window & flag(static_cast<unsigned>(d))) != 0;
+    return (w.bits & flag(static_cast<unsigned>(d))) != 0;
 }
 
-void UdpLink::markSeen(Peer& p, uint32_t id) {
-    if (!p.any) {
-        p.any = true;
-        p.newest = id;
-        p.window = 1;
+void UdpLink::markSeen(Window& w, uint32_t id) {
+    if (!w.any) {
+        w.any = true;
+        w.newest = id;
+        w.bits = 1;
         return;
     }
-    int32_t d = static_cast<int32_t>(p.newest - id);
+    int32_t d = static_cast<int32_t>(w.newest - id);
     if (d < 0) {
-        uint32_t shift = id - p.newest;
-        p.window = shift >= 64 ? 0 : p.window << shift;
-        p.window |= 1;
-        p.newest = id;
+        uint32_t shift = id - w.newest;
+        w.bits = shift >= 64 ? 0 : w.bits << shift;
+        w.bits |= 1;
+        w.newest = id;
     } else if (d < 64) {
-        p.window |= flag(static_cast<unsigned>(d));
+        w.bits |= flag(static_cast<unsigned>(d));
     }
 }
 
@@ -481,18 +513,19 @@ void UdpLink::handleData(const PeerAddress& from, Peer& peer, const uint8_t* dat
         return;
     }
     bool reliable = h.flags & kReliable;
+    Window& window = (h.flags & kBroadcast) ? peer.broadcast : peer.unicast;
     if (h.length > options_.maxMessage) {
         stats_.dropped++;
         if (reliable) sendAck(from, h.id, kRejected, 0);
         return;
     }
-    if (seen(peer, h.id)) {
+    if (seen(window, h.id)) {
         stats_.duplicates++;
         if (reliable && (h.flags & kAckRequest || h.count == 1)) sendAck(from, h.id, kComplete, 0);
         return;
     }
     if (h.count == 1) {
-        markSeen(peer, h.id);
+        markSeen(window, h.id);
         if (reliable) sendAck(from, h.id, kComplete, 0);
         out.push_back(Inbound{from, std::string(reinterpret_cast<const char*>(payload), n), reliable,
                               (h.flags & kBroadcast) != 0});
@@ -523,7 +556,7 @@ void UdpLink::handleData(const PeerAddress& from, Peer& peer, const uint8_t* dat
     p->got |= flag(h.index);
     p->touchedMs = t;
     if (p->got == allOf(p->count)) {
-        markSeen(peer, h.id);
+        markSeen(window, h.id);
         bool rel = p->flags & kReliable;
         if (rel) sendAck(from, h.id, kComplete, 0);
         out.push_back(Inbound{from, std::move(p->data), rel, (p->flags & kBroadcast) != 0});
@@ -591,6 +624,9 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
                 }
             }
         }
+        // A peer that keeps our broadcasts apart says so in what it sends
+        // back: from then on, our messages to it are numbered on their own.
+        if ((h.type == kAck || h.type == kAdvert) && (h.flags & kSplitIds)) peer->split = true;
         if (h.type == kData) {
             handleData(from, *peer, data, len, t, inbound);
         } else if (h.type == kAck) {

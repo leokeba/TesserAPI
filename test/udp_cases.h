@@ -32,6 +32,8 @@ struct Net {
     uint32_t clock = 1000;
     // Returns true to lose a datagram.
     std::function<bool(const Datagram&)> lose;
+    // Changes a datagram on its way, before lose.
+    std::function<void(Datagram&)> alter;
     int lost = 0;
 
     UdpLink::PacketFn sender(PeerAddress self) {
@@ -48,6 +50,7 @@ struct Net {
         while (!air.empty()) {
             Datagram d = air.front();
             air.pop_front();
+            if (alter) alter(d);
             if (lose && lose(d)) {
                 lost++;
                 continue;
@@ -645,6 +648,74 @@ TEST(udp_fragments_paced_on_a_tight_heap) {
     mirrored = false;
     CHECK_EQ(mirrorSnapshotInFlight(11000, 4000, mirrored), 1u);
     CHECK(mirrored);
+}
+
+// The message id of a datagram (header bytes 8-11).
+inline uint32_t datagramId(const std::vector<uint8_t>& d) {
+    return uint32_t(d[8]) | uint32_t(d[9]) << 8 | uint32_t(d[10]) << 16 | uint32_t(d[11]) << 24;
+}
+
+TEST(udp_window_gap_after_broadcasts) {
+    // A reliable message to the server is lost; more than 64 broadcasts go
+    // by (that the server doesn't get, as to another subnet); a later message
+    // completes first. The first one's retransmission is still delivered:
+    // the server keeps broadcasts in their own window, and the client numbers
+    // its messages to the server on their own.
+    Pair p;
+    bool dropFirst = true;
+    std::vector<uint32_t> ids;
+    p.net.lose = [&](const Net::Datagram& d) {
+        if (d.to == ip(2)) {
+            if ((d.data[1] & 0x0f) == 0) ids.push_back(datagramId(d.data));  // data
+            return dropFirst;
+        }
+        return d.to.length == 0 || d.to.bytes[3] == 255;
+    };
+    Result r1, r2;
+    CHECK(p.client.endpoint().request(ip(2), tesser::Op::Set, "/lamp/brightness", "77", capture(r1)));
+    p.net.deliver();
+    dropFirst = false;
+    for (int i = 0; i < 70; i++) {
+        p.client.endpoint().broadcast(tesser::udpAddress(10, 0, 0, 255, 8484), tesser::Op::Set, "/x", "1");
+    }
+    CHECK(p.client.endpoint().request(ip(2), tesser::Op::Get, "/lamp/on", "", capture(r2)));
+    p.net.run();
+    CHECK_EQ(r2.calls, 1);
+    CHECK_EQ(r2.status, Status::Ok);
+    p.net.advance(500);  // the set goes again
+    CHECK_EQ(r1.calls, 1);
+    CHECK_EQ(r1.status, Status::Ok);
+    CHECK_EQ(p.dev.lamp.brightness, 77);
+    CHECK_EQ(p.server.stats().duplicates, 0u);
+    CHECK(ids.size() >= 2);
+    if (ids.size() >= 2) CHECK_EQ(ids[1], ids[0] + 1);  // the broadcasts' ids aren't in between
+}
+
+TEST(udp_ids_for_an_older_peer) {
+    // A peer that doesn't say it keeps broadcasts apart (an older node) has
+    // one window for everything: messages to it take the common count, above
+    // the broadcasts' ids, or it would take them for repeats.
+    Pair p;
+    UdpLink older(&p.dev.api, p.net.sender(ip(3)), p.net.clockFn());
+    p.net.nodes.push_back({ip(3), &older});
+    std::vector<uint32_t> ids;
+    p.net.alter = [&](Net::Datagram& d) {
+        if (d.from == ip(3)) d.data[2] &= 0x7f;  // its flag doesn't arrive
+        if (d.to == ip(3) && (d.data[1] & 0x0f) == 0) ids.push_back(datagramId(d.data));  // data
+    };
+    older.start(0x3000);
+    p.net.run();
+    Result r1, r2;
+    p.client.endpoint().request(ip(3), tesser::Op::Get, "/lamp/on", "", capture(r1));
+    p.net.run();
+    for (int i = 0; i < 70; i++) p.client.endpoint().broadcast(PeerAddress(), tesser::Op::Set, "/x", "1");
+    p.net.run();
+    p.client.endpoint().request(ip(3), tesser::Op::Get, "/lamp/on", "", capture(r2));
+    p.net.run();
+    CHECK_EQ(r1.status, Status::Ok);
+    CHECK_EQ(r2.status, Status::Ok);
+    CHECK(ids.size() >= 2);
+    if (ids.size() >= 2) CHECK(ids.back() > ids.front() + 70);
 }
 
 }  // namespace udp_cases

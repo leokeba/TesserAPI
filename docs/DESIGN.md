@@ -797,10 +797,10 @@ The §10.1 envelopes between nodes and clients on a LAN, Ethernet or Wi-Fi, thro
   |---|---|---|
   | 0 | 1 | Magic `0x54` (`T`) |
   | 1 | 1 | Version (1) × 16 + type: 0 data, 1 acknowledgement, 2 advertisement |
-  | 2 | 1 | Flags. Data: `0x1` reliable, `0x2` ack-request, `0x4` broadcast. Advertisement: `0x1` query, `0x2` goodbye |
+  | 2 | 1 | Flags. Data: `0x1` reliable, `0x2` ack-request, `0x4` broadcast. Advertisement: `0x1` query, `0x2` goodbye. Acknowledgement and advertisement: `0x80` split windows (below) |
   | 3 | 1 | Data: fragment index. Acknowledgement: 0 complete, 1 partial, 2 rejected |
   | 4 | 4 | Sender's nonce: random, new at each `begin()` |
-  | 8 | 4 | Message id: per nonce, one more per message. An acknowledgement repeats the acknowledged message's |
+  | 8 | 4 | Message id: per nonce, one more per message, counted apart for some peers (below). An acknowledgement repeats the acknowledged message's |
   | 12 | 1 | Data: fragment count, 1 to 64 |
   | 13 | 1 | Reserved, 0 |
   | 14 | 2 | Data: fragment size `S` |
@@ -812,7 +812,8 @@ The §10.1 envelopes between nodes and clients on a LAN, Ethernet or Wi-Fi, thro
   2. The receiver answers an ack-request with complete or partial, and sends complete unasked when the message completes.
   3. On partial, the sender sends the missing fragments again at once. Without an answer it sends what is unacknowledged again after `ackTimeoutMs` (100 ms), doubling up to 1 s.
   4. After `sendTimeoutMs` (3 s) the message fails, and the peer is forgotten (`forgetPeer()`): its pending calls fail, its subscriptions and file transfer are dropped, its remote nodes show offline until it is heard from. A client that left without unsubscribing goes this way, at its next notification.
-  - **Repeats:** a receiver remembers, per peer and nonce, the 64 message ids behind the newest it completed; a repeat is acknowledged, not delivered, and an older id counts as a repeat. So a request whose acknowledgement was lost runs once.
+  - **Repeats:** a receiver remembers, per peer and nonce, the 64 message ids behind the newest it completed, in two windows: one for messages flagged broadcast, one for the others. A repeat is acknowledged, not delivered, and an older id counts as a repeat. So a request whose acknowledgement was lost runs once.
+  - **Ids per peer:** the window only works if a peer's ids to the receiver have no wide gaps. Numbered from one counter, a gateway notifying 15 peers at 20 Hz spends 64 ids in about 200 ms: a message awaiting its retransmission fell out of the receiver's window when a later one completed first, and was acknowledged as a repeat without being delivered. So a node sets `0x80` in its acknowledgements and advertisements to say it keeps the two windows apart. To a peer that has said so, a sender numbers its unicast messages on their own counter, which starts above every id already used. Broadcasts, and messages to a peer that hasn't said so (an older node, whose single window would take the separate count's lower ids for repeats), take the common counter. Older nodes ignore the flag.
   - **Order:** not guaranteed, as over NowTP.
   - **Bounds:** 16 reliable messages waiting for acknowledgement (`maxOutgoing`; then the send fails, and a notification is marked missed), 32 KB of messages being reassembled (`reassemblyBytes`; the oldest is evicted), 16 peers remembered (`maxPeers`).
   - **Restarts:** a peer heard with a new nonce has restarted, and is forgotten as above, so a client that restarts leaves no subscriptions behind. A node's own broadcasts, when the stack loops them back, carry its own nonce and are ignored.

@@ -140,13 +140,24 @@ public:
     const Options& options() const { return options_; }
 
 private:
+    // The ids of a peer's messages that completed: the 64 behind the newest.
+    struct Window {
+        uint32_t newest = 0;  // highest message id completed
+        uint64_t bits = 0;    // bit i: message newest - i completed
+        bool any = false;     // `newest` is valid
+    };
     struct Peer {
         PeerAddress address;
         uint32_t nonce = 0;
         uint32_t heardMs = 0;
-        uint32_t newest = 0;  // highest message id completed
-        uint64_t window = 0;  // bit i: message newest - i completed
-        bool any = false;     // `newest` is valid
+        // Its broadcasts apart from its other messages, so that a run of
+        // broadcasts doesn't push a message to us out of the window.
+        Window unicast, broadcast;
+        // Ours to it, numbered on their own once it keeps those windows
+        // apart (`split`: its acknowledgements and advertisements say so);
+        // 0 until the first.
+        uint32_t nextId = 0;
+        bool split = false;
         bool advertised = false;
     };
     struct Outgoing {
@@ -186,8 +197,10 @@ private:
     void sendAdvert(const PeerAddress& to, uint8_t flags);
     bool sendDatagram(const PeerAddress& to, const uint8_t* data, size_t len);
     Peer* peerFor(const PeerAddress& from, uint32_t nonce, uint32_t now, bool& restarted);
-    static bool seen(const Peer& p, uint32_t id);
-    static void markSeen(Peer& p, uint32_t id);
+    static bool seen(const Window& w, uint32_t id);
+    static void markSeen(Window& w, uint32_t id);
+    // The id of our next message to `to`.
+    uint32_t takeId(const PeerAddress& to, bool broadcast);
     void handleData(const PeerAddress& from, Peer& peer, const uint8_t* data, size_t len, uint32_t now,
                     std::vector<Inbound>& out);
     void handleAck(const PeerAddress& from, const uint8_t* data, size_t len, uint32_t now);
@@ -211,7 +224,7 @@ private:
     mutable Mutex mutex_{kRankLeaf, "udp link"};  // everything below; never held while calling the endpoint
     std::atomic<bool> running_{false};
     uint32_t nonce_ = 0;
-    uint32_t nextId_ = 0;
+    uint32_t nextId_ = 0;  // broadcasts', and messages' to peers that don't split; above every id used
     std::vector<Peer> peers_;
     std::vector<Outgoing> outgoing_;
     std::vector<Partial> partials_;
