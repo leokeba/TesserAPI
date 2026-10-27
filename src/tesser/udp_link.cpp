@@ -167,6 +167,7 @@ UdpLink::UdpLink(Api* api, PacketFn send, DatagramEndpoint::ClockFn clock, Optio
           std::move(clock), withLink(endpointOptions, options)),
       api_(api) {
     if (options_.fragmentSize < 64) options_.fragmentSize = 64;
+    if (!options_.maxPeers) options_.maxPeers = endpointOptions.maxMounted + 8;
     size_t most = size_t(options_.fragmentSize) * kMaxFragments;
     if (options_.maxMessage > most) options_.maxMessage = most;
     scratch_.resize(kHeader + options_.fragmentSize);
@@ -405,7 +406,20 @@ void UdpLink::sendAdvert(const PeerAddress& to, uint8_t flags) {
     if (to.length == 0 && !(flags & kBye)) advertisedMs_ = now();
 }
 
-UdpLink::Peer* UdpLink::peerFor(const PeerAddress& from, uint32_t nonce, uint32_t t, bool& restarted) {
+bool UdpLink::needed(const Peer& p, uint32_t t) const {
+    // Its window, while one of its messages may still be sent again.
+    if ((p.unicast.any || p.broadcast.any) && t - p.heardMs < options_.sendTimeoutMs) return true;
+    for (const Outgoing& o : outgoing_) {
+        if (o.to == p.address) return true;
+    }
+    for (const Partial& q : partials_) {
+        if (q.from == p.address) return true;
+    }
+    return false;
+}
+
+UdpLink::Peer* UdpLink::peerFor(const PeerAddress& from, uint32_t nonce, uint32_t t, bool& restarted,
+                                PeerAddress& forgotten) {
     for (Peer& p : peers_) {
         if (p.address != from) continue;
         if (p.nonce != nonce) {
@@ -420,11 +434,25 @@ UdpLink::Peer* UdpLink::peerFor(const PeerAddress& from, uint32_t nonce, uint32_
         return &p;
     }
     if (peers_.size() >= options_.maxPeers && !peers_.empty()) {
-        size_t oldest = 0;
-        for (size_t i = 1; i < peers_.size(); i++) {
-            if (static_cast<int32_t>(peers_[i].heardMs - peers_[oldest].heardMs) < 0) oldest = i;
+        // Room: never a peer whose window a retransmission may need (it would
+        // run again) or with messages in flight. Of the others, one that
+        // doesn't advertise first, one without a window next (a bare query),
+        // then the one heard from longest ago. An advertised peer forgotten
+        // is reported silent: without its nonce, its restart would go
+        // unseen.
+        size_t pick = peers_.size();
+        auto rank = [](const Peer& p) { return (p.advertised ? 2 : 0) + (p.unicast.any || p.broadcast.any ? 1 : 0); };
+        for (size_t i = 0; i < peers_.size(); i++) {
+            if (needed(peers_[i], t)) continue;
+            if (pick == peers_.size() || rank(peers_[i]) < rank(peers_[pick]) ||
+                (rank(peers_[i]) == rank(peers_[pick]) &&
+                 static_cast<int32_t>(peers_[i].heardMs - peers_[pick].heardMs) < 0)) {
+                pick = i;
+            }
         }
-        peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(oldest));
+        if (pick == peers_.size()) return nullptr;
+        if (peers_[pick].advertised) forgotten = peers_[pick].address;
+        peers_.erase(peers_.begin() + static_cast<std::ptrdiff_t>(pick));
     }
     Peer p;
     p.address = from;
@@ -602,6 +630,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
     }
     std::vector<Inbound> inbound;
     bool restarted = false, announced = false, bye = false;
+    PeerAddress forgotten;
     std::string name;
     uint32_t hash = 0;
     PeerAddress device;
@@ -612,7 +641,12 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
         if (!running_ || h.nonce == nonce_) return;  // our own broadcast, looped back
         stats_.received++;
         uint32_t t = now();
-        Peer* peer = peerFor(from, h.nonce, t, restarted);
+        Peer* peer = peerFor(from, h.nonce, t, restarted, forgotten);
+        if (!peer) {
+            // The table holds only peers it must keep: the sender tries again.
+            stats_.dropped++;
+            return;
+        }
         if (restarted) {
             // What we were sending to its previous run is moot.
             dropPartials(from);
@@ -663,6 +697,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
             stats_.dropped++;
         }
     }
+    if (forgotten.length) endpoint_.forgetPeer(forgotten, PeerLoss::Silent);
     // A peer that restarted lost its calls and subscriptions: forget them.
     if (restarted) endpoint_.forgetPeer(from, PeerLoss::Restarted);
     for (Inbound& in : inbound) endpoint_.receive(in.from, std::move(in.data), in.reliable, in.broadcast);

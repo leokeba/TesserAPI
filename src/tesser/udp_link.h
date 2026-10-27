@@ -55,7 +55,11 @@ public:
         // the oldest are dropped (the sender sends them again).
         size_t reassemblyBytes = 24576;
         size_t reassemblyBytesPerPeer = 16384;
-        size_t maxPeers = 16;             // peers remembered (duplicate suppression, discovery)
+        // Peers remembered (duplicate suppression, discovery); 0: the
+        // endpoint's maxMounted + 8. One that sent a message lately, or has
+        // messages in flight, is kept; with none to forget, a new peer's
+        // datagrams are dropped until one can go.
+        size_t maxPeers = 0;
         uint32_t advertiseMs = 5000;      // advertisement period, once advertise() is called
         uint32_t peerTimeoutMs = 15000;   // an advertised peer silent for this long is lost
         // Broadcasts (messages, queries, goodbyes) go this many times: Wi-Fi
@@ -69,7 +73,7 @@ public:
         uint32_t retransmits = 0;  // datagrams sent again
         uint32_t failed = 0;       // reliable messages never acknowledged
         uint32_t duplicates = 0;   // messages received again (acknowledged, not delivered)
-        uint32_t dropped = 0;      // malformed datagrams, refused or evicted messages
+        uint32_t dropped = 0;      // malformed datagrams, refused or evicted messages, new peers without room
     };
 
     // The endpoint options the link uses by default: a deeper queue (a
@@ -196,7 +200,12 @@ private:
     void sendAck(const PeerAddress& to, uint32_t id, uint8_t status, uint64_t got);
     void sendAdvert(const PeerAddress& to, uint8_t flags);
     bool sendDatagram(const PeerAddress& to, const uint8_t* data, size_t len);
-    Peer* peerFor(const PeerAddress& from, uint32_t nonce, uint32_t now, bool& restarted);
+    // Null when the table is full of peers it must keep. `forgotten` is set
+    // to an advertised peer it made room by forgetting.
+    Peer* peerFor(const PeerAddress& from, uint32_t nonce, uint32_t now, bool& restarted, PeerAddress& forgotten);
+    // Whether forgetting `p` could make a retransmission run twice, or
+    // drop what is in flight.
+    bool needed(const Peer& p, uint32_t now) const;
     static bool seen(const Window& w, uint32_t id);
     static void markSeen(Window& w, uint32_t id);
     // The id of our next message to `to`.

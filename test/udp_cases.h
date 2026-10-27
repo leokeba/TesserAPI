@@ -5,6 +5,7 @@
 
 #include <deque>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -716,6 +717,91 @@ TEST(udp_ids_for_an_older_peer) {
     CHECK_EQ(r2.status, Status::Ok);
     CHECK(ids.size() >= 2);
     if (ids.size() >= 2) CHECK(ids.back() > ids.front() + 70);
+}
+
+TEST(udp_peer_table_keeps_windows) {
+    // More peers than maxPeers talk to the server while the client's
+    // acknowledgement is lost: the client's entry, whose window the
+    // retransmission needs, stays, and the set runs once. A newcomer that
+    // finds no room is dropped, as if lost.
+    cases::Device dev;
+    Net net;
+    UdpLink::Options o;
+    o.maxPeers = 4;
+    UdpLink client(nullptr, net.sender(ip(1)), net.clockFn(), o);
+    UdpLink server(&dev.api, net.sender(ip(2)), net.clockFn(), o);
+    std::vector<std::unique_ptr<UdpLink>> others;
+    net.nodes = {{ip(1), &client}, {ip(2), &server}};
+    for (uint8_t i = 0; i < 5; i++) {
+        others.emplace_back(new UdpLink(nullptr, net.sender(ip(uint8_t(10 + i))), net.clockFn(), o));
+        net.nodes.push_back({ip(uint8_t(10 + i)), others.back().get()});
+    }
+    net.start();
+    net.advance(4000);  // the start's queries are old news
+    bool dropAcks = true;
+    net.lose = [&](const Net::Datagram& d) { return dropAcks && d.from == ip(2) && d.to == ip(1); };
+    Result r;
+    uint32_t before = server.endpoint().stats().requests;
+    CHECK(client.endpoint().request(ip(2), tesser::Op::Set, "/lamp/brightness", "77", capture(r)));
+    net.run();
+    CHECK_EQ(server.endpoint().stats().requests, before + 1);
+    std::vector<Result> theirs(others.size());
+    for (size_t i = 0; i < others.size(); i++) {
+        others[i]->endpoint().request(ip(2), tesser::Op::Get, "/lamp/on", "", capture(theirs[i]));
+    }
+    net.run();
+    dropAcks = false;
+    net.advance(200);  // the client's retransmission
+    CHECK_EQ(r.calls, 1);
+    CHECK_EQ(r.status, Status::Ok);
+    CHECK_EQ(server.stats().duplicates, 1u);
+    // Three newcomers found room; two found the table full for as long as
+    // they tried, and failed. Later, there is room again.
+    net.advance(4000);
+    size_t ok = 0;
+    for (const Result& t : theirs) ok += t.status == Status::Ok;
+    CHECK_EQ(ok, 3u);
+    CHECK_EQ(server.endpoint().stats().requests, before + 4);
+    Result again;
+    others.back()->endpoint().request(ip(2), tesser::Op::Get, "/lamp/on", "", capture(again));
+    net.advance(200);
+    CHECK_EQ(again.status, Status::Ok);
+}
+
+TEST(udp_forgotten_advertised_peer_reported) {
+    // An advertised peer the table forgets to make room is reported silent:
+    // its restart would otherwise go unseen.
+    tesser::Api gateway;
+    Net net;
+    UdpLink::Options o;
+    o.maxPeers = 2;
+    UdpLink gw(&gateway, net.sender(ip(1)), net.clockFn(), o);
+    std::vector<std::unique_ptr<cases::Device>> devs;
+    std::vector<std::unique_ptr<UdpLink>> links;
+    net.nodes = {{ip(1), &gw}};
+    for (uint8_t i = 0; i < 3; i++) {
+        devs.emplace_back(new cases::Device);
+        links.emplace_back(new UdpLink(&devs.back()->api, net.sender(ip(uint8_t(20 + i))), net.clockFn()));
+        links.back()->setName(std::string("d") + char('0' + i));
+        net.nodes.push_back({ip(uint8_t(20 + i)), links.back().get()});
+    }
+    std::vector<std::pair<PeerAddress, tesser::PeerLoss>> lost;
+    gw.endpoint().onPeerLost([&](const PeerAddress& peer, const PeerAddress&, tesser::PeerLoss why) {
+        lost.emplace_back(peer, why);
+    });
+    gw.start(0x100);
+    links[0]->start(0x200);
+    links[1]->start(0x201);
+    links[0]->advertise();
+    links[1]->advertise();
+    net.run();
+    net.advance(4000);
+    CHECK(lost.empty());
+    links[2]->start(0x202);
+    links[2]->advertise();
+    net.run();
+    CHECK_EQ(lost.size(), 1u);
+    if (!lost.empty()) CHECK(lost[0].second == tesser::PeerLoss::Silent);
 }
 
 }  // namespace udp_cases
