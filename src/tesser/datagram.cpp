@@ -252,6 +252,7 @@ bool DatagramEndpoint::process() {
     dropFiles(nullptr, now);
     dropDeferred(now);
     checkAdvertisement(now);
+    if (idleCheck_.exchange(false)) dropIdleSubscribers(nullptr);
     return worked || pendingCalls() != before;
 }
 
@@ -553,17 +554,31 @@ void DatagramEndpoint::handle(Incoming& msg) {
         req.subscriber = subscriberFor(msg.from, req.op == Op::Subscribe);
     }
     api_->handle(req, reply);
-    // A peer holds a subscriber only while it has a subscription: one
-    // refused, or the last one ended, leaves nothing behind.
-    if (req.subscriber) {
-        MutexGuard guard(subscribersMutex_);
-        for (size_t i = 0; i < subscribers_.size(); i++) {
-            if (subscribers_[i] != req.subscriber) continue;
-            if (api_->subscriptionsOf(subscribers_[i])) break;
-            delete subscribers_[i];
-            subscribers_.erase(subscribers_.begin() + static_cast<std::ptrdiff_t>(i));
-            break;
+    if (req.subscriber) dropIdleSubscribers(req.subscriber);
+}
+
+// A peer holds a subscriber only while it has a subscription: one refused,
+// or the last one ended, leaves nothing behind. In queued mode the request
+// may still wait for poll() with the subscriber: it stays, and a later
+// process() looks again. Queued requests are counted first: one that
+// poll() took out runs under the API lock, which counting subscriptions
+// waits for.
+void DatagramEndpoint::dropIdleSubscribers(const Subscriber* only) {
+    MutexGuard guard(subscribersMutex_);
+    for (size_t i = 0; i < subscribers_.size();) {
+        PeerSubscriber* s = subscribers_[i];
+        if (only && s != only) {
+            i++;
+            continue;
         }
+        if (api_->queuedRequests(s)) {
+            idleCheck_ = true;
+        } else if (!api_->subscriptionsOf(s)) {
+            delete s;
+            subscribers_.erase(subscribers_.begin() + static_cast<std::ptrdiff_t>(i));
+            continue;
+        }
+        i++;
     }
 }
 

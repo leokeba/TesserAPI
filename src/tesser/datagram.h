@@ -571,6 +571,10 @@ private:
     std::vector<std::pair<Object*, uint32_t>> mounts_;  // mountPeers(): parent, mirror interval
     mutable Mutex subscribersMutex_{kRankSubscribers, "endpoint subscribers"};  // taken before the API lock, never after
     std::vector<PeerSubscriber*> subscribers_;
+    std::atomic<bool> idleCheck_{false};  // a subscriber kept for a queued request
+    // Deletes subscribers (`only`, or all) without subscriptions or queued
+    // requests.
+    void dropIdleSubscribers(const Subscriber* only);
     std::vector<RemoteNode*> remotes_;  // guarded by mutex_
     // Remote nodes called without mutex_ (they call back into the endpoint,
     // the API and the application): pinned under it while the call lasts. A

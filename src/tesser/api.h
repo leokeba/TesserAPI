@@ -296,8 +296,10 @@ public:
     void yieldEnd() { yielded_--; }
     void retire(Node* node);
 
-    // Requests waiting for poll() in queued mode.
+    // Requests waiting for poll() in queued mode; of them, those from
+    // `subscriber`'s client.
     size_t queuedRequests() const;
+    size_t queuedRequests(const Subscriber* subscriber) const;
 
     // FNV-1a hash of the full schema (view=hash at the root, full access):
     // changes whenever the tree's shape, types or constraints do, but not

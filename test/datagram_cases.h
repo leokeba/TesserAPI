@@ -239,4 +239,45 @@ TEST(datagram_envelope_builder) {
              "{\"id\":8,\"op\":\"set\",\"path\":\"/\",\"body\":{\"a\":1}}");
 }
 
+TEST(datagram_queued_subscribe_keeps_subscriber) {
+    // In queued mode a peer's first sub waits for poll() with the peer's
+    // subscriber: it isn't deleted for having no subscription yet. A queued
+    // sub that is refused leaves nothing behind once process() looks again.
+    cases::Device dev;
+    dev.api.config().queued = true;
+    Net net;
+    DatagramEndpoint server(&dev.api, tesser::TransportKind::NowTP, net.sender(addr(2)), net.clockFn());
+    DatagramEndpoint client(nullptr, tesser::TransportKind::NowTP, net.sender(addr(1)), net.clockFn());
+    net.nodes = {{addr(1), &client}, {addr(2), &server}};
+    Result r;
+    CHECK(client.request(addr(2), tesser::Op::Subscribe, "/lamp", std::string_view(), capture(r)));
+    net.run();
+    CHECK_EQ(dev.api.queuedRequests(), 1u);
+    CHECK_EQ(server.peerSubscribers(), 1u);
+    dev.api.poll();
+    net.run();
+    CHECK(r.called);
+    CHECK_EQ(r.status, Status::Ok);
+    CHECK_EQ(dev.api.subscriptionCount(), 1u);
+    {
+        tesser::Lock lock(dev.api);
+        dev.lamp.brightness = 9;
+    }
+    dev.api.changed("/lamp/brightness");
+    dev.api.poll();
+    net.run();
+    CHECK_EQ(server.peerSubscribers(), 1u);
+
+    Result refused;
+    DatagramEndpoint other(nullptr, tesser::TransportKind::NowTP, net.sender(addr(3)), net.clockFn());
+    net.nodes.push_back({addr(3), &other});
+    CHECK(other.request(addr(2), tesser::Op::Subscribe, "/nothing", std::string_view(), capture(refused)));
+    net.run();
+    CHECK_EQ(server.peerSubscribers(), 2u);
+    dev.api.poll();
+    net.run();
+    CHECK_EQ(refused.status, Status::NotFound);
+    CHECK_EQ(server.peerSubscribers(), 1u);
+}
+
 }  // namespace datagram_cases

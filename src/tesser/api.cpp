@@ -1717,4 +1717,11 @@ size_t Api::queuedRequests() const {
     return queue_.size();
 }
 
+size_t Api::queuedRequests(const Subscriber* subscriber) const {
+    MutexGuard guard(queueMutex_);
+    size_t n = 0;
+    for (const QueuedRequest* q : queue_) n += q->request.subscriber == subscriber;
+    return n;
+}
+
 }  // namespace tesser
