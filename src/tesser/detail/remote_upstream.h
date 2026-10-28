@@ -50,6 +50,33 @@ UpstreamSpec unionOf(const std::vector<UpstreamSpec>& specs);
 // `have` holds everything `need` asks for.
 bool covers(const UpstreamSpec& have, const UpstreamSpec& need);
 
+class UpstreamCache;
+
+// What the node's parts may use of it (UpstreamCache): a narrow view rather
+// than friendship with the whole node. Cheap to copy: it holds the node.
+class RemoteContext {
+public:
+    RemoteContext(RemoteNode& node) : node_(&node) {}  // implicit: parts are handed the node
+    RemoteNode& node() const { return *node_; }
+    Api* api() const;
+    // Under the API lock: its path in its Api ("" until known).
+    const std::string& localPath() const;
+    // Finds it if not known yet: false while the node isn't in a tree.
+    bool findLocalPath(std::string& out) const;
+    // A subscription reached it in `api`, at `localPath`: both are known now.
+    void adopt(Api& api, std::string_view localPath) const;
+    const std::string& remotePath() const;
+    std::string remotePathOf(std::string_view rest) const;
+    bool route(RemoteRoute& out) const;
+    bool online() const;
+    uint32_t timeoutMs() const;
+    void changed() const;
+    UpstreamCache& upstream() const;
+
+private:
+    RemoteNode* node_;
+};
+
 class UpstreamCache {
 public:
     // ---- the mirror (RemoteNode::mirror()) -----------------------------------
@@ -63,25 +90,25 @@ public:
     // ---- shared subscriptions ---------------------------------------------------
     // `rest` is the path below the node in each: see RemoteNode's methods of
     // the same names.
-    void subscribe(RemoteNode& node, Api& api, const Request& req, std::string_view rest, std::string_view base,
+    void subscribe(RemoteContext node, Api& api, const Request& req, std::string_view rest, std::string_view base,
                    Reply& reply);
-    void narrowed(RemoteNode& node, const std::string& rest, std::string_view localPath, Access level);
-    void released(RemoteNode& node, const std::string& rest, Access level);
+    void narrowed(RemoteContext node, const std::string& rest, std::string_view localPath, Access level);
+    void released(RemoteContext node, const std::string& rest, Access level);
     // What the subscription below `rest` at `level` asked the remote for.
     bool sent(std::string_view rest, Access level, UpstreamSpec& out) const;
     size_t count() const;
 
     // ---- from the node's tick and its peer's notifications ----------------------
     // Renews the upstream subscriptions due.
-    void renew(RemoteNode& node, uint32_t nowMs);
+    void renew(RemoteContext node, uint32_t nowMs);
     // Subscribes the mirror when due, by `current`, the route in use.
-    void refreshMirror(RemoteNode& node, const RemoteRoute& current, uint32_t nowMs);
+    void refreshMirror(RemoteContext node, const RemoteRoute& current, uint32_t nowMs);
     // The route in use changed (`from` was it): subscriptions move to the new
     // one.
-    void rerouted(RemoteNode& node, const RemoteRoute& from, uint32_t nowMs);
+    void rerouted(RemoteContext node, const RemoteRoute& from, uint32_t nowMs);
     // A "change" or "event" (`op`) from the peer for `rest` below the node,
     // from a subscription at `level`: false if it isn't for the node.
-    bool notified(RemoteNode& node, std::string_view rest, Access level, std::string_view op,
+    bool notified(RemoteContext node, std::string_view rest, Access level, std::string_view op,
                   JsonObjectConst envelope);
 
 private:
@@ -103,10 +130,10 @@ private:
     // Under mutex_.
     Upstream* find(std::string_view rest, Access level);
     // The union of the needs of `local`'s subscribers at `level`, plus `extra`'s.
-    UpstreamSpec wanted(RemoteNode& node, const std::string& local, Access level, const Subscription* extra);
-    bool send(RemoteNode& node, const std::string& rest, Access level, uint32_t interval, bool renew);
-    void answered(RemoteNode& node, const std::string& rest, Access level, Status status, JsonVariantConst body);
-    bool relayChange(RemoteNode& node, std::string_view rest, Access level, JsonVariantConst patch);
+    UpstreamSpec wanted(RemoteContext node, const std::string& local, Access level, const Subscription* extra);
+    bool send(RemoteContext node, const std::string& rest, Access level, uint32_t interval, bool renew);
+    void answered(RemoteContext node, const std::string& rest, Access level, Status status, JsonVariantConst body);
+    bool relayChange(RemoteContext node, std::string_view rest, Access level, JsonVariantConst patch);
 
     bool mirror_ = false;
     Access mirrorLevel_ = Access::Public;

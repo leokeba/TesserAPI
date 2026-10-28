@@ -13,6 +13,21 @@
 namespace tesser {
 namespace detail {
 
+Api* RemoteContext::api() const { return node_->api_.load(); }
+const std::string& RemoteContext::localPath() const { return node_->localPath_; }
+bool RemoteContext::findLocalPath(std::string& out) const { return node_->localPath(out); }
+void RemoteContext::adopt(Api& api, std::string_view localPath) const {
+    node_->api_ = &api;
+    if (node_->localPath_.empty()) node_->localPath_.assign(localPath.data(), localPath.size());
+}
+const std::string& RemoteContext::remotePath() const { return node_->remotePath_; }
+std::string RemoteContext::remotePathOf(std::string_view rest) const { return node_->remotePathOf(rest); }
+bool RemoteContext::route(RemoteRoute& out) const { return node_->route(out); }
+bool RemoteContext::online() const { return node_->online(); }
+uint32_t RemoteContext::timeoutMs() const { return node_->timeoutMs(); }
+void RemoteContext::changed() const { node_->changed(); }
+UpstreamCache& RemoteContext::upstream() const { return node_->upstream(); }
+
 namespace {
 
 // A copy rendered like the value view: objects below `depth` levels as {}.
@@ -254,7 +269,7 @@ UpstreamCache::Upstream* UpstreamCache::find(std::string_view rest, Access level
     return nullptr;
 }
 
-void UpstreamCache::renew(RemoteNode& node, uint32_t nowMs) {
+void UpstreamCache::renew(RemoteContext node, uint32_t nowMs) {
     // Forwarded subscriptions: renewed every refreshMs in case the remote
     // node restarted, every 2 s after a failed renewal.
     struct Renewal {
@@ -282,7 +297,7 @@ void UpstreamCache::renew(RemoteNode& node, uint32_t nowMs) {
     }
 }
 
-void UpstreamCache::refreshMirror(RemoteNode& node, const RemoteRoute& cur, uint32_t nowMs) {
+void UpstreamCache::refreshMirror(RemoteContext node, const RemoteRoute& cur, uint32_t nowMs) {
     if (!mirror_ || subscribing_) return;
     if (subscribedOnce_) {
         // Renew: after refreshMs with a copy, every 2 s while there is none.
@@ -296,8 +311,8 @@ void UpstreamCache::refreshMirror(RemoteNode& node, const RemoteRoute& cur, uint
     Query unsub;
     unsub.ceiling = mirrorLevel_;
     cur.endpoint->request(
-        cur.peer, Op::Unsubscribe, node.remotePath_, std::string_view(), [](Status, JsonVariantConst) {}, unsub,
-        node.timeoutMs(), &node);
+        cur.peer, Op::Unsubscribe, node.remotePath(), std::string_view(), [](Status, JsonVariantConst) {}, unsub,
+        node.timeoutMs(), &node.node());
     Query q;
     q.interval = mirrorIntervalMs_;
     q.remotes = false;  // never mirror the peer's own mirrors: no loops between gateways
@@ -308,8 +323,8 @@ void UpstreamCache::refreshMirror(RemoteNode& node, const RemoteRoute& cur, uint
     // once, and a peer coming back after a restart took a gateway's free
     // heap 2 KB below its floor (DEVKIT-V3 mirroring DEVKIT-R1).
     bool sent = cur.endpoint->requestRaw(
-        cur.peer, Op::Subscribe, node.remotePath_, JsonVariantConst(),
-        [&node](std::string_view text) {
+        cur.peer, Op::Subscribe, node.remotePath(), JsonVariantConst(),
+        [node](std::string_view text) {
             UpstreamCache& c = node.upstream();
             c.subscribing_ = false;
             // A document takes up to about three times its text in small
@@ -325,11 +340,11 @@ void UpstreamCache::refreshMirror(RemoteNode& node, const RemoteRoute& cur, uint
             node.changed();
         },
         [this](Status, JsonVariantConst) { subscribing_ = false; },  // retried in 2 s
-        q, node.timeoutMs(), &node);
+        q, node.timeoutMs(), &node.node());
     if (!sent) subscribing_ = false;
 }
 
-void UpstreamCache::rerouted(RemoteNode& node, const RemoteRoute& from, uint32_t nowMs) {
+void UpstreamCache::rerouted(RemoteContext node, const RemoteRoute& from, uint32_t nowMs) {
     std::vector<std::pair<std::string, Access>> paths;
     {
         MutexGuard guard(mutex_);
@@ -341,23 +356,23 @@ void UpstreamCache::rerouted(RemoteNode& node, const RemoteRoute& from, uint32_t
         }
     }
     if (mirror_) {
-        paths.emplace_back(node.remotePath_, mirrorLevel_);
+        paths.emplace_back(node.remotePath(), mirrorLevel_);
         subscribedOnce_ = false;  // refreshMirror() subscribes again at once
     }
     // Back to a preferred route while the other one still works: drop what
     // the device sends that way. (A lost route's subscriptions end on their
     // own: the device fails to deliver to it.)
-    if (!from.endpoint || !from.online || !node.hasRoute(from.endpoint, from.peer)) return;
+    if (!from.endpoint || !from.online || !node.node().hasRoute(from.endpoint, from.peer)) return;
     for (const auto& p : paths) {
         Query q;
         q.ceiling = p.second;
         from.endpoint->request(
             from.peer, Op::Unsubscribe, p.first, std::string_view(), [](Status, JsonVariantConst) {}, q,
-            node.timeoutMs(), &node);
+            node.timeoutMs(), &node.node());
     }
 }
 
-bool UpstreamCache::notified(RemoteNode& node, std::string_view rest, Access level, std::string_view op,
+bool UpstreamCache::notified(RemoteContext node, std::string_view rest, Access level, std::string_view op,
                              JsonObjectConst envelope) {
     bool forMirror = mirror_ && level == mirrorLevel_;
     if (op == "change") {
@@ -384,14 +399,14 @@ bool UpstreamCache::notified(RemoteNode& node, std::string_view rest, Access lev
     if (op == "event") {
         if (!forMirror && count() == 0) return false;
         std::string local;
-        if (!node.localPath(local)) return true;
+        if (!node.findLocalPath(local)) return true;
         local.append(rest.data(), rest.size());
         JsonVariantConst body = envelope["body"];
         // It came at `level`, once for every subscription of this node's at
         // that level it concerns: for the local subscribers at that level
         // below this node, and, from the mirror, for those of the copy.
-        const Node* self = &node;
-        node.api_.load()->emitEvent(
+        const Node* self = &node.node();
+        node.api()->emitEvent(
             local, [body](JsonWriter& w) { w.variant(body); },
             [self, level, forMirror](const Subscription& sub) {
                 if (sub.forwarded) return sub.node == self && sub.access == level;
@@ -404,7 +419,7 @@ bool UpstreamCache::notified(RemoteNode& node, std::string_view rest, Access lev
 
 // ---- shared subscriptions ----------------------------------------------------------
 
-void UpstreamCache::subscribe(RemoteNode& node, Api& api, const Request& req, std::string_view rest,
+void UpstreamCache::subscribe(RemoteContext node, Api& api, const Request& req, std::string_view rest,
                               std::string_view base, Reply& reply) {
     std::string_view basePath = base.empty() ? std::string_view("/") : base;
     if (!req.subscriber) return writeError(reply, Status::NotAllowed, Reason::CannotWait, basePath, "this transport can't deliver notifications");
@@ -417,12 +432,11 @@ void UpstreamCache::subscribe(RemoteNode& node, Api& api, const Request& req, st
     Status allowed = api.subscriptionAllowed(req.subscriber);
     if (allowed != Status::Ok) return writeError(reply, allowed, Reason::SubscriptionLimit, basePath, "too many subscriptions");
 
-    node.api_ = &api;
-    if (node.localPath_.empty()) node.localPath_.assign(base.data(), base.size() - rest.size());
+    node.adopt(api, base.substr(0, base.size() - rest.size()));
 
     Subscription sub;
     sub.subscriber = req.subscriber;
-    sub.node = &node;
+    sub.node = &node.node();
     sub.path.assign(base.data(), base.size());
     sub.keys.assign(req.query.keys.data(), req.query.keys.size());
     sub.exclude.assign(req.query.exclude.data(), req.query.exclude.size());
@@ -502,12 +516,12 @@ void UpstreamCache::subscribe(RemoteNode& node, Api& api, const Request& req, st
     if (start && !send(node, r, level, interval, renew)) answered(node, r, level, Status::Busy, JsonVariantConst());
 }
 
-UpstreamSpec UpstreamCache::wanted(RemoteNode& node, const std::string& local, Access level,
+UpstreamSpec UpstreamCache::wanted(RemoteContext node, const std::string& local, Access level,
                                    const Subscription* extra) {
     std::vector<UpstreamSpec> specs;
     if (extra) specs.push_back(specOf(*extra));
-    if (Api* api = node.api_) {
-        api->forwardedSubscriptions(&node, [&](Subscription& sub) {
+    if (Api* api = node.api()) {
+        api->forwardedSubscriptions(&node.node(), [&](Subscription& sub) {
             if (sub.path == local && sub.access == level) specs.push_back(specOf(sub));
             return true;
         });
@@ -515,7 +529,7 @@ UpstreamSpec UpstreamCache::wanted(RemoteNode& node, const std::string& local, A
     return unionOf(specs);
 }
 
-void UpstreamCache::narrowed(RemoteNode& node, const std::string& rest, std::string_view localPath, Access level) {
+void UpstreamCache::narrowed(RemoteContext node, const std::string& rest, std::string_view localPath, Access level) {
     UpstreamSpec want = wanted(node, std::string(localPath), level, nullptr);
     uint32_t interval;
     {
@@ -544,7 +558,7 @@ bool UpstreamCache::sent(std::string_view rest, Access level, UpstreamSpec& out)
     return false;
 }
 
-bool UpstreamCache::send(RemoteNode& node, const std::string& rest, Access level, uint32_t interval, bool renew) {
+bool UpstreamCache::send(RemoteContext node, const std::string& rest, Access level, uint32_t interval, bool renew) {
     RemoteRoute r;
     if (!node.route(r)) return false;
     std::string path = node.remotePathOf(rest);
@@ -553,7 +567,7 @@ bool UpstreamCache::send(RemoteNode& node, const std::string& rest, Access level
         unsub.ceiling = level;
         r.endpoint->request(
             r.peer, Op::Unsubscribe, path, std::string_view(), [](Status, JsonVariantConst) {}, unsub,
-            node.timeoutMs(), &node);
+            node.timeoutMs(), &node.node());
     }
     UpstreamSpec spec;
     {
@@ -573,13 +587,13 @@ bool UpstreamCache::send(RemoteNode& node, const std::string& rest, Access level
     q.ceiling = level;  // the remote filters as for these subscribers
     return r.endpoint->request(
         r.peer, Op::Subscribe, path, std::string_view(),
-        [&node, rest, level](Status s, JsonVariantConst body) { node.upstream().answered(node, rest, level, s, body); },
-        q, node.timeoutMs(), &node);
+        [node, rest, level](Status s, JsonVariantConst body) { node.upstream().answered(node, rest, level, s, body); },
+        q, node.timeoutMs(), &node.node());
 }
 
-void UpstreamCache::answered(RemoteNode& node, const std::string& rest, Access level, Status s,
+void UpstreamCache::answered(RemoteContext node, const std::string& rest, Access level, Status s,
                              JsonVariantConst body) {
-    Api* api = node.api_;
+    Api* api = node.api();
     if (!api) return;
     bool again = false;
     uint32_t interval = 0;
@@ -596,7 +610,7 @@ void UpstreamCache::answered(RemoteNode& node, const std::string& rest, Access l
                 unsub.ceiling = level;
                 r.endpoint->request(
                     r.peer, Op::Unsubscribe, node.remotePathOf(rest), std::string_view(),
-                    [](Status, JsonVariantConst) {}, unsub, node.timeoutMs(), &node);
+                    [](Status, JsonVariantConst) {}, unsub, node.timeoutMs(), &node.node());
             }
             return;
         }
@@ -629,12 +643,12 @@ void UpstreamCache::answered(RemoteNode& node, const std::string& rest, Access l
             u->stale = true;  // keep the copy and the subscribers; retry soon
         }
 
-        std::string localPath = node.localPath_ + rest;
-        std::string remoteBase = node.remotePath_ == "/" ? std::string() : node.remotePath_;
-        std::string localBase = node.localPath_;
+        std::string localPath = node.localPath() + rest;
+        std::string remoteBase = node.remotePath() == "/" ? std::string() : node.remotePath();
+        std::string localBase = node.localPath();
         bool anyLeft = false, stillWaiting = false;
         JsonVariantConst copy = u->copy.as<JsonVariantConst>();
-        api->forwardedSubscriptions(&node, [&](Subscription& sub) {
+        api->forwardedSubscriptions(&node.node(), [&](Subscription& sub) {
             if (sub.path != localPath || sub.access != level) return true;
             if (sub.waiting) {
                 if (s == Status::Ok && !covers(u->copySpec, specOf(sub))) {
@@ -691,8 +705,8 @@ void UpstreamCache::answered(RemoteNode& node, const std::string& rest, Access l
     }
 }
 
-bool UpstreamCache::relayChange(RemoteNode& node, std::string_view rest, Access level, JsonVariantConst patch) {
-    Api* api = node.api_;
+bool UpstreamCache::relayChange(RemoteContext node, std::string_view rest, Access level, JsonVariantConst patch) {
+    Api* api = node.api();
     if (!api) return false;
     MutexGuard apiGuard(api->mutex());
     MutexGuard guard(mutex_);
@@ -707,8 +721,8 @@ bool UpstreamCache::relayChange(RemoteNode& node, std::string_view rest, Access 
         return true;
     }
     mergeJson(u->copy.as<JsonVariant>(), patch);
-    std::string localPath = node.localPath_ + std::string(rest);
-    api->forwardedSubscriptions(&node, [&](Subscription& sub) {
+    std::string localPath = node.localPath() + std::string(rest);
+    api->forwardedSubscriptions(&node.node(), [&](Subscription& sub) {
         if (sub.path != localPath || sub.access != level || sub.waiting || !sub.changes) return true;
         if (!patch.is<JsonObjectConst>()) {
             notifyChange(sub, [&](JsonWriter& w) { w.variant(patch); });
@@ -720,7 +734,7 @@ bool UpstreamCache::relayChange(RemoteNode& node, std::string_view rest, Access 
     return true;
 }
 
-void UpstreamCache::released(RemoteNode& node, const std::string& rest, Access level) {
+void UpstreamCache::released(RemoteContext node, const std::string& rest, Access level) {
     bool found = false;
     {
         MutexGuard guard(mutex_);
@@ -737,7 +751,7 @@ void UpstreamCache::released(RemoteNode& node, const std::string& rest, Access l
         unsub.ceiling = level;
         r.endpoint->request(
             r.peer, Op::Unsubscribe, node.remotePathOf(rest), std::string_view(), [](Status, JsonVariantConst) {},
-            unsub, node.timeoutMs(), &node);
+            unsub, node.timeoutMs(), &node.node());
     }
 }
 
