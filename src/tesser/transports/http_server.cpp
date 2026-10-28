@@ -1162,8 +1162,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req, bool inWorker) {
     const std::string& json = body.empty() ? shapeText : body;
     JsonDocument doc;
     if (!json.empty()) {
-        DeserializationError err = deserializeJson(doc, json.data(), json.size(),
-                                                   DeserializationOption::NestingLimit(requestNesting(cfg.maxDepth)));
+        DeserializationError err = parseJson(doc, json, requestNesting(cfg.maxDepth));
         if (err == DeserializationError::NoMemory) {
             writeError(reply, Status::Busy, Reason::LowMemory, path, "not enough memory for the request body");
             return ESP_OK;

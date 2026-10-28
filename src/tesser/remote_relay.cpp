@@ -232,7 +232,7 @@ public:
             for (const char* k : {"size", "filename", "contentType", "chunk", "offset", "end"}) filter[k] = true;
             JsonDocument body;
             std::string_view data;
-            bool bad = deserializeJson(body, text.data(), text.size(), DeserializationOption::Filter(filter)) ||
+            bool bad = parseJson(body, text, ARDUINOJSON_DEFAULT_NESTING_LIMIT, filter) ||
                        !body.is<JsonObjectConst>();
             // A JSON string, without escapes (base64).
             if (!bad && jsonMember(text, "data", data)) {

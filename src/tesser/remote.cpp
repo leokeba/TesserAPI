@@ -575,7 +575,7 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
 Status RemoteNode::stream(std::string_view path, std::string_view bodyJson) {
     if (!online()) return Status::Timeout;
     JsonDocument body;
-    if (deserializeJson(body, bodyJson.data(), bodyJson.size(), DeserializationOption::NestingLimit(kWrittenNesting))) {
+    if (parseJson(body, bodyJson, kWrittenNesting)) {
         return Status::BadRequest;
     }
     Status s = sets().push(path, std::move(body));

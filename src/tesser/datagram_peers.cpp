@@ -61,7 +61,7 @@ int hexValue(char c) {
 
 bool detail::parseAdvert(std::string_view text, Advert& out) {
     JsonDocument doc;
-    if (deserializeJson(doc, text.data(), text.size()) || !doc.is<JsonObjectConst>()) return false;
+    if (parseJson(doc, text) || !doc.is<JsonObjectConst>()) return false;
     if (doc["tesser"].is<uint8_t>()) out.port = doc["tesser"].as<uint8_t>();
     if (doc["name"].is<const char*>()) {
         out.hasName = true;

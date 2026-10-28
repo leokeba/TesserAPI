@@ -43,7 +43,7 @@ size_t ApiClient::process() {
     for (ClientInbox::Item& item : items) {
         // A whole tree or schema: in PSRAM when the chip has it.
         JsonDocument doc(jsonAllocator(item.json.size() > 1024 ? Pool::Large : Pool::Internal));
-        bool parsed = item.json.empty() || !deserializeJson(doc, item.json, DeserializationOption::NestingLimit(kWrittenNesting));
+        bool parsed = item.json.empty() || !parseJson(doc, item.json, kWrittenNesting);
         if (item.notification) {
             if (onNotification_ && parsed && doc.is<JsonObjectConst>()) onNotification_(doc.as<JsonObjectConst>());
         } else if (item.done) {
@@ -102,8 +102,7 @@ LocalClient::~LocalClient() { api_.dropSubscriber(this); }
 bool LocalClient::request(Op op, std::string_view path, std::string_view bodyJson, ResponseHandler done,
                           const Query& query) {
     JsonDocument doc;
-    if (!bodyJson.empty() && deserializeJson(doc, bodyJson.data(), bodyJson.size(),
-                                             DeserializationOption::NestingLimit(requestNesting(api_.config().maxDepth)))) {
+    if (!bodyJson.empty() && parseJson(doc, bodyJson, requestNesting(api_.config().maxDepth))) {
         return false;
     }
     Request req;

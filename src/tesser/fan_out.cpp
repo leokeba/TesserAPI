@@ -49,7 +49,7 @@ private:
 // A patch key that doesn't exist is named below the target instead.
 bool unresolved(const std::string& body, std::string_view match, std::string_view target) {
     JsonDocument doc;
-    if (deserializeJson(doc, body)) return false;
+    if (parseJson(doc, body)) return false;
     JsonVariantConst p = doc["path"];
     if (!p.is<const char*>()) return false;
     std::string_view path(p.as<const char*>());
@@ -182,7 +182,7 @@ private:
         snprintf(head, sizeof(head), "%u of %u failed: ", unsigned(failed), unsigned(total));
         std::string s = head + r.name + ": ";
         JsonDocument doc;
-        if (!deserializeJson(doc, r.body) && doc["message"].is<const char*>()) {
+        if (!parseJson(doc, r.body) && doc["message"].is<const char*>()) {
             s += doc["message"].as<const char*>();
         } else {
             s += toString(r.status);
@@ -211,7 +211,7 @@ private:
             // The first failure's reason, with its status.
             JsonDocument filter, firstBody;
             filter["reason"] = true;
-            if (!deserializeJson(firstBody, first->body, DeserializationOption::Filter(filter)) &&
+            if (!parseJson(firstBody, first->body, ARDUINOJSON_DEFAULT_NESTING_LIMIT, filter) &&
                 firstBody["reason"].is<const char*>()) {
                 w.key("reason");
                 w.string(firstBody["reason"].as<const char*>());

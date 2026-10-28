@@ -319,8 +319,7 @@ void UpstreamCache::refreshMirror(RemoteNode& node, const RemoteRoute& cur, uint
             {
                 MutexGuard guard(c.mutex_);
                 c.copy_.clear();
-                c.hasCopy_ = !deserializeJson(c.copy_, text.data(), text.size(),
-                                              DeserializationOption::NestingLimit(kWrittenNesting));
+                c.hasCopy_ = !parseJson(c.copy_, text, kWrittenNesting);
                 if (!c.hasCopy_) c.copy_.clear();
             }
             node.changed();

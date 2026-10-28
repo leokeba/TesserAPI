@@ -1673,7 +1673,7 @@ void Api::runQueued() {
         }
         // The body parsed once already, so only memory can run out here.
         JsonDocument doc;
-        bool parsed = q->body.empty() || !deserializeJson(doc, q->body, DeserializationOption::NestingLimit(kWrittenNesting));
+        bool parsed = q->body.empty() || !parseJson(doc, q->body, kWrittenNesting);
         q->request.body = doc.as<JsonVariantConst>();
         QueuedReply reply(q->reply);
         if (parsed) {

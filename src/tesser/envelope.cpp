@@ -59,11 +59,7 @@ Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth,
                      const char*& message, Reason* reason) {
     id.length = 0;
     DeserializationError err =
-        isUploadEnvelope(text)
-            ? deserializeJson(doc, text.data(), text.size(), DeserializationOption::Filter(uploadFilter()),
-                              DeserializationOption::NestingLimit(envelopeNesting(maxDepth)))
-            : deserializeJson(doc, text.data(), text.size(),
-                              DeserializationOption::NestingLimit(envelopeNesting(maxDepth)));
+        parseJson(doc, text, envelopeNesting(maxDepth), isUploadEnvelope(text) ? uploadFilter() : JsonVariantConst());
     if (err == DeserializationError::NoMemory) {
         // Not the client's fault: busy, under its id if the text has one,
         // so it sends the request again.

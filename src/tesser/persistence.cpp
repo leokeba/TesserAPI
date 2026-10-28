@@ -405,7 +405,7 @@ bool Api::load() {
         JsonDocument doc(jsonAllocator(Pool::Large));  // a whole subtree: PSRAM when the chip has it
         a.path = "/";
         a.path += c->name();
-        if (deserializeJson(doc, data, DeserializationOption::NestingLimit(kWrittenNesting))) {
+        if (parseJson(doc, data, kWrittenNesting)) {
             logWarning("stored state %s doesn't parse; keeping defaults", a.path.c_str());
             continue;
         }
@@ -446,7 +446,7 @@ void Api::finishMigration(const std::string& rewritten) {
 Status Api::restore(std::string_view json, std::vector<std::string>* skipped) {
     MutexGuard guard(mutex_);
     JsonDocument doc(jsonAllocator(Pool::Large));  // a whole backup: PSRAM when the chip has it
-    if (deserializeJson(doc, json.data(), json.size(), DeserializationOption::NestingLimit(kWrittenNesting)) ||
+    if (parseJson(doc, json, kWrittenNesting) ||
         !doc.is<JsonObjectConst>()) {
         return Status::BadRequest;
     }

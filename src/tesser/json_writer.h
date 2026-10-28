@@ -60,6 +60,15 @@ private:
     bool ok_ = true;
 };
 
+// The library's one call into ArduinoJson's parser, which deserializeJson()
+// instantiates again for each input type and set of options: every input
+// goes through this, as a bounded string. `filter` null keeps everything.
+// Applications that parse JSON too can call it rather than add their own
+// instantiations.
+DeserializationError parseJson(JsonDocument& doc, std::string_view text,
+                               uint8_t nesting = ARDUINOJSON_DEFAULT_NESTING_LIMIT,
+                               JsonVariantConst filter = JsonVariantConst());
+
 namespace detail {
 // Standard base64 with padding (RFC 4648) of `len` bytes, handed to `emit`
 // 64 characters at a time: the library's one encoder.

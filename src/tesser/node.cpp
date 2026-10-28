@@ -399,7 +399,7 @@ void ListNode::keys(std::vector<std::string>& out) const {
             out.emplace_back(json, 1, json.size() - 2);  // nothing escaped: the text between the quotes
         } else {
             JsonDocument doc;
-            deserializeJson(doc, json);
+            parseJson(doc, json);
             out.push_back(doc.is<const char*>() ? doc.as<const char*>() : "");
         }
     }

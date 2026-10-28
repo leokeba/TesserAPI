@@ -203,6 +203,19 @@ void JsonWriter::raw(std::string_view json) {
     put(json.data(), json.size());
 }
 
+DeserializationError parseJson(JsonDocument& doc, std::string_view text, uint8_t nesting, JsonVariantConst filter) {
+    // Always with a filter and a nesting limit, so the parser is instantiated
+    // once: `true` lets everything through.
+    static const JsonDocument* everything = [] {
+        auto* d = new JsonDocument();  // never destroyed: parsing may go on until the end
+        d->set(true);
+        return d;
+    }();
+    return deserializeJson(doc, text.data(), text.size(),
+                           DeserializationOption::Filter(filter.isNull() ? everything->as<JsonVariantConst>() : filter),
+                           DeserializationOption::NestingLimit(nesting));
+}
+
 void detail::base64Encode(const uint8_t* data, size_t len, void (*emit)(void* ctx, const char* text, size_t n),
                           void* ctx) {
     static const char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

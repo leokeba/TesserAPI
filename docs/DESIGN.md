@@ -1227,6 +1227,7 @@ Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware
 **Flash:** `examples/idf/http_api` against its `FOOTPRINT_BASELINE` build (the same app on bare `esp_http_server`):
 - **Total:** 45.5 KB for the core, the HTTP transport and ArduinoJson. With `TESSER_NO_SCHEMA`, `TESSER_NO_MESSAGES` and `TESSER_NO_DESCRIPTIONS` it is 43.8 KB.
 - **Against the target:** the 40 KB target was set before subscriptions, events, lists and authorization joined the core. 34.6 KB was measured for core + HTTP at phase 2.
+- **One JSON parser:** ArduinoJson's `deserializeJson()` is instantiated again for each input type and set of options. Every input goes through `tesser::parseJson(doc, text, nesting, filter)`, a bounded string with a filter (`true` for everything) and a nesting limit, so the parser is linked once: 2.6 KB less in the test firmware. Applications parsing JSON too can call it (TesserKIT's request bodies do).
 - **Linked only when used:** remote nodes (and the datagram client), persistence, WebSocket, NowTP and UDP. Remote forwarding is virtual and persistence is a hook installed by `persistence()`, so applications that don't use them don't link them.
 
 **No leaks:** running the whole host test suite a second time on the chip moves the heap by exactly the two nodes the duplicate-name test deliberately leaves unlinked.

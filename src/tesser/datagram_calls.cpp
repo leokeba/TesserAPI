@@ -102,8 +102,7 @@ bool DatagramEndpoint::takeRaw(const Incoming& msg) {
     filter["status"] = true;
     JsonDocument head;  // without the body: small whatever its size
     std::string_view text = msg.view();
-    if (deserializeJson(head, text.data(), text.size(), DeserializationOption::Filter(filter),
-                        DeserializationOption::NestingLimit(kWrittenNesting)) ||
+    if (parseJson(head, text, kWrittenNesting, filter) ||
         head["status"] != "ok" || !head["id"].is<uint32_t>()) {
         return false;
     }

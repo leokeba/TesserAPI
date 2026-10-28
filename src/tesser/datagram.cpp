@@ -265,8 +265,7 @@ void DatagramEndpoint::refuse(const PeerAddress& from, std::string_view text, bo
     filter["id"] = true;
     filter["status"] = true;
     JsonDocument doc;
-    if (deserializeJson(doc, text.data(), text.size(), DeserializationOption::Filter(filter),
-                        DeserializationOption::NestingLimit(kWrittenNesting))) {
+    if (parseJson(doc, text, kWrittenNesting, filter)) {
         return;
     }
     if (doc["status"].is<const char*>()) {
@@ -285,8 +284,7 @@ void DatagramEndpoint::reject(const PeerAddress& from, std::string_view text, bo
     filter["id"] = true;
     filter["op"] = true;
     JsonDocument doc;
-    if (deserializeJson(doc, text.data(), text.size(), DeserializationOption::Filter(filter),
-                        DeserializationOption::NestingLimit(kWrittenNesting))) {
+    if (parseJson(doc, text, kWrittenNesting, filter)) {
         return;
     }
     if (!doc["op"].is<const char*>()) return;
@@ -456,9 +454,8 @@ void DatagramEndpoint::handle(Incoming& msg) {
     // An upload's data is read from the text, not copied into the document.
     DeserializationError err =
         isUploadEnvelope(text)
-            ? deserializeJson(doc, text.data(), text.size(), DeserializationOption::Filter(uploadFilter()),
-                              DeserializationOption::NestingLimit(kWrittenNesting))
-            : deserializeJson(doc, text.data(), text.size(), DeserializationOption::NestingLimit(kWrittenNesting));
+            ? parseJson(doc, text, kWrittenNesting, uploadFilter())
+            : parseJson(doc, text, kWrittenNesting);
     if (err || !doc.is<JsonObjectConst>()) {
         {
             MutexGuard guard(mutex_);
