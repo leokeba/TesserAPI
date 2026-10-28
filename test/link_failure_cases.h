@@ -18,7 +18,10 @@ using tesser::Status;
 
 // Sends `envelope` to the gateway; the frame to the device is held back and
 // reported as `failure`, as the link would.
-inline std::string failedAsk(remote_cases::Rig& r, const std::string& envelope, SendFailure failure) {
+// `idMask`: what NowTP's completion tags carry of the call id (its low 24
+// bits, the peer's index above them).
+inline std::string failedAsk(remote_cases::Rig& r, const std::string& envelope, SendFailure failure,
+                             uint32_t idMask = 0xffffffffu) {
     r.lines.out.clear();
     std::string l = envelope + "\n";
     r.line.feed(l.data(), l.size());
@@ -29,7 +32,7 @@ inline std::string failedAsk(remote_cases::Rig& r, const std::string& envelope, 
         r.net.frames.erase(r.net.frames.begin() + static_cast<std::ptrdiff_t>(i));
         break;
     }
-    r.gatewayEnd.sendFailed(addr(2), id, failure);
+    r.gatewayEnd.sendFailed(addr(2), id & idMask, failure, idMask);
     r.net.run();  // no clock advance: no timeout involved
     return r.lines.out.size() == 1 ? r.lines.out[0] : "<" + std::to_string(r.lines.out.size()) + " lines>";
 }
@@ -80,6 +83,21 @@ TEST(link_auth_failed_is_its_own) {
     CHECK(r.ask("{\"id\":3,\"op\":\"get\",\"path\":\"/kitchen/lamp/on\"}").find("\"ok\"") != std::string::npos);
     failedAsk(r, "{\"id\":4,\"op\":\"get\",\"path\":\"/kitchen/lamp\"}", SendFailure::AuthFailed);
     CHECK_EQ(losses.size(), 2u);
+}
+
+// A link reporting only part of the call id (NowTP's tags): the call to
+// that peer whose id has those bits fails.
+TEST(link_partial_call_id) {
+    remote_cases::Rig r;
+    CHECK(r.ask("{\"id\":1,\"op\":\"get\",\"path\":\"/kitchen/lamp/on\"}").find("\"ok\"") != std::string::npos);
+    CHECK(failedAsk(r, "{\"id\":2,\"op\":\"get\",\"path\":\"/kitchen/lamp\"}", SendFailure::Rejected, 0x00ffffffu)
+              .find("\"reason\":\"rejected\"") != std::string::npos);
+    // Bits no call has: a reply's, or the call is gone. Nothing fails.
+    r.gatewayEnd.sendFailed(addr(2), 0x00abcdefu, SendFailure::Rejected, 0x00ffffffu);
+    r.net.run();
+    CHECK(r.kitchen.online());
+    CHECK(r.ask("{\"id\":3,\"op\":\"get\",\"path\":\"/kitchen/lamp/on\"}").find("\"ok\"") != std::string::npos);
+    CHECK_EQ(r.gateway.pending(), 0);
 }
 
 TEST(link_rejected_fails_that_call) {

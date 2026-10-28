@@ -113,10 +113,21 @@ private:
     struct Reports {
         Mutex mutex;
         DatagramEndpoint* endpoint = nullptr;
+        // The peers reliable messages went to, for NowTP's completion tags
+        // (the index + 1 in the top 8 bits, the call id's low 24 below): no
+        // handler, so no allocation, per send. At most 255; grows only.
+        std::vector<PeerAddress> peers;
     };
 
     static void taskEntry(void* arg);
     nowtp::CompletionHandler completion(const PeerAddress& to, uint32_t callId);
+    // How a reliable send reports its outcome: through the port's observer,
+    // with a tag in `opts`, when NowTP has one and the peer has a tag;
+    // otherwise a handler, in `done`.
+    template <class O>
+    void reportTo(const PeerAddress& to, uint32_t callId, O& opts, nowtp::CompletionHandler& done);
+    template <class T>
+    void installObserver(T& now);
     template <class T>
     void installOwnedSend(T& now);
 

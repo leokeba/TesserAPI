@@ -63,7 +63,8 @@ struct HasSendBuffer<T, decltype(void(std::declval<T&>().sendBuffer(
     : std::true_type {};
 
 // Room NowTP wants after the payload to send it in place (its
-// kSendOverhead: 21 bytes as of ce6b645); less, and it reallocates.
+// kSendOverhead: 30 bytes, headroom included, as of v0.7.2); less, and it
+// reallocates.
 constexpr size_t kSendSlack = 32;
 
 // NowTP deadc54 and later know each peer's largest message, from its
@@ -86,7 +87,64 @@ void installPeerLimit(DatagramEndpoint& endpoint, T& now) {
     }
 }
 
+// NowTP v0.7.2 and later report outcomes to one observer per port, with a
+// tag set per send (SendOptions::tag), in place of a handler per send.
+template <class T, class = void>
+struct HasObserver : std::false_type {};
+template <class T>
+struct HasObserver<T, decltype(void(std::declval<T&>().observeCompletions(uint8_t(0), nullptr)))> : std::true_type {};
+
+// What a NowTP outcome means for the endpoint; false when nothing failed.
+bool failureOf(nowtp::Status s, SendFailure& f) {
+    if (s == nowtp::Status::SendFailed || s == nowtp::Status::Timeout) {
+        f = SendFailure::Undelivered;
+    } else if (s == nowtp::Status::Rejected) {
+        f = SendFailure::Rejected;
+    } else if (s == nowtp::Status::AuthFailed) {
+        f = SendFailure::AuthFailed;
+    } else {
+        return false;  // delivered, superseded, cancelled
+    }
+    return true;
+}
+
+constexpr uint32_t kTagIdBits = 0x00ffffffu;
+
 }  // namespace
+
+
+template <class T>
+void NowTpTransport::installObserver(T& now) {
+    if constexpr (HasObserver<T>::value) {
+        // Runs in NowTP's task: it only queues.
+        now.observeCompletions(port_, [reports = reports_](uint32_t tag, nowtp::Status s) {
+            SendFailure f;
+            if (!failureOf(s, f)) return;
+            MutexGuard guard(reports->mutex);
+            size_t peer = tag >> 24;
+            if (!reports->endpoint || !peer || peer > reports->peers.size()) return;
+            reports->endpoint->sendFailed(reports->peers[peer - 1], tag & kTagIdBits, f, kTagIdBits);
+        });
+    } else {
+        (void)now;
+    }
+}
+
+template <class O>
+void NowTpTransport::reportTo(const PeerAddress& to, uint32_t callId, O& opts, nowtp::CompletionHandler& done) {
+    if constexpr (HasObserver<nowtp::EspNowTransport>::value) {
+        MutexGuard guard(reports_->mutex);
+        std::vector<PeerAddress>& peers = reports_->peers;
+        size_t i = 0;
+        while (i < peers.size() && peers[i] != to) i++;
+        if (i == peers.size() && i < 255) peers.push_back(to);
+        if (i < peers.size()) {
+            opts.tag = static_cast<uint32_t>(i + 1) << 24 | (callId & kTagIdBits);
+            return;
+        }
+    }
+    done = completion(to, callId);
+}
 
 nowtp::CompletionHandler NowTpTransport::completion(const PeerAddress& to, uint32_t callId) {
     // A delivery that fails later (docs/DESIGN.md section 10.3): the
@@ -94,15 +152,7 @@ nowtp::CompletionHandler NowTpTransport::completion(const PeerAddress& to, uint3
     // Runs in NowTP's task: it only queues.
     return [reports = reports_, to, callId](nowtp::Status s) {
         SendFailure f;
-        if (s == nowtp::Status::SendFailed || s == nowtp::Status::Timeout) {
-            f = SendFailure::Undelivered;
-        } else if (s == nowtp::Status::Rejected) {
-            f = SendFailure::Rejected;
-        } else if (s == nowtp::Status::AuthFailed) {
-            f = SendFailure::AuthFailed;
-        } else {
-            return;  // delivered, superseded, cancelled
-        }
+        if (!failureOf(s, f)) return;
         MutexGuard guard(reports->mutex);
         if (reports->endpoint) reports->endpoint->sendFailed(to, callId, f);
     };
@@ -125,7 +175,8 @@ void NowTpTransport::installOwnedSend(T& now) {
                 // section 10.3), not after its timeouts.
                 nowtp::CompletionHandler done;
                 if (opts.reliable) {
-                    done = completion(to, DatagramEndpoint::callIdOf(std::string_view(message.data(), message.size())));
+                    reportTo(to, DatagramEndpoint::callIdOf(std::string_view(message.data(), message.size())), opts,
+                             done);
                 }
                 size_t len = message.size(), capacity = message.capacity();
                 auto* buffer = reinterpret_cast<uint8_t*>(message.release());
@@ -149,7 +200,7 @@ NowTpTransport::NowTpTransport(Api* api, nowtp::EspNowTransport& now, uint8_t po
               opts.reliable = delivery == Delivery::Reliable && !mac.isBroadcast();
               opts.latestOnly = delivery == Delivery::LatestOnly;
               nowtp::CompletionHandler done;
-              if (opts.reliable) done = completion(to, DatagramEndpoint::callIdOf(message));
+              if (opts.reliable) reportTo(to, DatagramEndpoint::callIdOf(message), opts, done);
               // QueueFull (per destination) is a full buffer, not a failure:
               // false here, and the sender tries again or answers busy.
               return now_.send(mac, port_, message.data(), message.size(), opts, std::move(done)) ==
@@ -157,6 +208,7 @@ NowTpTransport::NowTpTransport(Api* api, nowtp::EspNowTransport& now, uint8_t po
           },
           &nowMs, options) {
     reports_->endpoint = &endpoint_;
+    installObserver(now_);
     installOwnedSend(now_);
     installPeerLimit(endpoint_, now_);
 }

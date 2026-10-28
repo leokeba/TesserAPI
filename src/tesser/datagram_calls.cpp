@@ -551,9 +551,16 @@ bool DatagramEndpoint::hasCalls(const void* owner) const {
     return false;
 }
 
-void DatagramEndpoint::sendFailed(const PeerAddress& peer, uint32_t callId, SendFailure failure) {
+void DatagramEndpoint::sendFailed(const PeerAddress& peer, uint32_t callId, SendFailure failure, uint32_t idMask) {
     {
         MutexGuard guard(mutex_);
+        if (idMask != 0xffffffffu && callId) {
+            uint32_t partial = callId;
+            callId = 0;  // none matches: a reply or a notification, or the call is gone
+            for (const CallSlot& c : calls_) {
+                if (c.to == peer && (c.id & idMask) == partial) callId = c.id;
+            }
+        }
         failures_.push_back(Failure{peer, callId, failure});
     }
     if (onQueued_) onQueued_();

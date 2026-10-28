@@ -292,7 +292,10 @@ public:
     // time out; Rejected fails that call alone (Status::Internal, reason
     // rejected). Safe from any task, including link callbacks: the work
     // happens in the next process(). docs/DESIGN.md section 10.3.
-    void sendFailed(const PeerAddress& peer, uint32_t callId, SendFailure failure);
+    // `idMask`: a link that carries only part of the id (NowTP's 32-bit
+    // completion tag, with a peer in it) gives the bits it has; the call to
+    // that peer whose id matches them is the one.
+    void sendFailed(const PeerAddress& peer, uint32_t callId, SendFailure failure, uint32_t idMask = 0xffffffffu);
     // The call id of a request this endpoint sent ({"id":N,"op":...}), or 0.
     static uint32_t callIdOf(std::string_view message);
 
