@@ -71,6 +71,7 @@ public:
 private:
     friend class Node;
     friend class ValueNode;
+    friend class CustomNode;
     friend class Api;
     // Fields in the order they are laid out in the block.
     enum Field : uint8_t {
@@ -84,7 +85,7 @@ private:
     };
     // What few nodes have.
     struct Extra {
-        std::function<Check(JsonVariantConst)> validator;  // ValueNode::validate()
+        std::function<Check(JsonVariantConst)> validator;  // ValueNode::validate(), CustomNode::validate()
         uint32_t hash = 0;  // watch(): the last sample
         bool hashed = false;
     };
@@ -108,6 +109,40 @@ private:
     Access write_ = Access::Public;
     uint8_t present_ = 0;  // Field bits
     uint8_t count_ = 0;    // hints
+};
+
+// An enum's names, in order of their underlying values. A braced list is
+// copied (at its exact size: the list itself is a temporary); a static array
+// is kept, not copied, so an application's tables cost nothing on the heap.
+// The names themselves must outlive the API either way.
+class EnumNames {
+public:
+    EnumNames(std::initializer_list<const char*> names)
+        : data_(copy(names.begin(), names.size())), size_(static_cast<uint16_t>(names.size())), owned_(true) {}
+    template <size_t N>
+    EnumNames(const char* const (&names)[N]) : data_(names), size_(static_cast<uint16_t>(N)) {}
+    EnumNames(const std::vector<const char*>& names)
+        : data_(copy(names.data(), names.size())), size_(static_cast<uint16_t>(names.size())), owned_(true) {}
+    EnumNames(EnumNames&& o) noexcept : data_(o.data_), size_(o.size_), owned_(o.owned_) { o.owned_ = false; }
+    EnumNames(const EnumNames&) = delete;
+    EnumNames& operator=(const EnumNames&) = delete;
+    ~EnumNames() {
+        if (owned_) delete[] data_;
+    }
+    const char* const* begin() const { return data_; }
+    const char* const* end() const { return data_ + size_; }
+    size_t size() const { return size_; }
+    const char* operator[](size_t i) const { return data_[i]; }
+
+private:
+    static const char* const* copy(const char* const* from, size_t n) {
+        auto* to = new const char*[n ? n : 1];
+        for (size_t i = 0; i < n; i++) to[i] = from[i];
+        return to;
+    }
+    const char* const* data_;
+    uint16_t size_;
+    bool owned_ = false;
 };
 
 // Change tracking: a global 32-bit generation counter, stamped on nodes as
@@ -333,7 +368,7 @@ public:
     virtual ValueKind kind() const = 0;
     virtual size_t maxLength() const { return 0; }
     // Allowed string values (enums), or null.
-    virtual const std::vector<const char*>* options() const { return nullptr; }
+    virtual const EnumNames* options() const { return nullptr; }
     virtual void write(JsonWriter& w) const = 0;
     // Type and range check. Doesn't consider writability.
     virtual Check check(JsonVariantConst v) const = 0;
@@ -427,9 +462,9 @@ private:
 // functions.
 class EnumNode : public ValueNode {
 public:
-    EnumNode(const char* name, std::vector<const char*> names) : ValueNode(name), names_(std::move(names)) {}
+    EnumNode(const char* name, EnumNames names) : ValueNode(name), names_(std::move(names)) {}
     ValueKind kind() const override { return ValueKind::String; }
-    const std::vector<const char*>* options() const override { return &names_; }
+    const EnumNames* options() const override { return &names_; }
     void write(JsonWriter& w) const override;
     Check check(JsonVariantConst v) const override;
     Check apply(JsonVariantConst v) override;
@@ -442,13 +477,13 @@ protected:
 
 private:
     size_t index(const char* s) const;
-    std::vector<const char*> names_;
+    EnumNames names_;
 };
 
 template <class E>
 class EnumValue : public EnumNode {
 public:
-    EnumValue(const char* name, E& ref, std::vector<const char*> names) : EnumNode(name, std::move(names)), ref_(ref) {}
+    EnumValue(const char* name, E& ref, EnumNames names) : EnumNode(name, std::move(names)), ref_(ref) {}
 
 protected:
     bool canWrite() const override { return true; }
@@ -469,7 +504,7 @@ public:
     using Getter = std::function<E()>;
     using Setter = std::function<Check(E)>;
 
-    FnEnumValue(const char* name, Getter get, Setter set, std::vector<const char*> names)
+    FnEnumValue(const char* name, Getter get, Setter set, EnumNames names)
         : EnumNode(name, std::move(names)), get_(std::move(get)), set_(std::move(set)) {}
 
 protected:
@@ -559,10 +594,11 @@ public:
     void emitWith(const std::function<void(JsonWriter&)>& write);
 
 private:
-    // Found on the first emit(): path_ is written once, before api_ is
-    // published, and only read after.
+    // Found on the first emit(): path_ (exactly its size, not a 24-byte
+    // std::string) is written once, before api_ is published, and only read
+    // after.
     std::atomic<Api*> api_{nullptr};
-    std::string path_;
+    std::unique_ptr<char[]> path_;
 };
 
 class ActionNode : public Annotated<ActionNode> {
@@ -625,8 +661,9 @@ public:
     CustomNode(const char* name, Writer writer, Applier applier)
         : Annotated(name, NodeType::Custom), writer_(std::move(writer)), applier_(std::move(applier)) {}
 
+    // Kept with the node's metadata: most custom nodes have none.
     CustomNode& validate(Validator v) {
-        validator_ = std::move(v);
+        editExtra().validator = std::move(v);
         return *this;
     }
     CustomNode& persist() {
@@ -646,13 +683,15 @@ public:
             w.null();
         }
     }
-    Check check(JsonVariantConst v) const { return validator_ ? validator_(v) : Check::ok(); }
+    Check check(JsonVariantConst v) const {
+        NodeMeta::Extra* e = meta_ ? meta_->extra() : nullptr;
+        return e && e->validator ? e->validator(v) : Check::ok();
+    }
     Status apply(JsonVariantConst v) { return applier_ ? applier_(v) : Status::ReadOnly; }
 
 private:
     Writer writer_;
     Applier applier_;
-    Validator validator_;
 };
 
 // A std::vector of described objects (docs/DESIGN.md section 4.4). Elements
@@ -1157,28 +1196,29 @@ public:
     ValueNode& value(const char* name, const char* constant) { return add(new ConstStringValue(name, constant)); }
 
     // An enum, as strings: `names` lists the enumerators in order of their
-    // underlying values (0, 1, 2, ...). The names must outlive the API.
+    // underlying values (0, 1, 2, ...), as a braced list or a static array
+    // (kept without a copy). The names must outlive the API.
     template <class E, std::enable_if_t<std::is_enum<E>::value, int> = 0>
-    ValueNode& value(const char* name, E& var, std::initializer_list<const char*> names) {
-        return add(new EnumValue<E>(name, var, std::vector<const char*>(names)));
+    ValueNode& value(const char* name, E& var, EnumNames names) {
+        return add(new EnumValue<E>(name, var, std::move(names)));
     }
 
     // An enum through a getter (read-only), as strings like the above.
     template <class G, std::enable_if_t<detail::IsCallable<std::decay_t<G>>::value, int> = 0>
-    ValueNode& value(const char* name, G getter, std::initializer_list<const char*> names) {
+    ValueNode& value(const char* name, G getter, EnumNames names) {
         using E = detail::Bare<decltype(getter())>;
         static_assert(std::is_enum<E>::value, "a getter with enumerator names must return an enum");
-        return add(new FnEnumValue<E>(name, std::move(getter), nullptr, std::vector<const char*>(names)));
+        return add(new FnEnumValue<E>(name, std::move(getter), nullptr, std::move(names)));
     }
 
     // An enum through a getter and a setter. The setter may return void,
     // bool, Status or Check.
     template <class G, class S>
-    ValueNode& value(const char* name, G getter, S setter, std::initializer_list<const char*> names) {
+    ValueNode& value(const char* name, G getter, S setter, EnumNames names) {
         using E = detail::Bare<decltype(getter())>;
         static_assert(std::is_enum<E>::value, "a getter with enumerator names must return an enum");
         return add(new FnEnumValue<E>(name, std::move(getter), detail::checkingSetter<E>(std::move(setter)),
-                                      std::vector<const char*>(names)));
+                                      std::move(names)));
     }
 
     // A getter: read-only.
@@ -1189,7 +1229,9 @@ public:
     }
 
     // A getter and a setter. The setter may return void, bool, Status or Check.
-    template <class G, class S>
+    template <class G, class S,
+              std::enable_if_t<detail::IsCallable<std::decay_t<G>>::value && detail::IsCallable<std::decay_t<S>>::value,
+                               int> = 0>
     ValueNode& value(const char* name, G getter, S setter) {
         using R = detail::Bare<decltype(getter())>;
         using P = detail::Bare<typename detail::Signature<std::decay_t<S>>::Arg>;

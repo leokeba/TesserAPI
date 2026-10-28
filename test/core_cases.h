@@ -646,6 +646,16 @@ TEST(enums) {
              "{\"type\":\"string\",\"writable\":true,\"enum\":[\"off\",\"auto\",\"manual\"]}");
     mode = Mode::Unnamed;
     CHECK_EQ(get(api, "/mode").body, "3");
+    // A static table of names is kept as it is, not copied.
+    static const char* const kModes[] = {"off", "auto", "manual"};
+    Mode other = Mode::Off;
+    auto& o = api.value("other", other, kModes);
+    CHECK(o.options()->begin() == kModes);
+    CHECK_EQ(o.options()->size(), size_t(3));
+    CHECK_EQ(set(api, "/other", "\"auto\"").body, "\"auto\"");
+    CHECK(other == Mode::Auto);
+    CHECK_EQ(get(api, "/other", schema()).body,
+             "{\"type\":\"string\",\"writable\":true,\"enum\":[\"off\",\"auto\",\"manual\"]}");
 }
 
 // Through a getter, for state another task owns under its own lock.

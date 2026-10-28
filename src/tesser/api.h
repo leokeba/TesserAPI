@@ -255,8 +255,9 @@ public:
     size_t removeSubscriptions(Subscriber* subscriber, std::string_view path, Access ceiling = Access::Admin);
     // Sends an event to the subscriptions it concerns; with `accept`, only
     // to those it accepts (a remote node's events, docs/DESIGN.md section 14).
-    void emitEvent(const std::string& path, const std::function<void(JsonWriter&)>& write,
+    void emitEvent(std::string_view path, const std::function<void(JsonWriter&)>& write,
                    const std::function<bool(const Subscription&)>& accept = nullptr);
+
     // Calls fn for each forwarded subscription to `node`, under the API lock;
     // fn returns false to remove the subscription. Used by RemoteNode.
     void forwardedSubscriptions(const Node* node, const std::function<bool(Subscription&)>& fn);

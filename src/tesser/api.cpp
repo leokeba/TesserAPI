@@ -798,7 +798,7 @@ private:
                     w.key("maxLength");
                     w.uinteger(v.maxLength());
                 }
-                if (const std::vector<const char*>* opts = v.options()) {
+                if (const EnumNames* opts = v.options()) {
                     w.key("enum");
                     w.beginArray();
                     for (const char* o : *opts) w.string(o);

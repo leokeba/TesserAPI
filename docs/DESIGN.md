@@ -87,7 +87,7 @@ The getter has the form `T()`. The setter has the form `void(T)`, or `bool(T)` /
 
 **Supported `T`:** `bool`, all integer types up to 64 bits, `float`, `double`, `std::string`, `char[N]` (a fixed buffer, NUL-terminated), Arduino `String` (when `ARDUINO` is defined), and `const char*` (read-only).
 
-**Enums** are exposed as strings: `o.value("mode", mode, {"off", "auto", "manual"})` names the enumerators in order of their underlying values. Writes accept only those names, and the schema lists them under `"enum"`. An enumerator without a name reads as its number. Through functions, `o.value("state", [&] { return axis.state(); }, {"disabled", "starting", "running"})` is read-only, and `o.value("mode", getter, setter, {...})` writable; the setter takes the enum and returns `void`, `bool`, `Status` or `Check`, like other setters. Use them for state another task owns under its own lock.
+**Enums** are exposed as strings: `o.value("mode", mode, {"off", "auto", "manual"})` names the enumerators in order of their underlying values. The braced list is copied once, at its size; a static array (`static const char* const kModes[] = {...}; o.value("mode", mode, kModes)`) is kept as it is, with nothing on the heap. Writes accept only those names, and the schema lists them under `"enum"`. An enumerator without a name reads as its number. Through functions, `o.value("state", [&] { return axis.state(); }, {"disabled", "starting", "running"})` is read-only, and `o.value("mode", getter, setter, {...})` writable; the setter takes the enum and returns `void`, `bool`, `Status` or `Check`, like other setters. Use them for state another task owns under its own lock.
 
 **Modifiers** (chainable on the returned node):
 
@@ -1206,6 +1206,9 @@ Measured on a classic ESP32 (ESP-IDF 6.1, heap overhead included, `test/hardware
 | Value bound to a variable | 32 B |
 | Value with getter and setter (small captures) | 60 B |
 | Object | 36 B |
+| Event | 32 B, and its path (found on the first `emit()`) at its exact size |
+| Enum bound to a variable | 36 B, and a copy of a braced list of names (none for a static array) |
+| Custom node | 56 B; a validator goes with the metadata (§7.1) |
 | Value with a range | 32 B node + 20 B metadata (from `sizeof`; 40 B in one block and 16 per hint in blocks of their own before 2026-10-28) |
 | List of any length | one node; elements are built per request |
 | Full GET of a 13-leaf tree (227 B response) | 0.43 ms |

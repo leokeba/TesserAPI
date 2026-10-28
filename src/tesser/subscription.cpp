@@ -476,7 +476,7 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
 
 // ---- events -----------------------------------------------------------------
 
-void Api::emitEvent(const std::string& path, const std::function<void(JsonWriter&)>& write,
+void Api::emitEvent(std::string_view path, const std::function<void(JsonWriter&)>& write,
                     const std::function<bool(const Subscription&)>& accept) {
     MutexGuard guard(mutex_);
     if (subs_.empty()) return;
@@ -581,11 +581,12 @@ void EventNode::emitWith(const std::function<void(JsonWriter&)>& write) {
         if (!api) return;
         MutexGuard guard(api->mutex());
         if (!api_.load(std::memory_order_relaxed)) {
-            path_ = std::move(path);
+            path_.reset(new char[path.size() + 1]);
+            memcpy(path_.get(), path.c_str(), path.size() + 1);
             api_.store(api, std::memory_order_release);
         }
     }
-    api->emitEvent(path_, write);
+    api->emitEvent(std::string_view(path_.get()), write);
 }
 
 void EventNode::emit() { emitWith(nullptr); }
