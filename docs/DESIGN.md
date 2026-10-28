@@ -38,15 +38,15 @@ TesserAPI lets ESP32 firmware describe its state and operations **once**, as a t
                                     │ Request{op, path, query, body, client}
  Transport ─── parses ─────▶  Api::handle()  ─── streams JSON ──▶ Reply ──▶ Transport
  (HTTP, NowTP, serial, WS)          │
-                                    └── (planned) change tracking ─▶ subscriptions ─▶ notifications
+                                    └── change tracking ─▶ subscriptions ─▶ notifications
 ```
 
-- **`Api`**: the root of the tree. Handles requests, and owns the lock, the configuration and (later) subscriptions.
+- **`Api`**: the root of the tree. Handles requests, and owns the lock, the configuration and the subscriptions.
 - **Node**: an element of the tree. Every node has a name (a string literal that is never copied) and a kind:
   - **Object**: named children.
   - **Value**: a typed scalar bound to a variable, or to a getter and an optional setter.
   - **Action**: a callable with zero or one typed argument and an optional return value.
-  - **Event**: something that happens and is pushed to subscribers *(planned)*.
+  - **Event**: something that happens and is pushed to subscribers (§11).
   - **Custom**: an escape hatch. User code writes JSON directly and receives a `JsonVariantConst` to apply.
 - **`Request`**: what a transport hands to the core: an operation, a path, query options, a parsed body, and a client identity.
 - **`Reply`**: what the core writes the response into. The transport implements it: it decides how a status is encoded and where the body bytes go.
@@ -307,7 +307,7 @@ api.object("sys").file("backup").contentType("application/json").readAccess(tess
 
 ```cpp
 struct Request {
-    Op op;                  // Get, Set (planned: Subscribe, Unsubscribe)
+    Op op;                  // Get, Set, Subscribe, Unsubscribe
     Str path;               // "/lamp/brightness"
     Query query;            // depth, keys, exclude, view
     JsonVariantConst body;  // Set: the value or patch. Get: an optional shape
@@ -663,7 +663,7 @@ http.attach(handle, "/api");     // registers a wildcard URI on an existing http
 | `PUT` or `POST /api/<file>?filename=` | upload to a file node: the body is the raw bytes, with any `Content-Type`. `filename`, optional, is the name the client gives the file (`FileRequest::filename`). The reply is JSON. |
 | `OPTIONS` | CORS preflight, when CORS is enabled |
 
-- Responses up to 512 bytes go out with a `Content-Length`. Larger ones are streamed with chunked encoding through the same 512-byte buffer, so there is no limit on response size.
+- A response that fits the 2 KB window (`HttpReply::kWindow`) when it ends goes out with a `Content-Length`. A larger one is streamed with chunked encoding, a window at a time, so there is no limit on response size. The window waits to be sent without the API lock (§9).
 - Request bodies are capped by `maxRequestBody`, except uploads to file nodes, which are capped by the node's `maxSize`. Over HTTP a body is reserved from the byte budget before it is read (§15): without room the client hears `busy` (`low_memory`) and the body is read and dropped. A client that stops sending mid-body is given up on after four of httpd's receive timeouts in a row, as for a dropped upload, rather than holding the httpd task, and every other client, before its token is even checked.
 - **File transfers** stream in 2 KB pieces from the heap. A download of known size goes out with a `Content-Length` (so clients can show progress) and a `Content-Disposition: attachment; filename="..."`; one of unknown size is chunked. In that `filename`, quotes, backslashes, control and non-ASCII bytes become `_`; a non-ASCII name also comes as `filename*=UTF-8''<percent-encoded>` (RFC 6266), which browsers prefer. A refused or failed upload's remaining body is read and dropped up to 256 KB, so the client, which sends it all before reading, gets the error; beyond that the connection is closed. With CORS, file responses carry the headers too. Below a remote node, the server first asks the remote whether the path is a file node, and a relayed transfer holds the httpd task until it ends (§14).
 - The status is mapped as in §8.
