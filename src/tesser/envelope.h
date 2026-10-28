@@ -48,11 +48,22 @@ Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth,
 Status requestFromEnvelope(JsonObjectConst envelope, Request& request, EnvelopeId& id, const char*& message,
                            Reason* reason = nullptr);
 
+// The members each kind of envelope may carry (docs/DESIGN.md section
+// 10.1.2), one list each: strict envelopes are checked against them, and an
+// upload is parsed with the file list, less "data".
+struct EnvelopeKeys {
+    const char* const* keys;
+    size_t count;
+    bool has(std::string_view key) const;
+};
+extern const EnvelopeKeys kRequestKeys;  // get, set, sub, unsub
+extern const EnvelopeKeys kFileKeys;     // upload, download
+extern const EnvelopeKeys kAuthKeys;     // auth
 // A strict envelope ("v" of 2 or more, docs/DESIGN.md section 10.1.2) whose
 // members aren't all among `known`: Status::BadRequest with `message` and
 // `reason` set. Ok otherwise.
-Status checkStrict(JsonObjectConst envelope, std::initializer_list<const char*> known, const char*& message,
-                   Reason* reason);
+Status checkStrict(JsonObjectConst envelope, const EnvelopeKeys& known, const char*& message,
+                   Reason* reason = nullptr);
 
 // An "upload" envelope (docs/DESIGN.md section 10.1.1), told from its text
 // alone. Its "data" is left out when it is parsed (uploadFilter()) and read

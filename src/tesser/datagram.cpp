@@ -538,7 +538,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
         if (send && !silent) send(to, std::move(m), Delivery::Reliable);
     });
     ownReplies(reply, to, silent);
-    if (s == Status::Ok && auth) s = checkStrict(env, {"v", "id", "op", "token"}, message, &reason);
+    if (s == Status::Ok && auth) s = checkStrict(env, kAuthKeys, message, &reason);
     if (s != Status::Ok) {
         writeError(reply, s, reason, std::string_view(), message);
         return;

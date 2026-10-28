@@ -699,19 +699,15 @@ void FileSession::handle(JsonObjectConst envelope, const Client& from, Reply& re
     if (state_ && client.level() < state_->level) state_.reset();
     const char* message = nullptr;
     Reason reason = Reason::None;
-    Status strict = checkStrict(envelope, {"v", "id", "op", "path", "offset", "size", "filename", "data", "length", "crc32"},
-                                message, &reason);
+    Status strict = checkStrict(envelope, kFileKeys, message, &reason);
     // Parsed without its data (uploadFilter()), it may have lost members:
     // a strict envelope's keys are checked in its text.
     JsonVariantConst v = envelope["v"];
     if (strict == Status::Ok && !raw.empty() && v.is<uint8_t>() && v.as<uint8_t>() >= 2) {
         bool known = true;
         jsonKeys(raw, [&known](std::string_view k) {
-            for (const char* ok : {"v", "id", "op", "path", "offset", "size", "filename", "data", "length", "crc32"}) {
-                if (k == ok) return true;
-            }
-            known = false;
-            return false;
+            known = kFileKeys.has(k);
+            return known;
         });
         if (!known) {
             strict = Status::BadRequest;

@@ -49,7 +49,9 @@ bool isUploadEnvelope(std::string_view text) {
 JsonVariantConst uploadFilter() {
     static const JsonDocument* filter = [] {
         auto* f = new JsonDocument();  // never destroyed: chunks may come until the end
-        for (const char* k : {"v", "id", "op", "path", "offset", "size", "filename", "length", "crc32"}) (*f)[k] = true;
+        for (size_t i = 0; i < kFileKeys.count; i++) {
+            if (strcmp(kFileKeys.keys[i], "data") != 0) (*f)[kFileKeys.keys[i]] = true;  // read from the text
+        }
         return f;
     }();
     return filter->as<JsonVariantConst>();
@@ -83,8 +85,25 @@ Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth,
     return requestFromEnvelope(doc.as<JsonObjectConst>(), request, id, message, reason);
 }
 
-Status checkStrict(JsonObjectConst env, std::initializer_list<const char*> known, const char*& message,
-                   Reason* reason) {
+namespace {
+const char* const kRequestKeyList[] = {"v",        "id",      "op",      "path",   "depth",    "keys", "exclude",
+                                       "view",     "interval", "remotes", "changes", "events", "snapshot", "body"};
+const char* const kFileKeyList[] = {"v", "id", "op", "path", "offset", "size", "filename", "data", "length", "crc32"};
+const char* const kAuthKeyList[] = {"v", "id", "op", "token"};
+}  // namespace
+
+const EnvelopeKeys kRequestKeys{kRequestKeyList, sizeof(kRequestKeyList) / sizeof(kRequestKeyList[0])};
+const EnvelopeKeys kFileKeys{kFileKeyList, sizeof(kFileKeyList) / sizeof(kFileKeyList[0])};
+const EnvelopeKeys kAuthKeys{kAuthKeyList, sizeof(kAuthKeyList) / sizeof(kAuthKeyList[0])};
+
+bool EnvelopeKeys::has(std::string_view key) const {
+    for (size_t i = 0; i < count; i++) {
+        if (key == keys[i]) return true;
+    }
+    return false;
+}
+
+Status checkStrict(JsonObjectConst env, const EnvelopeKeys& known, const char*& message, Reason* reason) {
     JsonVariantConst v = env["v"];
     if (v.isNull()) return Status::Ok;  // lenient: unknown members are ignored
     if (!v.is<uint8_t>() || v.as<uint8_t>() == 0) {
@@ -93,9 +112,7 @@ Status checkStrict(JsonObjectConst env, std::initializer_list<const char*> known
     }
     if (v.as<uint8_t>() < 2) return Status::Ok;
     for (JsonPairConst kv : env) {
-        bool ok = false;
-        for (const char* k : known) ok = ok || kv.key() == k;
-        if (!ok) {
+        if (!known.has(std::string_view(kv.key().c_str(), kv.key().size()))) {
             message = "an option this node doesn't know (the request is strict: \"v\")";
             if (reason) *reason = Reason::UnknownOption;
             return Status::BadRequest;
@@ -138,10 +155,7 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
     // A gateway's client (docs/DESIGN.md section 13.1): no more than its level.
     request.query.ceiling = ceiling;
     request.client.cap(ceiling);
-    s = checkStrict(env,
-                    {"v", "id", "op", "path", "depth", "keys", "exclude", "view", "interval", "remotes", "changes",
-                     "events", "snapshot", "body"},
-                    message, reason);
+    s = checkStrict(env, kRequestKeys, message, reason);
     if (s != Status::Ok) return s;
     JsonVariantConst path = env["path"];
     if (path.isNull()) {

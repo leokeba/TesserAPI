@@ -177,7 +177,7 @@ void LineTransport::handleAuth(JsonObjectConst envelope, const EnvelopeId& id) {
     EnvelopeReply reply(id, 0, [this](const std::string& m) { send(m, false); });
     const char* message = nullptr;
     Reason reason = Reason::None;
-    if (checkStrict(envelope, {"v", "id", "op", "token"}, message, &reason) != Status::Ok) {
+    if (checkStrict(envelope, kAuthKeys, message, &reason) != Status::Ok) {
         writeError(reply, Status::BadRequest, reason, std::string_view(), message);
         return;
     }
