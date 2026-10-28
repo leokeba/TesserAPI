@@ -402,6 +402,32 @@ TEST(remote_forwarded_events_only) {
     CHECK_EQ(r.lines.out.size(), 1u);
 }
 
+// "events": "toast" below a remote node isn't forwarded: the upstream
+// subscription is the gateway's own, shared, with no "events" member, so a
+// peer from before the option (which refuses a string there) still takes
+// it. The peer's events reach the subscriber unfiltered: the gateway doesn't
+// know the peer's hints.
+TEST(remote_event_hint_stays_local) {
+    Rig r;
+    std::string l = "{\"id\":1,\"op\":\"sub\",\"path\":\"/kitchen\",\"changes\":false,\"events\":\"toast\"}\n";
+    r.line.feed(l.data(), l.size());
+    bool sent = false;
+    for (const auto& f : r.net.frames) {
+        if (f.to != addr(2) || f.text.find("\"op\":\"sub\"") == std::string::npos) continue;
+        sent = true;
+        CHECK(f.text.find("\"events\"") == std::string::npos);
+    }
+    CHECK(sent);
+    r.net.run();
+    CHECK_EQ(r.lines.out.size(), 1u);
+    if (!r.lines.out.empty()) CHECK(r.lines.out[0].find("\"status\":\"ok\"") != std::string::npos);
+    r.lines.out.clear();
+    r.pressed.emit(5);  // no "toast" hint on the device: relayed all the same
+    r.net.run();
+    CHECK_EQ(r.lines.out.size(), 1u);
+    if (!r.lines.out.empty()) CHECK_EQ(r.lines.out[0], "{\"op\":\"event\",\"path\":\"/kitchen/button/pressed\",\"body\":5}");
+}
+
 TEST(remote_forwarded_subscription_failures) {
     Rig r;
     r.gateway.remote("ghost", r.gatewayEnd, addr(9)).timeout(500);
