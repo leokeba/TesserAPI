@@ -65,6 +65,9 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
         if (!query.events) {
             w.key("events");
             w.boolean(false);
+        } else if (!query.eventHint.empty()) {
+            w.key("events");
+            w.string(query.eventHint);
         }
         if (!query.snapshot) {
             w.key("snapshot");

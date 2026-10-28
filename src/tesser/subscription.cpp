@@ -477,7 +477,7 @@ void Api::flush(Subscription& sub, uint32_t nowMs) {
 // ---- events -----------------------------------------------------------------
 
 void Api::emitEvent(std::string_view path, const std::function<void(JsonWriter&)>& write,
-                    const std::function<bool(const Subscription&)>& accept) {
+                    const std::function<bool(const Subscription&)>& accept, const Node* node) {
     MutexGuard guard(mutex_);
     if (subs_.empty()) return;
     // Under the floor, not even a small event goes: its allocations
@@ -540,6 +540,7 @@ void Api::emitEvent(std::string_view path, const std::function<void(JsonWriter&)
     for (const Subscription& sub : subs_) {
         if (!sub.events || sub.waiting || sub.access < need) continue;
         if (accept && !accept(sub)) continue;
+        if (!sub.eventHint.empty() && node && !(node->meta() && node->meta()->hint(sub.eventHint.c_str()))) continue;
         // The subscription's path must be a prefix of the event's, at a
         // segment boundary, within its depth and key filter.
         std::string_view ev(path);
@@ -586,7 +587,7 @@ void EventNode::emitWith(const std::function<void(JsonWriter&)>& write) {
             api_.store(api, std::memory_order_release);
         }
     }
-    api->emitEvent(std::string_view(path_.get()), write);
+    api->emitEvent(std::string_view(path_.get()), write, nullptr, this);
 }
 
 void EventNode::emit() { emitWith(nullptr); }

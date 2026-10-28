@@ -54,6 +54,9 @@ struct Query {
     uint32_t interval = 0;  // minimum ms between change notifications
     bool changes = true;    // deliver change notifications (false: events only)
     bool events = true;     // also deliver events under the path
+    // Of those, only the events whose node has this ui hint ("toast"):
+    // "events": "toast" (docs/DESIGN.md section 11). Empty: every event.
+    std::string_view eventHint;
     bool snapshot = true;   // reply with the current state (false: with null)
     // Act at no more than this level (docs/DESIGN.md section 13.1): what a
     // gateway asks for its client. Below admin, it goes in the envelope's

@@ -866,7 +866,7 @@ The §10.1 envelopes between nodes and clients on a LAN, Ethernet or Wi-Fi, thro
 | `keys`, `exclude`, `depth` | Same as for get, applied to both the snapshot and the notifications. Shapes are not supported. |
 | `interval` | At most one change notification per `interval` ms (default 0: every `poll()`). Intermediate states are coalesced. |
 | `changes` | Deliver change notifications (default `true`). With `false` the subscription carries only events, filtered as usual by path, `depth`, `keys`, `exclude` and access: a client can follow the notifications of a whole tree (`"path": "/"`) without its changes. `interval` then has no effect, and the snapshot is still sent unless `snapshot` is `false`. It counts against the limits like any subscription. |
-| `events` | Also deliver events under the path (default `true`). |
+| `events` | Also deliver events under the path (default `true`). A string instead keeps only the events whose node has that ui hint (§7.1): `"events": "toast"`, `?sub&events=toast`, so a page showing toasts doesn't get every log line. Events relayed from a peer (§14) aren't filtered: a gateway doesn't know the peer's hints. |
 | `snapshot` | Reply with the current state (default `true`). With `false` the reply body is `null`, for clients that read large subtrees in pieces with gets. |
 
 **Notifications:**
@@ -874,7 +874,7 @@ The §10.1 envelopes between nodes and clients on a LAN, Ethernet or Wi-Fi, thro
 - Change notifications are deltas, so they are sent **reliably**. NowTP's latest-only mode would lose a superseded delta's values.
 - **Failure:** if a notification can't be queued, the subscription isn't advanced. The next one carries the missed changes merged with newer ones, plus `"overflow": true`. It is tried again after 50 ms, then after waits that double up to 2 s while it keeps failing (§15). The same flag follows when a transport reports a queued notification lost, and tells the client to re-read.
 
-**Events:** an event (`o.event("pressed")`, then `node.emit(value)`) is never coalesced. It goes out at once, reliably, to every subscriber whose path covers it and that didn't ask for `"events": false`. It reaches a client once even when several of its subscriptions match:
+**Events:** an event (`o.event("pressed")`, then `node.emit(value)`) is never coalesced. It goes out at once, reliably, to every subscriber whose path covers it and that didn't ask for `"events": false` (or for events with a hint this one lacks). It reaches a client once even when several of its subscriptions match:
 
 ```json
 ← {"op": "event", "path": "/button/pressed", "body": 3}

@@ -53,6 +53,35 @@ inline Resp subscribe(Api& api, tesser::Subscriber* sub, const char* path, Query
     return request(api, sub, Op::Subscribe, path, q, level);
 }
 
+// "events": "toast" keeps only the events that carry that ui hint: an
+// admin page's toasts without every log line.
+TEST(sub_events_with_a_hint) {
+    cases::Device d;
+    tesser::EventNode& line = d.api.object("log").event("line");
+    tesser::EventNode& alert = d.api.object("log").event("alert").ui("toast");
+    FakeSubscriber all, toasts;
+    Query q;
+    q.changes = false;
+    CHECK_EQ(subscribe(d.api, &all, "/", q).status, Status::Ok);
+    q.eventHint = "toast";
+    CHECK_EQ(subscribe(d.api, &toasts, "/", q).status, Status::Ok);
+    line.emit(std::string("booted"));
+    alert.emit(std::string("hot"));
+    CHECK_EQ(all.messages.size(), 2u);
+    CHECK_EQ(toasts.messages.size(), 1u);
+    CHECK(toasts.messages[0].find("\"hot\"") != std::string::npos);
+    // From an envelope: a string; anything else but a boolean is refused.
+    tesser::Request r;
+    JsonDocument doc;
+    tesser::EnvelopeId id;
+    const char* message = nullptr;
+    std::string text = "{\"id\":1,\"op\":\"sub\",\"path\":\"/\",\"events\":\"toast\"}";
+    CHECK_EQ(tesser::parseEnvelope(text, doc, 16, r, id, message), Status::Ok);
+    CHECK(r.query.eventHint == "toast");
+    text = "{\"id\":1,\"op\":\"sub\",\"path\":\"/\",\"events\":3}";
+    CHECK_EQ(tesser::parseEnvelope(text, doc, 16, r, id, message), Status::BadRequest);
+}
+
 TEST(sub_without_snapshot) {
     cases::Device d;
     FakeSubscriber s;

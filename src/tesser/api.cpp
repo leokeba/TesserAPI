@@ -1072,6 +1072,7 @@ private:
         sub.interval = req_.query.interval;
         sub.changes = req_.query.changes;
         sub.events = req_.query.events;
+        sub.eventHint.assign(req_.query.eventHint.data(), req_.query.eventHint.size());
         sub.remotes = req_.query.remotes;
         sub.access = level_;
         sub.ceiling = req_.query.ceiling;

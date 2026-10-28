@@ -50,6 +50,7 @@ struct Subscription {
     uint32_t interval = 0;
     bool changes = true;
     bool events = true;
+    std::string eventHint;  // only events whose node has this ui hint; empty: all
     bool remotes = true;
     uint32_t since = 0;  // generation of the last flush
     uint32_t lastFlushMs = 0;
@@ -255,8 +256,10 @@ public:
     size_t removeSubscriptions(Subscriber* subscriber, std::string_view path, Access ceiling = Access::Admin);
     // Sends an event to the subscriptions it concerns; with `accept`, only
     // to those it accepts (a remote node's events, docs/DESIGN.md section 14).
+    // `node`: the event's own, for subscriptions that keep only events with a
+    // ui hint (null for a relayed event: those go to them unfiltered).
     void emitEvent(std::string_view path, const std::function<void(JsonWriter&)>& write,
-                   const std::function<bool(const Subscription&)>& accept = nullptr);
+                   const std::function<bool(const Subscription&)>& accept = nullptr, const Node* node = nullptr);
 
     // Calls fn for each forwarded subscription to `node`, under the API lock;
     // fn returns false to remove the subscription. Used by RemoteNode.

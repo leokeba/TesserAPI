@@ -208,11 +208,15 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
     }
     JsonVariantConst events = env["events"];
     if (!events.isNull()) {
-        if (!events.is<bool>()) {
-            message = "events must be a boolean";
+        if (events.is<bool>()) {
+            request.query.events = events.as<bool>();
+        } else if (events.is<const char*>() && events.as<JsonString>().size()) {
+            JsonString hint = events.as<JsonString>();
+            request.query.eventHint = std::string_view(hint.c_str(), hint.size());
+        } else {
+            message = "events must be a boolean or a ui hint";
             return Status::BadRequest;
         }
-        request.query.events = events.as<bool>();
     }
     JsonVariantConst snapshot = env["snapshot"];
     if (!snapshot.isNull()) {

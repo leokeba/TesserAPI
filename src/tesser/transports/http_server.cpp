@@ -1026,7 +1026,7 @@ esp_err_t HttpServer::serve(httpd_req_t* req, bool inWorker) {
     char* query = nullptr;
     size_t queryLen = httpd_req_get_url_query_len(req);
     char value[16];
-    std::string keys, exclude, shapeText, filename;
+    std::string keys, exclude, shapeText, filename, eventHint;
     bool bad = false;
     bool sub = false;
     if (queryLen) {
@@ -1066,7 +1066,23 @@ esp_err_t HttpServer::serve(httpd_req_t* req, bool inWorker) {
             request.query.interval = static_cast<uint32_t>(ms);
         }
         boolParam(query, "changes", request.query.changes, bad);
-        boolParam(query, "events", request.query.events, bad);
+        // events=false, or events=<a ui hint>: only the events that have it.
+        eventHint.resize(queryLen + 1);
+        if (queryParam(query, "events", &eventHint[0], eventHint.size(), len, bad)) {
+            eventHint.resize(len);
+            if (eventHint == "true" || eventHint == "1") {
+                eventHint.clear();
+            } else if (eventHint == "false" || eventHint == "0") {
+                request.query.events = false;
+                eventHint.clear();
+            } else if (eventHint.empty()) {
+                bad = true;
+            } else {
+                request.query.eventHint = eventHint;
+            }
+        } else {
+            eventHint.clear();
+        }
         boolParam(query, "snapshot", request.query.snapshot, bad);
         boolParam(query, "remotes", request.query.remotes, bad);
         // Browsers can't send a GET body, so a shape may also come as ?shape=<json>.

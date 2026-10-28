@@ -430,6 +430,7 @@ void UpstreamCache::subscribe(RemoteNode& node, Api& api, const Request& req, st
     sub.interval = req.query.interval;
     sub.changes = req.query.changes;
     sub.events = req.query.events;
+    sub.eventHint.assign(req.query.eventHint.data(), req.query.eventHint.size());
     sub.remotes = req.query.remotes;
     sub.forwarded = true;
     sub.snapshot = req.query.snapshot;
