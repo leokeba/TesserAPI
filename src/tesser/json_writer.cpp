@@ -203,10 +203,9 @@ void JsonWriter::raw(std::string_view json) {
     put(json.data(), json.size());
 }
 
-void JsonWriter::base64(const uint8_t* data, size_t len) {
+void detail::base64Encode(const uint8_t* data, size_t len, void (*emit)(void* ctx, const char* text, size_t n),
+                          void* ctx) {
     static const char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    beforeValue();
-    put('"');
     char out[64];  // 48 bytes at a time
     size_t n = 0;
     for (size_t i = 0; i < len; i += 3) {
@@ -218,11 +217,18 @@ void JsonWriter::base64(const uint8_t* data, size_t len) {
         out[n++] = i + 1 < len ? kAlphabet[v >> 6 & 63] : '=';
         out[n++] = i + 2 < len ? kAlphabet[v & 63] : '=';
         if (n == sizeof(out)) {
-            put(out, n);
+            emit(ctx, out, n);
             n = 0;
         }
     }
-    if (n) put(out, n);
+    if (n) emit(ctx, out, n);
+}
+
+void JsonWriter::base64(const uint8_t* data, size_t len) {
+    beforeValue();
+    put('"');
+    detail::base64Encode(
+        data, len, [](void* w, const char* text, size_t n) { static_cast<JsonWriter*>(w)->put(text, n); }, this);
     put('"');
 }
 

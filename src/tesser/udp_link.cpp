@@ -104,13 +104,6 @@ uint64_t flag(unsigned i) { return uint64_t(1) << i; }
 uint64_t allOf(unsigned count) { return count >= 64 ? ~uint64_t(0) : flag(count) - 1; }
 uint32_t bits(uint64_t v) { return static_cast<uint32_t>(__builtin_popcountll(v)); }
 
-int hexDigit(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
 }  // namespace
 
 PeerAddress udpAddress(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint16_t port) {
@@ -690,22 +683,15 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
                 peer->advertised = false;
                 bye = true;
             } else if (len > kHeader) {
-                JsonDocument doc;
-                if (!deserializeJson(doc, reinterpret_cast<const char*>(data + kHeader), len - kHeader) &&
-                    doc["name"].is<const char*>() && doc["schema"].is<const char*>()) {
-                    name = doc["name"].as<const char*>();
-                    protocol = doc["v"].is<uint8_t>() && doc["v"].as<uint8_t>() ? doc["v"].as<uint8_t>() : uint8_t(1);
-                    maxMessage = doc["max"].is<uint32_t>() ? doc["max"].as<uint32_t>() : 0;
-                    hash = static_cast<uint32_t>(strtoul(doc["schema"].as<const char*>(), nullptr, 16));
-                    const char* id = doc["id"] | "";
-                    uint8_t mac[6];
-                    bool good = strlen(id) == 12;
-                    for (int i = 0; good && i < 6; i++) {
-                        int hi = hexDigit(id[2 * i]), lo = hexDigit(id[2 * i + 1]);
-                        good = hi >= 0 && lo >= 0;
-                        if (good) mac[i] = static_cast<uint8_t>(hi << 4 | lo);
-                    }
-                    if (good) device = PeerAddress::fromBytes(mac, 6);
+                detail::Advert a;
+                if (detail::parseAdvert(std::string_view(reinterpret_cast<const char*>(data + kHeader), len - kHeader),
+                                        a) &&
+                    a.hasName && a.hasSchema) {
+                    name = std::move(a.name);
+                    protocol = a.protocol;
+                    maxMessage = a.maxMessage;
+                    hash = a.schemaHash;
+                    device = a.device;
                     peer->advertised = true;
                     announced = true;
                 } else {

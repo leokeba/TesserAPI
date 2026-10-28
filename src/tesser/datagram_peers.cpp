@@ -41,13 +41,47 @@ bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& sche
 
 bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash, uint8_t& protocol,
                         size_t& maxMessage) {
+    detail::Advert a;
+    if (!detail::parseAdvert(metadata, a) || a.port < 0 || a.port > 255 || !a.hasSchema) return false;
+    port = static_cast<uint8_t>(a.port);
+    schemaHash = a.schemaHash;
+    protocol = a.protocol;
+    maxMessage = a.maxMessage;
+    return true;
+}
+
+namespace {
+int hexValue(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+}  // namespace
+
+bool detail::parseAdvert(std::string_view text, Advert& out) {
     JsonDocument doc;
-    if (deserializeJson(doc, metadata.data(), metadata.size())) return false;
-    if (!doc["tesser"].is<uint8_t>() || !doc["schema"].is<const char*>()) return false;
-    port = doc["tesser"].as<uint8_t>();
-    schemaHash = static_cast<uint32_t>(strtoul(doc["schema"].as<const char*>(), nullptr, 16));
-    protocol = doc["v"].is<uint8_t>() && doc["v"].as<uint8_t>() ? doc["v"].as<uint8_t>() : uint8_t(1);
-    maxMessage = doc["max"].is<uint32_t>() ? doc["max"].as<uint32_t>() : 0;
+    if (deserializeJson(doc, text.data(), text.size()) || !doc.is<JsonObjectConst>()) return false;
+    if (doc["tesser"].is<uint8_t>()) out.port = doc["tesser"].as<uint8_t>();
+    if (doc["name"].is<const char*>()) {
+        out.hasName = true;
+        out.name = doc["name"].as<const char*>();
+    }
+    if (doc["schema"].is<const char*>()) {
+        out.hasSchema = true;
+        out.schemaHash = static_cast<uint32_t>(strtoul(doc["schema"].as<const char*>(), nullptr, 16));
+    }
+    if (doc["v"].is<uint8_t>() && doc["v"].as<uint8_t>()) out.protocol = doc["v"].as<uint8_t>();
+    if (doc["max"].is<uint32_t>()) out.maxMessage = doc["max"].as<uint32_t>();
+    const char* id = doc["id"] | "";
+    uint8_t mac[6];
+    bool good = strlen(id) == 12;
+    for (int i = 0; good && i < 6; i++) {
+        int hi = hexValue(id[2 * i]), lo = hexValue(id[2 * i + 1]);
+        good = hi >= 0 && lo >= 0;
+        if (good) mac[i] = static_cast<uint8_t>(hi << 4 | lo);
+    }
+    if (good) out.device = PeerAddress::fromBytes(mac, 6);
     return true;
 }
 

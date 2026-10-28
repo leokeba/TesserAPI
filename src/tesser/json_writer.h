@@ -60,4 +60,10 @@ private:
     bool ok_ = true;
 };
 
+namespace detail {
+// Standard base64 with padding (RFC 4648) of `len` bytes, handed to `emit`
+// 64 characters at a time: the library's one encoder.
+void base64Encode(const uint8_t* data, size_t len, void (*emit)(void* ctx, const char* text, size_t n), void* ctx);
+}  // namespace detail
+
 }  // namespace tesser

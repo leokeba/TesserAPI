@@ -529,8 +529,6 @@ int FileTransfer::read(uint8_t* buf, size_t cap) {
 namespace detail {
 
 namespace {
-const char kBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 int base64Value(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -543,22 +541,8 @@ int base64Value(char c) {
 
 void base64Encode(const uint8_t* data, size_t len, std::string& out) {
     out.reserve(out.size() + (len + 2) / 3 * 4);
-    size_t i = 0;
-    for (; i + 3 <= len; i += 3) {
-        uint32_t v = uint32_t(data[i]) << 16 | uint32_t(data[i + 1]) << 8 | data[i + 2];
-        out += kBase64[v >> 18];
-        out += kBase64[(v >> 12) & 63];
-        out += kBase64[(v >> 6) & 63];
-        out += kBase64[v & 63];
-    }
-    if (i < len) {
-        uint32_t v = uint32_t(data[i]) << 16;
-        if (i + 1 < len) v |= uint32_t(data[i + 1]) << 8;
-        out += kBase64[v >> 18];
-        out += kBase64[(v >> 12) & 63];
-        out += i + 1 < len ? kBase64[(v >> 6) & 63] : '=';
-        out += '=';
-    }
+    base64Encode(
+        data, len, [](void* s, const char* text, size_t n) { static_cast<std::string*>(s)->append(text, n); }, &out);
 }
 
 bool base64Decode(std::string_view text, std::vector<uint8_t>& out) {

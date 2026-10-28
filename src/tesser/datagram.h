@@ -673,4 +673,21 @@ bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& sche
 bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash, uint8_t& protocol,
                         size_t& maxMessage);
 
+namespace detail {
+// What an advertisement says, NowTP's metadata or UdpLink's
+// ({"name":"...","schema":"...","id":"<MAC, 12 hex digits>","v":...,"max":...}):
+// one parser for both. Members it lacks keep these values.
+struct Advert {
+    int port = -1;  // "tesser"
+    std::string name;
+    bool hasName = false;
+    bool hasSchema = false;
+    uint32_t schemaHash = 0;
+    uint8_t protocol = 1;
+    size_t maxMessage = 0;
+    PeerAddress device;  // "id", when it is a MAC
+};
+bool parseAdvert(std::string_view text, Advert& out);
+}  // namespace detail
+
 }  // namespace tesser

@@ -448,25 +448,12 @@ private:
                         out.append(head);
                         out.append(kData, sizeof(kData) - 1);
                         // Encoded 48 bytes at a time into the envelope.
-                        static const char kAlphabet[] =
-                            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-                        const uint8_t* d = self->pending_.data();
-                        char buf[64];
-                        size_t k = 0;
-                        for (size_t i = 0; i < part; i += 3) {
-                            uint32_t v = uint32_t(d[i]) << 16;
-                            if (i + 1 < part) v |= uint32_t(d[i + 1]) << 8;
-                            if (i + 2 < part) v |= d[i + 2];
-                            buf[k++] = kAlphabet[v >> 18 & 63];
-                            buf[k++] = kAlphabet[v >> 12 & 63];
-                            buf[k++] = i + 1 < part ? kAlphabet[v >> 6 & 63] : '=';
-                            buf[k++] = i + 2 < part ? kAlphabet[v & 63] : '=';
-                            if (k == sizeof(buf)) {
-                                out.append(buf, k);
-                                k = 0;
-                            }
-                        }
-                        out.append(buf, k);
+                        detail::base64Encode(
+                            self->pending_.data(), part,
+                            [](void* o, const char* text, size_t len) {
+                                static_cast<DatagramEndpoint::EnvelopeOut*>(o)->append(text, len);
+                            },
+                            &out);
                         out.append("\"}", 2);
                         return true;
                     });
