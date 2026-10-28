@@ -78,22 +78,11 @@ void changesIn(const Object& o, uint32_t since, uint32_t now, int depth, const S
 // path leaving the local tree (below a remote node) stops at its last local
 // node.
 Access readNeed(const Object& root, std::string_view path) {
-    Access need = root.readAccess();
-    const Node* node = &root;
-    size_t pos = 0;
-    while (pos < path.size()) {
-        if (path[pos] == '/') {
-            pos++;
-            continue;
-        }
-        size_t slash = path.find('/', pos);
-        if (slash == std::string_view::npos) slash = path.size();
-        if (node->type() != NodeType::Object) return need;
-        node = static_cast<const Object*>(node)->child(path.substr(pos, slash - pos));
-        if (!node) return need;
-        if (node->readAccess() > need) need = node->readAccess();
-        pos = slash;
-    }
+    Access need = Access::Public;
+    detail::walkObjects(root, path, [&need](const Node& n) {
+        if (n.readAccess() > need) need = n.readAccess();
+        return true;
+    });
     return need;
 }
 
@@ -168,20 +157,8 @@ Api* Api::owner(const Node& node, std::string& path) {
 
 bool Api::changed(std::string_view path) {
     MutexGuard guard(mutex_);
-    Node* node = this;
-    size_t pos = 0;
-    while (pos < path.size()) {
-        if (path[pos] == '/') {
-            pos++;
-            continue;
-        }
-        size_t slash = path.find('/', pos);
-        if (slash == std::string_view::npos) slash = path.size();
-        if (node->type() != NodeType::Object) return false;
-        node = static_cast<Object*>(node)->child(path.substr(pos, slash - pos));
-        if (!node) return false;
-        pos = slash;
-    }
+    Node* node = detail::walkObjects(*this, path, [](const Node&) { return true; });
+    if (!node) return false;
     node->changed();
     return true;
 }

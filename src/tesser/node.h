@@ -1488,4 +1488,34 @@ ListNode& Object::list(const char* name, std::vector<T>& items) {
     return add(new VectorList<T>(name, items, [](Object& o, T& item) { detail::describeInto(o, item); }));
 }
 
+namespace detail {
+// Walks `path` from `root` through objects, a child per segment; empty
+// segments are skipped ("/a//b/" is a, then b). `visit(node)` sees each node
+// reached, `root` first, and returns false to stop there. Returns the node
+// the whole path names, or null when the walk stopped short: a segment
+// naming no child, or one past a node that isn't an object. Used by what
+// looks nodes up by path outside a request (Api::changed(), belowRemote(),
+// an event's access); requests resolve paths themselves, through lists,
+// arrays and remote nodes.
+template <class Visit>
+Node* walkObjects(const Node& root, std::string_view path, Visit&& visit) {
+    Node* node = const_cast<Node*>(&root);
+    if (!visit(*node)) return nullptr;
+    size_t pos = 0;
+    while (pos < path.size()) {
+        if (path[pos] == '/') {
+            pos++;
+            continue;
+        }
+        size_t slash = path.find('/', pos);
+        if (slash == std::string_view::npos) slash = path.size();
+        if (node->type() != NodeType::Object) return nullptr;
+        node = static_cast<Object*>(node)->child(path.substr(pos, slash - pos));
+        if (!node || !visit(*node)) return nullptr;
+        pos = slash;
+    }
+    return node;
+}
+}  // namespace detail
+
 }  // namespace tesser

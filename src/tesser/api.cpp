@@ -1516,22 +1516,12 @@ Access Api::tokenAccess(std::string_view token, const Client& client) const {
 
 bool Api::belowRemote(std::string_view path) const {
     MutexGuard guard(mutex_);
-    const Node* node = this;
-    size_t pos = 0;
-    while (pos < path.size()) {
-        if (path[pos] == '/') {
-            pos++;
-            continue;
-        }
-        if (node->type() == NodeType::Remote) return true;
-        if (node->type() != NodeType::Object) return false;
-        size_t slash = path.find('/', pos);
-        if (slash == std::string_view::npos) slash = path.size();
-        node = static_cast<const Object*>(node)->child(path.substr(pos, slash - pos));
-        if (!node) return false;
-        pos = slash;
-    }
-    return node->type() == NodeType::Remote;
+    bool remote = false;
+    detail::walkObjects(*this, path, [&remote](const Node& n) {
+        remote = n.type() == NodeType::Remote;
+        return !remote;  // what is below it is the peer's
+    });
+    return remote;
 }
 
 void Api::handle(const Request& request, Reply& reply) {
