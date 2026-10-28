@@ -374,20 +374,52 @@ ListNode& ListNode::key(const char* field) {
     return *this;
 }
 
+namespace {
+// Element `i`'s key as the JSON its value writes (a quoted string), into
+// `json`, cleared first.
+void keyJson(const ListNode& list, size_t i, std::string& json) {
+    json.clear();
+    StringSink sink(json);
+    JsonWriter w(sink);
+    std::unique_ptr<Object> e = list.element(i);
+    Node* k = e->child(list.keyField());
+    if (k) static_cast<ValueNode*>(k)->write(w);
+}
+}  // namespace
+
 void ListNode::keys(std::vector<std::string>& out) const {
     out.clear();
     if (!key_) return;
+    std::string json;
     for (size_t i = 0; i < size(); i++) {
-        std::string json;
-        StringSink sink(json);
-        JsonWriter w(sink);
-        std::unique_ptr<Object> e = element(i);
-        Node* k = e->child(key_);
-        if (k) static_cast<ValueNode*>(k)->write(w);
-        JsonDocument doc;
-        deserializeJson(doc, json);
-        out.push_back(doc.is<const char*>() ? doc.as<const char*>() : "");
+        keyJson(*this, i, json);
+        if (json.size() < 2 || json.front() != '"') {
+            out.emplace_back();
+        } else if (json.find('\\') == std::string::npos) {
+            out.emplace_back(json, 1, json.size() - 2);  // nothing escaped: the text between the quotes
+        } else {
+            JsonDocument doc;
+            deserializeJson(doc, json);
+            out.push_back(doc.is<const char*>() ? doc.as<const char*>() : "");
+        }
     }
+}
+
+size_t ListNode::find(std::string_view key, size_t skip) const {
+    if (!key_) return size();
+    // Compared as JSON: the key written the way the elements' are.
+    std::string want, json;
+    {
+        StringSink sink(want);
+        JsonWriter w(sink);
+        w.string(key);
+    }
+    for (size_t i = 0; i < size(); i++) {
+        if (i == skip) continue;
+        keyJson(*this, i, json);
+        if (json == want) return i;
+    }
+    return size();
 }
 
 Check ListNode::checkKey(JsonVariantConst v) {

@@ -45,6 +45,25 @@ struct Fixture {
     }
 };
 
+// Keys are found by comparing their JSON, so escaped characters (a quote,
+// a backslash, a non-ASCII letter) match as they should.
+TEST(keyed_escaped_keys) {
+    Fixture f;
+    f.sources[0].name = "Sun \"A\"";
+    f.sources[1].name = "Lune\\é";
+    CHECK_EQ(cases::get(f.api, "/sources/Sun \"A\"/az").body, "120");
+    CHECK_EQ(cases::get(f.api, "/sources/Lune\\é/az").body, "200");
+    std::vector<std::string> keys;
+    f.sourcesNode->keys(keys);
+    CHECK((keys == std::vector<std::string>{"Sun \"A\"", "Lune\\é"}));
+    CHECK_EQ(f.sourcesNode->find("Lune\\é"), size_t(1));
+    CHECK_EQ(f.sourcesNode->find("Lune\\é", 1), size_t(2));
+    // Renaming one to the other's key is refused.
+    CHECK_EQ(cases::set(f.api, "/sources/Sun \"A\"/name", "\"Lune\\\\é\"").status, Status::InvalidValue);
+    CHECK_EQ(cases::set(f.api, "/sources/Sun \"A\"/name", "\"Sol\"").status, Status::Ok);
+    CHECK_EQ(f.sources[0].name, "Sol");
+}
+
 TEST(keyed_read) {
     Fixture f;
     CHECK_EQ(cases::get(f.api, "/sources").body,

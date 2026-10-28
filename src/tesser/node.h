@@ -719,6 +719,9 @@ public:
     const char* keyField() const { return key_; }
     // Keys of the elements, in order (keyed lists).
     void keys(std::vector<std::string>& out) const;
+    // The index of the element whose key is `key`, other than `skip`; size()
+    // if none. Stops at the first.
+    size_t find(std::string_view key, size_t skip = SIZE_MAX) const;
     // A valid key: a non-empty string without '/'.
     static Check checkKey(JsonVariantConst v);
 

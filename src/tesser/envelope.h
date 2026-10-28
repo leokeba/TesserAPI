@@ -59,7 +59,9 @@ Status checkStrict(JsonObjectConst envelope, std::initializer_list<const char*> 
 // from the text instead (FileSession::handle()'s `raw`), so a chunk isn't
 // copied into the document too (docs/DESIGN.md section 15).
 bool isUploadEnvelope(std::string_view text);
-JsonDocument uploadFilter();
+// Built on the first upload and kept (a few hundred bytes), rather than
+// built for every chunk.
+JsonVariantConst uploadFilter();
 
 // Reads only the envelope's id, for envelopes that aren't requests ("auth",
 // "upload", "download"). An unusable id is BadRequest with `message`.

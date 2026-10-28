@@ -464,11 +464,7 @@ private:
                 auto* list = static_cast<ListNode*>(node);
                 size_t index = list->size();
                 if (list->keyField()) {
-                    std::vector<std::string> keys;
-                    list->keys(keys);
-                    for (size_t i = 0; i < keys.size(); i++) {
-                        if (keys[i] == seg) index = i;
-                    }
+                    index = list->find(seg);
                 } else if (!parseIndex(seg, index)) {
                     index = list->size();
                 }
@@ -1239,10 +1235,9 @@ private:
             if (ref.node != &n) continue;
             Check c = ListNode::checkKey(v);
             if (!c.isOk()) return error(c.status, c.message);
-            std::vector<std::string> keys;
-            ref.list->keys(keys);
-            for (size_t j = 0; j < keys.size(); j++) {
-                if (j != ref.index && keys[j] == v.as<const char*>()) return error(Status::InvalidValue, "key already used");
+            JsonString key = v.as<JsonString>();
+            if (ref.list->find(std::string_view(key.c_str(), key.size()), ref.index) < ref.list->size()) {
+                return error(Status::InvalidValue, "key already used");
             }
         }
         return true;

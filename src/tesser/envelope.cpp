@@ -46,10 +46,13 @@ bool isUploadEnvelope(std::string_view text) {
     return jsonMember(text, "op", op) && op.compare(0, 7, "\"upload") == 0;
 }
 
-JsonDocument uploadFilter() {
-    JsonDocument filter;
-    for (const char* k : {"v", "id", "op", "path", "offset", "size", "filename", "length", "crc32"}) filter[k] = true;
-    return filter;
+JsonVariantConst uploadFilter() {
+    static const JsonDocument* filter = [] {
+        auto* f = new JsonDocument();  // never destroyed: chunks may come until the end
+        for (const char* k : {"v", "id", "op", "path", "offset", "size", "filename", "length", "crc32"}) (*f)[k] = true;
+        return f;
+    }();
+    return filter->as<JsonVariantConst>();
 }
 
 Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth, Request& request, EnvelopeId& id,
