@@ -1,6 +1,6 @@
 {
   "name": "TesserAPI",
-  "version": "0.1.0",
+  "version": "0.3.4",
   "description": "Describe firmware state once, serve it as a queryable JSON tree over HTTP, ESP-NOW (NowTP) or serial. Arduino and ESP-IDF.",
   "keywords": ["api", "json", "rest", "esp32", "esp-now", "espnow", "http", "schema"],
   "repository": {
