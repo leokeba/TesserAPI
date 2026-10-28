@@ -295,7 +295,7 @@ ValueNode& ValueNode::secret() {
     return *this;
 }
 
-void ValueNode::setValidator(std::function<Check(JsonVariantConst)> v, const ValueKind* argKind) {
+void ValueNode::setValidator(Fn<Check(JsonVariantConst)> v, const ValueKind* argKind) {
     if (argKind && *argKind != kind()) {
         g_declarationErrors++;
         logError("validator of \"%s\" reads %s, the value is %s", name_ ? name_ : "(element)", kindName(*argKind),

@@ -18,6 +18,7 @@
 #include <ArduinoJson.h>
 
 #include "tesser/call.h"
+#include "tesser/fn.h"
 #include "tesser/json_writer.h"
 #include "tesser/request.h"
 #include "tesser/status.h"
@@ -85,7 +86,7 @@ private:
     };
     // What few nodes have.
     struct Extra {
-        std::function<Check(JsonVariantConst)> validator;  // ValueNode::validate(), CustomNode::validate()
+        Fn<Check(JsonVariantConst)> validator;  // ValueNode::validate(), CustomNode::validate()
         uint32_t hash = 0;  // watch(): the last sample
         bool hashed = false;
     };
@@ -385,7 +386,7 @@ protected:
 
 private:
     // `argKind`: the kind the validator reads the value as (null: JSON).
-    void setValidator(std::function<Check(JsonVariantConst)> v, const ValueKind* argKind);
+    void setValidator(Fn<Check(JsonVariantConst)> v, const ValueKind* argKind);
 };
 
 namespace detail {
@@ -501,8 +502,8 @@ private:
 template <class E>
 class FnEnumValue : public EnumNode {
 public:
-    using Getter = std::function<E()>;
-    using Setter = std::function<Check(E)>;
+    using Getter = Fn<E()>;
+    using Setter = Fn<Check(E)>;
 
     FnEnumValue(const char* name, Getter get, Setter set, EnumNames names)
         : EnumNode(name, std::move(names)), get_(std::move(get)), set_(std::move(set)) {}
@@ -524,8 +525,8 @@ private:
 template <class R, class P>
 class FnValue : public ValueNode {
 public:
-    using Getter = std::function<R()>;
-    using Setter = std::function<Check(const P&)>;
+    using Getter = Fn<R()>;
+    using Setter = Fn<Check(const P&)>;
 
     FnValue(const char* name, Getter get, Setter set) : ValueNode(name), get_(std::move(get)), set_(std::move(set)) {
         detail::assertSupported<R>();
@@ -562,7 +563,7 @@ private:
 template <class R>
 class FnValue<R, void> : public ValueNode {
 public:
-    using Getter = std::function<R()>;
+    using Getter = Fn<R()>;
 
     FnValue(const char* name, Getter get) : ValueNode(name), get_(std::move(get)) { detail::assertSupported<R>(); }
     ValueKind kind() const override { return ValueTraits<R>::kind; }
@@ -606,7 +607,7 @@ public:
     // Converts the argument and runs the action; the result goes through
     // call.reply() / call.fail() / call.defer(). `params` is the object
     // argument, filled from `arg`, for actions that take one (else null).
-    using Invoker = std::function<void(JsonVariantConst arg, Object* params, Call& call)>;
+    using Invoker = Fn<void(JsonVariantConst arg, Object* params, Call& call)>;
     using ArgCheck = Check (*)(JsonVariantConst);
     // A temporary object describing a default object argument.
     using ParamsFactory = std::unique_ptr<Object> (*)();
@@ -654,9 +655,9 @@ private:
 // Escape hatch: user code writes the JSON and applies incoming values.
 class CustomNode : public Annotated<CustomNode> {
 public:
-    using Writer = std::function<void(JsonWriter&)>;
-    using Applier = std::function<Status(JsonVariantConst)>;
-    using Validator = std::function<Check(JsonVariantConst)>;
+    using Writer = Fn<void(JsonWriter&)>;
+    using Applier = Fn<Status(JsonVariantConst)>;
+    using Validator = Fn<Check(JsonVariantConst)>;
 
     CustomNode(const char* name, Writer writer, Applier applier)
         : Annotated(name, NodeType::Custom), writer_(std::move(writer)), applier_(std::move(applier)) {}
@@ -809,10 +810,10 @@ public:
 // element.
 class FileNode : public Annotated<FileNode> {
 public:
-    using Upload = std::function<std::unique_ptr<FileSink>(FileRequest& request)>;
-    using Download = std::function<std::unique_ptr<FileSource>(FileRequest& request)>;
-    using TextGetter = std::function<std::string()>;
-    using TextSetter = std::function<Check(std::string_view text, JsonWriter& reply)>;
+    using Upload = Fn<std::unique_ptr<FileSink>(FileRequest& request)>;
+    using Download = Fn<std::unique_ptr<FileSource>(FileRequest& request)>;
+    using TextGetter = Fn<std::string()>;
+    using TextSetter = Fn<Check(std::string_view text, JsonWriter& reply)>;
 
     explicit FileNode(const char* name) : Annotated(name, NodeType::File) {}
 
@@ -1042,7 +1043,8 @@ Check toCheck(S&& setterResult) {
 // A setter taking P that returns void, bool, Status or Check, as one
 // returning Check.
 template <class P, class S>
-std::function<Check(const P&)> checkingSetter(S setter) {
+Fn<Check(const P&)> checkingSetter(S setter) {
+    if (isEmptyCallable(setter)) return nullptr;  // read-only, as without one
     return [setter = std::move(setter)](const P& v) mutable -> Check {
         using SR = decltype(setter(v));
         if constexpr (std::is_void<SR>::value) {
@@ -1435,7 +1437,7 @@ Object& Object::mount(const char* name, T& thing) {
 template <class T>
 class VectorList final : public ListNode {
 public:
-    using Describe = std::function<void(Object&, T&)>;
+    using Describe = Fn<void(Object&, T&)>;
     VectorList(const char* name, std::vector<T>& items, Describe describe)
         : ListNode(name), items_(items), describe_(std::move(describe)) {}
 

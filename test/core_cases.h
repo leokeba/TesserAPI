@@ -658,6 +658,36 @@ TEST(enums) {
              "{\"type\":\"string\",\"writable\":true,\"enum\":[\"off\",\"auto\",\"manual\"]}");
 }
 
+// Node callbacks are tesser::Fn: inline when small and trivially copyable,
+// on the heap otherwise, empty when made from an empty std::function.
+TEST(fn_callables) {
+    int hits = 0;
+    tesser::Fn<int(int)> small = [&hits](int v) { return v + ++hits; };
+    CHECK_EQ(small(1), 2);
+    std::string text = std::string(40, 'x');  // a capture past 8 bytes: on the heap
+    tesser::Fn<size_t()> big = [text]() { return text.size(); };
+    CHECK_EQ(big(), size_t(40));
+    tesser::Fn<size_t()> moved = std::move(big);
+    CHECK(!big);
+    CHECK_EQ(moved(), size_t(40));
+    moved = nullptr;
+    CHECK(!moved);
+    std::function<int()> none;
+    tesser::Fn<int()> fromNone = none;
+    CHECK(!fromNone);
+    int (*nullFn)() = nullptr;
+    CHECK(!tesser::Fn<int()>(nullFn));
+    std::function<int()> some = [] { return 7; };
+    tesser::Fn<int()> fromSome = some;
+    CHECK_EQ(fromSome(), 7);
+    // A read-only enum through an empty setter stays read-only.
+    Api api;
+    Mode m = Mode::Off;
+    std::function<void(Mode)> noSetter;
+    api.value("m", [&] { return m; }, noSetter, {"off", "auto", "manual"});
+    CHECK_EQ(set(api, "/m", "\"auto\"").status, Status::ReadOnly);
+}
+
 // Through a getter, for state another task owns under its own lock.
 TEST(enums_through_functions) {
     Api api;
