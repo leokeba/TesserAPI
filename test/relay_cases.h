@@ -859,4 +859,55 @@ TEST(relay_idle_transfer_is_a_deadline) {
     CHECK_EQ(at.delay(1000000), r.device.api.config().transferIdleMs);
 }
 
+TEST(relay_envelopes_on_the_wire) {
+    // What each stage of a relayed transfer sends the peer, member by member.
+    std::vector<std::string> sent;
+    Rig* rig = nullptr;
+    Rig r(nullptr, [&](const tesser::PeerAddress& to, std::string m, tesser::Delivery d) {
+        sent.push_back(m.substr(m.find(',') + 1));  // after the call's id
+        return rig->net.sender(addr(1))(to, m, d);
+    });
+    rig = &r;
+    r.dir.reset(new file_cases::Dir(r.device.api));
+
+    auto relay = r.dev.relayFile(r.gateway, "/big", "/dev/big");
+    relay->probe([](Status, JsonVariantConst) {});
+    r.net.run();
+    CHECK_EQ(sent.at(0), "\"op\":\"get\",\"path\":\"/big\",\"view\":\"schema\",\"depth\":0,\"v\":2}");
+    relay.reset();
+
+    // Upload: the opening envelope, with its name, then the parts.
+    sent.clear();
+    std::string text(600, 'x');
+    CHECK(r.ask("{\"id\":1,\"op\":\"upload\",\"path\":\"/dev/files/file\",\"size\":600,\"filename\":\"a.json\",\"data\":\"" +
+                b64(text) + "\"}")
+              .find("\"status\":\"ok\"") != std::string::npos);
+    CHECK_EQ(sent.size(), 3u);
+    CHECK_EQ(sent.at(0), "\"op\":\"upload\",\"path\":\"/files/file\",\"size\":600,\"filename\":\"a.json\",\"v\":2}");
+    CHECK_EQ(sent.at(1), "\"op\":\"upload\",\"path\":\"/files/file\",\"offset\":0,\"v\":2,\"data\":\"" +
+                             b64(text.substr(0, 576)) + "\"}");
+    CHECK_EQ(sent.at(2), "\"op\":\"upload\",\"path\":\"/files/file\",\"offset\":576,\"v\":2,\"data\":\"" +
+                             b64(text.substr(576)) + "\"}");
+
+    // Download: the opening chunk's name, and the offset after it.
+    sent.clear();
+    r.ask("{\"id\":2,\"op\":\"download\",\"path\":\"/dev/files/file\",\"filename\":\"a.json\",\"length\":2}");
+    r.ask("{\"id\":3,\"op\":\"download\",\"path\":\"/dev/files/file\",\"offset\":2,\"length\":3}");
+    CHECK_EQ(sent.size(), 2u);
+    CHECK_EQ(sent.at(0), "\"op\":\"download\",\"path\":\"/files/file\",\"filename\":\"a.json\",\"length\":2,\"v\":2}");
+    CHECK_EQ(sent.at(1), "\"op\":\"download\",\"path\":\"/files/file\",\"offset\":2,\"length\":3,\"v\":2}");
+
+    // Below admin, the ops say the client's level.
+    sent.clear();
+    relay = r.dev.relayFile(r.gateway, "/big", "/dev/big", tesser::Access::User);
+    relay->probe([](Status, JsonVariantConst) {});
+    relay->openUpload(1, "", [](Status, JsonVariantConst) {});
+    relay->download(0, 1, [](Status, JsonVariantConst, std::string_view) {});
+    r.net.run();
+    CHECK_EQ(sent.size(), 3u);
+    CHECK_EQ(sent.at(0), "\"op\":\"get@user\",\"path\":\"/big\",\"view\":\"schema\",\"depth\":0,\"v\":2}");
+    CHECK_EQ(sent.at(1), "\"op\":\"upload@user\",\"path\":\"/big\",\"size\":1,\"v\":2}");
+    CHECK_EQ(sent.at(2), "\"op\":\"download@user\",\"path\":\"/big\",\"length\":1,\"v\":2}");
+}
+
 }  // namespace relay_cases
