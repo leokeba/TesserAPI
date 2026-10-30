@@ -131,6 +131,7 @@ public:
 private:
     class WsClient;
     class Stream;
+    struct WsReply;
 
     static esp_err_t onRequest(httpd_req_t* req);
     static esp_err_t onOptions(httpd_req_t* req);
@@ -147,6 +148,8 @@ private:
     esp_err_t sendFile(httpd_req_t* req, FileTransfer& file);
     esp_err_t serveWebSocket(httpd_req_t* req);
     void addCorsHeaders(httpd_req_t* req);
+    // The same on a head written by hand (without a response from httpd).
+    void appendCors(std::string& head) const;
     WsClient* wsClient(int fd, bool create);
     void dropWsClient(int fd);
     bool wsSend(int fd, const std::string& message);

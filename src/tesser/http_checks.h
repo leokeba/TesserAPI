@@ -1,8 +1,12 @@
 #pragma once
 
 // The header checks of HttpServer's strict mode (docs/DESIGN.md section
-// 10.2): platform-independent, so they are host-tested.
+// 10.2), and what it does to text: platform-independent, so they are
+// host-tested.
 
+#include <stddef.h>
+
+#include <string>
 #include <string_view>
 
 namespace tesser {
@@ -22,6 +26,13 @@ bool originAllowed(std::string_view origin, const char* allowed, std::string_vie
 // Whether a Content-Type is JSON: "application/json", without case, with or
 // without parameters ("; charset=utf-8").
 bool isJsonType(std::string_view contentType);
+// Percent-decodes in place ('+' means space in query values only), and gives
+// the length left. A '%' without two hex digits stays as it is.
+size_t urlDecode(char* s, size_t len, bool plusIsSpace);
+// attachment; filename="<ASCII>", plus filename*=UTF-8''<percent-encoded>
+// (RFC 6266) for other names. Names may come from a file system: quotes,
+// backslashes and control bytes would break the header.
+std::string contentDisposition(std::string_view name);
 
 }  // namespace http
 }  // namespace tesser

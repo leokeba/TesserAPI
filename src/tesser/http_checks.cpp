@@ -1,5 +1,6 @@
 #include "tesser/http_checks.h"
 
+#include <ctype.h>
 #include <string.h>
 
 namespace tesser {
@@ -64,6 +65,58 @@ bool isJsonType(std::string_view contentType) {
     while (!type.empty() && (type.back() == ' ' || type.back() == '\t')) type.remove_suffix(1);
     while (!type.empty() && (type.front() == ' ' || type.front() == '\t')) type.remove_prefix(1);
     return equalsNoCase(type, "application/json");
+}
+
+namespace {
+
+int hexValue(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+}  // namespace
+
+size_t urlDecode(char* s, size_t len, bool plusIsSpace) {
+    size_t out = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (c == '%' && i + 2 < len && hexValue(s[i + 1]) >= 0 && hexValue(s[i + 2]) >= 0) {
+            c = static_cast<char>(hexValue(s[i + 1]) * 16 + hexValue(s[i + 2]));
+            i += 2;
+        } else if (c == '+' && plusIsSpace) {
+            c = ' ';
+        }
+        s[out++] = c;
+    }
+    return out;
+}
+
+std::string contentDisposition(std::string_view name) {
+    std::string d = "attachment; filename=\"";
+    bool ascii = true;
+    for (char c : name) {
+        auto u = static_cast<unsigned char>(c);
+        if (u >= 0x80) ascii = false;
+        d += (u < 0x20 || u >= 0x7f || c == '"' || c == '\\') ? '_' : c;
+    }
+    d += '"';
+    if (!ascii) {
+        static const char kHex[] = "0123456789ABCDEF";
+        d += "; filename*=UTF-8''";
+        for (char c : name) {
+            auto u = static_cast<unsigned char>(c);
+            if (isalnum(u) || (c && strchr("!#$&+-.^_`|~", c))) {
+                d += c;
+            } else {
+                d += '%';
+                d += kHex[u >> 4];
+                d += kHex[u & 15];
+            }
+        }
+    }
+    return d;
 }
 
 }  // namespace http

@@ -159,6 +159,26 @@ TEST(protocol_secret_equals) {
 }
 
 // HttpServer's strict mode (docs/DESIGN.md section 10.2): the header checks.
+TEST(protocol_http_text) {
+    auto decoded = [](std::string text, bool plus) {
+        text.resize(tesser::http::urlDecode(&text[0], text.size(), plus));
+        return text;
+    };
+    CHECK_EQ(decoded("a%20b%2fc%2Fd", false), "a b/c/d");
+    CHECK_EQ(decoded("a+b%2Bc", true), "a b+c");
+    CHECK_EQ(decoded("a+b", false), "a+b");  // a path's '+' is a '+'
+    CHECK_EQ(decoded("100%", false), "100%");  // not an escape: left alone
+    CHECK_EQ(decoded("%4", false), "%4");
+    CHECK_EQ(decoded("%zz", false), "%zz");
+    CHECK_EQ(decoded("", true), "");
+
+    using tesser::http::contentDisposition;
+    CHECK_EQ(contentDisposition("cal.json"), "attachment; filename=\"cal.json\"");
+    CHECK_EQ(contentDisposition("a\"b\\c\n.txt"), "attachment; filename=\"a_b_c_.txt\"");
+    CHECK_EQ(contentDisposition("caf\xc3\xa9 1.txt"),
+             "attachment; filename=\"caf__ 1.txt\"; filename*=UTF-8''caf%C3%A9%201.txt");
+}
+
 TEST(protocol_http_strict_checks) {
     using namespace tesser::http;
     CHECK(hostName("dev.local:8080") == "dev.local");

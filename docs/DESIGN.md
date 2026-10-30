@@ -1271,6 +1271,16 @@ A datagram endpoint (`DatagramEndpoint`) is a small class in front of four parts
 - `datagram_mounts.cpp` (`detail::Mounter`): the remote nodes routed through the endpoint, their pins, and the nodes it mounts for peers that announce themselves.
 - `datagram_server.cpp` (`detail::EndpointServer`): serving peers' requests, subscriptions, file transfers and tokens.
 
+`HttpServer` keeps one class across a file per concern, with what they share in `transports/http_internal.h`:
+- `http_server.cpp`: the server's life, and the dispatch of a request, with its response (`HttpReply`).
+- `http_request.cpp`: reading a request (query, headers, token, client address) and the strict mode.
+- `http_websocket.cpp`, `http_streams.cpp`: the connections that outlive a request (§10.5, §11).
+- `http_async.cpp`: what outlives a request's handler: deferred replies, and requests and relayed transfers on tasks of their own (§10.2, §14).
+- `http_files.cpp`: file nodes, raw bytes both ways.
+- `http_mdns.cpp`: `advertise()`.
+
+On ESP-IDF these build as one unit (CMake's `UNITY_BUILD_MODE GROUP`), for code size only: apart, `-Os` inlines differently in each, about 1.1 KB more on the full image. Each file still compiles alone, as Arduino's builds do. What can be tested off target is in `http_checks.cpp`.
+
 The Bluetooth transport (§10.6) is a header that `TesserAPI.h` doesn't include, so that only the firmware using it compiles a BLE stack. On ESP-IDF, its source compiles to nothing unless NimBLE is enabled.
 
 The UDP transport (§10.7) needs only lwIP and `esp_netif`, which every ESP-IDF and Arduino-ESP32 3.x build has: it is always compiled, and linked when used. On ESP-IDF `esp_netif` is a private requirement.
