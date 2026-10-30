@@ -14,6 +14,8 @@ set(TESSER_CORE_SRCS
     src/tesser/datagram.cpp
     src/tesser/datagram_calls.cpp
     src/tesser/datagram_peers.cpp
+    src/tesser/datagram_mounts.cpp
+    src/tesser/datagram_server.cpp
     src/tesser/udp_link.cpp
     src/tesser/subscription.cpp
     src/tesser/persistence.cpp

@@ -14,39 +14,16 @@
 
 #include <ArduinoJson.h>
 
-#include "tesser/budget.h"
-#include "tesser/bytes.h"
+#include "tesser/datagram_types.h"
 #include "tesser/deadline.h"
+#include "tesser/detail/datagram_parts.h"
 #include "tesser/platform.h"
 #include "tesser/request.h"
 
 namespace tesser {
 
 class Api;
-class EnvelopeReply;
-class FileSession;
-class Object;
-class RemoteNode;
 struct ClientInbox;
-
-// Address of a peer on a datagram link: a MAC for NowTP, an IPv4 address
-// and port for UDP. Six bytes: peer tables hold many, so there is no room
-// for IPv6 (which the UDP transport doesn't speak), and longer addresses are
-// cut short.
-struct PeerAddress {
-    static constexpr uint8_t kMaxLength = 6;
-    uint8_t bytes[kMaxLength] = {};
-    uint8_t length = 0;
-
-    static PeerAddress fromBytes(const uint8_t* b, uint8_t len) {
-        PeerAddress a;
-        a.length = len > sizeof(a.bytes) ? sizeof(a.bytes) : len;
-        memcpy(a.bytes, b, a.length);
-        return a;
-    }
-    bool operator==(const PeerAddress& o) const { return length == o.length && memcmp(bytes, o.bytes, length) == 0; }
-    bool operator!=(const PeerAddress& o) const { return !(*this == o); }
-};
 
 // Serves the API and acts as a client over a datagram link: one JSON envelope
 // per message, in both directions. Platform-independent; a link adapter
@@ -56,77 +33,8 @@ struct PeerAddress {
 // call from the link's own callback even while the link holds its locks.
 // process() does the work: it handles requests under the API lock and runs
 // client callbacks. Call it from a worker task or from loop().
-// Why an endpoint forgot a peer.
-enum class PeerLoss : uint8_t {
-    Lost,       // the link said so (NowTP's peer lost), or forgetPeer() without a reason
-    Failed,     // a reliable message wasn't acknowledged in time
-    Goodbye,    // it said it was leaving
-    Restarted,  // it came back with a new session: whatever it held is gone
-    Silent,     // an advertising peer went quiet
-    Stopped,    // this side's link stopped
-    AuthFailed, // the link couldn't authenticate with it: it holds another pairing key (NowTP), or none
-};
-
-// A message a link accepted but couldn't deliver (DatagramEndpoint::sendFailed()).
-enum class SendFailure : uint8_t {
-    Undelivered,  // not acknowledged after the link's retries: the peer is unreachable
-    Rejected,     // the peer refused it: no listener on the port, or too large
-    AuthFailed,   // the peer holds another pairing key, or none
-};
-// "lost" / "failed" / "goodbye" / "restarted" / "silent" / "stopped".
-const char* toString(PeerLoss reason);
-
-class DatagramEndpoint {
+class DatagramEndpoint : public detail::DatagramTypes {
 public:
-    // The message is passed by value: a link that keeps it (for
-    // retransmissions) takes it without a copy when the caller moves it.
-    using SendFn = std::function<bool(const PeerAddress& to, std::string message, Delivery delivery)>;
-    using ClockFn = std::function<uint32_t()>;
-    using ResponseHandler = std::function<void(Status status, JsonVariantConst body)>;
-    // A reply to a broadcast request; see broadcast().
-    using BroadcastHandler = std::function<void(const PeerAddress& from, Status status, JsonVariantConst body)>;
-
-    struct Options {
-        size_t queueLimit = 8;           // incoming messages waiting for process()
-        bool requireReliableSet = true;  // reject set requests that didn't arrive reliably
-        bool broadcastSet = false;       // but apply set requests that arrived by broadcast
-        uint32_t timeoutMs = 3000;       // default client call timeout
-        size_t maxCalls = 8;             // client calls in flight
-        size_t maxTokens = 8;            // peers holding a token ("auth"); the oldest is forgotten
-        // The largest message the link carries (NowTP's
-        // Config::maxMessageSize, UdpLink's maxMessage); 0: no limit. A reply
-        // that would be larger answers too_large (the client reads in
-        // pieces), and a larger notification is missed ("overflow"), rather
-        // than either failing on the link. Every node of a link must take
-        // what the others send it: give them all the same.
-        size_t maxMessage = 0;
-        // Bytes of incoming messages waiting for process(), in all and from
-        // any one peer (docs/DESIGN.md section 15); 0: no limit. Raised to
-        // maxMessage if below it, so the largest message can always queue.
-        size_t queueBytes = 20480;
-        size_t queueBytesPerPeer = 16384;
-        // What peers can make this node hold (docs/DESIGN.md section 14.1):
-        // nodes mounted for peers that announced themselves (mountPeers());
-        // past it, an offline one nothing uses is evicted, else the new peer
-        // isn't mounted. Routes a peer's announcement adds to one node,
-        // through this endpoint; past it, an offline one is replaced. File
-        // transfers peers have open at once; past it, busy. 0: no limit.
-        size_t maxMounted = 16;
-        size_t maxRoutesPerNode = 4;
-        size_t maxFileSessions = 4;
-    };
-
-    struct Stats {
-        uint32_t requests = 0;
-        uint32_t responses = 0;
-        uint32_t dropped = 0;    // queue full or malformed
-        uint32_t timeouts = 0;   // client calls that expired
-        uint32_t unmatched = 0;  // responses for no pending call
-        uint32_t evicted = 0;    // mounted nodes removed for a new one (maxMounted)
-        uint32_t unmounted = 0;  // peers not mounted: maxMounted, none to evict
-        uint32_t tooLarge = 0;   // requests larger than their peer takes, not sent (peerLimit())
-    };
-
     // `api` may be null for a client-only endpoint.
     DatagramEndpoint(Api* api, TransportKind kind, SendFn send, ClockFn clock, Options options);
     DatagramEndpoint(Api* api, TransportKind kind, SendFn send, ClockFn clock)
@@ -167,7 +75,6 @@ public:
     // sendBuffer()): replies are built in one, `slack` bytes spare at its
     // end, and handed over whole rather than copied (docs/DESIGN.md
     // section 15). `fn` takes the buffer in every case. Before begin().
-    using OwnedSendFn = std::function<bool(const PeerAddress& to, Bytes message, Delivery delivery)>;
     void setOwnedSend(OwnedSendFn fn, size_t slack) {
         ownedSend_ = std::move(fn);
         ownedSlack_ = slack;
@@ -195,7 +102,6 @@ public:
     // Same, but an "ok" reply's body reaches `raw` as the peer's JSON text,
     // unparsed, so a gateway relays it without holding it twice (parsed and
     // rewritten); other replies, and timeouts, reach `done`.
-    using RawHandler = std::function<void(std::string_view bodyJson)>;
     bool requestRaw(const PeerAddress& to, Op op, std::string_view path, JsonVariantConst body, RawHandler raw,
                     ResponseHandler done, const Query& query = Query(), uint32_t timeoutMs = 0,
                     const void* owner = nullptr);
@@ -207,18 +113,6 @@ public:
     // without the braces (`"op":"download","path":"/sys/backup"`).
     bool requestFields(const PeerAddress& to, std::string_view fields, ResponseHandler done, uint32_t timeoutMs = 0,
                        const void* owner = nullptr);
-    // Where a Builder writes an envelope: the link's own buffer when it
-    // takes one over (setOwnedSend()), else a string.
-    class EnvelopeOut {
-    public:
-        virtual ~EnvelopeOut() = default;
-        // Room for `bytes` in all; false if the heap can't give it.
-        virtual bool reserve(size_t bytes) = 0;
-        virtual void append(const char* data, size_t len) = 0;
-        // The pool `bytes` of it come from, to reserve them in.
-        virtual Pool pool(size_t bytes) const { return mallocPool(bytes); }
-        void append(std::string_view s) { append(s.data(), s.size()); }
-    };
     // Sends the envelope `build` writes for the call's id into `out`, which
     // it builds again rather than have it kept, should it go again (to a peer
     // with a token, after "unauthorized"); over a link that takes buffers
@@ -226,7 +120,6 @@ public:
     // relayed file chunk) is never held twice (docs/DESIGN.md section 15).
     // False from `build` (no memory for it): not sent, false. With `raw`,
     // an "ok" reply's body goes to it unparsed, as for requestRaw().
-    using Builder = std::function<bool(uint32_t id, EnvelopeOut& out)>;
     bool requestBuilt(const PeerAddress& to, Builder build, ResponseHandler done, uint32_t timeoutMs = 0,
                       const void* owner = nullptr, RawHandler raw = nullptr);
     // Sends a request once, unreliably, to every node behind `to` (a
@@ -239,21 +132,21 @@ public:
     bool broadcast(const PeerAddress& to, Op op, std::string_view path, std::string_view bodyJson,
                    BroadcastHandler onReply = nullptr, uint32_t windowMs = 0, const void* owner = nullptr);
     // Drops (without calling) the pending calls tagged with `owner`.
-    void cancelCalls(const void* owner);
+    void cancelCalls(const void* owner) { calls_.cancel(owner); }
     // Whether a call made for `owner` is in flight.
-    bool hasCalls(const void* owner) const;
+    bool hasCalls(const void* owner) const { return calls_.has(owner); }
     // Peers holding a subscription here, and peers with a file transfer open.
-    size_t peerSubscribers() const;
-    size_t fileSessions() const { return files_.size(); }
+    size_t peerSubscribers() const { return server_.subscribers(); }
+    size_t fileSessions() const { return server_.fileSessions(); }
 
     // Used by RemoteNode: a node with a route through this endpoint, and
     // that route (`peer`), so it gets the peer's advertised hash.
     // removeRemote() (its destructor) waits while another task calls the
     // node from this endpoint (process(), a token's answer): a node mustn't
     // be destroyed under the API lock, which that call may be waiting for.
-    void addRemote(RemoteNode* remote);
-    void removeRemote(RemoteNode* remote);
-    void routeAdded(RemoteNode* remote, const PeerAddress& peer);
+    void addRemote(RemoteNode* remote) { mounts_.addRemote(remote); }
+    void removeRemote(RemoteNode* remote) { mounts_.removeRemote(remote); }
+    void routeAdded(RemoteNode* remote, const PeerAddress& peer) { mounts_.routeAdded(remote, peer); }
     // Used by PeerClient: notifications from `peer` are queued in `inbox`.
     void addClient(const PeerAddress& peer, std::shared_ptr<ClientInbox> inbox);
     void removeClient(const ClientInbox* inbox);
@@ -273,7 +166,6 @@ public:
     // Notifications ("change" / "event" envelopes) from nodes this one
     // subscribed to, all of them, including those a mirrored RemoteNode
     // also consumes. Runs in process().
-    using NotificationHandler = std::function<void(const PeerAddress& from, JsonObjectConst envelope)>;
     void onNotification(NotificationHandler fn) { onNotification_ = std::move(fn); }
 
     // The peer is gone (e.g. NowTP reported it lost): its pending calls get
@@ -320,20 +212,18 @@ public:
     // restart, a goodbye, a failed delivery, the link stopped) and after an
     // "unauthorized" reply, whose request is then sent once more. An empty
     // token stops presenting one (the peer keeps it until it forgets us).
-    void setPeerToken(const PeerAddress& peer, std::string_view token);
+    void setPeerToken(const PeerAddress& peer, std::string_view token) { calls_.setToken(peer, token); }
     // The level the peer last granted our token (public if none yet).
-    Access grantedAccess(const PeerAddress& peer) const;
+    Access grantedAccess(const PeerAddress& peer) const { return calls_.granted(peer); }
     // Called, in process() and without the API lock, with each answer to a
     // token: Status::Ok and the level granted (public: the token wasn't
     // accepted), or the error (timeout: the peer didn't answer).
-    using AuthHandler = std::function<void(const PeerAddress& peer, Status status, Access level)>;
     void onAuth(AuthHandler fn) { onAuth_ = std::move(fn); }
 
     // ---- interfaces -------------------------------------------------------
     // Which local interface reaches `peer` (docs/DESIGN.md section 14.3),
     // for route orders that name one: the link's adapter tells (UdpTransport
     // by the subnets of its interfaces). Any without one, or when unknown.
-    using InterfaceFn = std::function<NetInterface(const PeerAddress& peer)>;
     void classifyInterfaces(InterfaceFn fn) { interfaceOf_ = std::move(fn); }
     NetInterface interfaceOf(const PeerAddress& peer) const {
         return interfaceOf_ ? interfaceOf_(peer) : NetInterface::Any;
@@ -345,9 +235,6 @@ public:
     // advertises), else empty. Runs in process(), without the API lock. A
     // node that a client drives undoes what it did here (docs/DESIGN.md
     // section 14.4); a restarted peer is reported though it is back at once.
-    using PeerLossHandler =
-        std::function<void(const PeerAddress& peer, const PeerAddress& device, PeerLoss reason)>;
-    using PeerLostHandler = std::function<void(const PeerAddress& peer, const PeerAddress& device)>;
     void onPeerLost(PeerLossHandler fn) { onPeerLost_ = std::move(fn); }
     void onPeerLost(PeerLostHandler fn) {
         if (!fn) return onPeerLost(PeerLossHandler());
@@ -364,7 +251,7 @@ public:
     // object of this endpoint's API, as a remote node named after the peer
     // (docs/DESIGN.md section 14.1). `mirrorIntervalMs` > 0 also mirrors it.
     // Each call adds a parent (again for the same one: a new interval).
-    void mountPeers(Object& parent, uint32_t mirrorIntervalMs = 0);
+    void mountPeers(Object& parent, uint32_t mirrorIntervalMs = 0) { mounts_.mountPeers(parent, mirrorIntervalMs); }
     // A peer announced itself as a TesserAPI node (from NowTP discovery
     // metadata, ...): `name` is its advertised name, `schemaHash` the hash
     // it advertises, `device` the device's MAC when the link's address isn't
@@ -376,7 +263,9 @@ public:
     // `maxMessage` the largest message it takes, as it advertises it (0:
     // not said).
     void peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash,
-                  const PeerAddress& device = PeerAddress(), uint8_t protocol = 0, size_t maxMessage = 0);
+                  const PeerAddress& device = PeerAddress(), uint8_t protocol = 0, size_t maxMessage = 0) {
+        mounts_.peerSeen(peer, name, schemaHash, device, protocol, maxMessage);
+    }
 
     // Keeps an advertisement current: once the API's tree has changed (a
     // peer mounted, a node added, a remote node's state, see
@@ -388,7 +277,7 @@ public:
                        uint32_t debounceMs = 1000);
 
     Stats stats() const;
-    size_t pendingCalls() const;
+    size_t pendingCalls() const { return calls_.pending(); }
     TransportKind kind() const { return kind_; }
     uint32_t now() const { return clock_ ? clock_() : 0; }
     // The default call timeout (Options::timeoutMs).
@@ -412,162 +301,29 @@ public:
     size_t maxMessage() const { return options_.maxMessage; }
 
 private:
-    struct FreeDeleter {
-        void operator()(char* p) const { free(p); }
-    };
-    // A message waiting for process(): its text, or a buffer the link
-    // handed over (receiveOwned()).
-    struct Incoming {
-        PeerAddress from;
-        std::string text;
-        bool reliable = false;
-        bool broadcast = false;
-        std::unique_ptr<char, FreeDeleter> owned;
-        size_t ownedLen = 0;
-        Reservation held;  // its bytes, in incoming_
-        std::string_view view() const { return owned ? std::string_view(owned.get(), ownedLen) : std::string_view(text); }
-    };
-    class PeerSubscriber : public Subscriber {
-    public:
-        PeerSubscriber(DatagramEndpoint& ep, const PeerAddress& address) : ep_(ep), peer(address) {}
-        bool notify(const std::string& message, Delivery delivery) override {
-            if (ep_.options_.maxMessage && message.size() > ep_.options_.maxMessage) return false;
-            return ep_.send_ && ep_.send_(peer, message, delivery);
-        }
-        bool notifyOwned(std::string&& message, Delivery delivery) override {
-            if (ep_.options_.maxMessage && message.size() > ep_.options_.maxMessage) return false;
-            return ep_.send_ && ep_.send_(peer, std::move(message), delivery);
-        }
-        // Api::tokensChanged(): a peer that isn't trusted is at its token's level.
-        bool recheckLevel(Access& level) override {
-            if (ep_.trust_ && ep_.trust_(peer)) return false;
-            level = ep_.levelOf(peer);
-            return true;
-        }
+    friend class detail::CallTable;
+    friend class detail::Mounter;
+    friend class detail::EndpointServer;
+    using Incoming = detail::Incoming;
 
-    private:
-        DatagramEndpoint& ep_;
-
-    public:
-        PeerAddress peer;
-    };
-
-    struct Seen {
-        PeerAddress peer;
-        std::string name;
-        uint32_t schemaHash;
-        PeerAddress device;
-        uint8_t protocol;
-        size_t maxMessage;
-    };
-    struct Advertised {
-        PeerAddress peer;
-        uint32_t schemaHash;
-        uint8_t protocol;
-    };
-
-    // A peer's file transfers, dropped once idle for Config::transferIdleMs.
-    struct PeerFiles {
-        PeerAddress peer;
-        std::unique_ptr<FileSession> session;
-        uint32_t usedMs;
-    };
-
-    // A request to a peer with a token is kept, to go again after
-    // "unauthorized", up to this size (unless it waits for the token).
-    static constexpr size_t kKeptEnvelope = 512;
-    struct CallSlot {
-        uint32_t id;
-        PeerAddress to;
-        uint32_t deadline;
-        ResponseHandler done;
-        const void* owner;
-        BroadcastHandler each;  // a broadcast call: replies from any peer
-        uint32_t sentMs;
-        RawHandler raw;        // requestRaw(): an "ok" reply's body, unparsed
-        std::string text;      // to a peer with a token: kept to send it again after "unauthorized"
-        std::shared_ptr<Builder> rebuild;  // or how to make it again (requestBuilt())
-        bool held = false;     // waiting for the token's answer before it is sent
-        bool retried = false;  // sent again once already
-    };
-    // A token presented to a peer (setPeerToken()).
-    struct PeerAuth {
-        PeerAddress peer;
-        std::string token;
-        enum State : uint8_t { Idle, Pending, Done } state = Idle;
-        Access level = Access::Public;
-        bool renew = false;  // changed while presented: present the new one when the answer comes
-    };
-    // Peers heard from, with their device when known (bounded).
-    struct Known {
-        PeerAddress peer;
-        PeerAddress device;
-        bool online;
-        uint32_t heardMs;
-        bool authFailed = false;  // reported as such; cleared when heard
-        size_t maxMessage = 0;    // as it advertises (0: not said)
-        bool lossPending = false; // linkLost() deferred: cleared when heard
-    };
     struct Failure {
         PeerAddress peer;
         uint32_t callId;
         SendFailure failure;
     };
 
-    // A held call to send once its token is answered: built then.
-    struct Held {
-        uint32_t id;
-        std::string text;
-        std::shared_ptr<Builder> rebuild;
-    };
-    // ---- datagram.cpp: taking messages, serving peers ------------------------
+    // ---- datagram.cpp: taking messages, process() ----------------------------
     void handle(Incoming& msg);
     bool queue(Incoming&& msg);
-    void handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply);
-    // A request's client from `peer`: transport, address and device, before
-    // its level is decided.
-    Client clientOf(const PeerAddress& peer) const;
-    Access levelOf(const PeerAddress& peer);
-    void reject(const PeerAddress& from, std::string_view text, bool broadcast, Status status, Reason reason,
-                const char* message);
-    void refuse(const PeerAddress& from, std::string_view text, bool broadcast, Reason reason);
     static Options checked(Options o);
-    // Replies to `to` hand their buffer to ownedSend_, when there is one.
-    void ownReplies(EnvelopeReply& reply, const PeerAddress& to, bool silent);
     // Holds `len` bytes from `from` in incoming_ (`heap`: about to be
     // allocated); empty, with a busy reply to a request, when refused.
     Reservation hold(const PeerAddress& from, std::string_view text, bool reliable, bool broadcast, bool heap);
     bool refusable(bool reliable, bool broadcast) const { return linkRefuses_ && reliable && !broadcast; }
-    Subscriber* subscriberFor(const PeerAddress& peer, bool create);
-    void handleFile(JsonObjectConst envelope, const Incoming& msg, const Client& client);
-    void dropFiles(const PeerAddress* peer, uint32_t now);
 
-    // ---- datagram_calls.cpp: calls to peers, tokens presented to them -------
-    bool sendRequest(const PeerAddress& to, uint32_t id, std::string envelope, ResponseHandler done,
-                     uint32_t timeoutMs, const void* owner, bool internal = false, RawHandler raw = nullptr,
-                     std::shared_ptr<Builder> rebuild = nullptr, Bytes owned = Bytes());
-    // A held call's text, built again from its builder.
-    static std::string rebuilt(const Builder& build, uint32_t id);
-    bool takeRaw(const Incoming& msg);
-    void handleResponse(JsonObjectConst envelope, const PeerAddress& from);
-    uint32_t nextCallId();
-    PeerAuth* authLocked(const PeerAddress& peer);
-    void sendAuth(const PeerAddress& peer, const std::string& token);
-    void authDone(const PeerAddress& peer, Status status, JsonVariantConst body);
-    // `reason`: why the calls of a forgotten peer fail (None: a plain timeout).
-    void expire(uint32_t now, bool all, const PeerAddress* peer, Reason reason = Reason::None);
-    void failCall(uint32_t id, Status status, Reason reason, const char* message);
-
-    // ---- datagram_peers.cpp: peers heard and lost, nodes routed and mounted --
+    // ---- datagram_peers.cpp: peers heard and lost ----------------------------
     void dropPeer(const PeerAddress& peer, PeerLoss reason);
     void unreachable(const PeerAddress& peer);
-    void applySeen(const Seen& seen);
-    void mount(Object& parent, uint32_t mirrorMs, const Seen& seen, const PeerAddress& device);
-    bool roomToMount();
-    void markOnline(const PeerAddress& peer, bool online);
-    // Under mutex_.
-    Known* knownLocked(const PeerAddress& peer);
-    Known& learnLocked(const PeerAddress& peer, uint32_t now);
     void checkAdvertisement(uint32_t now);
     bool deferLoss(const PeerAddress& peer);
     void dropDeferred(uint32_t now);
@@ -592,56 +348,10 @@ private:
 
     mutable Mutex mutex_{kRankEndpoint, "endpoint"};
     std::vector<Incoming> queue_;  // a vector: an empty deque allocates
-    std::vector<CallSlot> calls_;
     std::vector<std::pair<PeerAddress, PeerLoss>> lostPeers_;  // forgetPeer() → process()
     std::vector<PeerAddress> unheardPeers_;                    // linkLost() → process()
     std::vector<Failure> failures_;                            // sendFailed() → process()
-    std::vector<Seen> seenPeers_;         // peerSeen() → process()
-    // Schema hashes peers advertised, for remote nodes created later.
-    std::vector<Advertised> advertised_;  // guarded by mutex_
-    std::vector<std::pair<Object*, uint32_t>> mounts_;  // mountPeers(): parent, mirror interval
-    mutable Mutex subscribersMutex_{kRankSubscribers, "endpoint subscribers"};  // taken before the API lock, never after
-    std::vector<PeerSubscriber*> subscribers_;
-    std::atomic<bool> idleCheck_{false};  // a subscriber kept for a queued request
-    // Deletes subscribers (`only`, or all) without subscriptions or queued
-    // requests.
-    void dropIdleSubscribers(const Subscriber* only);
-    std::vector<RemoteNode*> remotes_;  // guarded by mutex_
-    // Remote nodes called without mutex_ (they call back into the endpoint,
-    // the API and the application): pinned under it while the call lasts. A
-    // pinned node isn't evicted, and its destructor (removeRemote()) waits
-    // for the pin to go (docs/DESIGN.md section 9).
-    class Pinned {
-    public:
-        explicit Pinned(DatagramEndpoint& endpoint) : endpoint_(endpoint) {}
-        ~Pinned();
-        // Under mutex_: pins every remote node, or `node`.
-        void all();
-        void add(RemoteNode* node);
-        std::vector<RemoteNode*> nodes;
-
-        Pinned(const Pinned&) = delete;
-        Pinned& operator=(const Pinned&) = delete;
-
-    private:
-        DatagramEndpoint& endpoint_;
-        bool scratch_ = false;  // `nodes` is the endpoint's pinScratch_, given back when done
-    };
-    bool pinnedLocked(const RemoteNode* node) const;
-    bool pinned(const RemoteNode* node) const;
-    void unlistLocked(const RemoteNode* remote);  // out of remotes_
-    std::vector<RemoteNode*> pinned_;  // one entry per pin; guarded by mutex_
-    // A Pinned's list, kept with its capacity so process() doesn't allocate
-    // each tick; one Pinned at a time has it. Guarded by mutex_.
-    std::vector<RemoteNode*> pinScratch_;
-    bool pinScratchBusy_ = false;
-    Signal unpinned_;                  // given as pins go, for removeRemote()
-    std::vector<PeerFiles> files_;      // used in process() only
     std::vector<std::pair<PeerAddress, std::shared_ptr<ClientInbox>>> clients_;  // guarded by mutex_
-    std::vector<std::pair<PeerAddress, std::string>> tokens_;  // from "auth", oldest first; guarded by mutex_
-    std::vector<Known> known_;  // guarded by mutex_
-    std::vector<PeerAuth> auths_;  // guarded by mutex_
-    uint32_t nextId_ = 1;
     Stats stats_;
     // autoAdvertise()
     std::function<void(uint32_t)> publish_;
@@ -650,6 +360,12 @@ private:
     uint32_t revisionAtMs_ = 0;
     uint32_t advertiseDebounceMs_ = 1000;
     bool revisionPending_ = false;
+
+    // Its parts (detail/datagram_parts.h), under mutex_.
+    detail::PeerTable peers_;
+    detail::CallTable calls_;
+    detail::Mounter mounts_;
+    detail::EndpointServer server_;
 };
 
 // Calls `lost` when a device is gone from every endpoint in `endpoints` that

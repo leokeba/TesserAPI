@@ -30,6 +30,10 @@ class Api;
 class DatagramEndpoint;
 class Object;
 class RemoteNode;
+
+namespace detail {
+class Mounter;
+}
 struct PeerAddress;
 
 enum class NodeType : uint8_t { Object, Value, Action, Event, Custom, List, Remote, Array, File };
@@ -1373,7 +1377,7 @@ public:
     size_t childCount() const;
 
 protected:
-    friend class DatagramEndpoint;  // mounts discovered peers, and evicts them
+    friend class detail::Mounter;  // mounts discovered peers, and evicts them
 
     template <class N>
     N& add(N* node) {

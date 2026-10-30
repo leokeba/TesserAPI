@@ -336,4 +336,97 @@ TEST(datagram_forget_all) {
     CHECK_EQ(server.peerSubscribers(), 0u);
 }
 
+TEST(peer_table_parts_last_apart) {
+    using Table = tesser::detail::PeerTable;
+    Table t(tesser::TransportKind::Udp);
+    PeerAddress a = addr(1);
+    // One record, whatever it was first known by.
+    t.setAdvertised(a, 0x11, 2);
+    CHECK_EQ(t.peers().size(), 1u);
+    CHECK(t.known(a) == nullptr);
+    t.learn(a, 100).maxMessage = 512;
+    CHECK_EQ(t.peers().size(), 1u);
+    CHECK(t.known(a) != nullptr && t.known(a)->online);
+    CHECK_EQ(t.find(a)->schemaHash, 0x11u);
+    CHECK_EQ(t.find(a)->device.length, 0u);  // only NowTP's addresses are devices
+    t.present(a).token = "out";
+    t.holdToken(a, "in", 8);
+    std::string token;
+    CHECK(t.heldToken(a, token));
+    CHECK_EQ(token, "in");
+    CHECK_EQ(t.presented(a)->token, "out");
+
+    // Forgotten as heard, it is still what it advertised and its tokens.
+    for (uint8_t i = 2; i < 34; i++) t.learn(addr(i), 200 + i);
+    CHECK(t.known(a) == nullptr);
+    CHECK(t.find(a) != nullptr);
+    CHECK(t.find(a)->advertised);
+    CHECK_EQ(t.find(a)->device.length, 0u);
+    CHECK_EQ(t.find(a)->maxMessage, 0u);
+    CHECK(t.presented(a) != nullptr);
+    CHECK(t.heldToken(a, token));
+    // The last part gone, the record goes.
+    t.dropHeldToken(a);
+    CHECK(!t.heldToken(a, token));
+    CHECK(t.presented(a) != nullptr);
+    t.stopPresenting(a);
+    CHECK(t.presented(a) == nullptr);
+    CHECK(t.find(a) != nullptr);  // advertised
+    for (uint8_t i = 40; i < 72; i++) t.setAdvertised(addr(i), i, 2);
+    CHECK(t.find(a) == nullptr);
+    CHECK_EQ(t.peers().size(), 64u);  // 32 heard, 32 advertised
+
+    // On NowTP, an address is the device.
+    Table now(tesser::TransportKind::NowTP);
+    CHECK(now.learn(a, 1).device == a);
+}
+
+TEST(peer_table_evicts_as_each_part_says) {
+    using Table = tesser::detail::PeerTable;
+    // Heard: an offline peer goes first, then the one silent longest.
+    Table heard(tesser::TransportKind::Udp);
+    for (uint8_t i = 0; i < 32; i++) heard.learn(addr(uint8_t(i + 1)), 1000u + i);
+    heard.known(addr(9))->online = false;
+    heard.learn(addr(100), 5000);
+    CHECK(heard.known(addr(9)) == nullptr);
+    CHECK(heard.known(addr(1)) != nullptr);
+    heard.learn(addr(101), 5001);
+    CHECK(heard.known(addr(1)) == nullptr);
+    CHECK(heard.known(addr(2)) != nullptr);
+    // Heard again: back online, what was deferred or reported cleared.
+    heard.known(addr(2))->online = false;
+    heard.known(addr(2))->lossPending = true;
+    heard.known(addr(2))->authFailed = true;
+    heard.learn(addr(2), 6000);
+    CHECK(heard.known(addr(2))->online && !heard.known(addr(2))->lossPending && !heard.known(addr(2))->authFailed);
+    CHECK_EQ(heard.known(addr(2))->heardMs, 6000u);
+
+    // Advertised: the first to advertise goes, an update doesn't move it.
+    Table adverts(tesser::TransportKind::Udp);
+    for (uint8_t i = 0; i < 32; i++) adverts.setAdvertised(addr(uint8_t(i + 1)), i, 2);
+    adverts.setAdvertised(addr(1), 77, 3);
+    CHECK_EQ(adverts.find(addr(1))->schemaHash, 77u);
+    adverts.setAdvertised(addr(100), 1, 2);
+    CHECK(adverts.find(addr(1)) == nullptr);
+    CHECK(adverts.find(addr(2)) != nullptr);
+
+    // Tokens: the oldest goes; a new token from a peer makes it the newest.
+    Table tokens(tesser::TransportKind::Udp);
+    std::string t;
+    tokens.holdToken(addr(1), "a", 2);
+    tokens.holdToken(addr(2), "b", 2);
+    tokens.holdToken(addr(1), "c", 2);
+    tokens.holdToken(addr(3), "d", 2);
+    CHECK(!tokens.heldToken(addr(2), t));
+    CHECK(tokens.heldToken(addr(1), t));
+    CHECK_EQ(t, "c");
+    CHECK(tokens.heldToken(addr(3), t));
+    // None kept with no room, and an empty one signs out.
+    tokens.holdToken(addr(4), "e", 0);
+    CHECK(!tokens.heldToken(addr(4), t));
+    tokens.holdToken(addr(1), "", 2);
+    CHECK(!tokens.heldToken(addr(1), t));
+    CHECK(tokens.find(addr(1)) == nullptr);
+}
+
 }  // namespace datagram_cases
