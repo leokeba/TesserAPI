@@ -86,10 +86,14 @@ struct Rig {
             radio.run();
         }
     }
+    // UDP's nodes sleep between deadlines, as their workers do (Net::advance()).
     void advance(uint32_t ms) {
         for (uint32_t t = 0; t < ms; t += 10) {
             net.clock += 10;
-            run();
+            for (int i = 0; i < 10; i++) {
+                net.settle();
+                radio.run();
+            }
         }
     }
     RemoteNode& node() { return *RemoteNode::byDevice(peers, mac); }
@@ -663,6 +667,76 @@ TEST(route_own_device_id) {
     CHECK_EQ(cases::get(dev.api, "/", cases::schema(0)).body, "{\"type\":\"object\",\"id\":\"10521c75f37c\"}");
     CHECK(cases::get(dev.api, "/lamp", cases::schema(0)).body.find("\"id\"") == std::string::npos);
     CHECK_EQ(dev.api.schemaHash(), hash);
+}
+
+TEST(route_loss_wakes_the_other_endpoints_worker) {
+    Defaults d;
+    Rig r;
+    r.advance(1000);
+    r.node().routeOrder({{TransportKind::NowTP, tesser::NetInterface::Any}, {TransportKind::Udp, tesser::NetInterface::Any}});
+    r.advance(1100);
+    CHECK(r.kind() == TransportKind::NowTP);
+    // NowTP loses the device: its task runs, and the route in use moves to
+    // UDP, whose worker is asleep and has the rest to do (states, subscriptions).
+    std::vector<std::string> states;
+    RemoteNode::onStateChange([&](RemoteNode& n) {
+        RemoteNode::Route route;
+        n.route(route);
+        states.push_back(tesser::toString(route.kind()));
+    });
+    r.gwNow.forgetPeer(r.mac);
+    r.radio.run();
+    CHECK(r.kind() == TransportKind::Udp);
+    CHECK(r.net.workers[&r.gwUdp].woken);
+    r.net.settle();
+    CHECK_EQ(states.size(), 1u);
+    if (!states.empty()) CHECK_EQ(states[0], "udp");
+}
+
+TEST(route_probes_are_deadlines) {
+    Defaults d;
+    Rig r;
+    RemoteNode& n = r.node();
+    constexpr uint32_t none = 1000000;
+    auto next = [&](DatagramEndpoint& by) {
+        tesser::Deadline at(r.net.clock);
+        n.nextTick(by, at);
+        return at.delay(none);
+    };
+    r.advance(100);
+    CHECK(r.kind() == TransportKind::Udp);
+    CHECK_EQ(next(r.gwUdp.endpoint()), none);  // nothing to do
+
+    // UDP's route is lost: NowTP's endpoint now does the node's work,
+    // probing it after probeMs, and the wait doubles.
+    r.gwUdp.endpoint().forgetPeer(ip(20));
+    r.net.lose = [](const udp_cases::Net::Datagram&) { return true; };
+    r.advance(10);
+    CHECK(r.kind() == TransportKind::NowTP);
+    CHECK_EQ(next(r.gwNow), 5000u);
+    CHECK_EQ(next(r.gwUdp.endpoint()), none);
+    r.advance(1000);
+    CHECK_EQ(next(r.gwNow), 4000u);
+    r.advance(4100);
+    CHECK(next(r.gwNow) > 9000);
+    r.net.lose = nullptr;
+}
+
+TEST(route_stream_retry_is_a_deadline) {
+    Defaults d;
+    Rig r;
+    RemoteNode& n = r.node();
+    constexpr uint32_t none = 1000000;
+    tesser::Deadline at(r.net.clock);
+    r.net.lose = [](const udp_cases::Net::Datagram&) { return true; };
+    // No call slot for it: the node's tick tries again, soon.
+    for (int i = 0; i < 8; i++) {
+        CHECK(r.gwUdp.endpoint().request(ip(20), tesser::Op::Get, "/", std::string_view(), [](Status, JsonVariantConst) {}));
+    }
+    CHECK_EQ(n.stream("/out", "{\"level\":5}"), Status::Ok);
+    n.nextTick(r.gwUdp.endpoint(), at);
+    CHECK_EQ(at.delay(none), DatagramEndpoint::kRetryMs);
+    r.net.lose = nullptr;
 }
 
 }  // namespace route_cases

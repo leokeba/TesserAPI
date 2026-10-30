@@ -17,6 +17,7 @@
 #include <ArduinoJson.h>
 
 #include "tesser/budget.h"
+#include "tesser/deadline.h"
 #include "tesser/platform.h"
 #include "tesser/request.h"
 #include "tesser/route.h"
@@ -103,6 +104,8 @@ public:
     void renew(RemoteContext node, uint32_t nowMs);
     // Subscribes the mirror when due, by `current`, the route in use.
     void refreshMirror(RemoteContext node, const RemoteRoute& current, uint32_t nowMs);
+    // When renew() or refreshMirror() next has something to do.
+    void nextTick(Deadline& d) const;
     // The route in use changed (`from` was it): subscriptions move to the new
     // one.
     void rerouted(RemoteContext node, const RemoteRoute& from, uint32_t nowMs);

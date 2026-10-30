@@ -595,4 +595,34 @@ TEST(remote_mutual_mirrors_dont_loop) {
     // nodes first.
 }
 
+TEST(remote_renewals_are_deadlines) {
+    Rig r;
+    constexpr uint32_t none = 1000000;
+    auto next = [&] {
+        tesser::Deadline at(r.net.clock);
+        r.kitchen.nextTick(r.gatewayEnd, at);
+        return at.delay(none);
+    };
+    r.net.run();
+    r.gatewayEnd.process();
+    CHECK_EQ(next(), none);
+    // A forwarded subscription: renewed every 30 s.
+    CHECK(r.ask("{\"id\":1,\"op\":\"sub\",\"path\":\"/kitchen/lamp\",\"keys\":\"on\"}").find("\"ok\"") != std::string::npos);
+    CHECK_EQ(next(), 30000u);
+    r.net.clock += 1000;
+    CHECK_EQ(next(), 29000u);
+    // A mirror: at once, then after refreshMs, which the subscription now
+    // goes by too, a second old.
+    r.kitchen.mirror(0, 20000);
+    CHECK_EQ(next(), 0u);
+    r.gatewayEnd.process();
+    r.net.run();
+    CHECK(r.kitchen.hasCopy());
+    CHECK_EQ(next(), 19000u);
+    r.net.clock += 19000;
+    r.gatewayEnd.process();
+    r.net.run();
+    CHECK_EQ(next(), 1000u);  // the mirror's
+}
+
 }  // namespace remote_cases

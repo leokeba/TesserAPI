@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "tesser/datagram.h"
+#include "tesser/deadline.h"
 #include "tesser/platform.h"
 
 namespace tesser {
@@ -32,7 +33,7 @@ std::string formatUdpAddress(const PeerAddress& address);
 // retransmission, duplicate suppression), and broadcasts; plus discovery
 // advertisements. Platform-independent: an adapter (UdpTransport, or a test)
 // sends the datagrams with `send`, hands received ones to packet(), and calls
-// tick() every few milliseconds.
+// tick() when nextDelayMs() says, and when onQueued() fires.
 //
 // `send` gets the destination and the datagram. An empty destination means
 // every local network: the adapter sends the datagram to each interface's
@@ -124,11 +125,23 @@ public:
     // A datagram from `from`. Any task; requests run in tick().
     void packet(const PeerAddress& from, const uint8_t* data, size_t len);
     // Retransmits, advertises, forgets silent peers, then runs the
-    // endpoint's process(). Call every 10-50 ms, and when onQueued() fires.
-    // Returns true if it did anything.
+    // endpoint's process(). Call after nextDelayMs(), and when onQueued()
+    // fires. Returns true if it did anything.
     bool tick();
-    // Called (from packet()'s context) when the endpoint has work, so an
-    // adapter can wake its worker.
+    // What nextDelayMs() gives at most: what has no deadline to tell, such
+    // as the tree changing (advertised), is seen within this.
+    static constexpr uint32_t kMaxDelayMs = 1000;
+    // How long tick() can wait, in ms: until the next retransmission,
+    // timeout or advertisement, or until the endpoint's next deadline
+    // (DatagramEndpoint::nextTick()); 0 if it has something to do now. A
+    // worker sleeps this long (docs/DESIGN.md section 10.7). From the task
+    // that calls tick().
+    uint32_t nextDelayMs(uint32_t most = kMaxDelayMs);
+    // Called when the endpoint has work, or something tick() must see comes
+    // due sooner than a sleeping worker would look (a reliable message sent
+    // from another task), so an adapter can wake its worker. Any task, and
+    // possibly under the API lock or the endpoint's: it should only wake
+    // something (DatagramEndpoint::onQueued()).
     void onQueued(std::function<void()> fn) { endpoint_.onQueued(std::move(fn)); }
 
     // ---- discovery ------------------------------------------------------

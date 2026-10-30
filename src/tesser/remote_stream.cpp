@@ -110,6 +110,11 @@ bool SetStream::next(bool reachable, std::string& path, std::string& body) {
     return false;
 }
 
+bool SetStream::waiting() const {
+    MutexGuard guard(mutex_);
+    return !inFlight_ && !queue_.empty();
+}
+
 void SetStream::unsent() {
     // No call slot or no room on the link: the node's tick tries again.
     MutexGuard guard(mutex_);

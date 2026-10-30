@@ -382,6 +382,11 @@ RouteTable::Observed RouteTable::observe(const Route& current, bool online) {
     return o;
 }
 
+bool RouteTable::unobserved(const Route& current, bool online) const {
+    MutexGuard guard(mutex_);
+    return lastEndpoint_ != current.endpoint || lastPeer_ != current.peer || lastOnline_ != online || announce_.load();
+}
+
 std::vector<RouteTable::Route> RouteTable::dueProbes(uint32_t nowMs) {
     std::vector<Route> probes;
     MutexGuard guard(mutex_);
@@ -396,6 +401,16 @@ std::vector<RouteTable::Route> RouteTable::dueProbes(uint32_t nowMs) {
         }
     }
     return probes;
+}
+
+void RouteTable::nextProbe(Deadline& d) const {
+    MutexGuard guard(mutex_);
+    if (!probeMs_) return;
+    for (const Slot& r : routes_) {
+        if (r.route.online) continue;
+        d.at(lastProbeMs_ + (probeWaitMs_ ? probeWaitMs_ : probeMs_));
+        return;
+    }
 }
 
 }  // namespace detail

@@ -297,6 +297,19 @@ void UpstreamCache::renew(RemoteContext node, uint32_t nowMs) {
     }
 }
 
+void UpstreamCache::nextTick(Deadline& d) const {
+    MutexGuard guard(mutex_);
+    for (auto& u : upstreams_) {
+        if (u->ready && !u->subscribing) d.at(u->lastSubscribeMs + (u->stale ? 2000 : refreshMs_));
+    }
+    if (!mirror_ || subscribing_) return;
+    if (subscribedOnce_) {
+        d.at(lastSubscribeMs_ + (hasCopy_ ? refreshMs_ : 2000));
+    } else {
+        d.in(0);
+    }
+}
+
 void UpstreamCache::refreshMirror(RemoteContext node, const RemoteRoute& cur, uint32_t nowMs) {
     if (!mirror_ || subscribing_) return;
     if (subscribedOnce_) {

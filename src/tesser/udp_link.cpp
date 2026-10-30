@@ -313,29 +313,35 @@ bool UdpLink::sendMessage(const PeerAddress& to, std::string message, Delivery d
     // Broadcasts can't be acknowledged; LatestOnly goes once too.
     bool broadcast = to.length == 0 || delivery == Delivery::BestEffort;
     bool reliable = delivery == Delivery::Reliable && !broadcast;
-    MutexGuard guard(mutex_);
-    if (!running_) return false;
-    if (reliable && outgoing_.size() >= options_.maxOutgoing) return false;
-    // Kept until acknowledged: counted (allocated already).
-    Reservation held;
-    if (reliable) {
-        held = outgoingBytes_.reserve(message.size(), budgetKey(to), true, false);
-        if (!held) return false;
+    {
+        MutexGuard guard(mutex_);
+        if (!running_) return false;
+        if (reliable && outgoing_.size() >= options_.maxOutgoing) return false;
+        // Kept until acknowledged: counted (allocated already).
+        Reservation held;
+        if (reliable) {
+            held = outgoingBytes_.reserve(message.size(), budgetKey(to), true, false);
+            if (!held) return false;
+        }
+        uint32_t id = takeId(to, broadcast);
+        if (!reliable) {
+            // Copies of a broadcast keep its id: receivers apply the first.
+            uint8_t copies = broadcast && options_.broadcastCopies ? options_.broadcastCopies : 1;
+            for (uint8_t c = 0; c < copies; c++) {
+                transmit(to, id, message, count, allOf(count), broadcast ? kBroadcast : 0);
+            }
+            return true;
+        }
+        uint32_t t = now();
+        // Kept for retransmissions: taken, not copied (a large reply on a
+        // fragmented heap had no room for a second block).
+        outgoing_.push_back(Outgoing{to, id, std::move(message), count, 0, t + options_.ackTimeoutMs,
+                                     options_.ackTimeoutMs, t + options_.sendTimeoutMs, std::move(held)});
+        const Outgoing& o = outgoing_.back();
+        transmit(to, id, o.data, count, allOf(count), kReliable);
     }
-    uint32_t id = takeId(to, broadcast);
-    if (!reliable) {
-        // Copies of a broadcast keep its id: receivers apply the first.
-        uint8_t copies = broadcast && options_.broadcastCopies ? options_.broadcastCopies : 1;
-        for (uint8_t c = 0; c < copies; c++) transmit(to, id, message, count, allOf(count), broadcast ? kBroadcast : 0);
-        return true;
-    }
-    uint32_t t = now();
-    // Kept for retransmissions: taken, not copied (a large reply on a
-    // fragmented heap had no room for a second block).
-    outgoing_.push_back(Outgoing{to, id, std::move(message), count, 0, t + options_.ackTimeoutMs, options_.ackTimeoutMs,
-                                 t + options_.sendTimeoutMs, std::move(held)});
-    const Outgoing& o = outgoing_.back();
-    transmit(to, id, o.data, count, allOf(count), kReliable);
+    // Its retransmission is due before a sleeping worker would look.
+    endpoint_.wake();
     return true;
 }
 
@@ -762,6 +768,27 @@ bool UdpLink::tick() {
     }
     for (const auto& p : lost) endpoint_.forgetPeer(p.first, p.second);
     return endpoint_.process() || !lost.empty();
+}
+
+uint32_t UdpLink::nextDelayMs(uint32_t most) {
+    Deadline d(now());
+    {
+        MutexGuard guard(mutex_);
+        if (running_) {
+            for (const Outgoing& o : outgoing_) {
+                d.at(o.probeMs);
+                d.at(o.deadlineMs);
+            }
+            for (const Partial& p : partials_) d.at(p.touchedMs + options_.sendTimeoutMs);
+            for (const Peer& p : peers_) {
+                if (p.advertised) d.at(p.heardMs + options_.peerTimeoutMs);
+            }
+            if (advertising_) d.at(advertisedMs_ + options_.advertiseMs);
+        }
+    }
+    endpoint_.nextTick(d);
+    uint32_t delay = d.delay(most);
+    return delay < most ? delay : most;
 }
 
 UdpLink::Stats UdpLink::stats() const {

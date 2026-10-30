@@ -53,6 +53,9 @@ public:
     Stats stats() const;
     // Sets queued or in flight.
     size_t size() const;
+    // A set could go, and only the node's tick will send it (unsent(), or a
+    // busy peer's answer).
+    bool waiting() const;
 
 private:
     struct Pending {

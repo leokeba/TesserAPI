@@ -194,6 +194,7 @@ void RemoteNode::addRoute(DatagramEndpoint& endpoint, const PeerAddress& peer) {
     std::string token = this->token();
     if (!token.empty()) endpoint.setPeerToken(peer, token);
     routes_.announce();  // mounted, or a route added: tick() tells onStateChange()
+    endpoint.wake();
 }
 
 void RemoteNode::setToken(std::string_view token) {
@@ -294,7 +295,16 @@ void RemoteNode::setRouteOnline(const DatagramEndpoint* endpoint, const PeerAddr
     // Back online: the interface may have changed (addresses come and go).
     bool back = online && routes_.down(endpoint, peer);
     NetInterface iface = back ? endpoint->interfaceOf(peer) : NetInterface::Any;
+    bool flipped = online ? back : routes_.up(endpoint, peer);
     if (routes_.setOnline(endpoint, peer, online, nowMs, back, iface)) changed();
+    // The route in use may move to another endpoint, whose tick does the rest.
+    if (flipped) wakeEndpoints(endpoint);
+}
+
+void RemoteNode::wakeEndpoints(const DatagramEndpoint* except) const {
+    for (DatagramEndpoint* e : routes_.endpoints()) {
+        if (e != except) e->wake();
+    }
 }
 
 void RemoteNode::routeRoundTrip(const DatagramEndpoint* endpoint, const PeerAddress& peer, uint32_t rttMs) {
@@ -344,6 +354,7 @@ void RemoteNode::detach(const DatagramEndpoint* endpoint) {
 RemoteNode& RemoteNode::mirror(uint32_t intervalMs, uint32_t refreshMs, Access level) {
     upstream().mirror(intervalMs, refreshMs, level);
     touch();
+    wakeEndpoints();
     return *this;
 }
 bool RemoteNode::hasCopy() const { return upstreamIf() && upstreamIf()->hasCopy(); }
@@ -401,6 +412,20 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
     // Streamed sets that couldn't be sent (no call slot, a busy peer).
     pump();
     if (u) u->refreshMirror(*this, cur, nowMs);
+}
+
+void RemoteNode::nextTick(const DatagramEndpoint& by, Deadline& d) const {
+    if (!api_.load()) {
+        uint32_t looked = apiLookupMs_.load();
+        d.at(looked ? looked + 1000 : d.now());
+    }
+    Route cur;
+    if (!route(cur) || cur.endpoint != &by) return;
+    if (routes_.unobserved(cur, online())) d.in(0);
+    routes_.nextProbe(d);
+    if (detail::UpstreamCache* u = upstreamIf()) u->nextTick(d);
+    detail::SetStream* stream = setsIf();
+    if (stream && stream->waiting()) d.in(DatagramEndpoint::kRetryMs);
 }
 
 bool RemoteNode::localPath(std::string& out) {

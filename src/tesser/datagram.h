@@ -16,6 +16,7 @@
 
 #include "tesser/budget.h"
 #include "tesser/bytes.h"
+#include "tesser/deadline.h"
 #include "tesser/platform.h"
 #include "tesser/request.h"
 
@@ -154,6 +155,13 @@ public:
     // Handles queued messages and expires client calls. Returns true if it did
     // anything.
     bool process();
+    // When process() next has something to do, into `d`: now with messages
+    // waiting, else its calls' timeouts and its remote nodes' timers. For a
+    // worker that sleeps until then (UdpLink::nextDelayMs()). What adds
+    // to it from another task calls wake(). From the task that calls process().
+    void nextTick(Deadline& d);
+    // How soon a tick looks again at what it can only retry.
+    static constexpr uint32_t kRetryMs = 20;
 
     // A link that sends from a malloc()ed buffer it takes over (NowTP's
     // sendBuffer()): replies are built in one, `slack` bytes spare at its
@@ -165,9 +173,14 @@ public:
         ownedSlack_ = slack;
     }
 
-    // Called (from receive()'s context) whenever something is queued, so an
-    // adapter can wake its worker.
+    // Called whenever something is queued, or wake() is, so an adapter can
+    // wake its worker: from receive()'s context, or any task's, possibly
+    // under the API lock or this endpoint's. It should do no more than that.
     void onQueued(std::function<void()> fn) { onQueued_ = std::move(fn); }
+    // A worker sleeping until nextTick() must look again.
+    void wake() {
+        if (onQueued_) onQueued_();
+    }
 
     // ---- client side ----------------------------------------------------
     // Sends a request; `done` runs later in process() with the response, or

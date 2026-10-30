@@ -848,4 +848,15 @@ TEST(relay_survives_a_link_loss) {
     CHECK_EQ(r.gateway.pending(), 0);
 }
 
+TEST(relay_idle_transfer_is_a_deadline) {
+    Rig r;
+    CHECK(r.ask("{\"id\":1,\"op\":\"upload\",\"path\":\"/dev/big\",\"size\":1500,\"data\":\"" + b64(r.big.substr(0, 576)) +
+                "\"}")
+              .find("\"received\":576") != std::string::npos);
+    CHECK_EQ(r.deviceEnd.fileSessions(), 1u);
+    tesser::Deadline at(r.net.clock);
+    r.deviceEnd.nextTick(at);
+    CHECK_EQ(at.delay(1000000), r.device.api.config().transferIdleMs);
+}
+
 }  // namespace relay_cases

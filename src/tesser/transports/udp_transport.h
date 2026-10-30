@@ -21,6 +21,7 @@ namespace tesser {
 class UdpTransport {
 public:
     static constexpr uint16_t kDefaultPort = 8484;
+    static constexpr uint32_t kSocketPollMs = 20;  // without a receive task, poll() reads the socket this often
 
     // Which tasks begin() starts (docs/DESIGN.md section 10.7).
     enum class Tasks : uint8_t {
@@ -40,8 +41,9 @@ public:
 
     // Opens the socket on `port` (all interfaces) once the network is up.
     // `tasks` says which tasks handle the traffic and the requests; without
-    // a worker, call poll() at least every 20 ms, and when the endpoint's
-    // onQueued() hook fires, which begin() leaves to the application then.
+    // a worker, call poll() when pollDelayMs() says (at least every 20 ms
+    // will do), and when the endpoint's onQueued() hook fires, which begin()
+    // leaves to the application then.
     // `stackSize` is the worker's, `priority` the worker's (the receive
     // task runs one above). Advertises the device's Wi-Fi station MAC as its
     // id, and, unless setName() came first, "tesser-<last two MAC bytes>" as
@@ -64,6 +66,10 @@ public:
     // without a receive task), then retransmits, advertises and runs the
     // requests.
     void poll();
+    // Without a worker: how long poll() can wait, in ms, from the task that
+    // calls it. Until the next deadline, at most UdpLink::kMaxDelayMs; 20 at
+    // most without a receive task, for the socket.
+    uint32_t pollDelayMs();
 
     // ---- interfaces (docs/DESIGN.md section 10.7) -------------------------
     static constexpr uint8_t kEthernet = 1, kWifi = 2, kAp = 4, kAllInterfaces = 7;

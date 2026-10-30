@@ -262,6 +262,8 @@ bool UdpTransport::begin(uint16_t port, Tasks tasks, uint32_t stackSize, UBaseTy
         link_.onQueued(nullptr);
         ownHook_ = false;
     }
+    // A worker end() left behind sees what it is to do now, not at its next deadline.
+    if (tasks != Tasks::Both && workTask_) xTaskNotifyGive(workTask_);
     if (tasks == Tasks::None) return true;
     bool worker = tasks == Tasks::Both;
     // A worker that end() let finish may still be there: it carries on
@@ -271,8 +273,11 @@ bool UdpTransport::begin(uint16_t port, Tasks tasks, uint32_t stackSize, UBaseTy
         workTask_ = nullptr;
     }
     if (worker && workTask_) {
+        // Not itself: it looks at what is due after each tick anyway.
         TaskHandle_t task = workTask_;
-        link_.onQueued([task] { xTaskNotifyGive(task); });
+        link_.onQueued([task] {
+            if (task != xTaskGetCurrentTaskHandle()) xTaskNotifyGive(task);
+        });
         ownHook_ = true;
     }
     if ((worker && !workTask_) ||
@@ -293,11 +298,15 @@ void UdpTransport::end() {
     link_.stop();  // the goodbye goes out before the socket closes
     running_ = false;
     while (receiveTask_) vTaskDelay(pdMS_TO_TICKS(10));
-    MutexGuard guard(socketMutex_);
-    int s = socket_.exchange(-1);
-    if (s >= 0) close(s);
+    {
+        MutexGuard guard(socketMutex_);
+        int s = socket_.exchange(-1);
+        if (s >= 0) close(s);
+    }
     // The worker exits on its own after one more tick, which forgets the
     // peers; waiting for it here could deadlock a caller holding the API.
+    MutexGuard guard(taskMutex_);
+    if (workTask_) xTaskNotifyGive(workTask_);
 }
 
 void UdpTransport::receiveWaiting() {
@@ -317,6 +326,10 @@ void UdpTransport::receiveWaiting() {
 void UdpTransport::poll() {
     if (running_ && tasks_ == Tasks::None) receiveWaiting();
     link_.tick();
+}
+
+uint32_t UdpTransport::pollDelayMs() {
+    return link_.nextDelayMs(tasks_ == Tasks::None ? kSocketPollMs : UdpLink::kMaxDelayMs);
 }
 
 void UdpTransport::receiveEntry(void* arg) {
@@ -341,8 +354,13 @@ void UdpTransport::receiveEntry(void* arg) {
 void UdpTransport::workEntry(void* arg) {
     auto* self = static_cast<UdpTransport*>(arg);
     for (;;) {
-        // Wake on new messages; tick for retransmissions and timeouts.
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        // Sleep until the next retransmission or timeout, or until a message
+        // or a send from another task wakes it (what wakes it between here
+        // and the sleep is kept: the sleep ends at once). Rounded up, and a
+        // tick at least: early, it would find nothing due and look again.
+        uint32_t ms = self->link_.nextDelayMs();
+        TickType_t ticks = static_cast<TickType_t>((uint64_t(ms) * configTICK_RATE_HZ + 999) / 1000);
+        ulTaskNotifyTake(pdTRUE, ticks ? ticks : 1);
         if (self->running_ && self->tasks_ != Tasks::Both) {
             // begin() came again without a worker: poll() does the work now.
             MutexGuard guard(self->taskMutex_);

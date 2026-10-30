@@ -257,6 +257,42 @@ bool DatagramEndpoint::process() {
     return worked || pendingCalls() != before;
 }
 
+void DatagramEndpoint::nextTick(Deadline& d) {
+    {
+        MutexGuard guard(mutex_);
+        if (!queue_.empty() || !lostPeers_.empty() || !unheardPeers_.empty() || !failures_.empty() ||
+            !seenPeers_.empty()) {
+            d.in(0);
+        }
+        for (const CallSlot& c : calls_) d.at(c.deadline);
+        for (const Known& k : known_) {
+            if (k.lossPending) d.at(k.heardMs + kLossGraceMs);
+        }
+    }
+    uint32_t idleMs = api_ ? api_->config().transferIdleMs : 0;
+    for (const PeerFiles& f : files_) {
+        if (!f.session->busy()) {
+            d.in(0);
+        } else if (idleMs) {
+            d.at(f.usedMs + idleMs);
+        }
+    }
+    if (publish_ && api_) {
+        if (schemaRevision() != seenRevision_) {
+            d.in(0);
+        } else if (revisionPending_) {
+            d.at(revisionAtMs_ + advertiseDebounceMs_);
+        }
+    }
+    if (idleCheck_.load()) d.in(kRetryMs);
+    Pinned remotes(*this);
+    {
+        MutexGuard guard(mutex_);
+        remotes.all();
+    }
+    for (RemoteNode* r : remotes.nodes) r->nextTick(*this, d);
+}
+
 // A message that can't be taken or parsed now: a request is answered busy,
 // and a reply fails its call, at once, rather than either waiting for a
 // timeout and a resend (docs/DESIGN.md section 15).

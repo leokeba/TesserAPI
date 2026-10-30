@@ -5,6 +5,7 @@
 
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -89,16 +90,45 @@ struct Net {
             if (air.empty() && !any) break;
         }
     }
-    // Lets `ms` pass in 10 ms steps.
+    // Lets `ms` pass in 10 ms steps. Each node runs as UdpTransport's worker
+    // does: it sleeps for nextDelayMs(), and only what onQueued() fires for
+    // (start() sets it) ends the sleep early.
     void advance(uint32_t ms) {
         for (uint32_t t = 0; t < ms; t += 10) {
             clock += 10;
-            run();
+            settle();
         }
     }
+    // What the workers do at this time.
+    void settle() {
+        for (int round = 0; round < 50; round++) {
+            deliver();
+            bool any = false;
+            for (auto& n : nodes) {
+                Worker& w = workers[n.second];
+                if (!w.woken && static_cast<int32_t>(clock - w.wakeAt) < 0) continue;
+                w.woken = false;
+                any = n.second->tick() || any;
+                w.wakeAt = clock + n.second->nextDelayMs();
+                ticks++;
+            }
+            if (air.empty() && !any) break;
+        }
+    }
+    struct Worker {
+        uint32_t wakeAt = 0;
+        bool woken = false;
+    };
+    std::map<UdpLink*, Worker> workers;  // advance()
+    int ticks = 0;
     void start() {
         uint32_t nonce = 0x1000;
-        for (auto& n : nodes) n.second->start(nonce++);
+        for (auto& n : nodes) {
+            UdpLink* link = n.second;
+            link->onQueued([this, link] { workers[link].woken = true; });
+            workers[link].wakeAt = clock;
+            link->start(nonce++);
+        }
         run();
     }
 };
@@ -568,9 +598,10 @@ TEST(udp_discovery) {
     net.advance(2000);
     CHECK(!online("lamp"));
     CHECK(online("lamp-152124"));
-    // A node that changes its tree advertises the new hash.
+    // A node that changes its tree advertises the new hash: its worker sees
+    // the change within nextDelayMs()'s limit, then waits out the debounce.
     fan.api.value("extra", fan.level);
-    net.advance(1100);
+    net.advance(UdpLink::kMaxDelayMs + 1100);
     q.keys = "lamp-152124";
     snprintf(hash, sizeof(hash), "%08lx", static_cast<unsigned long>(fan.api.schemaHash()));
     CHECK(cases::get(gateway, "/peers", q).body.find(hash) != std::string::npos);
@@ -865,6 +896,201 @@ TEST(udp_forgotten_advertised_peer_reported) {
     net.run();
     CHECK_EQ(lost.size(), 1u);
     if (!lost.empty()) CHECK(lost[0].second == tesser::PeerLoss::Silent);
+}
+
+TEST(deadline_takes_the_earliest) {
+    tesser::Deadline none(100);
+    CHECK_EQ(none.delay(77), 77u);
+    tesser::Deadline d(100);
+    d.at(500);
+    d.in(50);
+    d.at(900);
+    CHECK_EQ(d.delay(77), 50u);
+    d.at(99);  // past: due
+    CHECK_EQ(d.delay(77), 0u);
+    tesser::Deadline wrapped(0xfffffff0u);
+    wrapped.at(0x10);  // across the clock's wrap
+    CHECK_EQ(wrapped.delay(77), 0x20u);
+}
+
+// Two nodes that know each other, for the worker's timing.
+struct WorkerPair {
+    cases::Device device;
+    tesser::Api client;
+    Net net;
+    UdpLink server;
+    UdpLink link;
+    explicit WorkerPair(UdpLink::Options o = UdpLink::Options())
+        : server(&device.api, net.sender(ip(20)), net.clockFn(), o), link(&client, net.sender(ip(1)), net.clockFn(), o) {
+        net.nodes = {{ip(20), &server}, {ip(1), &link}};
+        net.start();
+    }
+    bool woken() {
+        bool w = net.workers[&link].woken;
+        net.workers[&link].woken = false;
+        return w;
+    }
+};
+
+TEST(udp_worker_sleeps_when_idle) {
+    WorkerPair p;
+    p.server.setName("s");
+    p.link.setName("c");
+    p.server.advertise();
+    p.link.advertise();
+    p.link.mountPeers(p.client.object("peers"));
+    p.net.advance(1000);
+    auto* node = static_cast<tesser::RemoteNode*>(p.client.object("peers").child("s"));
+    CHECK(node && node->online());
+    // A minute of advertisements: about one wake-up a second per node,
+    // against 3000 at a fixed 20 ms.
+    p.net.ticks = 0;
+    p.net.advance(60000);
+    CHECK(node && node->online());
+    CHECK(p.net.ticks <= 2 * 80);
+
+    // Nothing to do at all: as long as it may.
+    WorkerPair idle;
+    CHECK_EQ(idle.link.nextDelayMs(), UdpLink::kMaxDelayMs);
+    CHECK_EQ(idle.link.nextDelayMs(250), 250u);
+}
+
+TEST(udp_worker_keeps_time) {
+    // Every timer of the link, with a worker that sleeps between them: to a
+    // peer that doesn't answer, attempts go at 100, 300, 700, 1500 and 2500
+    // ms, and the message fails at 3000.
+    WorkerPair p;
+    p.net.lose = [](const Net::Datagram&) { return true; };
+    int done = 0;
+    Status s = Status::Ok;
+    uint32_t start = p.net.clock;
+    CHECK(p.link.endpoint().request(ip(20), tesser::Op::Get, "/", std::string_view(), [&](Status st, JsonVariantConst) {
+        done++;
+        s = st;
+    }));
+    CHECK_EQ(p.link.nextDelayMs(), 100u);
+    p.net.advance(90);
+    CHECK_EQ(p.link.stats().retransmits, 0u);
+    p.net.advance(20);
+    CHECK_EQ(p.link.stats().retransmits, 1u);
+    p.net.advance(180);
+    CHECK_EQ(p.link.stats().retransmits, 1u);
+    p.net.advance(20);
+    CHECK_EQ(p.link.stats().retransmits, 2u);
+    p.net.advance(2670);  // to 2980
+    CHECK_EQ(p.link.stats().retransmits, 5u);
+    CHECK_EQ(done, 0);
+    p.net.advance(40);
+    CHECK_EQ(done, 1);
+    CHECK_EQ(s, Status::Timeout);
+    CHECK_EQ(p.link.stats().failed, 1u);
+    CHECK(p.net.clock - start <= 3020);
+
+    // A partial message is given up after sendTimeoutMs.
+    WorkerPair q;
+    q.net.lose = [](const Net::Datagram& d) { return d.data.size() > 20 && d.data[3] == 1; };  // fragment 1
+    std::string large(2000, 'x');
+    CHECK(q.link.endpoint().broadcast(ip(20), tesser::Op::Set, "/none", "\"" + large + "\""));
+    q.net.settle();
+    CHECK_EQ(q.server.stats().dropped, 0u);
+    CHECK(q.server.nextDelayMs(10000) > 0);
+    q.net.advance(2980);
+    CHECK_EQ(q.server.stats().dropped, 0u);
+    q.net.advance(40);
+    CHECK_EQ(q.server.stats().dropped, 1u);
+
+    // An advertising peer that goes quiet is lost after peerTimeoutMs.
+    WorkerPair r;
+    r.server.setName("s");
+    r.server.advertise();
+    r.net.settle();
+    std::vector<tesser::PeerLoss> lost;
+    r.link.endpoint().onPeerLost([&](const PeerAddress&, const PeerAddress&, tesser::PeerLoss why) { lost.push_back(why); });
+    r.net.advance(1000);
+    r.net.lose = [](const Net::Datagram&) { return true; };
+    r.net.advance(13900);
+    CHECK(lost.empty());
+    r.net.advance(1200);
+    CHECK_EQ(lost.size(), 1u);
+}
+
+// What each timer asks of a worker, without nextDelayMs()'s limit.
+constexpr uint32_t kNoLimit = 1000000;
+
+TEST(udp_worker_sleeps_until_each_timer) {
+    // Nothing at all.
+    WorkerPair idle;
+    CHECK_EQ(idle.link.nextDelayMs(kNoLimit), kNoLimit);
+
+    // The next advertisement.
+    WorkerPair a;
+    a.server.setName("s");
+    a.server.advertise();
+    a.net.settle();
+    CHECK_EQ(a.server.nextDelayMs(kNoLimit), 5000u);
+    a.net.advance(1000);
+    CHECK_EQ(a.server.nextDelayMs(kNoLimit), 4000u);
+
+    // An advertising peer going silent.
+    CHECK_EQ(a.link.nextDelayMs(kNoLimit), 14000u);
+
+    // A loss a link reported, held for its grace.
+    a.link.endpoint().linkLost(ip(20));
+    a.link.tick();
+    CHECK(a.link.endpoint().lossPending(ip(20)));
+    tesser::Deadline d(a.net.clock);
+    a.link.endpoint().nextTick(d);
+    CHECK_EQ(d.delay(kNoLimit), tesser::DatagramEndpoint::kLossGraceMs - 1000);
+
+    // A message partly received.
+    WorkerPair q;
+    q.net.lose = [](const Net::Datagram& g) { return g.data.size() > 20 && g.data[3] == 1; };  // fragment 1
+    CHECK(q.link.endpoint().broadcast(ip(20), tesser::Op::Set, "/none", "\"" + std::string(2000, 'x') + "\""));
+    q.net.settle();
+    CHECK_EQ(q.server.nextDelayMs(kNoLimit), 3000u);
+
+    // The timeout of a call, and a message's retransmission first.
+    WorkerPair c;
+    c.net.lose = [](const Net::Datagram&) { return true; };
+    CHECK(c.link.endpoint().request(ip(20), tesser::Op::Get, "/", std::string_view(), [](Status, JsonVariantConst) {}));
+    CHECK_EQ(c.link.nextDelayMs(kNoLimit), 100u);
+}
+
+TEST(udp_worker_is_woken_by_what_comes_due) {
+    WorkerPair p;
+    p.net.settle();
+    CHECK(!p.woken());
+    // A request from another task: its retransmission and timeout.
+    CHECK(p.link.endpoint().request(ip(20), tesser::Op::Get, "/", std::string_view(), [](Status, JsonVariantConst) {}));
+    CHECK(p.woken());
+    p.net.advance(50);
+    p.woken();
+    // A broadcast leaves the link nothing to do, but its window closes.
+    bool closed = false;
+    CHECK(p.link.endpoint().broadcast(
+        tesser::udpAddress(192, 168, 1, 255, 8484), tesser::Op::Get, "/",  std::string_view(),
+        [&](const PeerAddress& from, Status, JsonVariantConst) { closed = closed || !from.length; }, 40));
+    CHECK(p.woken());
+    CHECK(p.link.nextDelayMs() <= 40);
+    p.net.advance(50);
+    CHECK(closed);
+    p.woken();
+    // A request held for a token's answer goes nowhere yet: its timeout counts.
+    p.link.endpoint().setPeerToken(ip(20), "t");
+    p.net.lose = [](const Net::Datagram&) { return true; };
+    CHECK(p.link.endpoint().request(ip(20), tesser::Op::Get, "/", std::string_view(), [](Status, JsonVariantConst) {}));
+    CHECK(p.woken());
+    // And another that waits for the same answer, with less time.
+    CHECK(p.link.endpoint().request(ip(20), tesser::Op::Get, "/", std::string_view(), [](Status, JsonVariantConst) {},
+                                    tesser::Query(), 40));
+    CHECK(p.woken());
+    CHECK_EQ(p.link.nextDelayMs(), 40u);
+    p.net.advance(50);
+    p.woken();
+    p.net.lose = nullptr;
+    // A datagram sent without an acknowledgement: nothing to wait for.
+    CHECK(p.link.endpoint().broadcast(PeerAddress(), tesser::Op::Set, "/none", "1"));
+    CHECK(!p.woken());
 }
 
 }  // namespace udp_cases

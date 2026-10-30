@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 
+#include "tesser/deadline.h"
 #include "tesser/platform.h"
 #include "tesser/route.h"
 
@@ -95,8 +96,12 @@ public:
     // Compares the route in use and the node's online state with the last
     // tick's.
     Observed observe(const Route& current, bool online);
+    // Whether observe() would have something to say.
+    bool unobserved(const Route& current, bool online) const;
     // The routes to probe now (offline ones, when their wait is over).
     std::vector<Route> dueProbes(uint32_t nowMs);
+    // When dueProbes() next gives any.
+    void nextProbe(Deadline& d) const;
     void setProbe(uint32_t ms) {
         probeMs_ = ms;
         probeWaitMs_ = ms;

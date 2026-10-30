@@ -288,7 +288,10 @@ bool DatagramEndpoint::sendRequest(const PeerAddress& to, uint32_t id, std::stri
         calls_.push_back(std::move(slot));
     }
     if (startAuth) sendAuth(to, token);
-    if (hold) return true;
+    if (hold) {
+        wake();  // nothing goes on the link yet, but its timeout counts
+        return true;
+    }
     // Taken by the link, not copied (a large envelope on a short heap).
     if (owned.data()) {
         if (ownedSend_(to, std::move(owned), Delivery::Reliable)) return true;
@@ -516,6 +519,7 @@ bool DatagramEndpoint::broadcast(const PeerAddress& to, Op op, std::string_view 
                                   std::move(onReply), now, nullptr, std::string(), nullptr, false, false});
     }
     if (send_ && send_(to, buildRequestEnvelope(id, op, path, Query(), bodyJson), Delivery::BestEffort)) {
+        wake();  // the window's end is due; a broadcast leaves the link nothing to wait for
         return true;
     }
     MutexGuard guard(mutex_);

@@ -263,6 +263,8 @@ public:
 
     // Called by an endpoint, from its process(), and when it is destroyed.
     void tick(const DatagramEndpoint& by, uint32_t nowMs);
+    // When tick() next has something to do for `by`.
+    void nextTick(const DatagramEndpoint& by, Deadline& d) const;
     void detach(const DatagramEndpoint* endpoint);
     bool handleNotification(const DatagramEndpoint& by, const PeerAddress& from, JsonObjectConst envelope);
 
@@ -279,6 +281,9 @@ private:
     std::string remotePathOf(std::string_view rest) const;
     // Sends the next streamed set if none is in flight.
     void pump();
+    // Each endpoint but `except` looks at the node at once, rather than at
+    // its next deadline.
+    void wakeEndpoints(const DatagramEndpoint* except = nullptr) const;
     uint32_t streamTimeoutMs() const;
 
     std::string remotePath_;
