@@ -1279,7 +1279,12 @@ A datagram endpoint (`DatagramEndpoint`) is a small class in front of four parts
 - `http_files.cpp`: file nodes, raw bytes both ways.
 - `http_mdns.cpp`: `advertise()`.
 
-On ESP-IDF these build as one unit (CMake's `UNITY_BUILD_MODE GROUP`), for code size only: apart, `-Os` inlines differently in each, about 1.1 KB more on the full image. Each file still compiles alone, as Arduino's builds do. What can be tested off target is in `http_checks.cpp`.
+A request (§5) runs in one `detail::Handler` (`detail/api_handler.h`), which `api.cpp` starts:
+- `api_resolve.cpp`: the walk down the path, the access it needs, and how errors name a node.
+- `api_render.cpp`: reading: values, schemas, hashes, and subscribing.
+- `api_patch.cpp`: writing: a patch validated whole, then applied, and `*` fanning it out.
+
+On ESP-IDF, each of these two groups builds as one unit (CMake's `UNITY_BUILD_MODE GROUP`), for code size only: apart, `-Os` inlines differently in each (about 1.1 KB more for HTTP on the full image), and `Handler` loses the internal linkage that lets a function with one caller be inlined (about 180 B, and larger frames in the recursive walkers, §15). Each file still compiles alone, as Arduino's builds do, with those costs. What can be tested off target is in `http_checks.cpp`.
 
 The Bluetooth transport (§10.6) is a header that `TesserAPI.h` doesn't include, so that only the firmware using it compiles a BLE stack. On ESP-IDF, its source compiles to nothing unless NimBLE is enabled.
 

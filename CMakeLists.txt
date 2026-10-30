@@ -7,6 +7,9 @@ set(TESSER_CORE_SRCS
     src/tesser/node.cpp
     src/tesser/call.cpp
     src/tesser/api.cpp
+    src/tesser/api_resolve.cpp
+    src/tesser/api_render.cpp
+    src/tesser/api_patch.cpp
     src/tesser/fan_out.cpp
     src/tesser/stream_subscriber.cpp
     src/tesser/envelope.cpp
@@ -76,13 +79,16 @@ if(ESP_PLATFORM)
         INCLUDE_DIRS "src"
         REQUIRES ${TESSER_REQS}
         PRIV_REQUIRES log esp_timer lwip esp_netif nvs_flash bt)
-    # The HTTP server's files build as one unit: split, -Os inlines differently
-    # in each, for about 1 KB of flash (docs/DESIGN.md section 16).
+    # These files build as one unit each: split, -Os inlines differently in
+    # each, for about 1 KB of flash per group (docs/DESIGN.md section 16).
     set(TESSER_HTTP_UNIT http_server http_request http_websocket http_streams http_async http_files http_mdns)
     list(TRANSFORM TESSER_HTTP_UNIT PREPEND src/tesser/transports/)
     list(TRANSFORM TESSER_HTTP_UNIT APPEND .cpp)
     set_source_files_properties(${TESSER_HTTP_UNIT} PROPERTIES UNITY_GROUP http)
-    set_target_properties(${COMPONENT_LIB} PROPERTIES UNITY_BUILD ON UNITY_BUILD_MODE GROUP)
+    set_source_files_properties(src/tesser/api.cpp src/tesser/api_resolve.cpp src/tesser/api_render.cpp
+                                src/tesser/api_patch.cpp PROPERTIES UNITY_GROUP api)
+    set_target_properties(${COMPONENT_LIB} PROPERTIES UNITY_BUILD ON UNITY_BUILD_MODE GROUP
+                          UNITY_BUILD_CODE_BEFORE_INCLUDE "#define TESSER_UNITY_BUILD 1")
     if(TESSER_NOWTP)
         # Requirements are resolved before the component list is known, so
         # NowTP is linked here rather than listed in REQUIRES.
