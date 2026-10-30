@@ -245,11 +245,10 @@ void EndpointServer::serve(JsonObjectConst env, const Incoming& msg) {
         call.status = Status::BadRequest;
         call.message = "envelope nested too deeply";
     }
-    PeerAddress to = msg.from;
     // A broadcast request without an id is never answered.
     bool silent = msg.broadcast && call.id.length == 0;
-    EnvelopeReply reply(call.id, ep_.replyLimitFor(to), ReplySender{ep_.send_, to, silent});
-    ownReplies(reply, to, silent);
+    EnvelopeReply reply(call.id, ep_.replyLimitFor(msg.from), ReplySender{ep_.send_, msg.from, silent});
+    ownReplies(reply, msg.from, silent);
     if (call.failed(reply)) return;
     if (call.kind == Kind::File) {
         handleFile(env, msg, req.client, reply);

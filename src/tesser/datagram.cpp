@@ -352,6 +352,34 @@ bool jsonMember(std::string_view json, std::string_view key, std::string_view& o
     }
 }
 
+// Out of handle(), whose frame sits under every request a peer makes: what
+// only a notification needs stays off it (recursive walkers and handlers
+// run on top, in a task of 6-8 KB).
+__attribute__((noinline)) void DatagramEndpoint::handleNotification(JsonObjectConst env, const Incoming& msg,
+                                                                    std::string_view text) {
+    {
+        detail::Mounter::Pinned remotes(mounts_);
+        {
+            MutexGuard guard(mutex_);
+            remotes.all();
+        }
+        // Remote nodes take what concerns their mirror; the application's
+        // handler and clients of the peer still see everything.
+        for (RemoteNode* r : remotes.nodes) {
+            if (r->handleNotification(*this, msg.from, env)) break;
+        }
+    }
+    std::vector<std::shared_ptr<ClientInbox>> inboxes;
+    {
+        MutexGuard guard(mutex_);
+        for (auto& c : clients_) {
+            if (c.first == msg.from) inboxes.push_back(c.second);
+        }
+    }
+    for (auto& inbox : inboxes) inbox->notification(std::string(text));
+    if (onNotification_) onNotification_(msg.from, env);
+}
+
 void DatagramEndpoint::handle(Incoming& msg) {
     if (calls_.takeRaw(msg.from, msg.view())) return;
     // Parsed, a large message takes about as much again: only above the
@@ -395,30 +423,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
 
     // Notification from a node we subscribed to: never answered.
     std::string_view op = env["op"].is<const char*>() ? std::string_view(env["op"].as<const char*>()) : "";
-    if (op == "change" || op == "event") {
-        {
-            detail::Mounter::Pinned remotes(mounts_);
-            {
-                MutexGuard guard(mutex_);
-                remotes.all();
-            }
-            // Remote nodes take what concerns their mirror; the application's
-            // handler and clients of the peer still see everything.
-            for (RemoteNode* r : remotes.nodes) {
-                if (r->handleNotification(*this, msg.from, env)) break;
-            }
-        }
-        std::vector<std::shared_ptr<ClientInbox>> inboxes;
-        {
-            MutexGuard guard(mutex_);
-            for (auto& c : clients_) {
-                if (c.first == msg.from) inboxes.push_back(c.second);
-            }
-        }
-        for (auto& inbox : inboxes) inbox->notification(std::string(text));
-        if (onNotification_) onNotification_(msg.from, env);
-        return;
-    }
+    if (op == "change" || op == "event") return handleNotification(env, msg, text);
 
     // Request.
     if (op.empty() || !api_) {

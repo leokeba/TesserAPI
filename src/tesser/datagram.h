@@ -314,6 +314,7 @@ private:
 
     // ---- datagram.cpp: taking messages, process() ----------------------------
     void handle(Incoming& msg);
+    void handleNotification(JsonObjectConst envelope, const Incoming& msg, std::string_view text);
     bool queue(Incoming&& msg);
     static Options checked(Options o);
     // Holds `len` bytes from `from` in incoming_ (`heap`: about to be
