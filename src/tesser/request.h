@@ -117,6 +117,17 @@ enum class Delivery : uint8_t {
     BestEffort,  // sent once: broadcast
 };
 
+class Api;
+
+// The token a client presented, for Api::tokensChanged() to check again.
+struct ClientToken {
+    std::string token;
+    bool fixed = true;  // its level doesn't come from the token check
+    // The client's level now, from the token check: false, leaving `level`,
+    // when fixed. What Subscriber::recheckLevel() does.
+    bool recheck(const Api& api, const Client& client, Access& level) const;
+};
+
 // A client that can receive notifications: one per persistent connection
 // (serial line, WebSocket connection, NowTP peer). Implemented by transports,
 // which must call Api::dropSubscriber() before destroying one.

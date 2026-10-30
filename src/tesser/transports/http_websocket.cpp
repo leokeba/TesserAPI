@@ -147,11 +147,12 @@ esp_err_t HttpServer::onWebSocketHandshake(httpd_req_t* req) {
     ws->client.transport = TransportKind::WebSocket;
     peerAddress(fd, ws->client);
     ws->generation = self->api_.tokenGeneration();
-    ws->token = requestToken(req);
+    ws->token.token = requestToken(req);
     // The server's own token is admin, whatever the check says.
-    ws->checked = !(self->token_ && *self->token_ && secretEquals(ws->token, self->token_));
-    if (!ws->checked) ws->token.clear();
-    ws->access = ws->checked ? self->api_.tokenAccess(ws->token, ws->client) : Access::Admin;
+    ws->token.fixed = self->token_ && *self->token_ && secretEquals(ws->token.token, self->token_);
+    if (ws->token.fixed) ws->token.token.clear();
+    ws->access = Access::Admin;
+    ws->token.recheck(self->api_, ws->client, ws->access);
     return ESP_OK;
 }
 
@@ -213,9 +214,9 @@ esp_err_t HttpServer::serveWebSocket(httpd_req_t* req) {
     }
     // The token check's answers changed since: asked again.
     uint32_t generation = api_.tokenGeneration();
-    if (ws->checked && ws->generation != generation) {
+    if (ws->generation != generation) {
         ws->generation = generation;
-        ws->access = api_.tokenAccess(ws->token, ws->client);
+        ws->token.recheck(api_, ws->client, ws->access);
     }
     client.access = ws->access;
     client.authenticated = ws->access != Access::Public;

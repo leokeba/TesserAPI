@@ -426,7 +426,7 @@ void DatagramEndpoint::handle(Incoming& msg) {
         stats_.dropped++;
         return;
     }
-    server_.serve(env, op, msg);
+    server_.serve(env, msg);
 }
 
 void DatagramEndpoint::addClient(const PeerAddress& peer, std::shared_ptr<ClientInbox> inbox) {

@@ -191,12 +191,44 @@ int nesting(JsonVariantConst v) {
 
 }  // namespace
 
-void EndpointServer::serve(JsonObjectConst env, std::string_view op, const Incoming& msg) {
+// A peer's token, from "auth": kept until the next one or until the peer is
+// forgotten. A trusted peer is admin whatever it sends.
+struct EndpointServer::PeerToken : TokenClient {
+    PeerToken(EndpointServer& s, const PeerAddress& p) : server(s), peer(p) {}
+    Access tokenLevel() override {
+        DatagramEndpoint& ep = server.ep_;
+        return ep.trust_ && ep.trust_(peer) ? Access::Admin : server.levelOf(peer);
+    }
+    void setToken(std::string_view token) override {
+        DatagramEndpoint& ep = server.ep_;
+        MutexGuard guard(ep.mutex_);
+        ep.peers_.holdToken(peer, token, ep.options_.maxTokens);
+    }
+    void levelFell() override {
+        {
+            MutexGuard guard(server.subscribersMutex_);
+            for (PeerSubscriber* sub : server.subscribers_) {
+                if (sub->peer == peer) server.ep_.api_->dropSubscriber(sub);
+            }
+        }
+        for (size_t i = 0; i < server.files_.size(); i++) {
+            if (server.files_[i].peer == peer) {
+                server.files_.erase(server.files_.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+        }
+    }
+    EndpointServer& server;
+    const PeerAddress& peer;
+};
+
+void EndpointServer::serve(JsonObjectConst env, const Incoming& msg) {
     {
         MutexGuard guard(ep_.mutex_);
         ep_.stats_.requests++;
     }
-    Request req;
+    EnvelopeCall call;
+    Request& req = call.request;
     req.client = clientOf(msg.from);
     // A trusted peer is admin; any other is where the token check puts its
     // token, like an HTTP request's, and at least at setPeerAccess().
@@ -206,32 +238,26 @@ void EndpointServer::serve(JsonObjectConst env, std::string_view op, const Incom
         req.client.access = levelOf(msg.from);
         req.client.authenticated = req.client.access != Access::Public;
     }
-    bool file = FileSession::handles(env);
-    bool auth = op == "auth";
-    EnvelopeId id;
-    const char* message = nullptr;
-    Reason reason = Reason::None;
-    Status s = auth || file ? envelopeId(env, id, message) : requestFromEnvelope(env, req, id, message, &reason);
-    if (s == Status::Ok && !file && nesting(env) > envelopeNesting(ep_.api_->config().maxDepth)) {
-        s = Status::BadRequest;
-        message = "envelope nested too deeply";
+    readEnvelope(env, kTakesAuth | kTakesFiles, call);
+    using Kind = EnvelopeCall::Kind;
+    if (call.status == Status::Ok && call.kind != Kind::File &&
+        nesting(env) > envelopeNesting(ep_.api_->config().maxDepth)) {
+        call.status = Status::BadRequest;
+        call.message = "envelope nested too deeply";
     }
     PeerAddress to = msg.from;
     // A broadcast request without an id is never answered.
-    bool silent = msg.broadcast && id.length == 0;
-    EnvelopeReply reply(id, ep_.replyLimitFor(to), ReplySender{ep_.send_, to, silent});
+    bool silent = msg.broadcast && call.id.length == 0;
+    EnvelopeReply reply(call.id, ep_.replyLimitFor(to), ReplySender{ep_.send_, to, silent});
     ownReplies(reply, to, silent);
-    if (s == Status::Ok && auth) s = checkStrict(env, kAuthKeys, message, &reason);
-    if (s != Status::Ok) {
-        writeError(reply, s, reason, std::string_view(), message);
-        return;
-    }
-    if (file) {
+    if (call.failed(reply)) return;
+    if (call.kind == Kind::File) {
         handleFile(env, msg, req.client, reply);
         return;
     }
-    if (auth) {
-        handleAuth(env, msg, reply);
+    if (call.kind == Kind::Auth) {
+        PeerToken token(*this, msg.from);
+        answerAuth(env, token, reply);
         return;
     }
     bool reliable = msg.reliable || (req.op == Op::Set && msg.broadcast && ep_.options_.broadcastSet);
@@ -293,44 +319,6 @@ Access EndpointServer::levelOf(const PeerAddress& peer) {
     Access level = ep_.api_->tokenAccess(token, clientOf(peer));
     Access least = ep_.peerAccess_.load();
     return level > least ? level : least;
-}
-
-// {"op":"auth","token":"..."} sets the peer's token until the next one or
-// until the peer is forgotten; an empty or missing token signs out. As on a
-// line (docs/DESIGN.md section 10.4), the reply gives the level, and a lower
-// one drops the peer's subscriptions and file transfer.
-void EndpointServer::handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply) {
-    JsonVariantConst token = envelope["token"];
-    if (!token.isNull() && !token.is<const char*>()) {
-        writeError(reply, Status::BadRequest, std::string_view(), "token must be a string");
-        return;
-    }
-    bool trusted = ep_.trust_ && ep_.trust_(msg.from);
-    Access before = trusted ? Access::Admin : levelOf(msg.from);
-    {
-        MutexGuard guard(ep_.mutex_);
-        JsonString t = token.as<JsonString>();
-        ep_.peers_.holdToken(msg.from, std::string_view(t.c_str() ? t.c_str() : "", t.size()), ep_.options_.maxTokens);
-    }
-    Access after = trusted ? Access::Admin : levelOf(msg.from);
-    if (after < before) {
-        // Subscriptions and a transfer keep the level they were opened at.
-        {
-            MutexGuard guard(subscribersMutex_);
-            for (PeerSubscriber* sub : subscribers_) {
-                if (sub->peer == msg.from) ep_.api_->dropSubscriber(sub);
-            }
-        }
-        for (size_t i = 0; i < files_.size(); i++) {
-            if (files_[i].peer == msg.from) {
-                files_.erase(files_.begin() + static_cast<std::ptrdiff_t>(i));
-                break;
-            }
-        }
-    }
-    std::string body = std::string("{\"access\":\"") + toString(after) + "\"}";
-    reply.begin(Status::Ok).write(body.data(), body.size());
-    reply.end();
 }
 
 // "upload" and "download" (docs/DESIGN.md section 10.1.1): each peer has a

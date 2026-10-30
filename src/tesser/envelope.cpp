@@ -57,8 +57,11 @@ JsonVariantConst uploadFilter() {
     return filter->as<JsonVariantConst>();
 }
 
-Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth, Request& request, EnvelopeId& id,
-                     const char*& message, Reason* reason) {
+namespace {
+
+// The envelope's JSON, on its own terms: an object, or the error.
+Status parseObject(std::string_view text, JsonDocument& doc, uint8_t maxDepth, EnvelopeId& id, const char*& message,
+                   Reason* reason) {
     id.length = 0;
     DeserializationError err =
         parseJson(doc, text, envelopeNesting(maxDepth), isUploadEnvelope(text) ? uploadFilter() : JsonVariantConst());
@@ -82,7 +85,54 @@ Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth,
         message = "envelope must be an object";
         return Status::BadRequest;
     }
-    return requestFromEnvelope(doc.as<JsonObjectConst>(), request, id, message, reason);
+    return Status::Ok;
+}
+
+}  // namespace
+
+Status parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth, Request& request, EnvelopeId& id,
+                     const char*& message, Reason* reason) {
+    Status s = parseObject(text, doc, maxDepth, id, message, reason);
+    return s == Status::Ok ? requestFromEnvelope(doc.as<JsonObjectConst>(), request, id, message, reason) : s;
+}
+
+void parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth, uint8_t takes, EnvelopeCall& call) {
+    call.status = parseObject(text, doc, maxDepth, call.id, call.message, &call.reason);
+    if (call.status == Status::Ok) readEnvelope(doc.as<JsonObjectConst>(), takes, call);
+}
+
+void readEnvelope(JsonObjectConst env, uint8_t takes, EnvelopeCall& call) {
+    bool auth = (takes & kTakesAuth) && env["op"] == "auth";
+    bool file = (takes & kTakesFiles) && FileSession::handles(env);
+    if (!auth && !file) {
+        call.status = requestFromEnvelope(env, call.request, call.id, call.message, &call.reason);
+        return;
+    }
+    call.kind = auth ? EnvelopeCall::Kind::Auth : EnvelopeCall::Kind::File;
+    call.status = envelopeId(env, call.id, call.message);
+    if (auth && call.status == Status::Ok) call.status = checkStrict(env, kAuthKeys, call.message, &call.reason);
+}
+
+bool EnvelopeCall::failed(Reply& reply) const {
+    if (status == Status::Ok) return false;
+    writeError(reply, status, reason, std::string_view(), message);
+    return true;
+}
+
+void answerAuth(JsonObjectConst env, TokenClient& client, Reply& reply) {
+    JsonVariantConst token = env["token"];
+    if (!token.isNull() && !token.is<const char*>()) {
+        writeError(reply, Status::BadRequest, std::string_view(), "token must be a string");
+        return;
+    }
+    Access before = client.tokenLevel();
+    JsonString t = token.as<JsonString>();
+    client.setToken(std::string_view(t.c_str() ? t.c_str() : "", t.size()));
+    Access after = client.tokenLevel();
+    if (after < before) client.levelFell();
+    std::string body = std::string("{\"access\":\"") + toString(after) + "\"}";
+    reply.begin(Status::Ok).write(body.data(), body.size());
+    reply.end();
 }
 
 namespace {
@@ -413,29 +463,18 @@ void EnvelopeReply::release() {
 void handleEnvelope(Api& api, std::string_view text, const Client& client, const EnvelopeReply::Send& send,
                     Subscriber* subscriber, const EnvelopeReply::Fragment& stream, FileSession* files) {
     JsonDocument doc;
-    Request req;
-    req.client = client;
-    req.subscriber = subscriber;
-    EnvelopeId id;
-    const char* message = nullptr;
-    Reason reason = Reason::None;
-    Status s = parseEnvelope(text, doc, api.config().maxDepth, req, id, message, &reason);
-    bool file = s != Status::Ok && files && doc.is<JsonObjectConst>() && FileSession::handles(doc.as<JsonObjectConst>());
-    if (file) {
-        reason = Reason::None;
-        s = envelopeId(doc.as<JsonObjectConst>(), id, message);
-    }
-    EnvelopeReply reply(id, api.config().maxResponse, send);
+    EnvelopeCall call;
+    call.request.client = client;
+    call.request.subscriber = subscriber;
+    parseEnvelope(text, doc, api.config().maxDepth, files ? kTakesFiles : 0, call);
+    EnvelopeReply reply(call.id, api.config().maxResponse, send);
     if (stream) reply.stream(stream);
-    if (file && s == Status::Ok) {
+    if (call.failed(reply)) return;
+    if (call.kind == EnvelopeCall::Kind::File) {
         files->handle(doc.as<JsonObjectConst>(), client, reply, text);
         return;
     }
-    if (s != Status::Ok) {
-        writeError(reply, s, reason, std::string_view(), message);
-        return;
-    }
-    api.handle(req, reply);
+    api.handle(call.request, reply);
 }
 
 }  // namespace tesser

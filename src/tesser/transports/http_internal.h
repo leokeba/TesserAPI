@@ -158,20 +158,15 @@ public:
     // Decided at the handshake, from its token; asked again when the token
     // check's answers change (Api::tokensChanged()).
     Access access = Access::Public;
-    std::string token;      // the handshake's, set before any request
+    ClientToken token;      // the handshake's, set before any request
     Client client;          // the handshake's
-    bool checked = false;   // access comes from the token check
     uint32_t generation = 0;  // Api::tokenGeneration() when access was decided
     bool notify(const std::string& message, Delivery) override { return server_.wsSend(fd, message); }
     bool notifyOwned(std::string&& message, Delivery) override { return server_.wsSend(fd, std::move(message)); }
     bool notifyShared(const std::shared_ptr<const std::string>& message, Delivery) override {
         return server_.wsSendShared(fd, message);
     }
-    bool recheckLevel(Access& level) override {
-        if (!checked) return false;
-        level = server_.api_.tokenAccess(token, client);
-        return true;
-    }
+    bool recheckLevel(Access& level) override { return token.recheck(server_.api_, client, level); }
     // Subscriptions ended: closed, so the client notices and connects again.
     void levelLowered() override {
         if (server_.server_) httpd_sess_trigger_close(server_.server_, fd);

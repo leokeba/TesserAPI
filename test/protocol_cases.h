@@ -159,6 +159,144 @@ TEST(protocol_secret_equals) {
 }
 
 // HttpServer's strict mode (docs/DESIGN.md section 10.2): the header checks.
+TEST(protocol_envelopes_sorted_out) {
+    using tesser::EnvelopeCall;
+    using Kind = EnvelopeCall::Kind;
+    auto read = [](const char* text, uint8_t takes, EnvelopeCall& call, JsonDocument& doc) {
+        tesser::parseEnvelope(std::string_view(text), doc, 8, takes, call);
+    };
+    constexpr uint8_t all = tesser::kTakesAuth | tesser::kTakesFiles;
+    {
+        JsonDocument doc;
+        EnvelopeCall c;
+        read("{\"id\":7,\"op\":\"get\",\"path\":\"/a\"}", all, c, doc);
+        CHECK(c.status == Status::Ok && c.kind == Kind::Request);
+        CHECK(c.request.path == "/a");
+        CHECK_EQ(c.id.length, 1u);
+    }
+    {
+        JsonDocument doc;
+        EnvelopeCall c;
+        read("{\"id\":7,\"op\":\"auth\",\"token\":\"t\"}", all, c, doc);
+        CHECK(c.status == Status::Ok && c.kind == Kind::Auth);
+    }
+    {
+        JsonDocument doc;
+        EnvelopeCall c;
+        read("{\"op\":\"upload@user\",\"path\":\"/f\"}", all, c, doc);
+        CHECK(c.status == Status::Ok && c.kind == Kind::File);
+    }
+    // What a transport doesn't take is a bad op, with its id.
+    for (const char* op : {"auth", "upload", "download"}) {
+        JsonDocument doc;
+        EnvelopeCall c;
+        std::string text = std::string("{\"id\":7,\"op\":\"") + op + "\"}";
+        read(text.c_str(), 0, c, doc);
+        CHECK(c.status == Status::BadRequest && c.kind == Kind::Request);
+        CHECK_EQ(std::string(c.message), "op must be \"get\", \"set\", \"sub\" or \"unsub\"");
+        CHECK_EQ(c.id.length, 1u);
+    }
+    {
+        // A strict "auth" with an option it doesn't know.
+        JsonDocument doc;
+        EnvelopeCall c;
+        read("{\"id\":7,\"op\":\"auth\",\"v\":2,\"bogus\":1}", all, c, doc);
+        CHECK(c.status == Status::BadRequest && c.kind == Kind::Auth);
+        CHECK(c.reason == tesser::Reason::UnknownOption);
+    }
+    {
+        // Not JSON, and an id it can't use.
+        JsonDocument doc;
+        EnvelopeCall c;
+        read("{nope", all, c, doc);
+        CHECK(c.status == Status::BadRequest);
+        JsonDocument doc2;
+        EnvelopeCall d;
+        read("{\"id\":[],\"op\":\"auth\"}", all, d, doc2);
+        CHECK(d.status == Status::BadRequest && d.kind == Kind::Auth);
+    }
+}
+
+TEST(protocol_client_token_rechecked) {
+    tesser::Api api;
+    api.authenticate(tesser::TokenCheck([](std::string_view token, const tesser::Client& client) {
+        return token == "ok" && client.transport == tesser::TransportKind::Serial ? tesser::Access::Admin
+                                                                                  : tesser::Access::Public;
+    }));
+    tesser::ClientToken t;
+    tesser::Client client;
+    client.transport = tesser::TransportKind::Serial;
+    tesser::Access level = tesser::Access::User;
+    t.token = "ok";
+    CHECK(!t.recheck(api, client, level));  // fixed: its level isn't the check's
+    CHECK(level == tesser::Access::User);
+    t.fixed = false;
+    CHECK(t.recheck(api, client, level));
+    CHECK(level == tesser::Access::Admin);
+    t.token = "no";
+    CHECK(t.recheck(api, client, level));
+    CHECK(level == tesser::Access::Public);
+    t.token = "ok";
+    client.transport = tesser::TransportKind::Http;  // the check sees the client
+    CHECK(t.recheck(api, client, level));
+    CHECK(level == tesser::Access::Public);
+}
+
+TEST(protocol_auth_alike_on_lines_and_peers) {
+    // One token, one answer: a line and a datagram peer answer "auth" the
+    // same way, and a lower level ends what was opened above it.
+    auto check = [](const std::function<std::string(const std::string&)>& ask) {
+        CHECK_EQ(ask("{\"id\":1,\"op\":\"auth\",\"token\":\"good\"}"), "{\"id\":1,\"status\":\"ok\",\"body\":{\"access\":\"admin\"}}");
+        CHECK_EQ(ask("{\"id\":2,\"op\":\"auth\",\"token\":5}"),
+                 "{\"id\":2,\"status\":\"bad_request\",\"body\":{\"error\":\"bad_request\",\"path\":\"/\","
+                 "\"message\":\"token must be a string\"}}");
+        CHECK(ask("{\"id\":3,\"op\":\"auth\",\"v\":2,\"bogus\":1}").find("\"reason\":\"unknown_option\"") != std::string::npos);
+        CHECK(ask("{\"id\":4,\"op\":\"sub\",\"path\":\"/level\"}").find("\"status\":\"ok\"") != std::string::npos);
+        CHECK_EQ(ask("{\"id\":5,\"op\":\"auth\"}"), "{\"id\":5,\"status\":\"ok\",\"body\":{\"access\":\"public\"}}");
+    };
+    auto tokens = [](std::string_view t, const tesser::Client&) {
+        return t == "good" ? tesser::Access::Admin : tesser::Access::Public;
+    };
+    {
+        tesser::Api api;
+        int level = 1;
+        api.value("level", level);
+        api.authenticate(tesser::TokenCheck(tokens));
+        std::vector<std::string> out;
+        std::string pending;
+        tesser::LineTransport line(api, [&](const char* d, size_t n) { pending.append(d, n); });
+        line.setAuthenticated(false);
+        check([&](const std::string& text) {
+            pending.clear();
+            line.feed((text + "\n").data(), text.size() + 1);
+            return pending.substr(0, pending.find('\n'));
+        });
+        CHECK_EQ(api.subscriptionCount(), 0u);
+    }
+    {
+        tesser::Api api;
+        int level = 1;
+        api.value("level", level);
+        api.authenticate(tesser::TokenCheck(tokens));
+        std::vector<std::string> sent;
+        tesser::PeerAddress peer;
+        tesser::DatagramEndpoint ep(&api, tesser::TransportKind::Udp,
+                                    [&](const tesser::PeerAddress&, std::string m, tesser::Delivery) {
+                                        sent.push_back(std::move(m));
+                                        return true;
+                                    },
+                                    [] { return 1u; });
+        peer.length = 6;
+        check([&](const std::string& text) {
+            sent.clear();
+            ep.receive(peer, text.data(), text.size(), true);
+            ep.process();
+            return sent.empty() ? std::string() : sent.front();
+        });
+        CHECK_EQ(api.subscriptionCount(), 0u);
+    }
+}
+
 TEST(protocol_http_text) {
     auto decoded = [](std::string text, bool plus) {
         text.resize(tesser::http::urlDecode(&text[0], text.size(), plus));

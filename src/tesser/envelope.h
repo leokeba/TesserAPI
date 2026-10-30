@@ -78,6 +78,44 @@ JsonVariantConst uploadFilter();
 // "upload", "download"). An unusable id is BadRequest with `message`.
 Status envelopeId(JsonObjectConst envelope, EnvelopeId& id, const char*& message);
 
+// An envelope sorted out, as every transport of envelopes does it: what it
+// asks for, its id and, for a request, the request, whose strings point into
+// its document. Set `request.client` first if it matters.
+struct EnvelopeCall {
+    enum class Kind : uint8_t { Request, Auth, File } kind = Kind::Request;
+    Request request;
+    EnvelopeId id;
+    Status status = Status::Ok;  // otherwise, the error to answer with
+    const char* message = nullptr;
+    Reason reason = Reason::None;
+    // Answers the error, if there is one: true then.
+    bool failed(Reply& reply) const;
+};
+// What a transport takes beyond requests: any other op is a bad request.
+constexpr uint8_t kTakesAuth = 1;   // "auth" (answerAuth())
+constexpr uint8_t kTakesFiles = 2;  // "upload", "download" (FileSession)
+void readEnvelope(JsonObjectConst envelope, uint8_t takes, EnvelopeCall& call);
+// Same, from its text: parseEnvelope()'s rules. Strings point into `doc`.
+void parseEnvelope(std::string_view text, JsonDocument& doc, uint8_t maxDepth, uint8_t takes, EnvelopeCall& call);
+
+// A client whose level comes from a token it sends with "auth".
+class TokenClient {
+public:
+    // Its level now.
+    virtual Access tokenLevel() = 0;
+    virtual void setToken(std::string_view token) = 0;
+    // Its level fell: what it opened above the new one ends (subscriptions
+    // keep the level they were made at, as a file transfer does).
+    virtual void levelFell() = 0;
+
+protected:
+    ~TokenClient() = default;
+};
+// {"op":"auth","token":"..."} sets the client's token until the next one; an
+// empty or missing token signs out. The reply gives the level
+// (docs/DESIGN.md section 10.4).
+void answerAuth(JsonObjectConst envelope, TokenClient& client, Reply& reply);
+
 // Buffers one response envelope and hands it to `send` when complete.
 // Detaching copies it, so deferred replies work for any message transport
 // whose `send` may be called from another task.

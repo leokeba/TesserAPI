@@ -287,8 +287,8 @@ public:
     explicit EndpointServer(DatagramEndpoint& endpoint);
     ~EndpointServer();
 
-    // A request (`env`, from `msg`); `op` isn't empty, and there is an Api.
-    void serve(JsonObjectConst env, std::string_view op, const Incoming& msg);
+    // A request (`env`, from `msg`); it has an op, and there is an Api.
+    void serve(JsonObjectConst env, const Incoming& msg);
     // A message that can't be taken or parsed now: answered busy, or its
     // call failed, at once.
     void refuse(const PeerAddress& from, std::string_view text, bool broadcast, Reason reason);
@@ -332,6 +332,7 @@ private:
     public:
         PeerAddress peer;
     };
+    struct PeerToken;
     // A peer's file transfers, dropped once idle for Config::transferIdleMs.
     struct PeerFiles {
         PeerAddress peer;
@@ -341,7 +342,6 @@ private:
 
     // Replies to `to` hand their buffer to the owned send, when there is one.
     void ownReplies(EnvelopeReply& reply, const PeerAddress& to, bool silent);
-    void handleAuth(JsonObjectConst envelope, const Incoming& msg, Reply& reply);
     void handleFile(JsonObjectConst envelope, const Incoming& msg, const Client& client, EnvelopeReply& reply);
     Subscriber* subscriberFor(const PeerAddress& peer, bool create);
     // Deletes subscribers (`only`, or all) without subscriptions or queued

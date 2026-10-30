@@ -17,11 +17,7 @@ LineTransport::~LineTransport() { api_.dropSubscriber(this); }
 bool LineTransport::notify(const std::string& message, Delivery) { return send(message, true); }
 
 // Api::tokensChanged(): an unauthenticated line's level comes from its token.
-bool LineTransport::recheckLevel(Access& out) {
-    if (authenticated_) return false;
-    out = level();
-    return true;
-}
+bool LineTransport::recheckLevel(Access& out) { return token_.recheck(api_, client(), out); }
 
 void LineTransport::feed(const char* data, size_t len) {
     for (size_t i = 0; i < len; i++) feed(data[i]);
@@ -109,6 +105,21 @@ void LineTransport::feed(char c) {
     line_ += c;
 }
 
+// The line's token, for "auth".
+struct LineTransport::Token : TokenClient {
+    explicit Token(LineTransport& l) : line(l) {}
+    Access tokenLevel() override { return line.level(); }
+    void setToken(std::string_view token) override {
+        MutexGuard guard(line.api_.mutex());  // recheckLevel() reads it from another task
+        line.token_.token.assign(token.data(), token.size());
+    }
+    void levelFell() override {
+        line.api_.dropSubscriber(&line);
+        line.files_.reset();
+    }
+    LineTransport& line;
+};
+
 void LineTransport::handleLine() {
     // Skip whitespace and the noise a UART picks up while the peer resets
     // (control bytes, 0xff, ...), which would otherwise hide the request.
@@ -123,40 +134,24 @@ void LineTransport::handleLine() {
     if (!text.empty() && text.back() == '\r') text.remove_suffix(1);
 
     JsonDocument doc;
-    Request req;
-    EnvelopeId id;
-    const char* message = nullptr;
-    Reason reason = Reason::None;
-    Status s = parseEnvelope(text, doc, api_.config().maxDepth, req, id, message, &reason);
-    // "auth", "upload" and "download" aren't request ops, so they fail to
-    // parse as requests: read their id alone.
-    bool auth = false, file = false;
-    if (s != Status::Ok && doc.is<JsonObjectConst>()) {
-        JsonObjectConst env = doc.as<JsonObjectConst>();
-        auth = env["op"] == "auth";
-        file = FileSession::handles(env);
-        if (auth || file) {
-            reason = Reason::None;
-            s = envelopeId(env, id, message);
-        }
-        if (auth && s == Status::Ok) {
-            handleAuth(env, id);
-            return;
-        }
-    }
-    EnvelopeReply reply(id, api_.config().maxResponse, [this](const std::string& m) { send(m, false); });
+    EnvelopeCall call;
+    parseEnvelope(text, doc, api_.config().maxDepth, kTakesAuth | kTakesFiles, call);
+    EnvelopeReply reply(call.id, api_.config().maxResponse, [this](const std::string& m) { send(m, false); });
     // A short window: a serial line drains slowly, and what waits for it
     // is heap the next request may need.
     reply.stream([this](const char* data, size_t len, bool first, bool final) { return sendPiece(data, len, first, final); },
                  512, 1024);
-    if (s != Status::Ok) {
-        writeError(reply, s, reason, std::string_view(), message);
+    if (call.failed(reply)) return;
+    if (call.kind == EnvelopeCall::Kind::Auth) {
+        Token token(*this);
+        answerAuth(doc.as<JsonObjectConst>(), token, reply);
         return;
     }
+    Request& req = call.request;
     req.client.transport = kind_;
     req.client.access = level();
     req.client.authenticated = req.client.access != Access::Public;
-    if (file) {
+    if (call.kind == EnvelopeCall::Kind::File) {
         files_.handle(doc.as<JsonObjectConst>(), req.client, reply, text);
         return;
     }
@@ -165,44 +160,15 @@ void LineTransport::handleLine() {
 }
 
 Access LineTransport::level() const {
-    if (authenticated_) return Access::Admin;
-    Client client;
-    client.transport = kind_;
-    return api_.tokenAccess(token_, client);
+    Access level = Access::Admin;
+    token_.recheck(api_, client(), level);
+    return level;
 }
 
-// {"op":"auth","token":"..."} sets the line's token until the next one or
-// reset(); an empty or missing token signs out. The reply gives the level.
-void LineTransport::handleAuth(JsonObjectConst envelope, const EnvelopeId& id) {
-    EnvelopeReply reply(id, 0, [this](const std::string& m) { send(m, false); });
-    const char* message = nullptr;
-    Reason reason = Reason::None;
-    if (checkStrict(envelope, kAuthKeys, message, &reason) != Status::Ok) {
-        writeError(reply, Status::BadRequest, reason, std::string_view(), message);
-        return;
-    }
-    JsonVariantConst token = envelope["token"];
-    if (!token.isNull() && !token.is<const char*>()) {
-        writeError(reply, Status::BadRequest, std::string_view(), "token must be a string");
-        return;
-    }
-    Access before = level();
-    JsonString t = token.as<JsonString>();
-    {
-        MutexGuard guard(api_.mutex());  // recheckLevel() reads it from another task
-        token_.assign(t.c_str() ? t.c_str() : "", t.size());
-    }
-    Access after = level();
-    // Subscriptions keep the level they were made at: drop them rather than
-    // show the client what it can no longer read.
-    // A transfer opened at the higher level ends too.
-    if (after < before) {
-        api_.dropSubscriber(this);
-        files_.reset();
-    }
-    std::string body = std::string("{\"access\":\"") + toString(after) + "\"}";
-    reply.begin(Status::Ok).write(body.data(), body.size());
-    reply.end();
+Client LineTransport::client() const {
+    Client client;
+    client.transport = kind_;
+    return client;
 }
 
 void LineTransport::reset() {
@@ -212,7 +178,7 @@ void LineTransport::reset() {
     discarding_ = starved_ = damaged_ = false;
     {
         MutexGuard guard(api_.mutex());
-        token_.clear();
+        token_.token.clear();
     }
     files_.reset();
 }

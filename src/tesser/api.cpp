@@ -188,6 +188,12 @@ Access Api::tokenAccess(std::string_view token, const Client& client) const {
     return tokenCheck_ ? tokenCheck_(token, client) : Access::Public;
 }
 
+bool ClientToken::recheck(const Api& api, const Client& client, Access& level) const {
+    if (fixed) return false;
+    level = api.tokenAccess(token, client);
+    return true;
+}
+
 bool Api::belowRemote(std::string_view path) const {
     MutexGuard guard(mutex_);
     bool remote = false;

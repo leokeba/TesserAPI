@@ -181,11 +181,7 @@ bool StreamSubscriber::notify(const std::string& message, Delivery) {
     return send(message, "\n");
 }
 
-bool StreamSubscriber::recheckLevel(Access& level) {
-    if (fixed_) return false;
-    level = api_.tokenAccess(token_, client_);
-    return true;
-}
+bool StreamSubscriber::recheckLevel(Access& level) { return token_.recheck(api_, client_, level); }
 
 // Its one subscription ended: nothing more goes out, and the transport
 // closes the stream, so its client notices and opens it again.

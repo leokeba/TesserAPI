@@ -64,8 +64,8 @@ public:
     // from the token check (the transport's own token). Before open().
     // Without it, the stream keeps its level.
     void presented(std::string_view token, bool fixed) {
-        token_.assign(token.data(), token.size());
-        fixed_ = fixed;
+        token_.token.assign(token.data(), token.size());
+        token_.fixed = fixed;
     }
 
     bool notify(const std::string& message, Delivery delivery) override;
@@ -91,8 +91,7 @@ private:
     std::atomic<bool> open_{false};
     std::atomic<bool> sent_{false};
     std::atomic<bool> revoked_{false};
-    std::string token_;
-    bool fixed_ = true;
+    ClientToken token_;
     Client client_;  // as it opened, for the token check
     bool opened_ = false;
     bool ticked_ = false;  // keepAlive() state, in the caller's task

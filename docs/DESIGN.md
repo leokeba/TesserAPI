@@ -1271,6 +1271,8 @@ A datagram endpoint (`DatagramEndpoint`) is a small class in front of four parts
 - `datagram_mounts.cpp` (`detail::Mounter`): the remote nodes routed through the endpoint, their pins, and the nodes it mounts for peers that announce themselves.
 - `datagram_server.cpp` (`detail::EndpointServer`): serving peers' requests, subscriptions, file transfers and tokens.
 
+Every transport of envelopes sorts them out the same way (`envelope.cpp`): `readEnvelope()` says whether one is a request, a token or a file transfer, and gives its id, for `LineTransport`, `handleEnvelope()` (WebSocket) and `detail::EndpointServer`; `answerAuth()` is what `auth` does to a client's token, on a line or from a peer. A client's token is a `ClientToken`, whose `recheck()` is what `Api::tokensChanged()` asks of a WebSocket client, a line and a stream.
+
 `HttpServer` keeps one class across a file per concern, with what they share in `transports/http_internal.h`:
 - `http_server.cpp`: the server's life, and the dispatch of a request, with its response (`HttpReply`).
 - `http_request.cpp`: reading a request (query, headers, token, client address) and the strict mode.

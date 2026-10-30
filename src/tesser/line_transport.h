@@ -43,7 +43,7 @@ public:
     // the line's level is the one the API's token check (Api::authenticate())
     // gives its token, like an HTTP request's: the empty token until the
     // client sends {"op":"auth","token":"..."} (docs/DESIGN.md section 10.4).
-    void setAuthenticated(bool authenticated) { authenticated_ = authenticated; }
+    void setAuthenticated(bool authenticated) { token_.fixed = authenticated; }
     // The transport its clients are shown with (Client::transport), for the
     // token check and the authorizer: Serial by default, Ble on Bluetooth.
     void setTransport(TransportKind kind) { kind_ = kind; }
@@ -77,10 +77,11 @@ public:
     size_t overruns() const { return overruns_; }
 
 private:
+    struct Token;
     void handleLine();
     EnvelopeId keptId() const;
-    void handleAuth(JsonObjectConst envelope, const EnvelopeId& id);
     Access level() const;
+    Client client() const;  // for the token check
     // A whole message (a notification, `mayDrop`, or a deferred reply):
     // waits in `waiting_` while a reply streams. False if dropped.
     bool send(const std::string& message, bool mayDrop);
@@ -99,9 +100,8 @@ private:
     bool discarding_ = false;
     bool starved_ = false;  // discarding_ because the heap couldn't hold the line
     bool damaged_ = false;  // lineDamaged(): bytes of this line were lost
-    bool authenticated_ = true;
     TransportKind kind_ = TransportKind::Serial;
-    std::string token_;  // from the last "auth" envelope; written under the API lock
+    ClientToken token_;  // from the last "auth" envelope; written under the API lock
     FileSession files_;
     size_t overflows_ = 0;
     size_t overruns_ = 0;
