@@ -196,6 +196,7 @@ private:
         uint32_t id;
         std::string data;
         uint8_t count;
+        uint8_t burst;  // fragments its bursts are cut to, once the adapter refused one (0: all)
         uint64_t acked;
         uint32_t probeMs;
         uint32_t backoffMs;
@@ -223,7 +224,7 @@ private:
 
     bool sendMessage(const PeerAddress& to, std::string message, Delivery delivery);
     void transmit(const PeerAddress& to, uint32_t id, const std::string& data, uint8_t count, uint64_t mask,
-                  uint8_t flags);
+                  uint8_t flags, uint8_t* burst = nullptr);
     void sendAck(const PeerAddress& to, uint32_t id, uint8_t status, uint64_t got);
     void sendAdvert(const PeerAddress& to, uint8_t flags);
     bool sendDatagram(const PeerAddress& to, const uint8_t* head, size_t headLen, const uint8_t* body = nullptr,

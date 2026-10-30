@@ -265,6 +265,33 @@ TEST(udp_refused_datagrams_go_again) {
     CHECK_EQ(whole.body, local.body);
 }
 
+// Buffers that take only part of a burst, every time: the fragment that asks
+// for an acknowledgement never goes, so a burst that started over at each
+// retransmission never got anywhere, and the message failed.
+TEST(udp_message_larger_than_the_adapters_buffers) {
+    UdpLink::Options o;
+    o.fragmentSize = 64;
+    Pair p(o);
+    tesser::StringReply local;
+    tesser::Request req;
+    req.path = "/";
+    req.query = cases::schema();
+    p.dev.api.handle(req, local);
+    CHECK(local.body.size() > 8 * 64);
+    // The server's adapter takes 3 datagrams between two of its ticks.
+    int taken = 0;
+    p.net.refuse = [&](const PeerAddress& from) { return from == ip(2) && ++taken > 3; };
+    Result r;
+    p.client.endpoint().request(ip(2), tesser::Op::Get, "/", "", capture(r), cases::schema());
+    for (int i = 0; i < 300 && !r.calls; i++) {
+        taken = 0;
+        p.net.advance(10);
+    }
+    CHECK_EQ(r.status, Status::Ok);
+    CHECK_EQ(r.body, local.body);
+    CHECK_EQ(p.server.stats().failed, 0u);
+}
+
 TEST(udp_losses_and_repeats) {
     UdpLink::Options o;
     o.fragmentSize = 64;

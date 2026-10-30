@@ -266,11 +266,12 @@ bool UdpLink::sendDatagram(const PeerAddress& to, const uint8_t* head, size_t he
 // section 10.7). Measured on DEVKIT-V3: a peer's mirror snapshot, sent all
 // at once, took the gateway 2 KB below its floor.
 void UdpLink::transmit(const PeerAddress& to, uint32_t id, const std::string& data, uint8_t count, uint64_t mask,
-                       uint8_t flags) {
+                       uint8_t flags, uint8_t* burst) {
     size_t size = options_.fragmentSize;
     if (flags & kReliable) {
         unsigned room = 0;
         while (heapAbove(2 * (room + 1) * (kHeader + size)) && room < count) room++;
+        if (burst && *burst && room > *burst) room = *burst;
         unsigned sent = 0;
         for (unsigned i = 0; i < count; i++) {
             if (!(mask & flag(i))) continue;
@@ -282,6 +283,7 @@ void UdpLink::transmit(const PeerAddress& to, uint32_t id, const std::string& da
     for (unsigned i = 0; i < count; i++) {
         if (mask & flag(i)) last = i;
     }
+    uint8_t taken = 0;
     for (unsigned i = 0; i < count; i++) {
         if (!(mask & flag(i))) continue;
         Header h;
@@ -297,12 +299,18 @@ void UdpLink::transmit(const PeerAddress& to, uint32_t id, const std::string& da
         size_t n = data.size() - offset < size ? data.size() - offset : size;
         uint8_t head[kHeader];
         writeHeader(head, h);
-        // Refused (the network stack's buffers are full): the rest would be
-        // too. The retransmission timer sends what is missing, rather than
-        // retrying here under the link's lock, often the API's too.
-        if (!sendDatagram(to, head, kHeader, reinterpret_cast<const uint8_t*>(data.data()) + offset, n) &&
-            (flags & kReliable))
+        if (sendDatagram(to, head, kHeader, reinterpret_cast<const uint8_t*>(data.data()) + offset, n)) {
+            taken++;
+        } else if (flags & kReliable) {
+            // Refused (the network stack's buffers are full): the rest would
+            // be too. The retransmission timer sends what is missing, rather
+            // than retrying here under the link's lock, often the API's too.
+            // Its bursts are cut to what was taken: refused, the fragment
+            // asking for an acknowledgement never goes, and without one a
+            // burst would start over from the same fragment for good.
+            if (burst) *burst = taken ? taken : 1;
             break;
+        }
     }
 }
 
@@ -335,10 +343,10 @@ bool UdpLink::sendMessage(const PeerAddress& to, std::string message, Delivery d
         uint32_t t = now();
         // Kept for retransmissions: taken, not copied (a large reply on a
         // fragmented heap had no room for a second block).
-        outgoing_.push_back(Outgoing{to, id, std::move(message), count, 0, t + options_.ackTimeoutMs,
+        outgoing_.push_back(Outgoing{to, id, std::move(message), count, 0, 0, t + options_.ackTimeoutMs,
                                      options_.ackTimeoutMs, t + options_.sendTimeoutMs, std::move(held)});
-        const Outgoing& o = outgoing_.back();
-        transmit(to, id, o.data, count, allOf(count), kReliable);
+        Outgoing& o = outgoing_.back();
+        transmit(to, id, o.data, count, allOf(count), kReliable, &o.burst);
     }
     // Its retransmission is due before a sleeping worker would look.
     endpoint_.wake();
@@ -624,7 +632,7 @@ void UdpLink::handleAck(const PeerAddress& from, const uint8_t* data, size_t len
             uint64_t missing = allOf(o.count) & ~o.acked;
             if (missing) {
                 // Only what is missing goes again, at once.
-                transmit(o.to, o.id, o.data, o.count, missing, kReliable);
+                transmit(o.to, o.id, o.data, o.count, missing, kReliable, &o.burst);
                 stats_.retransmits += bits(missing);
                 o.probeMs = t + o.backoffMs;
                 return;
@@ -742,7 +750,7 @@ bool UdpLink::tick() {
                 }
                 if (static_cast<int32_t>(t - o.probeMs) >= 0) {
                     uint64_t missing = allOf(o.count) & ~o.acked;
-                    transmit(o.to, o.id, o.data, o.count, missing, kReliable);
+                    transmit(o.to, o.id, o.data, o.count, missing, kReliable, &o.burst);
                     stats_.retransmits += bits(missing);
                     o.backoffMs = o.backoffMs * 2 > 1000 ? 1000 : o.backoffMs * 2;
                     o.probeMs = t + o.backoffMs;
