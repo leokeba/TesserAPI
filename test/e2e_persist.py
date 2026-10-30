@@ -38,14 +38,18 @@ def main():
     s.rts = False
     s.close()
 
+    # HTTP comes up before the firmware's api.load(): until then /settings
+    # answers with its defaults. The counter moving says the load is done.
     end = time.time() + 30
     got = None
     while time.time() < end:
         try:
             got = h.call('get', '/settings', {}, ABSENT)
-            break
+            if got[0] == 'ok' and got[1]['boots'] > boots:
+                break
         except OSError:
-            time.sleep(0.5)
+            pass
+        time.sleep(0.5)
     check('back after reboot', got is not None, got)
     if got:
         status, settings = got

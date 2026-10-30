@@ -50,7 +50,8 @@ def main():
     check('B has A over both routes', wait(lambda: state(b, name_a).get('routes') == 2, 12), state(b, name_a))
     both = json.loads(a.raw('GET', '/both', {'view': 'schema', 'depth': 1})[1])['children']
     stub = both.get(name_b, {})
-    check('stub: route and device', stub.get('route') == 'udp' and stub.get('id') == mac_b, stub)
+    # The schema names the interface too: udp/wifi, udp/ethernet.
+    check('stub: route and device', stub.get('route', '').split('/')[0] == 'udp' and stub.get('id') == mac_b, stub)
     check('A uses UDP to B', wait(lambda: state(a, name_b).get('route') == 'udp', 6), state(a, name_b))
 
     # ---- a stream over UDP -----------------------------------------------

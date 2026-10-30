@@ -109,7 +109,8 @@ def main():
     end = time.time() + 0.5
     while time.time() < end:
         client.pump(end - time.time())
-    replies = [e for _, e in client.messages if 'status' in e]
+    # Of the two boards: any other TesserAPI node on the LAN gets it too.
+    replies = [e for addr, e in client.messages if 'status' in e and addr in (A, B)]
     check('a broadcast set from this machine reaches both boards',
           get(a, '/lamp/label') == 'bcast' and get(b, '/lamp/label') == 'bcast',
           (get(a, '/lamp/label'), get(b, '/lamp/label')))
@@ -121,8 +122,10 @@ def main():
           (status, r, get(a, '/lamp/label'), get(b, '/lamp/label')))
     status, r = a.call('set', '/net/udp/broadcast', {}, {'path': '/lamp/label', 'value': 'desk', 'to': bcast,
                                                          'replies': True})
-    check('replies collected from a directed broadcast', status == 'ok' and r == [{'from': f'{ip_b}:{PORT}',
-                                                                                   'status': 'ok'}], (status, r))
+    boards = (f'{ip_a}:{PORT}', f'{ip_b}:{PORT}')
+    ours = [x for x in r if x.get('from') in boards] if isinstance(r, list) else r
+    check('replies collected from a directed broadcast',
+          status == 'ok' and ours == [{'from': f'{ip_b}:{PORT}', 'status': 'ok'}], (status, r))
     a.call('set', '/lamp/label', {}, 'desk')
     check('labels restored', get(a, '/lamp/label') == 'desk' and get(b, '/lamp/label') == 'desk')
 
