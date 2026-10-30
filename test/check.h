@@ -10,6 +10,11 @@
 #include <type_traits>
 #include <vector>
 
+#if defined(ESP_PLATFORM)
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
+
 namespace check {
 
 struct Case {
@@ -73,6 +78,13 @@ inline int run(const char* filter) {
         g_caseFailures = 0;
         g_firstFailure.clear();
         c.fn();
+#if defined(ESP_PLATFORM)
+        // The cases never block, and most of the suite would run without a
+        // context switch: this feeds the idle task's watchdog, and FreeRTOS
+        // checks a stack only at a switch, so an overflow is caught here,
+        // not cases later at the first one that waits.
+        vTaskDelay(1);
+#endif
         if (g_caseFailures == 0) {
             pass++;
             printf("PASS %s\n", c.name);

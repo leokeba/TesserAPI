@@ -767,9 +767,12 @@ TEST(udp_fragments_paced_on_a_tight_heap) {
     bool mirrored = false;
     CHECK_EQ(mirrorSnapshotInFlight(0, 0, mirrored), 2u);  // all at once with room (the third is short)
     CHECK(mirrored);
+#if !defined(ESP_PLATFORM)
+    // A limit on operator new: HeapLimit does nothing on target.
     mirrored = false;
     CHECK_EQ(mirrorSnapshotInFlight(11000, 4000, mirrored), 1u);
     CHECK(mirrored);
+#endif
 }
 
 // The message id of a datagram (header bytes 8-11).
@@ -975,17 +978,21 @@ TEST(udp_worker_sleeps_when_idle) {
     p.net.advance(60000);
     CHECK(node && node->online());
     CHECK(p.net.ticks <= 2 * 80);
+}
 
-    // Nothing to do at all: as long as it may.
+TEST(udp_worker_sleeps_as_long_as_it_may) {
+    // Nothing to do at all.
     WorkerPair idle;
     CHECK_EQ(idle.link.nextDelayMs(), UdpLink::kMaxDelayMs);
     CHECK_EQ(idle.link.nextDelayMs(250), 250u);
 }
 
+// One WorkerPair a test: two links and their trees are about 3.6 KB of a test's
+// frame on target, whose main task has 16 KB (see test/hardware/main/CMakeLists.txt).
 TEST(udp_worker_keeps_time) {
-    // Every timer of the link, with a worker that sleeps between them: to a
-    // peer that doesn't answer, attempts go at 100, 300, 700, 1500 and 2500
-    // ms, and the message fails at 3000.
+    // With a worker that sleeps between timers: to a peer that doesn't
+    // answer, attempts go at 100, 300, 700, 1500 and 2500 ms, and the
+    // message fails at 3000.
     WorkerPair p;
     p.net.lose = [](const Net::Datagram&) { return true; };
     int done = 0;
@@ -1012,8 +1019,9 @@ TEST(udp_worker_keeps_time) {
     CHECK_EQ(s, Status::Timeout);
     CHECK_EQ(p.link.stats().failed, 1u);
     CHECK(p.net.clock - start <= 3020);
+}
 
-    // A partial message is given up after sendTimeoutMs.
+TEST(udp_worker_gives_up_a_partial_message) {
     WorkerPair q;
     q.net.lose = [](const Net::Datagram& d) { return d.data.size() > 20 && d.data[3] == 1; };  // fragment 1
     std::string large(2000, 'x');
@@ -1025,8 +1033,10 @@ TEST(udp_worker_keeps_time) {
     CHECK_EQ(q.server.stats().dropped, 0u);
     q.net.advance(40);
     CHECK_EQ(q.server.stats().dropped, 1u);
+}
 
-    // An advertising peer that goes quiet is lost after peerTimeoutMs.
+TEST(udp_worker_loses_a_silent_peer) {
+    // After peerTimeoutMs.
     WorkerPair r;
     r.server.setName("s");
     r.server.advertise();
@@ -1048,7 +1058,9 @@ TEST(udp_worker_sleeps_until_each_timer) {
     // Nothing at all.
     WorkerPair idle;
     CHECK_EQ(idle.link.nextDelayMs(kNoLimit), kNoLimit);
+}
 
+TEST(udp_worker_sleeps_until_advertisements_and_losses) {
     // The next advertisement.
     WorkerPair a;
     a.server.setName("s");
@@ -1068,15 +1080,18 @@ TEST(udp_worker_sleeps_until_each_timer) {
     tesser::Deadline d(a.net.clock);
     a.link.endpoint().nextTick(d);
     CHECK_EQ(d.delay(kNoLimit), tesser::DatagramEndpoint::kLossGraceMs - 1000);
+}
 
-    // A message partly received.
+TEST(udp_worker_sleeps_until_a_partial_message_expires) {
     WorkerPair q;
     q.net.lose = [](const Net::Datagram& g) { return g.data.size() > 20 && g.data[3] == 1; };  // fragment 1
     CHECK(q.link.endpoint().broadcast(ip(20), tesser::Op::Set, "/none", "\"" + std::string(2000, 'x') + "\""));
     q.net.settle();
     CHECK_EQ(q.server.nextDelayMs(kNoLimit), 3000u);
+}
 
-    // The timeout of a call, and a message's retransmission first.
+TEST(udp_worker_sleeps_until_a_retransmission) {
+    // Before the call's timeout.
     WorkerPair c;
     c.net.lose = [](const Net::Datagram&) { return true; };
     CHECK(c.link.endpoint().request(ip(20), tesser::Op::Get, "/", std::string_view(), [](Status, JsonVariantConst) {}));
