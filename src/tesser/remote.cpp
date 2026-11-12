@@ -536,13 +536,13 @@ void RemoteNode::forward(Api& api, const Request& request, std::string_view rest
 
 // ---- streamed sets -----------------------------------------------------------
 
-Status RemoteNode::stream(std::string_view path, std::string_view bodyJson) {
+Status RemoteNode::stream(std::string_view path, std::string_view bodyJson, const Query& query) {
     if (!online()) return Status::Timeout;
     JsonDocument body;
     if (parseJson(body, bodyJson, kWrittenNesting)) {
         return Status::BadRequest;
     }
-    Status s = sets().push(path, std::move(body));
+    Status s = sets().push(path, std::move(body), query.persist);
     if (s == Status::Ok) pump();
     return s;
 }
@@ -573,13 +573,14 @@ void RemoteNode::pump() {
     Route r;
     bool reachable = route(r) && online();
     std::string path, body;
-    if (!stream->next(reachable, path, body)) return;
+    Query q;
+    if (!stream->next(reachable, path, body, q.persist)) return;
     bool sent = r.endpoint->request(
         r.peer, Op::Set, remotePathOf(path), std::string_view(body),
         [this, stream](Status s, JsonVariantConst reply) {
             if (stream->done(s, reply)) pump();
         },
-        Query(), streamTimeoutMs(), this);
+        q, streamTimeoutMs(), this);
     if (!sent) stream->unsent();  // tick() tries again
 }
 

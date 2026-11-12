@@ -64,11 +64,12 @@ struct Query {
     // made with one says so in its notifications and ends only with an
     // unsub at the same level.
     Access ceiling = Access::Admin;
-    // Set only, from the application (not on the wire): false keeps the
-    // change out of the stored state (docs/DESIGN.md section 12), for a
-    // writer that drives a persisted value many times a second (DMX, a
-    // sequencer): the record isn't rewritten for it, and the value stored
-    // before comes back at the next boot.
+    // Set only: false keeps the change out of the stored state
+    // (docs/DESIGN.md section 12), for a writer that drives a persisted
+    // value many times a second (DMX, a sequencer, a knob on another
+    // node): the record isn't rewritten for it, and the value stored before
+    // comes back at the next boot. On the wire, "persist": false in the
+    // envelope and ?persist=false over HTTP; a node that predates it saves.
     bool persist = true;
 };
 

@@ -27,7 +27,7 @@ bool overlaps(const std::string& a, const std::string& b) {
 
 }  // namespace
 
-Status SetStream::push(std::string_view path, JsonDocument&& body) {
+Status SetStream::push(std::string_view path, JsonDocument&& body, bool persist) {
     std::string p = normalPath(path);
     MutexGuard guard(mutex_);
     // On top of the last set queued for the path, unless a set to a path
@@ -35,6 +35,7 @@ Status SetStream::push(std::string_view path, JsonDocument&& body) {
     for (size_t i = queue_.size(); i-- > 0;) {
         if (queue_[i].path == p) {
             mergeJson(queue_[i].body.as<JsonVariant>(), body.as<JsonVariantConst>());
+            queue_[i].persist = queue_[i].persist || persist;
             stats_.queued++;
             stats_.merged++;
             return Status::Ok;
@@ -45,6 +46,7 @@ Status SetStream::push(std::string_view path, JsonDocument&& body) {
     queue_.emplace_back();
     queue_.back().path = std::move(p);
     queue_.back().body = std::move(body);
+    queue_.back().persist = persist;
     stats_.queued++;
     return Status::Ok;
 }
@@ -70,6 +72,7 @@ void SetStream::requeue(std::vector<Pending>& queue, Pending p) {
     for (size_t i = 0; i < queue.size();) {
         if (queue[i].path == p.path) {
             mergeJson(p.body.as<JsonVariant>(), queue[i].body.as<JsonVariantConst>());
+            p.persist = p.persist || queue[i].persist;
             queue.erase(queue.begin() + static_cast<std::ptrdiff_t>(i));
             continue;
         }
@@ -79,7 +82,7 @@ void SetStream::requeue(std::vector<Pending>& queue, Pending p) {
     queue.insert(queue.begin(), std::move(p));
 }
 
-bool SetStream::next(bool reachable, std::string& path, std::string& body) {
+bool SetStream::next(bool reachable, std::string& path, std::string& body, bool& persist) {
     std::vector<Pending> dropped;
     ErrorHandler onError;
     {
@@ -91,6 +94,7 @@ bool SetStream::next(bool reachable, std::string& path, std::string& body) {
             inFlight_ = true;
             stats_.sent++;
             path = flying_.path;
+            persist = flying_.persist;
             serializeJson(flying_.body, body);
             return true;
         }

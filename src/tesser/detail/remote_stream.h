@@ -36,12 +36,16 @@ public:
 
     // Queues a set to `path` below the node, merged into the last one queued
     // for that path unless a set to a path above or below it came after.
-    // Ok, or Busy when the queue is full.
-    Status push(std::string_view path, JsonDocument&& body);
+    // `persist` false: the device doesn't save it (Query::persist); a merged
+    // set is saved if any set in it was, as the device would have saved them
+    // one by one (a save due takes the unsaved value along). Ok, or Busy
+    // when the queue is full.
+    Status push(std::string_view path, JsonDocument&& body, bool persist = true);
     // The set to send next, if none is in flight: true, with its path below
-    // the node and its body as text; it is then in flight. Not `reachable`:
-    // every set waiting is dropped and reported to the error handler.
-    bool next(bool reachable, std::string& path, std::string& body);
+    // the node, its body as text and whether it is saved; it is then in
+    // flight. Not `reachable`: every set waiting is dropped and reported to
+    // the error handler.
+    bool next(bool reachable, std::string& path, std::string& body, bool& persist);
     // The set next() gave couldn't be sent: it waits at the front again.
     void unsent();
     // The answer to the set in flight. True when the next one should go now
@@ -62,6 +66,7 @@ private:
         std::string path;  // below the node
         JsonDocument body;
         uint8_t attempts = 0;
+        bool persist = true;
     };
     static void requeue(std::vector<Pending>& queue, Pending p);
 

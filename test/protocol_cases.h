@@ -68,6 +68,27 @@ TEST(protocol_strict_requests) {
     CHECK_EQ(tesser::buildRequestEnvelope(1, Op::Set, "/a", Query(), "1"), "{\"id\":1,\"op\":\"set\",\"path\":\"/a\",\"body\":1}");
 }
 
+TEST(protocol_unsaved_sets) {
+    // "persist": false (Query::persist) doesn't make a set strict: a node
+    // that predates it ignores it and saves, as it always did.
+    Query q;
+    q.persist = false;
+    CHECK_EQ(tesser::buildRequestEnvelope(1, Op::Set, "/a", q, "1"),
+             "{\"id\":1,\"op\":\"set\",\"path\":\"/a\",\"persist\":false,\"body\":1}");
+    CHECK_EQ(tesser::buildRequestEnvelope(2, Op::Get, "/a", q, ""), "{\"id\":2,\"op\":\"get\",\"path\":\"/a\"}");
+    q.ceiling = tesser::Access::User;  // strict for the ceiling: "persist" is known
+    CHECK_EQ(tesser::buildRequestEnvelope(3, Op::Set, "/a", q, "1"),
+             "{\"id\":3,\"op\":\"set@user\",\"path\":\"/a\",\"persist\":false,\"v\":2,\"body\":1}");
+
+    cases::Device d;
+    CHECK(cases::roundTrip(d.api, "{\"id\":4,\"op\":\"set\",\"path\":\"/lamp/on\",\"body\":true,\"persist\":false,\"v\":2}")
+              .find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(cases::roundTrip(d.api, "{\"id\":5,\"op\":\"set\",\"path\":\"/lamp/on\",\"body\":true,\"persist\":0}")
+              .find("\"message\":\"persist must be a boolean\"") != std::string::npos);
+    CHECK(cases::roundTrip(d.api, "{\"op\":\"get\",\"path\":\"/\",\"view\":\"info\"}").find("\"persist\"") !=
+          std::string::npos);
+}
+
 TEST(protocol_error_reasons) {
     tesser::Reason r = tesser::Reason::None;
     CHECK(tesser::parseReason("low_memory", r));

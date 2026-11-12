@@ -74,6 +74,13 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
             w.boolean(false);
         }
     }
+    // Not an option that makes the request strict: a node that predates it
+    // ignores it and saves the change, as it always did (docs/DESIGN.md
+    // section 12).
+    if (op == Op::Set && !query.persist) {
+        w.key("persist");
+        w.boolean(false);
+    }
     // With options, strict (docs/DESIGN.md section 10.1.2): a node that
     // doesn't know one refuses the request rather than ignore it.
     bool options = query.depth >= 0 || !query.keys.empty() || !query.exclude.empty() || query.view != View::Value ||

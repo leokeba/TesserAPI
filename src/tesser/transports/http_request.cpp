@@ -168,6 +168,7 @@ bool readQuery(httpd_req_t* req, Request& request, QueryText& text, Reply& reply
         }
         boolParam(query, "snapshot", request.query.snapshot, bad);
         boolParam(query, "remotes", request.query.remotes, bad);
+        boolParam(query, "persist", request.query.persist, bad);
         // Browsers can't send a GET body, so a shape may also come as ?shape=<json>.
         textParam(query, "shape", queryLen + 1, text.shape, bad);
         // The file name the client gave, for a transfer (FileRequest::filename).

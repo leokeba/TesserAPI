@@ -208,8 +208,10 @@ public:
     // replaces). Streams converge on the latest state: they don't replay
     // every set. Ok: queued. Timeout: the node is offline. Busy: the queue
     // is full. BadRequest: `bodyJson` isn't JSON. Any task, under the API
-    // lock or not.
-    Status stream(std::string_view path, std::string_view bodyJson);
+    // lock or not. Of `query`, only `persist` applies: false, the device
+    // doesn't save the change (Query::persist); a set merged with one that
+    // is saved is saved.
+    Status stream(std::string_view path, std::string_view bodyJson, const Query& query = Query());
     // Sets that may wait (default 8).
     RemoteNode& streamLimit(size_t entries) {
         sets().setLimit(entries);

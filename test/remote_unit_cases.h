@@ -35,16 +35,17 @@ TEST(unit_stream_merges_and_orders) {
     CHECK_EQ(s.stats().merged, 1u);
 
     std::string path, body;
-    CHECK(s.next(true, path, body));
+    bool persist = false;
+    CHECK(s.next(true, path, body, persist));
     CHECK_EQ(path, "/out");
     CHECK_EQ(body, "{\"level\":1,\"on\":true}");
-    CHECK(!s.next(true, path, body));  // one in flight at a time
+    CHECK(!s.next(true, path, body, persist));  // one in flight at a time
     CHECK(s.done(Status::Ok, ArduinoJson::JsonVariantConst()));
-    CHECK(s.next(true, path, body));
+    CHECK(s.next(true, path, body, persist));
     CHECK_EQ(path, "/out/level");
     CHECK_EQ(body, "2");
     CHECK(s.done(Status::Ok, ArduinoJson::JsonVariantConst()));
-    CHECK(s.next(true, path, body));
+    CHECK(s.next(true, path, body, persist));
     CHECK_EQ(body, "{\"level\":3}");
     CHECK(s.done(Status::Ok, ArduinoJson::JsonVariantConst()));
     CHECK_EQ(s.size(), 0u);
@@ -66,37 +67,68 @@ TEST(unit_stream_limit_and_retries) {
         CHECK_EQ(st, Status::Timeout);
     });
     std::string path, body;
-    CHECK(s.next(true, path, body));
+    bool persist = false;
+    CHECK(s.next(true, path, body, persist));
     CHECK_EQ(path, "/a");
     // A newer set to the path comes while it is in flight: a timed-out one
     // goes again with it merged on top.
     CHECK_EQ(s.push("/a", parsed("{\"x\":5}")), Status::Ok);
     CHECK(s.done(Status::Timeout, ArduinoJson::JsonVariantConst()));
-    CHECK(s.next(true, path, body));
+    CHECK(s.next(true, path, body, persist));
     CHECK_EQ(path, "/a");
     CHECK_EQ(body, "{\"x\":5}");
     // Busy: sent again later (the node's tick), not at once.
     CHECK(!s.done(Status::Busy, ArduinoJson::JsonVariantConst()));
-    CHECK(s.next(true, path, body));
+    CHECK(s.next(true, path, body, persist));
     CHECK(s.done(Status::Timeout, ArduinoJson::JsonVariantConst()));  // the third attempt
     CHECK_EQ(failed.size(), 1u);
     CHECK_EQ(s.stats().failed, 1u);
 
     // Couldn't be sent: it waits at the front, not counted as sent.
     uint32_t sent = s.stats().sent;
-    CHECK(s.next(true, path, body));
+    CHECK(s.next(true, path, body, persist));
     CHECK_EQ(path, "/b");
     s.unsent();
     CHECK_EQ(s.stats().sent, sent);
     CHECK_EQ(s.size(), 1u);
 
     // Unreachable: dropped and reported.
-    CHECK(!s.next(false, path, body));
+    CHECK(!s.next(false, path, body, persist));
     CHECK_EQ(s.size(), 0u);
     CHECK_EQ(failed.size(), 2u);
     if (failed.size() == 2) CHECK_EQ(failed[1], "/b");
     CHECK_EQ(s.stats().failed, 2u);
     CHECK(!s.done(Status::Ok, ArduinoJson::JsonVariantConst()));  // nothing in flight
+}
+
+TEST(unit_stream_unsaved_sets) {
+    // Query::persist false travels with a set; one merged with a saved set
+    // is saved, in a merge and when it goes again.
+    tesser::Mutex m{tesser::kRankLeaf, "test"};
+    SetStream s(m);
+    std::string path, body;
+    bool persist = true;
+    CHECK_EQ(s.push("/a", parsed("{\"x\":1}"), false), Status::Ok);
+    CHECK(s.next(true, path, body, persist));
+    CHECK(!persist);
+    CHECK_EQ(s.push("/a", parsed("{\"x\":2}"), false), Status::Ok);
+    CHECK_EQ(s.push("/b", parsed("{\"x\":1}"), false), Status::Ok);
+    CHECK_EQ(s.push("/b", parsed("{\"y\":1}")), Status::Ok);  // merged: saved
+    // The one in flight times out: merged with "/a" queued, still unsaved.
+    CHECK(s.done(Status::Timeout, ArduinoJson::JsonVariantConst()));
+    CHECK(s.next(true, path, body, persist));
+    CHECK_EQ(body, "{\"x\":2}");
+    CHECK(!persist);
+    CHECK(s.done(Status::Ok, ArduinoJson::JsonVariantConst()));
+    CHECK(s.next(true, path, body, persist));
+    CHECK_EQ(body, "{\"x\":1,\"y\":1}");
+    CHECK(persist);
+    // A saved set in flight takes an unsaved one along when it goes again.
+    CHECK_EQ(s.push("/b", parsed("{\"x\":3}"), false), Status::Ok);
+    CHECK(s.done(Status::Timeout, ArduinoJson::JsonVariantConst()));
+    CHECK(s.next(true, path, body, persist));
+    CHECK_EQ(body, "{\"x\":3,\"y\":1}");
+    CHECK(persist);
 }
 
 // Endpoints a route table points at: only their kind matters to it.

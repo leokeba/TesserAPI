@@ -338,6 +338,58 @@ TEST(route_stream_queue) {
     CHECK_EQ(n.stream("/out/level", "5"), Status::Timeout);
 }
 
+TEST(route_stream_unsaved) {
+    // A knob on the master sweeping a persisted value on the device: streamed
+    // with Query::persist false, the device doesn't rewrite its record.
+    Defaults d;
+    Rig r;
+    tesser::MemoryStorage storage;
+    r.dev.object("out").persist();
+    r.dev.persistence(storage, 1000);
+    r.dev.load();  // nothing stored yet
+    auto settle = [&r](uint32_t ms) {
+        for (uint32_t t = 0; t < ms; t += 50) {
+            r.advance(50);
+            r.dev.poll(r.net.clock);
+        }
+    };
+    RemoteNode& n = r.node();
+    tesser::Query unsaved;
+    unsaved.persist = false;
+    for (int v = 1; v <= 20; v++) {
+        CHECK_EQ(n.stream("/out", "{\"level\":" + std::to_string(v) + "}", unsaved), Status::Ok);
+        settle(100);
+    }
+    settle(3000);
+    CHECK_EQ(r.level, 20);
+    CHECK_EQ(storage.saves, 0);
+
+    // A forwarded set carries it too.
+    tesser::LocalClient local(r.master);
+    Status got = Status::Internal;
+    CHECK(local.set("/peers/lamp/out/level", "21", [&got](Status s, JsonVariantConst) { got = s; }, unsaved));
+    for (int i = 0; i < 10 && got == Status::Internal; i++) {
+        settle(50);
+        local.process();
+    }
+    CHECK_EQ(got, Status::Ok);
+    CHECK_EQ(r.level, 21);
+    settle(3000);
+    CHECK_EQ(storage.saves, 0);
+
+    // Merged with a set that is saved, it is saved: as the device would
+    // have done with the two (a save due takes the unsaved value along).
+    CHECK_EQ(n.stream("/out", "{\"level\":22}", unsaved), Status::Ok);  // in flight
+    CHECK_EQ(n.stream("/out", "{\"level\":23}", unsaved), Status::Ok);
+    CHECK_EQ(n.stream("/out", "{\"on\":true}"), Status::Ok);  // merged into "23"
+    CHECK_EQ(n.streamStats().merged, 1u);
+    settle(3000);
+    CHECK_EQ(r.level, 23);
+    CHECK(r.on);
+    CHECK_EQ(storage.saves, 1);
+    CHECK_EQ(storage.records["out"], "{\"level\":23,\"on\":true}");
+}
+
 TEST(route_peer_lost_on_the_device) {
     Defaults d;
     Rig r;

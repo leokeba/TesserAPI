@@ -136,8 +136,9 @@ void answerAuth(JsonObjectConst env, TokenClient& client, Reply& reply) {
 }
 
 namespace {
-const char* const kRequestKeyList[] = {"v",        "id",      "op",      "path",   "depth",    "keys", "exclude",
-                                       "view",     "interval", "remotes", "changes", "events", "snapshot", "body"};
+const char* const kRequestKeyList[] = {"v",       "id",      "op",     "path",     "depth",   "keys",
+                                       "exclude", "view",    "interval", "remotes", "changes", "events",
+                                       "snapshot", "persist", "body"};
 const char* const kFileKeyList[] = {"v", "id", "op", "path", "offset", "size", "filename", "data", "length", "crc32"};
 const char* const kAuthKeyList[] = {"v", "id", "op", "token"};
 }  // namespace
@@ -289,6 +290,14 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
             return Status::BadRequest;
         }
         request.query.snapshot = snapshot.as<bool>();
+    }
+    JsonVariantConst persist = env["persist"];
+    if (!persist.isNull()) {
+        if (!persist.is<bool>()) {
+            message = "persist must be a boolean";
+            return Status::BadRequest;
+        }
+        request.query.persist = persist.as<bool>();
     }
     request.body = env["body"];
     return Status::Ok;
