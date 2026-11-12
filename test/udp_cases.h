@@ -634,6 +634,111 @@ TEST(udp_discovery) {
     CHECK(cases::get(gateway, "/peers", q).body.find(hash) != std::string::npos);
 }
 
+TEST(udp_discovery_groups) {
+    // A gateway in the group "ballet" mounts only the peers that advertise
+    // it (docs/DESIGN.md section 14.1): the groups' text.
+    using tesser::detail::groupsMeet;
+    using tesser::detail::validGroups;
+    CHECK(validGroups("") && validGroups("ballet") && validGroups("ballet,fluante_2.x"));
+    CHECK(!validGroups("a b") && !validGroups("a,,b") && !validGroups(",a") && !validGroups("a,"));
+    CHECK(!validGroups("sixteen-chars-xx") && !validGroups("abcdefghij,abcdefghij,abcdefghij,a"));
+    CHECK(groupsMeet("ballet", "fluante,ballet") && !groupsMeet("ballet", "") && !groupsMeet("", "ballet"));
+    CHECK(!groupsMeet("ballet", "balle"));
+    CHECK_EQ(tesser::buildAdvertisement(84, 0x1a2b3c4d, 0, "ballet"),
+             "{\"tesser\":84,\"schema\":\"1a2b3c4d\",\"v\":2,\"group\":\"ballet\"}");
+    tesser::detail::Advert advert;
+    CHECK(tesser::detail::parseAdvert("{\"tesser\":84,\"schema\":\"1\",\"group\":\"a,b\"}", advert));
+    CHECK_EQ(advert.group, "a,b");
+    tesser::detail::Advert bad;
+    CHECK(tesser::detail::parseAdvert("{\"tesser\":84,\"schema\":\"1\",\"group\":\"a b\"}", bad));
+    CHECK_EQ(bad.group, "");  // not a group: none
+}
+
+// Four nodes and a gateway: on the heap, as they are too large for a test's
+// frame on target (see udp_worker_keeps_time).
+struct GroupsNet {
+    cases::Device lamp, motor, other, declared;
+    tesser::Api gateway;
+    Net net;
+    UdpLink lampLink{&lamp.api, net.sender(ip(20)), net.clockFn()};
+    UdpLink motorLink{&motor.api, net.sender(ip(21)), net.clockFn()};
+    UdpLink otherLink{&other.api, net.sender(ip(22)), net.clockFn()};
+    UdpLink declaredLink{&declared.api, net.sender(ip(23)), net.clockFn()};
+    UdpLink gw{&gateway, net.sender(ip(1)), net.clockFn()};
+    GroupsNet() {
+        net.nodes = {{ip(20), &lampLink}, {ip(21), &motorLink}, {ip(22), &otherLink}, {ip(23), &declaredLink},
+                     {ip(1), &gw}};
+    }
+};
+
+TEST(udp_discovery_groups_mounted) {
+    using Announced = tesser::DatagramEndpoint::Announced;
+    std::unique_ptr<GroupsNet> f(new GroupsNet);
+    tesser::Api& gateway = f->gateway;
+    Net& net = f->net;
+    UdpLink &lampLink = f->lampLink, &motorLink = f->motorLink, &otherLink = f->otherLink,
+            &declaredLink = f->declaredLink, &gw = f->gw;
+    auto& peers = gateway.object("peers");
+    CHECK(lampLink.endpoint().setGroup("ballet"));
+    CHECK(motorLink.endpoint().setGroup("fluante,ballet"));
+    lampLink.setName("lamp");
+    motorLink.setName("motor");
+    otherLink.setName("other");
+    declaredLink.setName("declared");
+    for (UdpLink* l : {&lampLink, &motorLink, &otherLink, &declaredLink}) l->advertise();
+    // Declared by the application: there whatever its group.
+    peers.remote("far", gw.endpoint(), ip(23));
+    CHECK(!gw.endpoint().setGroup("not valid"));
+    CHECK(gw.endpoint().setGroup("ballet"));
+    net.start();
+    gw.mountPeers(peers);
+    net.run();
+    auto mounted = [&]() { return cases::get(gateway, "/peers", cases::depth(1)).body; };
+    CHECK_EQ(mounted(), "{\"far\":null,\"lamp\":null,\"motor\":null}");
+    CHECK(gw.endpoint().stats().filtered > 0);
+    tesser::Query q = cases::schema(1);
+    q.keys = "motor";
+    CHECK(cases::get(gateway, "/peers", q).body.find("\"group\":\"fluante,ballet\"") != std::string::npos);
+
+    // A filter can take others too (a device declared by MAC, say).
+    std::vector<std::string> asked;
+    gw.endpoint().setMountFilter([&asked](const Announced& a) {
+        asked.push_back(std::string(a.name) + (a.inGroup ? "+" : "-"));
+        return a.inGroup || a.name == "other";
+    });
+    net.run();
+    CHECK_EQ(mounted(), "{\"far\":null,\"lamp\":null,\"motor\":null,\"other\":null}");
+    CHECK(std::find(asked.begin(), asked.end(), "other-") != asked.end());
+
+    // A subscription below a node that goes ends with it.
+    tesser::LocalClient client(gateway);
+    CHECK(client.subscribe("/peers/lamp/lamp", [](Status, JsonVariantConst) {}));
+    for (int i = 0; i < 5; i++) {
+        net.run();
+        client.process();
+    }
+    CHECK_EQ(gateway.subscriptionCount(), 1u);
+    // Another group, at run time: the lamp goes, the motor and the filter's stay.
+    CHECK(gw.endpoint().setGroup("fluante"));
+    net.run();
+    CHECK_EQ(mounted(), "{\"far\":null,\"motor\":null,\"other\":null}");
+    CHECK_EQ(gateway.subscriptionCount(), 0u);
+    gw.endpoint().setMountFilter(nullptr);
+    net.run();
+    CHECK_EQ(mounted(), "{\"far\":null,\"motor\":null}");
+    // No group: everyone, as before groups.
+    CHECK(gw.endpoint().setGroup(""));
+    net.run();
+    CHECK_EQ(mounted(), "{\"far\":null,\"motor\":null,\"lamp\":null,\"other\":null}");
+    // A peer that leaves the group is unmounted when it advertises it.
+    CHECK(gw.endpoint().setGroup("ballet"));
+    net.run();
+    CHECK_EQ(mounted(), "{\"far\":null,\"motor\":null,\"lamp\":null}");
+    CHECK(motorLink.endpoint().setGroup("fluante"));
+    net.run();
+    CHECK_EQ(mounted(), "{\"far\":null,\"lamp\":null}");
+}
+
 TEST(udp_device_mounted_once) {
     // A gateway reaching the same device over NowTP and UDP mounts it once,
     // whichever announces it first.

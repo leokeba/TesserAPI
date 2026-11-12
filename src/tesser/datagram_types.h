@@ -108,6 +108,7 @@ struct DatagramTypes {
         uint32_t unmatched = 0;  // responses for no pending call
         uint32_t evicted = 0;    // mounted nodes removed for a new one (maxMounted)
         uint32_t unmounted = 0;  // peers not mounted: maxMounted, none to evict
+        uint32_t filtered = 0;   // announcements not mounted, or nodes unmounted: the group or mount filter
         uint32_t tooLarge = 0;   // requests larger than their peer takes, not sent (peerLimit())
     };
 
@@ -135,6 +136,18 @@ struct DatagramTypes {
     using PeerLossHandler =
         std::function<void(const PeerAddress& peer, const PeerAddress& device, PeerLoss reason)>;
     using PeerLostHandler = std::function<void(const PeerAddress& peer, const PeerAddress& device)>;
+
+    // A peer that announced itself, as a mount filter sees it
+    // (docs/DESIGN.md section 14.1).
+    struct Announced {
+        PeerAddress peer;        // its address on this link
+        PeerAddress device;      // its MAC, when known
+        std::string_view name;   // as advertised
+        std::string_view group;  // as advertised: "" for none
+        bool inGroup;            // the default answer: this endpoint has no group, or they share one
+    };
+    // True to mount it.
+    using MountFilter = std::function<bool(const Announced& peer)>;
 };
 
 }  // namespace detail

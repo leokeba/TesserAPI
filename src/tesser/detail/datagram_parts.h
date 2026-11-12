@@ -58,6 +58,7 @@ struct SeenPeer {
     PeerAddress device;
     uint8_t protocol;
     size_t maxMessage;
+    std::string group;
 };
 
 // What the endpoint knows of each peer, one record per address, under the
@@ -254,7 +255,14 @@ public:
 
     void mountPeers(Object& parent, uint32_t mirrorIntervalMs);
     void peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash, const PeerAddress& device,
-                  uint8_t protocol, size_t maxMessage);
+                  uint8_t protocol, size_t maxMessage, std::string_view group);
+    // Unmounts the nodes this endpoint mounted for peers its group or mount
+    // filter no longer takes (docs/DESIGN.md section 14.1): its routes to
+    // them go, and a node left without a route is removed. True if one in
+    // use (a task calling it, a relayed transfer) must be tried again.
+    bool refilter();
+    // A mounted peer advertised another group since (applySeen()): refilter().
+    bool takeRecheck();
     // Whether a peerSeen() waits for process(). Under the endpoint's mutex.
     bool seenWaiting() const { return !seen_.empty(); }
     // Applies what peerSeen() queued; true if there was any.
@@ -262,6 +270,9 @@ public:
 
 private:
     void apply(const SeenPeer& seen);
+    // Whether this endpoint's group or mount filter takes a peer. Under the
+    // API lock, not the endpoint's.
+    bool admits(const PeerAddress& peer, const PeerAddress& device, std::string_view name, std::string_view group);
     void mount(Object& parent, uint32_t mirrorMs, const SeenPeer& seen, const PeerAddress& device);
     bool roomToMount();
     bool pinnedLocked(const RemoteNode* node) const;
@@ -278,6 +289,7 @@ private:
     // each tick; one Pinned at a time has it.
     std::vector<RemoteNode*> pinScratch_;
     bool pinScratchBusy_ = false;
+    bool recheck_ = false;  // process() only
     Signal unpinned_;  // given as pins go, for removeRemote()
 };
 

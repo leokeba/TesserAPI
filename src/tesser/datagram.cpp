@@ -196,6 +196,28 @@ bool DatagramEndpoint::process() {
         worked = true;
     }
     if (mounts_.applySeen()) worked = true;
+    // Discovery groups: a change, or nodes in use that had to stay.
+    bool requery = false, recheck = mounts_.takeRecheck();
+    {
+        uint32_t t = now();
+        MutexGuard guard(mutex_);
+        requery = refilter_;
+        refilter_ = false;
+        recheck = recheck || requery || (refilterRetry_ && static_cast<int32_t>(t - refilterRetryAt_) >= 0);
+    }
+    if (recheck) {
+        bool retry = mounts_.refilter();
+        MutexGuard guard(mutex_);
+        refilterRetry_ = retry;
+        refilterRetryAt_ = now() + 100;
+        worked = true;
+    }
+    if (requery) {
+        // Advertised with the new group, if this node advertises; then the
+        // peers announce themselves again and those now taken are mounted.
+        if (requery_) requery_();
+        if (publish_) publish_(publishedHash_);
+    }
     for (;;) {
         Incoming msg;
         {
@@ -230,9 +252,10 @@ void DatagramEndpoint::nextTick(Deadline& d) {
     {
         MutexGuard guard(mutex_);
         if (!queue_.empty() || !lostPeers_.empty() || !unheardPeers_.empty() || !failures_.empty() ||
-            mounts_.seenWaiting()) {
+            mounts_.seenWaiting() || refilter_) {
             d.in(0);
         }
+        if (refilterRetry_) d.at(refilterRetryAt_);
         calls_.nextTick(d);
         for (const detail::PeerTable::Peer& k : peers_.peers()) {
             if (k.lossPending) d.at(k.heardMs + kLossGraceMs);

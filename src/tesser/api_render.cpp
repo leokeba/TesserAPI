@@ -502,6 +502,13 @@ void Handler::schemaAttributes(JsonWriter& w, const Node& n) {
                 w.key("protocol");
                 w.integer(v);
             }
+            if (!hashing_) {  // docs/DESIGN.md section 14.1
+                std::string group = r.group();
+                if (!group.empty()) {
+                    w.key("group");
+                    w.string(group);
+                }
+            }
             break;
         }
     }

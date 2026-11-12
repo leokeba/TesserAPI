@@ -463,6 +463,47 @@ TEST(route_writer_released) {
     CHECK_EQ(writer(), "none");
 }
 
+TEST(route_groups_on_both_links) {
+    // One node, two routes: each endpoint's group decides for its own route,
+    // and the node goes with its last one (docs/DESIGN.md section 14.1).
+    Defaults d;
+    Rig r;
+    auto nowtpSeen = [&r](const char* group) {
+        r.gwNow.peerSeen(r.mac, "lamp", r.dev.schemaHash(), PeerAddress(), 2, 0, group);
+        r.run();
+    };
+    CHECK(r.devUdp.endpoint().setGroup("ballet"));
+    nowtpSeen("ballet");
+    CHECK(r.gwUdp.endpoint().setGroup("ballet"));
+    CHECK(r.gwNow.setGroup("ballet"));
+    r.advance(200);
+    CHECK(RemoteNode::byDevice(r.peers, r.mac) != nullptr);
+    CHECK_EQ(r.node().routes().size(), 2u);
+    CHECK_EQ(r.node().group(), "ballet");
+
+    // NowTP's group no longer takes it: the UDP route stays.
+    CHECK(r.gwNow.setGroup("fluante"));
+    r.advance(200);
+    CHECK_EQ(r.node().routes().size(), 1u);
+    CHECK(r.kind() == TransportKind::Udp);
+    nowtpSeen("ballet");  // announced again: not routed
+    CHECK_EQ(r.node().routes().size(), 1u);
+
+    // Neither does UDP's: gone.
+    CHECK(r.gwUdp.endpoint().setGroup("fluante"));
+    r.advance(200);
+    CHECK(RemoteNode::byDevice(r.peers, r.mac) == nullptr);
+    CHECK_EQ(cases::get(r.master, "/peers", cases::depth(1)).body, "{}");
+
+    // Back in both: mounted again, both routes.
+    CHECK(r.gwUdp.endpoint().setGroup("ballet,fluante"));
+    CHECK(r.gwNow.setGroup("ballet,fluante"));
+    r.advance(200);
+    nowtpSeen("ballet");
+    CHECK(RemoteNode::byDevice(r.peers, r.mac) != nullptr);
+    if (RemoteNode::byDevice(r.peers, r.mac)) CHECK_EQ(r.node().routes().size(), 2u);
+}
+
 TEST(route_peer_lost_on_the_device) {
     Defaults d;
     Rig r;

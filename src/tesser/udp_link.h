@@ -272,6 +272,7 @@ private:
     Stats stats_;
     // discovery
     std::string name_;
+    std::string group_;  // the endpoint's, copied: advertised under mutex_
     PeerAddress device_;
     bool advertising_ = false;
     uint32_t hash_ = 0;

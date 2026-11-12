@@ -16,13 +16,18 @@ namespace {
 constexpr size_t kMaxKnown = 32;  // peers a table knows, and whose advertisements it keeps
 }  // namespace
 
-std::string buildAdvertisement(uint8_t port, uint32_t schemaHash, size_t maxMessage) {
-    char meta[80];
+std::string buildAdvertisement(uint8_t port, uint32_t schemaHash, size_t maxMessage, std::string_view group) {
+    char meta[128];
     int n = snprintf(meta, sizeof(meta), "{\"tesser\":%u,\"schema\":\"%08lx\",\"v\":%d", unsigned(port),
                      static_cast<unsigned long>(schemaHash), kProtocolVersion);
     if (n > 0 && maxMessage) {
         n += snprintf(meta + n, sizeof(meta) - static_cast<size_t>(n), ",\"max\":%lu",
                       static_cast<unsigned long>(maxMessage));
+    }
+    // A valid group needs no escaping, and fits (32 characters).
+    if (n > 0 && !group.empty() && detail::validGroups(group)) {
+        n += snprintf(meta + n, sizeof(meta) - static_cast<size_t>(n), ",\"group\":\"%.*s\"",
+                      static_cast<int>(group.size()), group.data());
     }
     if (n > 0 && static_cast<size_t>(n) + 1 < sizeof(meta)) meta[n++] = '}';
     return std::string(meta, n > 0 ? static_cast<size_t>(n) : 0);
@@ -81,7 +86,49 @@ bool detail::parseAdvert(std::string_view text, Advert& out) {
         if (good) mac[i] = static_cast<uint8_t>(hi << 4 | lo);
     }
     if (good) out.device = PeerAddress::fromBytes(mac, 6);
+    if (doc["group"].is<const char*>()) {
+        JsonString g = doc["group"].as<JsonString>();
+        std::string_view groups(g.c_str(), g.size());
+        if (validGroups(groups)) out.group.assign(groups.data(), groups.size());
+    }
     return true;
+}
+
+namespace {
+constexpr size_t kMaxGroups = 32;     // characters in a list of groups
+constexpr size_t kMaxGroupName = 15;  // in one group's name
+
+// Calls `each` with every group of a valid list, until it returns true;
+// true then.
+template <class F>
+bool anyGroup(std::string_view groups, F each) {
+    while (!groups.empty()) {
+        size_t comma = groups.find(',');
+        if (each(groups.substr(0, comma))) return true;
+        if (comma == std::string_view::npos) break;
+        groups.remove_prefix(comma + 1);
+    }
+    return false;
+}
+}  // namespace
+
+bool detail::validGroups(std::string_view groups) {
+    if (groups.size() > kMaxGroups) return false;
+    if (groups.empty()) return true;
+    if (groups.front() == ',' || groups.back() == ',') return false;
+    return !anyGroup(groups, [](std::string_view g) {
+        if (g.empty() || g.size() > kMaxGroupName) return true;
+        for (char c : g) {
+            bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' ||
+                      c == '_' || c == '.';
+            if (!ok) return true;
+        }
+        return false;
+    });
+}
+
+bool detail::groupsMeet(std::string_view a, std::string_view b) {
+    return anyGroup(a, [b](std::string_view x) { return anyGroup(b, [x](std::string_view y) { return x == y; }); });
 }
 
 const char* toString(PeerLoss reason) {

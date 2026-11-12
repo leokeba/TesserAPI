@@ -172,6 +172,13 @@ UdpLink::UdpLink(Api* api, PartsFn send, DatagramEndpoint::ClockFn clock, Option
       api_(api) {
     if (options_.fragmentSize < 64) options_.fragmentSize = 64;
     if (!options_.maxPeers) options_.maxPeers = endpointOptions.maxMounted + 8;
+    // A new group or mount filter: the advertising peers answer a query.
+    endpoint_.onRequery([this] {
+        std::string group = endpoint_.group();  // not under mutex_: a leaf
+        MutexGuard guard(mutex_);
+        group_ = std::move(group);
+        if (running_) sendAdvert(PeerAddress(), kQuery);
+    });
     size_t most = size_t(options_.fragmentSize) * kMaxFragments;
     if (options_.maxMessage > most) options_.maxMessage = most;
 }
@@ -223,10 +230,12 @@ void UdpLink::setDeviceId(const uint8_t mac[6]) {
 bool UdpLink::advertise() {
     if (!api_) return false;
     uint32_t hash = api_->schemaHash();
+    std::string group = endpoint_.group();
     {
         MutexGuard guard(mutex_);
         advertising_ = true;
         hash_ = hash;
+        group_ = std::move(group);
         if (running_) sendAdvert(PeerAddress(), 0);
     }
     // From now on tick() re-advertises when the tree changes.
@@ -395,7 +404,8 @@ void UdpLink::sendAck(const PeerAddress& to, uint32_t id, uint8_t status, uint64
     sendDatagram(to, buf, len);
 }
 
-// {"name":"...","schema":"<8 hex digits>","id":"<MAC, 12 hex digits>","v":<protocol>}
+// {"name":"...","schema":"<8 hex digits>","id":"<MAC, 12 hex digits>","v":<protocol>,"max":...,
+//  "group":"..."} (the group when the endpoint has one)
 void UdpLink::sendAdvert(const PeerAddress& to, uint8_t flags) {
     std::string payload;
     if (advertising_ && !(flags & kBye)) {
@@ -418,6 +428,10 @@ void UdpLink::sendAdvert(const PeerAddress& to, uint8_t flags) {
         w.integer(kProtocolVersion);
         w.key("max");  // the largest message this node takes (docs/DESIGN.md section 14.1)
         w.uinteger(options_.maxMessage);
+        if (!group_.empty()) {
+            w.key("group");  // docs/DESIGN.md section 14.1
+            w.string(group_);
+        }
         w.endObject();
     }
     std::vector<uint8_t> buf(kHeader + payload.size());
@@ -663,6 +677,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
     PeerAddress device;
     uint8_t protocol = 1;
     size_t maxMessage = 0;
+    std::string group;
     {
         MutexGuard guard(mutex_);
         if (!running_ || h.nonce == nonce_) return;  // our own broadcast, looped back
@@ -706,6 +721,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
                     maxMessage = a.maxMessage;
                     hash = a.schemaHash;
                     device = a.device;
+                    group = std::move(a.group);
                     peer->advertised = true;
                     announced = true;
                 } else {
@@ -721,7 +737,7 @@ void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
     // A peer that restarted lost its calls and subscriptions: forget them.
     if (restarted) endpoint_.forgetPeer(from, PeerLoss::Restarted);
     for (Inbound& in : inbound) endpoint_.receive(in.from, std::move(in.data), in.reliable, in.broadcast);
-    if (announced) endpoint_.peerSeen(from, name, hash, device, protocol, maxMessage);
+    if (announced) endpoint_.peerSeen(from, name, hash, device, protocol, maxMessage, group);
     if (bye) endpoint_.forgetPeer(from, PeerLoss::Goodbye);
 }
 

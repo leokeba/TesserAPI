@@ -270,6 +270,10 @@ public:
     // Whether a subscription is on `node`, or forwarded below it (a remote
     // node). Under the API lock.
     bool subscribedLocked(const Node& node) const;
+    // Ends the subscriptions on `node`, or forwarded below it, as a node
+    // about to be removed (an unmounted peer, docs/DESIGN.md section 14.1).
+    // Under the API lock.
+    void dropSubscriptionsLocked(const Node& node);
     // How many subscriptions `subscriber` holds. Any task.
     size_t subscriptionsOf(const Subscriber* subscriber) const;
 

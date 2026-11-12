@@ -119,7 +119,7 @@ void Mounter::mountPeers(Object& parent, uint32_t mirrorIntervalMs) {
 }
 
 void Mounter::peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash,
-                                const PeerAddress& device, uint8_t protocol, size_t maxMessage) {
+                                const PeerAddress& device, uint8_t protocol, size_t maxMessage, std::string_view group) {
     {
         MutexGuard guard(ep_.mutex_);
         for (SeenPeer& s : seen_) {
@@ -129,10 +129,12 @@ void Mounter::peerSeen(const PeerAddress& peer, std::string_view name, uint32_t 
                 s.device = device;
                 s.protocol = protocol;
                 s.maxMessage = maxMessage;
+                s.group.assign(group.data(), group.size());
                 return;
             }
         }
-        seen_.push_back(SeenPeer{peer, std::string(name), schemaHash, device, protocol, maxMessage});
+        seen_.push_back(
+            SeenPeer{peer, std::string(name), schemaHash, device, protocol, maxMessage, std::string(group)});
     }
     ep_.wake();
 }
@@ -188,6 +190,8 @@ void Mounter::apply(const SeenPeer& seen) {
             r->setRouteOnline(&ep_, seen.peer, true, now);
             r->setAdvertisedSchema(seen.schemaHash);
             r->setProtocol(seen.protocol);
+            // A mounted peer that changed its group is checked again.
+            if (r->setGroup(seen.group) && r->autoMounted()) recheck_ = true;
             routed.add(r);
         }
         ep_.peers_.setAdvertised(seen.peer, seen.schemaHash, seen.protocol);
@@ -214,6 +218,9 @@ void Mounter::mount(Object& parentRef, uint32_t mirrorMs, const SeenPeer& seen, 
         auto* r = const_cast<RemoteNode*>(static_cast<const RemoteNode*>(c));
         if (r->hasRoute(&ep_, seen.peer)) return;
         if (device.length && r->device() == device) {
+            // A node the application declared takes every route; one
+            // mounted for a peer, only those this endpoint's group takes.
+            if (r->autoMounted() && !admits(seen.peer, device, seen.name, seen.group)) return;
             // Bounded however many addresses announce the device (over UDP
             // the device is what the peer says): an offline route makes
             // room, else the address isn't added.
@@ -224,8 +231,14 @@ void Mounter::mount(Object& parentRef, uint32_t mirrorMs, const SeenPeer& seen, 
             }
             r->setAdvertisedSchema(seen.schemaHash);
             r->setProtocol(seen.protocol);
+            r->setGroup(seen.group);
             return;
         }
+    }
+    if (!admits(seen.peer, device, seen.name, seen.group)) {
+        MutexGuard guard(ep_.mutex_);
+        ep_.stats_.filtered++;
+        return;
     }
     // Named after the peer; when that is taken or empty, the last three bytes
     // of its device's address (or its own) are added.
@@ -242,8 +255,85 @@ void Mounter::mount(Object& parentRef, uint32_t mirrorMs, const SeenPeer& seen, 
     RemoteNode& node = parent->add(new RemoteNode(std::move(name), ep_, seen.peer, "/"));
     node.setAutoMounted();
     node.setDevice(device);
+    node.setGroup(seen.group);
     if (mirrorMs) node.mirror(mirrorMs);
     node.changed();  // subscribers of the parent see the new key
+}
+
+bool Mounter::admits(const PeerAddress& peer, const PeerAddress& device, std::string_view name,
+                     std::string_view group) {
+    std::string mine;
+    DatagramEndpoint::MountFilter filter;
+    {
+        MutexGuard guard(ep_.mutex_);
+        mine = ep_.group_;
+        filter = ep_.mountFilter_;
+    }
+    DatagramEndpoint::Announced a{peer, device, name, group, mine.empty() || groupsMeet(mine, group)};
+    return filter ? filter(a) : a.inGroup;
+}
+
+bool Mounter::takeRecheck() {
+    bool r = recheck_;
+    recheck_ = false;
+    return r;
+}
+
+bool Mounter::refilter() {
+    if (!ep_.api_) return false;
+    std::vector<std::pair<Object*, uint32_t>> mounts;
+    {
+        MutexGuard guard(ep_.mutex_);
+        mounts = mounts_;
+    }
+    bool retry = false;
+    Api& api = *ep_.api_;
+    MutexGuard apiGuard(api.mutex());
+    for (auto& m : mounts) {
+        Object* parent = m.first;
+        for (Node* c = parent->first(); c;) {
+            Node* n = c;
+            c = c->next();
+            if (n->type() != NodeType::Remote) continue;
+            auto* r = static_cast<RemoteNode*>(n);
+            if (!r->autoMounted() || !r->routeCount(&ep_)) continue;
+            PeerAddress peer;
+            for (const RemoteNode::Route& route : r->routes()) {
+                if (route.endpoint == &ep_) {
+                    peer = route.peer;
+                    break;
+                }
+            }
+            if (admits(peer, r->device(), r->name(), r->group())) continue;
+            // This endpoint's routes go; the node goes with its last one.
+            // Not while a relayed transfer or another task holds it: the
+            // next process() tries again.
+            if (r->relays()) {
+                retry = true;
+                continue;
+            }
+            bool last = r->onlyThrough(&ep_);
+            {
+                MutexGuard guard(ep_.mutex_);
+                if (pinnedLocked(r)) {
+                    retry = true;
+                    continue;
+                }
+                unlistLocked(r);
+                ep_.stats_.filtered++;
+            }
+            if (last) api.dropSubscriptionsLocked(*r);
+            ep_.calls_.cancel(r);
+            r->detach(&ep_);
+            if (last) {
+                // As an evicted node: a reply that let go of the API lock
+                // may still stand on it (Api::retire()).
+                parent->unlink(r);
+                api.retire(r);
+            }
+        }
+    }
+    return retry;
 }
 
 // Under the API lock: room for one more node mounted for a peer
@@ -309,4 +399,39 @@ bool Mounter::roomToMount() {
 }
 
 }  // namespace detail
+
+bool DatagramEndpoint::setGroup(std::string_view groups) {
+    if (!detail::validGroups(groups)) return false;
+    {
+        MutexGuard guard(mutex_);
+        if (group_ == groups) return true;
+        group_.assign(groups.data(), groups.size());
+        refilter_ = true;
+    }
+    wake();
+    return true;
+}
+
+std::string DatagramEndpoint::group() const {
+    MutexGuard guard(mutex_);
+    return group_;
+}
+
+void DatagramEndpoint::setMountFilter(MountFilter fn) {
+    {
+        MutexGuard guard(mutex_);
+        mountFilter_ = std::move(fn);
+        refilter_ = true;
+    }
+    wake();
+}
+
+void DatagramEndpoint::refilterMounts() {
+    {
+        MutexGuard guard(mutex_);
+        refilter_ = true;
+    }
+    wake();
+}
+
 }  // namespace tesser

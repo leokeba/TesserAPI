@@ -347,6 +347,21 @@ void RemoteNode::setAdvertisedSchema(uint32_t hash) {
     if (advertisedSchema_.exchange(hash) != hash) changed();
 }
 
+std::string RemoteNode::group() const {
+    MutexGuard guard(leaf_);
+    return group_;
+}
+
+bool RemoteNode::setGroup(std::string_view group) {
+    {
+        MutexGuard guard(leaf_);
+        if (group_ == group) return false;
+        group_.assign(group.data(), group.size());
+    }
+    changed();
+    return true;
+}
+
 void RemoteNode::detach(const DatagramEndpoint* endpoint) {
     if (routes_.detach(endpoint)) changed();
 }

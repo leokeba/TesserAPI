@@ -262,10 +262,40 @@ public:
     // 10.1.2): 1 for an advertisement that names none, 0 when unknown.
     // `maxMessage` the largest message it takes, as it advertises it (0:
     // not said).
+    // `group` the discovery groups it advertises ("" for none).
     void peerSeen(const PeerAddress& peer, std::string_view name, uint32_t schemaHash,
-                  const PeerAddress& device = PeerAddress(), uint8_t protocol = 0, size_t maxMessage = 0) {
-        mounts_.peerSeen(peer, name, schemaHash, device, protocol, maxMessage);
+                  const PeerAddress& device = PeerAddress(), uint8_t protocol = 0, size_t maxMessage = 0,
+                  std::string_view group = std::string_view()) {
+        mounts_.peerSeen(peer, name, schemaHash, device, protocol, maxMessage, group);
     }
+
+    // ---- discovery groups (docs/DESIGN.md section 14.1) -------------------
+    // The groups this node advertises on this link, and the ones whose
+    // peers mountPeers() mounts: "ballet", or several, "ballet,fluante"
+    // (names of 1-15 letters, digits, '-', '_' or '.', 32 characters in
+    // all). Empty (the default): none advertised, every peer mounted. With
+    // groups, only peers that advertise one of them are mounted; a node
+    // the application declared, or a peer the mount filter takes, is
+    // whatever its group. A discovery filter, not access control: any peer
+    // can claim a group. A change takes effect in the next process():
+    // re-advertised, nodes mounted for peers now left out unmounted, and
+    // the peers asked to announce themselves again. False, unchanged, if
+    // `groups` isn't valid. Any task.
+    bool setGroup(std::string_view groups);
+    std::string group() const;
+    // Decides instead which announced peers are mounted (`Announced::inGroup`
+    // is the group's answer): to keep devices the application declares by
+    // MAC whatever their group, say. Called in process(), under the API
+    // lock. Empty: the group decides. Applied as setGroup() is.
+    void setMountFilter(MountFilter fn);
+    // The filter's answers changed (a device declared or forgotten): applies
+    // it again, as setGroup() does. Any task.
+    void refilterMounts();
+    // Called by the link in process(), after a group or filter change and
+    // without the API lock: asks the peers to announce themselves again (a
+    // query over UDP, NowTP's known peers fed again), so that the peers now
+    // taken are mounted.
+    void onRequery(std::function<void()> fn) { requery_ = std::move(fn); }
 
     // Keeps an advertisement current: once the API's tree has changed (a
     // peer mounted, a node added, a remote node's state, see
@@ -354,6 +384,13 @@ private:
     std::vector<Failure> failures_;                            // sendFailed() → process()
     std::vector<std::pair<PeerAddress, std::shared_ptr<ClientInbox>>> clients_;  // guarded by mutex_
     Stats stats_;
+    // Discovery groups, under mutex_ (setGroup(), setMountFilter()).
+    std::string group_;
+    MountFilter mountFilter_;
+    bool refilter_ = false;         // a change to apply in process()
+    bool refilterRetry_ = false;    // nodes in use that still have to go
+    uint32_t refilterRetryAt_ = 0;
+    std::function<void()> requery_;
     // autoAdvertise()
     std::function<void(uint32_t)> publish_;
     uint32_t publishedHash_ = 0;
@@ -396,8 +433,10 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
 
 // Discovery metadata announcing a TesserAPI node:
 // {"tesser":<port>,"schema":"<schemaHash, 8 hex digits>","v":<protocol>},
-// and "max":<maxMessage>, the largest message the node takes, unless 0.
-std::string buildAdvertisement(uint8_t port, uint32_t schemaHash, size_t maxMessage = 0);
+// and "max":<maxMessage>, the largest message the node takes, unless 0, and
+// "group":"<groups>" unless empty (DatagramEndpoint::setGroup()).
+std::string buildAdvertisement(uint8_t port, uint32_t schemaHash, size_t maxMessage = 0,
+                               std::string_view group = std::string_view());
 // Reads it; false if the metadata isn't a TesserAPI advertisement.
 // `protocol` is 1 when it names none (docs/DESIGN.md section 10.1.2),
 // `maxMessage` 0.
@@ -419,8 +458,13 @@ struct Advert {
     uint8_t protocol = 1;
     size_t maxMessage = 0;
     PeerAddress device;  // "id", when it is a MAC
+    std::string group;   // "group", when it is valid (validGroups())
 };
 bool parseAdvert(std::string_view text, Advert& out);
+// A list of discovery groups as setGroup() takes it ("" included).
+bool validGroups(std::string_view groups);
+// The two lists share a group.
+bool groupsMeet(std::string_view a, std::string_view b);
 }  // namespace detail
 
 }  // namespace tesser

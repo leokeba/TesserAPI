@@ -309,6 +309,19 @@ size_t Api::subscriptionsOf(const Subscriber* subscriber) const {
     return n;
 }
 
+void Api::dropSubscriptionsLocked(const Node& node) {
+    std::vector<Subscription> gone;
+    for (size_t i = 0; i < subs_.size();) {
+        if (subs_[i].node == &node) {
+            gone.push_back(std::move(subs_[i]));
+            subs_.erase(subs_.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            i++;
+        }
+    }
+    subscriptionsRemoved(gone, false);
+}
+
 bool Api::subscribedLocked(const Node& node) const {
     for (const Subscription& s : subs_) {
         if (s.node == &node) return true;

@@ -180,6 +180,10 @@ public:
     // (docs/DESIGN.md section 14.1). Set by DatagramEndpoint::mountPeers().
     PeerAddress device() const;
     void setDevice(const PeerAddress& device);
+    // The discovery groups the peer advertises ("" for none; docs/DESIGN.md
+    // section 14.1), shown in the schema. setGroup() is true if it changed.
+    std::string group() const;
+    bool setGroup(std::string_view group);
 
     // ---- credentials --------------------------------------------------------
     // A token the device's token check accepts (docs/DESIGN.md section
@@ -305,6 +309,7 @@ private:
     };
     static constexpr size_t kKnownPaths = 8;
     std::vector<KnownPath> knownPaths_;  // under leaf_
+    std::string group_;                  // under leaf_
     bool autoMounted_ = false;
     std::atomic<int> relays_{0};
 

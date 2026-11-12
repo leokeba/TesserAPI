@@ -211,6 +211,10 @@ NowTpTransport::NowTpTransport(Api* api, nowtp::EspNowTransport& now, uint8_t po
     installObserver(now_);
     installOwnedSend(now_);
     installPeerLimit(endpoint_, now_);
+    // A new group or mount filter: the peers NowTP knows are announced again.
+    endpoint_.onRequery([this] {
+        for (const nowtp::PeerInfo& p : now_.peers()) peerEvent(nowtp::PeerEvent::Found, p);
+    });
 }
 
 NowTpTransport::~NowTpTransport() {
@@ -295,12 +299,12 @@ bool NowTpTransport::advertise() {
     Api* api = endpoint_.api();
     if (!api) return false;
     uint32_t hash = api->schemaHash();
-    std::string meta = buildAdvertisement(port_, hash, endpoint_.maxMessage());
+    std::string meta = buildAdvertisement(port_, hash, endpoint_.maxMessage(), endpoint_.group());
     bool ok = now_.setDiscoveryMetadata(meta.data(), meta.size()) == nowtp::Status::Ok;
     // From now on the worker (or poll()) re-advertises when the tree changes.
     endpoint_.autoAdvertise(
         [this](uint32_t h) {
-            std::string m = buildAdvertisement(port_, h, endpoint_.maxMessage());
+            std::string m = buildAdvertisement(port_, h, endpoint_.maxMessage(), endpoint_.group());
             now_.setDiscoveryMetadata(m.data(), m.size());
         },
         hash);
@@ -314,12 +318,11 @@ bool NowTpTransport::parseAdvertisement(const std::vector<uint8_t>& metadata, ui
 
 void NowTpTransport::peerEvent(nowtp::PeerEvent event, const nowtp::PeerInfo& peer) {
     if (event == nowtp::PeerEvent::Lost) return peerLost(peer.mac);
-    uint8_t port, protocol;
-    uint32_t hash;
-    size_t maxMessage;
+    detail::Advert a;
     std::string_view meta(reinterpret_cast<const char*>(peer.metadata.data()), peer.metadata.size());
-    if (tesser::parseAdvertisement(meta, port, hash, protocol, maxMessage) && port == port_) {
-        endpoint_.peerSeen(address(peer.mac), peer.name, hash, PeerAddress(), protocol, maxMessage);
+    if (detail::parseAdvert(meta, a) && a.hasSchema && a.port == port_) {
+        endpoint_.peerSeen(address(peer.mac), peer.name, a.schemaHash, PeerAddress(), a.protocol, a.maxMessage,
+                           a.group);
     }
 }
 
