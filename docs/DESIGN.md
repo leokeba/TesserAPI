@@ -1148,6 +1148,24 @@ tesser::watchDevices({&udp.endpoint(), &nowApi.endpoint()}, [&](const tesser::Pe
 - **Across transports:** a master reached over UDP and NowTP that fails over from one to the other is still there. `tesser::watchDevices(endpoints, fn)` takes the endpoints' `onPeerLost()` and calls `fn` only once the device is gone from all of them (a peer without a known device: when that peer is), and on every restart, though the device is back at once: a master that reboots mid-note must not leave its notes on. A device lost on two endpoints at the same moment may be reported twice. NowTP has no session nonce, so a master that reboots quickly is noticed as a restart over UDP only.
 - **Silence needs advertisements:** a quiet client sends nothing, so silence only counts for peers that advertise: the master calls `UdpLink::advertise()` (with `setDeviceId()`, for the device to be known over UDP), or is in NowTP discovery. Goodbyes, restarts and failed deliveries are noticed either way.
 
+The API can keep the writer for chosen nodes, and release them when it is lost:
+
+```cpp
+for (Output& o : outputs) {
+    api.trackWriter(o.node, [&o](tesser::Node&, tesser::PeerLoss) { o.off(); });   // under the API lock
+}
+api.object("midi").action("send", [&](const Note& n) { outputs[n.channel].play(n); api.wrote(outputs[n.channel].node); });
+tesser::watchDevices({&udp.endpoint(), &nowApi.endpoint()}, [&](const tesser::PeerAddress&,
+                                                               const tesser::PeerAddress& device, tesser::PeerLoss why) {
+    api.writerLost(device, why);   // or from TesserKIT's peers.onDeviceLost(device, reason)
+});
+```
+
+- **Tracked nodes:** `api.trackWriter(node, release)` keeps the device of the client that last wrote `node`, an object as one unit: a set that changes anything in it records its client's `Client::device`, whatever path it was made to (the node, a value below it, a patch above it such as `{"3": {...}}` to `/outputs`), and a client without a device (local, HTTP, serial) leaves it with none. Tracking a node again replaces its release; `untrackWriter(node)`, before the node is removed from the tree. Only tracked nodes cost anything: a side table of the API, and a walk of their subtrees after each set, comparing change stamps (§11), so a set that writes a value equal to the old one counts too. A change stamped by another task without the API lock while a set runs is taken as the set's.
+- **Other writes:** state written outside a set on the node, by an action's handler (`/midi/send`) or a task of the application (a player), is claimed with `api.wrote(node)`: the tracked nodes at, above or below `node` take the current client's device, or none outside a request. Without it, a node's own keyboard taking an output from a master would leave the output the master's, and the master's loss would end a note the keyboard plays.
+- **Release:** `api.writerLost(device, reason)` takes the API lock and calls `release(node, reason)` for each tracked node `device` wrote last, which then has none: a second loss calls nothing. The reason lets a node treat a restart differently (a motor that holds its speed through a master's reboot). `api.writerOf(node, device)` gives the writer, for diagnostics.
+- **Through a gateway,** the device recorded is the gateway's: it is the client the node sees and the one whose loss it can watch. Releasing for the gateway's own clients is the gateway's to do.
+
 ## 15. Memory budget
 
 Targets to be measured on a classic ESP32 and a C3, and enforced in CI:
@@ -1331,7 +1349,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
 | 14 | Routes over several transports with failover, streamed sets in order, the writer's device and peer loss on the receiving side, for a master driving other nodes | done |
 | 15 | Tokens presented as a client over NowTP and UDP, for TesserKIT's masters | done |
 | 16 | Sets that aren't saved, on the wire (`"persist": false`, `?persist=false`) and in streamed sets, for ballet-photophonique's MIDI mappings (asked 2026-11-12) | done |
-| 17 | Releasing what a lost writer set: a value node remembers the device that last wrote it, and runs a release when that device is lost, for ballet-photophonique's outputs and ballet-motophonique's speed (asked 2026-11-12) | *(planned)* |
+| 17 | Releasing what a lost writer set: tracked nodes keep the device that last wrote them, and a release runs when it is lost (`trackWriter()`, `wrote()`, `writerLost()`), for ballet-photophonique's outputs and ballet-motophonique's speed (asked 2026-11-12) | done |
 
 ## 19. Decisions on former open questions
 

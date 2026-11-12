@@ -390,6 +390,79 @@ TEST(route_stream_unsaved) {
     CHECK_EQ(storage.records["out"], "{\"level\":23,\"on\":true}");
 }
 
+TEST(route_writer_released) {
+    // The device tracks who writes /out as one unit, and releases it when
+    // that device is lost (docs/DESIGN.md section 14.4).
+    Defaults d;
+    Rig r;
+    tesser::Object& out = r.dev.object("out");
+    tesser::Node& level = *out.child("level");
+    std::vector<std::string> released;
+    r.dev.trackWriter(out, [&](tesser::Node& n, tesser::PeerLoss why) {
+        released.push_back(std::string(n.name()) + " " + tesser::toString(why));
+        r.on = false;
+    });
+    // Pressing a key on the device: an action whose handler writes the
+    // state, claiming it for whoever called.
+    r.dev.action("press", [&r, &level] {
+        r.on = true;
+        r.dev.wrote(level);
+    });
+    PeerAddress w;
+    CHECK(!r.dev.writerOf(out, w));
+    RemoteNode& n = r.node();
+    auto writer = [&]() { return r.dev.writerOf(out, w) ? hex(w.bytes, w.length) : std::string("none"); };
+    const std::string master = hex(r.masterMac.bytes, r.masterMac.length);
+
+    CHECK_EQ(n.stream("/out/level", "1"), Status::Ok);  // below it
+    r.advance(200);
+    CHECK_EQ(writer(), master);
+    // The node's own page (a client without a device) takes it.
+    tesser::LocalClient local(r.dev);
+    CHECK(local.set("/out/on", "true"));
+    local.process();
+    CHECK_EQ(writer(), "none");
+    r.dev.writerLost(r.masterMac, tesser::PeerLoss::Goodbye);
+    CHECK(released.empty());
+    CHECK(r.on);
+    // A patch from above takes it back; a set elsewhere doesn't touch it.
+    CHECK_EQ(n.stream("/", "{\"out\":{\"on\":false}}"), Status::Ok);
+    r.advance(200);
+    CHECK_EQ(writer(), master);
+    CHECK(local.set("/press", "null"));  // the action's wrote(): local
+    local.process();
+    CHECK_EQ(writer(), "none");
+    tesser::LocalClient remote(r.master);
+    CHECK(remote.set("/peers/lamp/press", "null"));
+    for (int i = 0; i < 10 && writer() == "none"; i++) {
+        r.advance(20);
+        remote.process();
+    }
+    CHECK_EQ(writer(), master);
+    // A task of the application (a player), outside any request.
+    r.dev.wrote(out);
+    CHECK_EQ(writer(), "none");
+
+    CHECK_EQ(n.stream("/out/level", "2"), Status::Ok);
+    r.advance(200);
+    CHECK_EQ(writer(), master);
+    r.dev.writerLost(r.mac, tesser::PeerLoss::Lost);  // another device
+    CHECK(released.empty());
+    r.dev.writerLost(r.masterMac, tesser::PeerLoss::Restarted);
+    CHECK_EQ(released.size(), 1u);
+    if (released.size() == 1) CHECK_EQ(released[0], "out restarted");
+    CHECK(!r.on);
+    CHECK_EQ(writer(), "none");
+    r.dev.writerLost(r.masterMac, tesser::PeerLoss::Restarted);  // once
+    CHECK_EQ(released.size(), 1u);
+
+    r.dev.untrackWriter(out);
+    CHECK_EQ(n.stream("/out/level", "3"), Status::Ok);
+    r.advance(200);
+    CHECK_EQ(r.level, 3);
+    CHECK_EQ(writer(), "none");
+}
+
 TEST(route_peer_lost_on_the_device) {
     Defaults d;
     Rig r;

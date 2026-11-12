@@ -254,6 +254,7 @@ void Api::handleNow(const Request& request, Reply& reply) {
         uint32_t before = currentGeneration();
         detail::Handler(*this, request, reply).run();
         if (request.op == Op::Set && !request.query.persist && unsavedHook_) unsavedHook_(*this, before);
+        if (request.op == Op::Set && writersHook_) writersHook_(*this, request.client, before);
         current_ = outer;
     }
     // What a streamed reply still holds goes out without the lock, unless

@@ -19,6 +19,8 @@
 namespace tesser {
 
 class RemoteHooks;
+struct PeerAddress;
+enum class PeerLoss : uint8_t;
 
 struct Config {
     size_t maxRequestBody = 4096;  // bytes of request text a transport accepts
@@ -140,6 +142,33 @@ public:
     // device); null outside a request. Valid under the API lock, until the
     // handler returns.
     const Client* currentClient() const { return current_; }
+
+    // ---- writers (docs/DESIGN.md section 14.4) -----------------------------
+    // What a tracked node does when the device that last wrote it is lost:
+    // `node` is the tracked node, `reason` why its writer was lost. Called
+    // under the API lock.
+    using WriterLost = std::function<void(Node& node, PeerLoss reason)>;
+    // Tracks who writes `node` (an object: as one unit, anything below it).
+    // A set that changes it, whatever path it was made to (the node, below
+    // it, or a patch above it), records its client's device
+    // (Client::device), or none for a client without one (local, HTTP,
+    // serial). Through a gateway, that is the gateway's device. Then
+    // writerLost() of that device calls `release`. Tracking a node again
+    // replaces its release. Untrack a node before removing it from the tree.
+    void trackWriter(Node& node, WriterLost release);
+    void untrackWriter(Node& node);
+    // A write that doesn't come through a set on the node (an action's
+    // handler writing state, a task of the application): records the
+    // current client's device for the tracked nodes at, above or below
+    // `node`, or none outside a request or for a client without a device.
+    void wrote(Node& node);
+    // The device that last wrote tracked `node`: false when none, or when it
+    // isn't tracked.
+    bool writerOf(const Node& node, PeerAddress& device) const;
+    // `device` is gone (watchDevices(), TesserKIT's peers.onDeviceLost()):
+    // calls the release of every tracked node it last wrote, which then has
+    // no writer. Takes the API lock.
+    void writerLost(const PeerAddress& device, PeerLoss reason);
 
     // Deferred calls in flight.
     int pending() const { return pending_.load(); }
@@ -389,6 +418,20 @@ private:
     std::vector<Node*> retired_;    // under mutex_: unlinked, destroyed by poll()
     Api* nextApi_ = nullptr;  // registry used by EventNode
     const Client* current_ = nullptr;  // under mutex_: see currentClient()
+    // Tracked nodes and their last writer's device (trackWriter()), under
+    // mutex_. Set by trackWriter(): handleNow() reaches the code through
+    // it, so applications that don't track writers don't link it.
+    struct Tracked {
+        Node* node;
+        WriterLost release;
+        uint8_t device[6];
+        uint8_t deviceLength;
+    };
+    std::vector<Tracked> tracked_;
+    void (*writersHook_)(Api& api, const Client& client, uint32_t before) = nullptr;
+    // After a set: the tracked nodes it changed (`before`: the generation
+    // before it) have its client as their writer.
+    void writersSet(const Client& client, uint32_t before);
     uint8_t deviceId_[6] = {};
     bool hasDeviceId_ = false;
     friend void detail::handleNested(Api&, const Request&, Reply&);

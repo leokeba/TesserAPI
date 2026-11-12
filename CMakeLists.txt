@@ -10,6 +10,7 @@ set(TESSER_CORE_SRCS
     src/tesser/api_resolve.cpp
     src/tesser/api_render.cpp
     src/tesser/api_patch.cpp
+    src/tesser/api_writers.cpp
     src/tesser/fan_out.cpp
     src/tesser/stream_subscriber.cpp
     src/tesser/envelope.cpp
@@ -86,7 +87,7 @@ if(ESP_PLATFORM)
     list(TRANSFORM TESSER_HTTP_UNIT APPEND .cpp)
     set_source_files_properties(${TESSER_HTTP_UNIT} PROPERTIES UNITY_GROUP http)
     set_source_files_properties(src/tesser/api.cpp src/tesser/api_resolve.cpp src/tesser/api_render.cpp
-                                src/tesser/api_patch.cpp PROPERTIES UNITY_GROUP api)
+                                src/tesser/api_patch.cpp src/tesser/api_writers.cpp PROPERTIES UNITY_GROUP api)
     set_target_properties(${COMPONENT_LIB} PROPERTIES UNITY_BUILD ON UNITY_BUILD_MODE GROUP
                           UNITY_BUILD_CODE_BEFORE_INCLUDE "#define TESSER_UNITY_BUILD 1")
     if(TESSER_NOWTP)
