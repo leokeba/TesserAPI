@@ -445,6 +445,13 @@ bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& sche
 bool parseAdvertisement(std::string_view metadata, uint8_t& port, uint32_t& schemaHash, uint8_t& protocol,
                         size_t& maxMessage);
 
+// A list of discovery groups as DatagramEndpoint::setGroup() takes it ("ballet",
+// "ballet,fluante" or ""; docs/DESIGN.md section 14.1), for an application
+// that checks one before setting it.
+bool validGroups(std::string_view groups);
+// The two lists share a group (an empty list shares none).
+bool groupsMeet(std::string_view a, std::string_view b);
+
 namespace detail {
 // What an advertisement says, NowTP's metadata or UdpLink's
 // ({"name":"...","schema":"...","id":"<MAC, 12 hex digits>","v":...,"max":...}):
@@ -461,10 +468,9 @@ struct Advert {
     std::string group;   // "group", when it is valid (validGroups())
 };
 bool parseAdvert(std::string_view text, Advert& out);
-// A list of discovery groups as setGroup() takes it ("" included).
-bool validGroups(std::string_view groups);
-// The two lists share a group.
-bool groupsMeet(std::string_view a, std::string_view b);
+// Their first names, kept for code written against 6e78e58.
+using ::tesser::groupsMeet;
+using ::tesser::validGroups;
 }  // namespace detail
 
 }  // namespace tesser

@@ -401,7 +401,7 @@ bool Mounter::roomToMount() {
 }  // namespace detail
 
 bool DatagramEndpoint::setGroup(std::string_view groups) {
-    if (!detail::validGroups(groups)) return false;
+    if (!validGroups(groups)) return false;
     {
         MutexGuard guard(mutex_);
         if (group_ == groups) return true;

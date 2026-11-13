@@ -638,8 +638,9 @@ TEST(udp_discovery) {
 TEST(udp_discovery_groups) {
     // A gateway in the group "ballet" mounts only the peers that advertise
     // it (docs/DESIGN.md section 14.1): the groups' text.
-    using tesser::detail::groupsMeet;
-    using tesser::detail::validGroups;
+    using tesser::groupsMeet;
+    using tesser::validGroups;
+    CHECK(tesser::detail::validGroups("ballet"));  // the name 6e78e58 gave it
     CHECK(validGroups("") && validGroups("ballet") && validGroups("ballet,fluante_2.x"));
     CHECK(!validGroups("a b") && !validGroups("a,,b") && !validGroups(",a") && !validGroups("a,"));
     CHECK(!validGroups("sixteen-chars-xx") && !validGroups("abcdefghij,abcdefghij,abcdefghij,a"));

@@ -25,7 +25,7 @@ std::string buildAdvertisement(uint8_t port, uint32_t schemaHash, size_t maxMess
                       static_cast<unsigned long>(maxMessage));
     }
     // A valid group needs no escaping, and fits (32 characters).
-    if (n > 0 && !group.empty() && detail::validGroups(group)) {
+    if (n > 0 && !group.empty() && validGroups(group)) {
         n += snprintf(meta + n, sizeof(meta) - static_cast<size_t>(n), ",\"group\":\"%.*s\"",
                       static_cast<int>(group.size()), group.data());
     }
@@ -112,7 +112,7 @@ bool anyGroup(std::string_view groups, F each) {
 }
 }  // namespace
 
-bool detail::validGroups(std::string_view groups) {
+bool validGroups(std::string_view groups) {
     if (groups.size() > kMaxGroups) return false;
     if (groups.empty()) return true;
     if (groups.front() == ',' || groups.back() == ',') return false;
@@ -127,7 +127,7 @@ bool detail::validGroups(std::string_view groups) {
     });
 }
 
-bool detail::groupsMeet(std::string_view a, std::string_view b) {
+bool groupsMeet(std::string_view a, std::string_view b) {
     return anyGroup(a, [b](std::string_view x) { return anyGroup(b, [x](std::string_view y) { return x == y; }); });
 }
 
