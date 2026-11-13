@@ -561,6 +561,73 @@ TEST(route_peer_lost_on_the_device) {
     CHECK_EQ(lost.size(), 1u);
 }
 
+TEST(route_master_back_after_a_loss) {
+    // A device that lost its master (silent over UDP, a failed delivery
+    // over NowTP) counts it online again on its first message, not at its
+    // next advertisement: a grace before releasing what it wrote
+    // (TesserKIT's peers.grace()) ends as soon as the master's writes come
+    // back. How soon they do is the master's: its probe (RemoteNode::probe())
+    // or the device's advertisement.
+    Defaults d;
+    Rig r;
+    RemoteNode::setDefaultRouteOrder({TransportKind::Udp});
+    r.gwNow.forgetPeer(r.mac);  // UDP only
+    r.devNow.forgetPeer(r.masterMac);
+    r.run();
+    RemoteNode& n = r.node();
+    n.probe(500);
+    CHECK_EQ(n.stream("/out/level", "1"), Status::Ok);
+    r.advance(200);
+    CHECK_EQ(r.level, 1);
+    std::vector<std::string> lost;
+    auto record = DatagramEndpoint::PeerLossHandler(
+        [&](const PeerAddress&, const PeerAddress&, tesser::PeerLoss reason) { lost.push_back(tesser::toString(reason)); });
+    r.devUdp.endpoint().onPeerLost(record);
+    r.devNow.onPeerLost(record);
+
+    // UDP: silent for peerTimeoutMs, then back.
+    bool down = true;
+    r.net.lose = [&](const udp_cases::Net::Datagram&) { return down; };
+    for (int i = 2; i < 300 && r.devUdp.endpoint().deviceOnline(r.masterMac); i++) {
+        n.stream("/out/level", std::to_string(i));
+        r.advance(100);
+    }
+    CHECK(!r.devUdp.endpoint().deviceOnline(r.masterMac));
+    CHECK((lost == std::vector<std::string>{"silent"}));
+    down = false;
+    uint32_t t0 = r.net.clock;
+    int last = 0;
+    for (int i = 50; i < 700 && !r.devUdp.endpoint().deviceOnline(r.masterMac); i++) {
+        n.stream("/out/level", std::to_string(i));
+        r.advance(10);
+        last = i;
+    }
+    CHECK(r.devUdp.endpoint().deviceOnline(r.masterMac));
+    // The master's route comes back with its probe (backed off during a long
+    // outage) or the device's next advertisement, then its writes.
+    CHECK(r.net.clock - t0 <= UdpLink::Options().advertiseMs + 100);
+    r.advance(200);
+    CHECK_EQ(r.level, last);
+
+    // NowTP: the device's reply undelivered, then the master's next write.
+    RemoteNode::setDefaultRouteOrder({TransportKind::NowTP});
+    r.gwNow.peerSeen(r.mac, "lamp", r.dev.schemaHash());
+    r.run();
+    CHECK_EQ(n.stream("/out/level", "200"), Status::Ok);
+    r.run();
+    CHECK_EQ(r.level, 200);
+    CHECK(r.devNow.deviceOnline(r.masterMac));
+    lost.clear();
+    r.devNow.sendFailed(r.masterMac, 0, tesser::SendFailure::Undelivered);
+    r.devNow.process();
+    CHECK((lost == std::vector<std::string>{"failed"}));
+    CHECK(!r.devNow.deviceOnline(r.masterMac));
+    CHECK_EQ(n.stream("/out/level", "201"), Status::Ok);
+    r.run();
+    CHECK_EQ(r.level, 201);
+    CHECK(r.devNow.deviceOnline(r.masterMac));
+}
+
 TEST(route_declared_device) {
     // A node declared by its UDP address takes the device it advertises,
     // and the device's other routes join it instead of mounting it again.
