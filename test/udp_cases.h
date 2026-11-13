@@ -3,6 +3,7 @@
 // sockets.
 #pragma once
 
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <map>
