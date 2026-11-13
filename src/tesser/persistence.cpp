@@ -1,5 +1,6 @@
 // Persistence (docs/DESIGN.md section 12).
 #include <algorithm>
+#include <optional>
 
 #include "tesser/api.h"
 #include "tesser/budget.h"
@@ -331,53 +332,64 @@ bool Api::persistedState(std::string& out, Reservation& held, bool reserve) {
     return true;
 }
 
-bool Api::saveRecords(bool all, std::vector<std::string>* written) {
+bool Api::saveRecords(bool all, std::vector<std::string>* written, bool yield) {
     if (!storage_) return false;
     uint32_t gen = currentGeneration();
     bool ok = true;
     auto skip = [this](const Node& n) { return atDefault(n); };
+    auto dirty = [&](const Node& c) {
+        if (!holdsPersisted(c, persisted())) return false;
+        if (all) return true;
+        uint32_t newest = 0;
+        newestPersisted(c, persisted(), savedGen_, gen, newest);
+        return newest != 0;  // else its record is current
+    };
+    // By name: with the lock let go, the tree may change between records.
+    std::vector<std::string> names;
     for (const Node* c = first(); c; c = c->next()) {
-        if (!holdsPersisted(*c, persisted())) continue;
-        if (!all) {
-            uint32_t newest = 0;
-            newestPersisted(*c, persisted(), savedGen_, gen, newest);
-            if (!newest) continue;  // its record is current
-        }
+        if (dirty(*c)) names.emplace_back(c->name());
+    }
+    for (const std::string& name : names) {
+        const Node* c = child(name);
+        if (!c || !dirty(*c)) continue;
         std::string text;
         Reservation held;
-        switch (record(*c, persisted(), skip, text, held)) {
-            case Record::Empty:
-                // Every value at its default: no record, so a new default
-                // reaches this device.
-                if (!storage_->remove(c->name())) {
-                    logError("removing state %s failed", c->name());
-                    ok = false;
-                } else if (written) {
-                    written->push_back(c->name());
-                }
-                break;
-            case Record::NoRoom:
-                logWarning("no memory to save state %s now; trying again", c->name());
-                ok = false;
-                break;
-            case Record::Written:
-                if (!storage_->save(c->name(), text)) {
-                    logError("saving state %s failed", c->name());
-                    ok = false;
-                } else if (written) {
-                    written->push_back(c->name());
-                }
-                break;
+        Record r = record(*c, persisted(), skip, text, held);
+        if (r == Record::NoRoom) {
+            logWarning("no memory to save state %s now; trying again", name.c_str());
+            ok = false;
+            continue;
+        }
+        // Writing flash takes tens of ms: without the API lock, so requests
+        // and timed sets don't wait for it. Another save renders under the
+        // API lock and waits here, so records are written in the order they
+        // were rendered.
+        bool done;
+        storageMutex_.lock();
+        {
+            std::optional<MutexRelease> unlocked;
+            if (yield) unlocked.emplace(mutex_);
+            // Every value at its default: no record, so a new default
+            // reaches this device.
+            done = r == Record::Empty ? storage_->remove(name) : storage_->save(name, text);
+            storageMutex_.unlock();  // before the API lock is taken again
+        }
+        if (!done) {
+            logError(r == Record::Empty ? "removing state %s failed" : "saving state %s failed", name.c_str());
+            ok = false;
+        } else if (written) {
+            written->push_back(name);
         }
     }
-    // After a failure the dirty records stay dirty and are written again.
-    if (ok) savedGen_ = seenGen_ = gen;
+    // After a failure the dirty records stay dirty and are written again. A
+    // save that ran meanwhile, with the lock let go, may have gone further.
+    if (ok && static_cast<int32_t>(gen - savedGen_) >= 0) savedGen_ = seenGen_ = gen;
     return ok;
 }
 
 bool Api::save() {
     MutexGuard guard(mutex_);
-    return saveRecords(true);
+    return saveRecords(true, nullptr, true);
 }
 
 bool Api::load() {
@@ -505,7 +517,7 @@ void Api::checkPersistence(uint32_t nowMs) {
         changedAtMs_ = nowMs;
         return;
     }
-    if (nowMs - changedAtMs_ >= debounceMs_) saveRecords(false);
+    if (nowMs - changedAtMs_ >= debounceMs_) saveRecords(false, nullptr, true);
 }
 
 }  // namespace tesser

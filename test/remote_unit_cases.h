@@ -232,6 +232,34 @@ TEST(unit_routes_switch_probes_and_replace) {
     if (p.size() == 1) CHECK(p[0].peer == l.a);
     CHECK(t.dueProbes(15999).empty());
     CHECK_EQ(t.dueProbes(16000).size(), 1u);
+    // The Api's probe, for a node without its own: taken at the next tick,
+    // the wait started again when it changes, kept when it doesn't (Peers
+    // sets it at every refresh).
+    tesser::Api api;
+    t.inheritProbe(&api);
+    CHECK_EQ(t.probeMs(), 5000u);
+    CHECK(t.dueProbes(35999).empty());  // 20 s after 16000
+    api.remoteHooks().setProbe(500);
+    t.inheritProbe(&api);
+    CHECK_EQ(t.probeMs(), 500u);
+    CHECK_EQ(t.dueProbes(16500).size(), 1u);
+    CHECK(t.dueProbes(17499).empty());
+    t.inheritProbe(&api);  // unchanged: the wait doubles on
+    CHECK_EQ(t.dueProbes(17500).size(), 1u);
+    t.setProbe(500);  // its own, the same value: still doubling
+    CHECK(t.dueProbes(19499).empty());
+    CHECK_EQ(t.dueProbes(19500).size(), 1u);
+    api.remoteHooks().setProbe(2000);
+    t.inheritProbe(&api);  // its own wins
+    CHECK_EQ(t.probeMs(), 500u);
+    tesser::detail::RouteTable fresh(m);
+    fresh.inheritProbe(&api);
+    CHECK_EQ(fresh.probeMs(), 2000u);
+    api.remoteHooks().clearProbe();
+    fresh.inheritProbe(&api);
+    CHECK_EQ(fresh.probeMs(), 5000u);
+    uint32_t ms = 1;
+    CHECK(!api.remoteHooks().probe(ms));
     t.setProbe(0);
     CHECK(t.dueProbes(100000).empty());
 

@@ -41,6 +41,23 @@ std::vector<RouteKind> RemoteHooks::routeOrder() const {
     return order_;
 }
 
+void RemoteHooks::setProbe(uint32_t ms) {
+    MutexGuard guard(mutex_);
+    probeMs_ = ms;
+    hasProbe_ = true;
+}
+
+void RemoteHooks::clearProbe() {
+    MutexGuard guard(mutex_);
+    hasProbe_ = false;
+}
+
+bool RemoteHooks::probe(uint32_t& ms) const {
+    MutexGuard guard(mutex_);
+    if (hasProbe_) ms = probeMs_;
+    return hasProbe_;
+}
+
 void RemoteHooks::stateChanged(RemoteNode& node) const {
     std::vector<StateHandler> fns;
     {

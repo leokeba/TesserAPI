@@ -28,6 +28,7 @@ enum LockRank : uint8_t {
     kRankNone = 0,
     kRankSubscribers = 10,  // DatagramEndpoint's subscribers: before the API lock
     kRankApi = 20,          // Api: the tree
+    kRankStorage = 25,      // Api's storage writes: taken under the API lock, which is then let go
     kRankRemote = 30,       // a RemoteNode's copies: after the API lock
     kRankEndpoint = 80,     // DatagramEndpoint's state: its remote nodes' routes are taken inside
     kRankLeaf = 90,         // routes, streams, endpoint and link state, request queues: nothing taken inside

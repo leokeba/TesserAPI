@@ -387,6 +387,18 @@ bool RouteTable::unobserved(const Route& current, bool online) const {
     return lastEndpoint_ != current.endpoint || lastPeer_ != current.peer || lastOnline_ != online || announce_.load();
 }
 
+void RouteTable::inheritProbe(Api* api) {
+    {
+        MutexGuard guard(mutex_);
+        if (ownProbe_) return;
+    }
+    // Read under the hooks' lock, not under ours.
+    uint32_t ms = kDefaultProbeMs;
+    if (api) api->remoteHooks().probe(ms);
+    MutexGuard guard(mutex_);
+    if (!ownProbe_) useProbe(ms);
+}
+
 std::vector<RouteTable::Route> RouteTable::dueProbes(uint32_t nowMs) {
     std::vector<Route> probes;
     MutexGuard guard(mutex_);

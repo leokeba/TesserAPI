@@ -35,6 +35,15 @@ public:
     // RemoteNode::setDefaultRouteOrder()'s).
     void setRouteOrder(std::vector<RouteKind> order);
     std::vector<RouteKind> routeOrder() const;
+    // The probe of this Api's nodes without their own (RemoteNode::probe()):
+    // the first probe of an offline route `ms` after it is lost (0: never),
+    // doubling after each. Nodes take it at their next tick, and a node
+    // whose probe it changes starts its wait again. clearProbe(): back to
+    // the default, 5000.
+    void setProbe(uint32_t ms);
+    void clearProbe();
+    // False when not set.
+    bool probe(uint32_t& ms) const;
 
     // For RemoteNode: calls the handlers, without the hooks' lock.
     void stateChanged(RemoteNode& node) const;
@@ -46,6 +55,8 @@ private:
     std::vector<std::pair<Id, StateHandler>> state_;
     std::vector<std::pair<Id, AccessHandler>> access_;
     std::vector<RouteKind> order_;
+    uint32_t probeMs_ = 0;
+    bool hasProbe_ = false;
 };
 
 }  // namespace tesser

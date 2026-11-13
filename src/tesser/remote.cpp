@@ -415,6 +415,7 @@ void RemoteNode::tick(const DatagramEndpoint& by, uint32_t nowMs) {
     }
 
     // Offline routes: does the device answer? Any reply puts the route back.
+    routes_.inheritProbe(api_.load());
     for (const Route& r : routes_.dueProbes(nowMs)) {
         Query q;
         q.depth = 0;

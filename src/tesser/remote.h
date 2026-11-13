@@ -75,12 +75,16 @@ public:
     // Asks offline routes whether the device answers again, with a get at
     // depth 0: a device that doesn't advertise (a declared address on
     // another subnet) comes back that way. The first probe goes `ms` after
-    // the route is lost (default 5000; 0: never), and the wait doubles after
-    // each one, up to a minute, so a device that is gone costs little.
+    // the route is lost (default 5000, or the Api's: RemoteHooks::setProbe();
+    // 0: never), and the wait doubles after each one, up to a minute, so a
+    // device that is gone costs little. Setting the same value again keeps
+    // the wait where it is.
     RemoteNode& probe(uint32_t ms) {
         routes_.setProbe(ms);
         return *this;
     }
+    // The probe in effect (its own, the Api's as of its last tick, or 5000).
+    uint32_t probeMs() const { return routes_.probeMs(); }
 
     // ---- routes ---------------------------------------------------------
     // Another way to reach the device (no effect if the node has it).

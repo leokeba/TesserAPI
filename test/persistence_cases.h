@@ -1,6 +1,10 @@
 // Persistence and access control.
 #pragma once
 
+#include <chrono>
+#include <functional>
+#include <thread>
+
 #include <stdio.h>
 #include <string.h>
 #if !defined(ESP_PLATFORM)
@@ -535,6 +539,74 @@ TEST(persist_unsaved_set) {
     s.api.poll(30000);
     CHECK_EQ(storage.saves, 1);
     CHECK_EQ(storage.records["config"], "{\"brightness\":5,\"name\":\"desk\"}");
+}
+
+// Notes whether each write ran under the API lock, and lets a test act
+// from another task while one is being written.
+struct WatchedStorage : MemoryStorage {
+    tesser::Api* api = nullptr;
+    std::vector<std::string> log;  // "<key> locked" or "<key> free"
+    std::function<void(std::string_view key)> during;
+    bool save(std::string_view key, const std::string& data) override {
+        log.push_back(std::string(key) + (api && api->mutex().heldByMe() ? " locked" : " free"));
+        if (during) during(key);
+        return MemoryStorage::save(key, data);
+    }
+};
+
+TEST(persist_writes_without_the_api_lock) {
+    // A save renders its records under the API lock and writes them with
+    // it let go: writing flash takes tens of ms, and requests (timed sets
+    // most of all) would wait on it (docs/DESIGN.md section 12).
+    WatchedStorage storage;
+    Settings s(&storage, 1000);
+    storage.api = &s.api;
+    cases::set(s.api, "/config/brightness", "1");
+    s.calibration = 5;
+    s.api.changed("/calibration");
+    // Another task takes the lock while a record is written, and changes
+    // the record just written.
+    storage.during = [&](std::string_view key) {
+        if (key != "config") return;
+        bool took = false;
+        std::thread other([&] {
+            for (int i = 0; i < 200 && !took; i++) {
+                if (s.api.mutex().tryLock()) {
+                    took = true;
+                    s.brightness = 9;
+                    s.api.changed("/config/brightness");
+                    s.api.mutex().unlock();
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+        });
+        other.join();
+        CHECK(took);
+    };
+    s.api.poll(10000);
+    s.api.poll(11100);
+    CHECK((storage.log == std::vector<std::string>{"config free", "calibration free"}));
+    CHECK(storage.records["config"].find("\"brightness\":1") != std::string::npos);
+    // The change made meanwhile is still unsaved: the next save writes it.
+    storage.during = nullptr;
+    s.api.poll(11200);
+    s.api.poll(12300);
+    CHECK_EQ(storage.log.size(), 3u);
+    CHECK(storage.records["config"].find("\"brightness\":9") != std::string::npos);
+
+    // save() too, unless the caller holds the lock already.
+    // (calibration, every record, is written last.)
+    CHECK(s.api.save());
+    CHECK_EQ(storage.log.back(), "calibration free");
+    {
+        tesser::MutexGuard held(s.api.mutex());
+        CHECK(s.api.save());
+    }
+    CHECK_EQ(storage.log.back(), "calibration locked");
+    // A restore writes under the lock, as before.
+    CHECK_EQ(s.api.restore("{\"config\":{\"brightness\":3}}"), Status::Ok);
+    CHECK_EQ(storage.log.back(), "calibration locked");
 }
 
 // Refuses to save one key while `failing`.

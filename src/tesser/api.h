@@ -399,7 +399,9 @@ private:
     void checkPersistence(uint32_t nowMs);
     // Writes the records of top-level nodes (all, or those changed since
     // the last save); the names of those written go to `written`.
-    bool saveRecords(bool all, std::vector<std::string>* written = nullptr);
+    // `yield`: each record is written with the API lock let go (when the
+    // caller holds it once), under storageMutex_ (docs/DESIGN.md section 12).
+    bool saveRecords(bool all, std::vector<std::string>* written = nullptr, bool yield = false);
     void writePersistedState(Sink& sink);
     bool persistedState(std::string& out, Reservation& held, bool reserve);
     // After a migration: every record rewritten under this version, then
@@ -428,6 +430,9 @@ private:
     std::atomic<uint32_t> tokenGeneration_{0};
     std::unique_ptr<RemoteHooks> remoteHooks_;
     Storage* storage_ = nullptr;
+    // Storage writes, in the order their records were rendered: taken under
+    // the API lock, which is let go while the record is written.
+    Mutex storageMutex_{kRankStorage, "api storage"};
     uint32_t debounceMs_ = 2000;
     // Persisted values' defaults: node, hash of its value; sorted by node.
     std::vector<std::pair<const Node*, uint32_t>> defaults_;

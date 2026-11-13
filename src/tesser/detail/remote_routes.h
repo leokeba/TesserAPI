@@ -102,9 +102,20 @@ public:
     std::vector<Route> dueProbes(uint32_t nowMs);
     // When dueProbes() next gives any.
     void nextProbe(Deadline& d) const;
+    // The node's own probe (RemoteNode::probe()); the wait starts again
+    // only if it changes, so setting it again at each refresh keeps the
+    // backoff.
     void setProbe(uint32_t ms) {
-        probeMs_ = ms;
-        probeWaitMs_ = ms;
+        MutexGuard guard(mutex_);
+        ownProbe_ = true;
+        useProbe(ms);
+    }
+    // A node without its own takes its Api's (RemoteHooks::setProbe()), or
+    // the default. From the node's tick.
+    void inheritProbe(Api* api);
+    uint32_t probeMs() const {
+        MutexGuard guard(mutex_);
+        return probeMs_;
     }
     // A route was added: the next tick reports a state change.
     void announce() { announce_ = true; }
@@ -118,6 +129,11 @@ private:
     // the inherited order is read before taking mutex_.
     void ensureOrder(Api* api) const;
     int activeLocked() const;
+    void useProbe(uint32_t ms) {
+        if (ms == probeMs_) return;
+        probeMs_ = ms;
+        probeWaitMs_ = ms;
+    }
     bool updateOnlineLocked();
 
     Mutex& mutex_;
@@ -141,7 +157,9 @@ private:
     uint32_t probeMs_ = 5000;
     uint32_t probeWaitMs_ = 5000;  // until the next probe; doubles up to kMaxProbeMs
     uint32_t lastProbeMs_ = 0;
+    bool ownProbe_ = false;
     static constexpr uint32_t kMaxProbeMs = 60000;
+    static constexpr uint32_t kDefaultProbeMs = 5000;
 };
 
 }  // namespace detail
