@@ -87,6 +87,27 @@ void boolParam(const char* query, const char* key, bool& out, bool& bad) {
     }
 }
 
+// A positive integer query parameter (?at=N). Leaves `out` alone when absent.
+void uint64Param(const char* query, const char* key, uint64_t& out, bool& bad) {
+    char buf[24];
+    size_t len = 0;
+    if (!queryParam(query, key, buf, sizeof(buf), len, bad)) return;
+    uint64_t v = 0;
+    if (len == 0 || len > 19) {
+        bad = true;
+        return;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] < '0' || buf[i] > '9') {
+            bad = true;
+            return;
+        }
+        v = v * 10 + static_cast<uint64_t>(buf[i] - '0');
+    }
+    if (!v) bad = true;
+    out = v;
+}
+
 // A flag that may come bare (?sub) or with a boolean value (?sub=1).
 bool flagParam(const char* query, const char* key, bool& bad) {
     size_t keyLen = strlen(key);
@@ -169,6 +190,7 @@ bool readQuery(httpd_req_t* req, Request& request, QueryText& text, Reply& reply
         boolParam(query, "snapshot", request.query.snapshot, bad);
         boolParam(query, "remotes", request.query.remotes, bad);
         boolParam(query, "persist", request.query.persist, bad);
+        uint64Param(query, "at", request.query.at, bad);
         // Browsers can't send a GET body, so a shape may also come as ?shape=<json>.
         textParam(query, "shape", queryLen + 1, text.shape, bad);
         // The file name the client gave, for a transfer (FileRequest::filename).

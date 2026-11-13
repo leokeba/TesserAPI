@@ -81,10 +81,14 @@ std::string buildRequestEnvelope(uint32_t id, Op op, std::string_view path, cons
         w.key("persist");
         w.boolean(false);
     }
+    if (op == Op::Set && query.at) {
+        w.key("at");
+        w.uinteger(query.at);
+    }
     // With options, strict (docs/DESIGN.md section 10.1.2): a node that
     // doesn't know one refuses the request rather than ignore it.
     bool options = query.depth >= 0 || !query.keys.empty() || !query.exclude.empty() || query.view != View::Value ||
-                   !query.remotes || query.ceiling < Access::Admin ||
+                   !query.remotes || query.ceiling < Access::Admin || (op == Op::Set && query.at) ||
                    (op == Op::Subscribe && (query.interval || !query.changes || !query.events || !query.snapshot));
     if (options) {
         w.key("v");

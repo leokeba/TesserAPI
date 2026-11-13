@@ -138,7 +138,7 @@ void answerAuth(JsonObjectConst env, TokenClient& client, Reply& reply) {
 namespace {
 const char* const kRequestKeyList[] = {"v",       "id",      "op",     "path",     "depth",   "keys",
                                        "exclude", "view",    "interval", "remotes", "changes", "events",
-                                       "snapshot", "persist", "body"};
+                                       "snapshot", "persist", "at", "body"};
 const char* const kFileKeyList[] = {"v", "id", "op", "path", "offset", "size", "filename", "data", "length", "crc32"};
 const char* const kAuthKeyList[] = {"v", "id", "op", "token"};
 }  // namespace
@@ -298,6 +298,18 @@ Status requestFromEnvelope(JsonObjectConst env, Request& request, EnvelopeId& id
             return Status::BadRequest;
         }
         request.query.persist = persist.as<bool>();
+    }
+    JsonVariantConst at = env["at"];
+    if (!at.isNull()) {
+        if (!at.is<uint64_t>() || at.as<uint64_t>() == 0) {
+            message = "at must be a positive integer (network time, µs)";
+            return Status::BadRequest;
+        }
+        if (request.op != Op::Set) {
+            message = "at is for set";
+            return Status::BadRequest;
+        }
+        request.query.at = at.as<uint64_t>();
     }
     request.body = env["body"];
     return Status::Ok;

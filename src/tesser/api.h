@@ -100,6 +100,20 @@ using TokenCheck = std::function<Access(std::string_view token, const Client& cl
 // comparisons use it.
 bool secretEquals(std::string_view presented, std::string_view expected);
 
+// A set to apply at a network time (Query::at), checked and waiting for
+// it (docs/DESIGN.md section 10.1.3): what Api::setScheduler()'s scheduler
+// holds and gives back to Api::applyTimed(). A copy of everything: the
+// client that sent it may be gone by then.
+struct TimedWrite {
+    std::string path;  // as requested
+    std::string body;  // JSON
+    uint64_t at = 0;   // network time, µs
+    // Who wrote it, at the level it had (a gateway's ceiling applied): its
+    // device goes to writer tracking (Api::trackWriter()) when it is applied.
+    Client client;
+    bool persist = true;  // Query::persist
+};
+
 namespace authorizers {
 // Anyone may read and subscribe; writes and actions need an authenticated
 // client (HTTP/WebSocket bearer token, trusted NowTP peer, serial line).
@@ -169,6 +183,23 @@ public:
     // calls the release of every tracked node it last wrote, which then has
     // no writer. Takes the API lock.
     void writerLost(const PeerAddress& device, PeerLoss reason);
+
+    // ---- timed sets (docs/DESIGN.md section 10.1.3) ------------------------
+    // Takes a timed set (Query::at) whose access and value were checked, to
+    // apply it at its time with applyTimed(): TesserKIT's clock queues it.
+    // Answers Ok (taken), Timeout (its time is past: the client gets
+    // timeout, reason late), Busy (no room) or NotAllowed (no clock, or not
+    // synchronized). Called under the API lock: it only queues. Without a
+    // scheduler, timed sets are refused (not_allowed).
+    using Scheduler = std::function<Status(TimedWrite&& write)>;
+    void setScheduler(Scheduler fn);
+    bool hasScheduler() const;
+    // Under the API lock (the request handler).
+    const Scheduler& scheduler() const { return scheduler_; }
+    // Applies a timed set now, as the client that sent it: checked again
+    // (the tree may have changed), its writer recorded, saved unless it
+    // wasn't to be. Takes the API lock. The status of the set.
+    Status applyTimed(const TimedWrite& write);
 
     // Deferred calls in flight.
     int pending() const { return pending_.load(); }
@@ -393,6 +424,7 @@ private:
     uint32_t lastWatchMs_ = 0;
     Authorizer authorizer_;
     TokenCheck tokenCheck_;
+    Scheduler scheduler_;
     std::atomic<uint32_t> tokenGeneration_{0};
     std::unique_ptr<RemoteHooks> remoteHooks_;
     Storage* storage_ = nullptr;

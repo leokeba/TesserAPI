@@ -1,5 +1,7 @@
 #include "tesser/detail/remote_stream.h"
 
+#include <string.h>
+
 #include "tesser/detail/remote_json.h"
 
 namespace tesser {
@@ -27,9 +29,21 @@ bool overlaps(const std::string& a, const std::string& b) {
 
 }  // namespace
 
-Status SetStream::push(std::string_view path, JsonDocument&& body, bool persist) {
+Status SetStream::push(std::string_view path, JsonDocument&& body, bool persist, uint64_t at) {
     std::string p = normalPath(path);
     MutexGuard guard(mutex_);
+    if (at) {
+        if (timed_.size() >= limit_) return Status::Busy;
+        if (at <= lastAt_) at = lastAt_ + 1;
+        lastAt_ = at;
+        timed_.emplace_back();
+        timed_.back().path = std::move(p);
+        timed_.back().body = std::move(body);
+        timed_.back().persist = persist;
+        timed_.back().at = at;
+        stats_.queued++;
+        return Status::Ok;
+    }
     // On top of the last set queued for the path, unless a set to a path
     // above or below it came after (they must stay in order).
     for (size_t i = queue_.size(); i-- > 0;) {
@@ -63,7 +77,7 @@ SetStream::Stats SetStream::stats() const {
 
 size_t SetStream::size() const {
     MutexGuard guard(mutex_);
-    return queue_.size() + (inFlight_ ? 1 : 0);
+    return queue_.size() + (inFlight_ ? 1 : 0) + timed_.size() + timedFlying_.size();
 }
 
 // Puts a set that must go again at the front, with the later sets to its
@@ -82,6 +96,85 @@ void SetStream::requeue(std::vector<Pending>& queue, Pending p) {
     queue.insert(queue.begin(), std::move(p));
 }
 
+// Under mutex_: everything waiting, untimed and timed, to `dropped`.
+void SetStream::dropAll(std::vector<Pending>& dropped) {
+    for (auto* q : {&queue_, &timed_}) {
+        for (Pending& p : *q) dropped.push_back(std::move(p));
+        q->clear();
+    }
+    stats_.failed += static_cast<uint32_t>(dropped.size());
+}
+
+void SetStream::reportDropped(const std::vector<Pending>& dropped, const ErrorHandler& onError) {
+    if (!onError || dropped.empty()) return;
+    JsonDocument error;
+    error["error"] = "timeout";
+    error["reason"] = "peer_offline";
+    error["message"] = "peer offline";
+    for (const Pending& p : dropped) {
+        error["path"] = p.path.empty() ? std::string("/") : p.path;
+        onError(p.path, Status::Timeout, error.as<JsonVariantConst>());
+    }
+}
+
+bool SetStream::nextTimed(bool reachable, std::string& path, std::string& body, bool& persist, uint64_t& at,
+                          uint32_t& token) {
+    std::vector<Pending> dropped;
+    ErrorHandler onError;
+    {
+        MutexGuard guard(mutex_);
+        if (timed_.empty()) return false;
+        if (reachable) {
+            if (timedFlying_.size() >= kTimedWindow) return false;
+            timedFlying_.push_back(std::move(timed_.front()));
+            timed_.erase(timed_.begin());
+            Pending& p = timedFlying_.back();
+            p.token = ++tokens_;
+            stats_.sent++;
+            path = p.path;
+            persist = p.persist;
+            at = p.at;
+            token = p.token;
+            serializeJson(p.body, body);
+            return true;
+        }
+        dropAll(dropped);
+        onError = onError_;
+    }
+    reportDropped(dropped, onError);
+    return false;
+}
+
+void SetStream::unsentTimed(uint32_t token) {
+    MutexGuard guard(mutex_);
+    for (size_t i = 0; i < timedFlying_.size(); i++) {
+        if (timedFlying_[i].token != token) continue;
+        stats_.sent--;
+        timed_.insert(timed_.begin(), std::move(timedFlying_[i]));
+        timedFlying_.erase(timedFlying_.begin() + static_cast<std::ptrdiff_t>(i));
+        return;
+    }
+}
+
+void SetStream::doneTimed(uint32_t token, Status s, JsonVariantConst body) {
+    std::string failed;
+    ErrorHandler onError;
+    {
+        MutexGuard guard(mutex_);
+        size_t i = 0;
+        while (i < timedFlying_.size() && timedFlying_[i].token != token) i++;
+        if (i == timedFlying_.size()) return;
+        failed = std::move(timedFlying_[i].path);
+        timedFlying_.erase(timedFlying_.begin() + static_cast<std::ptrdiff_t>(i));
+        if (s == Status::Ok) return;
+        stats_.failed++;
+        const char* reason = body["reason"];
+        if (s == Status::Timeout && reason && strcmp(reason, toString(Reason::Late)) == 0) stats_.late++;
+        onError = onError_;
+    }
+    if (onError) onError(failed, s, body);
+}
+
 bool SetStream::next(bool reachable, std::string& path, std::string& body, bool& persist) {
     std::vector<Pending> dropped;
     ErrorHandler onError;
@@ -98,25 +191,16 @@ bool SetStream::next(bool reachable, std::string& path, std::string& body, bool&
             serializeJson(flying_.body, body);
             return true;
         }
-        dropped.swap(queue_);
-        stats_.failed += static_cast<uint32_t>(dropped.size());
+        dropAll(dropped);
         onError = onError_;
     }
-    if (!onError) return false;
-    JsonDocument error;
-    error["error"] = "timeout";
-    error["reason"] = "peer_offline";
-    error["message"] = "peer offline";
-    for (const Pending& p : dropped) {
-        error["path"] = p.path.empty() ? std::string("/") : p.path;
-        onError(p.path, Status::Timeout, error.as<JsonVariantConst>());
-    }
+    reportDropped(dropped, onError);
     return false;
 }
 
 bool SetStream::waiting() const {
     MutexGuard guard(mutex_);
-    return !inFlight_ && !queue_.empty();
+    return (!inFlight_ && !queue_.empty()) || (!timed_.empty() && timedFlying_.size() < kTimedWindow);
 }
 
 void SetStream::unsent() {

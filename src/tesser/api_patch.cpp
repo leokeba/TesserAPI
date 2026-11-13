@@ -137,6 +137,84 @@ void Handler::set(Node& target) {
     }
 }
 
+// What set() checks before it applies anything; false with the error
+// replied.
+bool Handler::checkSet(Node& target) {
+    if (req_.query.view != View::Value || !req_.query.keys.empty() || !req_.query.exclude.empty()) {
+        replyError(Status::BadRequest, "set takes no query options", base_);
+        return false;
+    }
+    JsonVariantConst body = req_.body;
+    switch (target.type()) {
+        case NodeType::Object:
+            if (!body.is<JsonObjectConst>()) {
+                replyError(Status::InvalidValue, "expected object", base_);
+                return false;
+            }
+            if (!validatePatch(target, body, writeNeed_)) return replyError(), false;
+            return true;
+        case NodeType::Value: {
+            auto& v = static_cast<ValueNode&>(target);
+            if (!v.writable()) return replyError(Status::ReadOnly, "read-only", base_), false;
+            if (!keyWriteOk(v, body)) return replyError(), false;
+            Check c = v.check(body);
+            if (!c.isOk()) return replyError(c.status, c.message, base_), false;
+            return true;
+        }
+        case NodeType::Custom: {
+            auto& c = static_cast<CustomNode&>(target);
+            if (!c.writable()) return replyError(Status::ReadOnly, "read-only", base_), false;
+            Check chk = c.check(body);
+            if (!chk.isOk()) return replyError(chk.status, chk.message, base_), false;
+            return true;
+        }
+        case NodeType::Action: {
+            auto& a = static_cast<ActionNode&>(target);
+            Check chk = a.check(body);
+            if (!chk.isOk()) return replyError(chk.status, chk.message, base_), false;
+            if (a.takesObject() && !fillParams(a, body)) return replyError(), false;
+            return true;
+        }
+        case NodeType::Event: return replyError(Status::NotAllowed, "events can't be set", base_), false;
+        case NodeType::File: return replyError(Status::NotAllowed, "upload files over HTTP", base_), false;
+        case NodeType::Array:
+        case NodeType::List:
+            if (!validatePatch(target, body, writeNeed_)) return replyError(), false;
+            return true;
+        case NodeType::Remote: return false;  // forwarded before
+    }
+    return false;
+}
+
+// A set with Query::at (docs/DESIGN.md section 10.1.3): checked now,
+// applied by the scheduler at its time (Api::applyTimed()).
+void Handler::timedSet(Node& target) {
+    if (!api_.scheduler()) return replyError(Status::NotAllowed, "no clock here: at isn't supported", base_);
+    if (!checkSet(target)) return;
+    TimedWrite w;
+    if (base_.empty()) {
+        w.path = "/";
+    } else {
+        w.path.assign(base_.data(), base_.size());
+    }
+    serializeJson(req_.body, w.body);
+    w.at = req_.query.at;
+    w.client = req_.client;
+    w.persist = req_.query.persist;
+    Status s = api_.scheduler()(std::move(w));
+    switch (s) {
+        case Status::Ok: {
+            JsonWriter jw(reply_.begin(Status::Ok));
+            jw.null();
+            detail::finishBody(reply_, jw, base_);
+            return;
+        }
+        case Status::Timeout: return replyError(Status::Timeout, Reason::Late, "arrived after its time", base_);
+        case Status::NotAllowed: return replyError(s, "the clock isn't synchronized", base_);
+        default: return replyError(s, "not scheduled", base_);
+    }
+}
+
 void Handler::setObject(Object& obj, JsonVariantConst body) {
     if (!body.is<JsonObjectConst>()) {
         replyError(Status::InvalidValue, "expected object", base_);

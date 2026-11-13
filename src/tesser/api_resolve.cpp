@@ -24,9 +24,13 @@ bool parseIndex(std::string_view s, size_t& out) {
 }
 
 void Handler::run() {
+    if (req_.query.at && req_.op != Op::Set) return replyError(Status::BadRequest, "at is for set", base_);
     Node* target = resolve();
     if (!target) return;
-    if (star_) return fanOut(*target);
+    if (star_) {
+        if (req_.query.at) return replyError(Status::BadRequest, "at doesn't take a '*' path", base_);
+        return fanOut(*target);
+    }
     if (req_.op != Op::Unsubscribe) {
         Access need = req_.op == Op::Set ? writeNeed_ : readNeed_;
         if (level_ < need || !allowed(*target)) return replyError(Status::Unauthorized, Reason::NotAuthorized, "not authorized", base_);
@@ -34,7 +38,7 @@ void Handler::run() {
     if (target->type() == NodeType::Remote) {
         auto& remote = static_cast<RemoteNode&>(*target);
         bool itself = remoteRest_.empty();
-        if (req_.op == Op::Get || req_.op == Op::Set) return forward(remote);
+        if (req_.op == Op::Get || req_.op == Op::Set) return forward(remote);  // Query::at goes along
         // A mirrored remote node itself is subscribed to locally, like a
         // value, by clients the copy is for; anything else is forwarded.
         // Unsubscribing is local.
@@ -45,7 +49,7 @@ void Handler::run() {
     }
     switch (req_.op) {
         case Op::Get: get(*target); break;
-        case Op::Set: set(*target); break;
+        case Op::Set: req_.query.at ? timedSet(*target) : set(*target); break;
         case Op::Subscribe: subscribe(*target); break;
         case Op::Unsubscribe: unsubscribe(); break;
     }

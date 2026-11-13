@@ -557,7 +557,7 @@ Status RemoteNode::stream(std::string_view path, std::string_view bodyJson, cons
     if (parseJson(body, bodyJson, kWrittenNesting)) {
         return Status::BadRequest;
     }
-    Status s = sets().push(path, std::move(body), query.persist);
+    Status s = sets().push(path, std::move(body), query.persist, query.at);
     if (s == Status::Ok) pump();
     return s;
 }
@@ -589,14 +589,31 @@ void RemoteNode::pump() {
     bool reachable = route(r) && online();
     std::string path, body;
     Query q;
-    if (!stream->next(reachable, path, body, q.persist)) return;
-    bool sent = r.endpoint->request(
-        r.peer, Op::Set, remotePathOf(path), std::string_view(body),
-        [this, stream](Status s, JsonVariantConst reply) {
-            if (stream->done(s, reply)) pump();
-        },
-        q, streamTimeoutMs(), this);
-    if (!sent) stream->unsent();  // tick() tries again
+    if (stream->next(reachable, path, body, q.persist)) {
+        bool sent = r.endpoint->request(
+            r.peer, Op::Set, remotePathOf(path), std::string_view(body),
+            [this, stream](Status s, JsonVariantConst reply) {
+                if (stream->done(s, reply)) pump();
+            },
+            q, streamTimeoutMs(), this);
+        if (!sent) stream->unsent();  // tick() tries again
+    }
+    // Timed sets go without waiting for one another: the device applies
+    // them by time (docs/DESIGN.md section 14.3).
+    uint32_t token = 0;
+    while (stream->nextTimed(reachable, path, body, q.persist, q.at, token)) {
+        bool sent = r.endpoint->request(
+            r.peer, Op::Set, remotePathOf(path), std::string_view(body),
+            [this, stream, token](Status s, JsonVariantConst reply) {
+                stream->doneTimed(token, s, reply);
+                pump();
+            },
+            q, streamTimeoutMs(), this);
+        if (!sent) {
+            stream->unsentTimed(token);
+            break;
+        }
+    }
 }
 
 // ---- forwarded subscriptions ------------------------------------------------

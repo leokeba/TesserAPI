@@ -271,6 +271,49 @@ void detail::handleNested(Api& api, const Request& request, Reply& reply) {
     api.current_ = outer;
 }
 
+// ---- timed sets (docs/DESIGN.md section 10.1.3) -------------------------------
+
+void Api::setScheduler(Scheduler fn) {
+    MutexGuard guard(mutex_);
+    scheduler_ = std::move(fn);
+}
+
+bool Api::hasScheduler() const {
+    MutexGuard guard(mutex_);
+    return static_cast<bool>(scheduler_);
+}
+
+namespace {
+// Keeps a reply's status; its body is counted and dropped.
+class StatusReply : public Reply {
+public:
+    Sink& begin(Status s) override {
+        status = s;
+        return sink_;
+    }
+    void end() override {}
+    bool rollback() override { return true; }
+    Status status = Status::Internal;
+
+private:
+    CountingSink sink_;
+};
+}  // namespace
+
+Status Api::applyTimed(const TimedWrite& write) {
+    JsonDocument body;
+    if (parseJson(body, write.body, requestNesting(config_.maxDepth))) return Status::BadRequest;
+    Request req;
+    req.op = Op::Set;
+    req.path = write.path;
+    req.body = body.as<JsonVariantConst>();
+    req.client = write.client;
+    req.query.persist = write.persist;
+    StatusReply reply;
+    handleNow(req, reply);
+    return reply.status;
+}
+
 // ---- queued mode ------------------------------------------------------------
 
 namespace {

@@ -212,9 +212,12 @@ public:
     // replaces). Streams converge on the latest state: they don't replay
     // every set. Ok: queued. Timeout: the node is offline. Busy: the queue
     // is full. BadRequest: `bodyJson` isn't JSON. Any task, under the API
-    // lock or not. Of `query`, only `persist` applies: false, the device
-    // doesn't save the change (Query::persist); a set merged with one that
-    // is saved is saved.
+    // lock or not. Of `query`, only `persist` and `at` apply: `persist`
+    // false, the device doesn't save the change (Query::persist); a set
+    // merged with one that is saved is saved. `at` makes it a timed set
+    // (Query::at): never merged, in order, its time strictly after the
+    // previous timed set's, several in flight, not sent again
+    // (SetStream::push(), docs/DESIGN.md section 14.3).
     Status stream(std::string_view path, std::string_view bodyJson, const Query& query = Query());
     // Sets that may wait (default 8).
     RemoteNode& streamLimit(size_t entries) {

@@ -43,6 +43,7 @@ enum class Reason : uint8_t {
     Rejected,           // internal: the remote node refused the message (no listener on the port, too large)
     LineOverrun,        // busy: bytes of the request were lost on the line (a UART overrun); send it again
     Checksum,           // bad_request: a file chunk's data doesn't match its crc32; send it again
+    Late,               // timeout: a timed set (Query::at) arrived after its time; dropped
 };
 
 // Wire name: "low_memory", ...; "" for None.

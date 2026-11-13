@@ -198,6 +198,10 @@ private:
     // ---- set ----------------------------------------------------------
 
     void set(Node& target);
+    // A set with Query::at: checked as set() would, then handed to the
+    // Api's scheduler instead of applied.
+    void timedSet(Node& target);
+    bool checkSet(Node& target);
 
     void setObject(Object& obj, JsonVariantConst body);
 

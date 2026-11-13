@@ -71,6 +71,15 @@ struct Query {
     // comes back at the next boot. On the wire, "persist": false in the
     // envelope and ?persist=false over HTTP; a node that predates it saves.
     bool persist = true;
+    // Set only: when to apply it, in network µs (docs/DESIGN.md section
+    // 10.1.3); 0, the default: when it arrives. A node with a scheduler
+    // (Api::setScheduler(), TesserKIT's clock) checks access and the value
+    // at once, then applies it at that time; one that comes after its time
+    // fails with timeout, reason late; a node without a scheduler refuses
+    // it (not_allowed). On the wire, "at": N in the envelope (a strict
+    // option: a node that predates it refuses the request) and ?at=N over
+    // HTTP.
+    uint64_t at = 0;
 };
 
 enum class TransportKind : uint8_t { Local, Serial, Http, NowTP, WebSocket, Udp, Ble };
