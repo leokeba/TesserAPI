@@ -137,6 +137,7 @@ UdpTransport::UdpTransport(Api* api, UdpLink::Options options, DatagramEndpoint:
           },
           &nowMs, options, endpointOptions) {
     link_.endpoint().classifyInterfaces([this](const PeerAddress& p) { return interfaceOf(p); });
+    link_.setMicros([] { return static_cast<uint64_t>(esp_timer_get_time()); });
 }
 
 UdpTransport::~UdpTransport() {
@@ -318,8 +319,9 @@ void UdpTransport::receiveWaiting() {
         int n = recvfrom(s, buffer_.data(), buffer_.size(), MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&from),
                          &fromLen);
         if (n <= 0) return;
+        uint64_t rxUs = static_cast<uint64_t>(esp_timer_get_time());  // before anything else: side datagrams' times
         PeerAddress peer = fromSockaddr(from);
-        if (allowed(peer)) link_.packet(peer, buffer_.data(), static_cast<size_t>(n));
+        if (allowed(peer)) link_.packet(peer, buffer_.data(), static_cast<size_t>(n), rxUs);
     }
 }
 
@@ -341,8 +343,9 @@ void UdpTransport::receiveEntry(void* arg) {
         int n = recvfrom(s, self->buffer_.data(), self->buffer_.size(), 0, reinterpret_cast<sockaddr*>(&from),
                          &fromLen);
         if (n > 0) {
+            uint64_t rxUs = static_cast<uint64_t>(esp_timer_get_time());  // before anything else: side datagrams' times
             PeerAddress peer = fromSockaddr(from);
-            if (self->allowed(peer)) self->link_.packet(peer, self->buffer_.data(), static_cast<size_t>(n));
+            if (self->allowed(peer)) self->link_.packet(peer, self->buffer_.data(), static_cast<size_t>(n), rxUs);
         } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }

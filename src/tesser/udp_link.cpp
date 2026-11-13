@@ -18,6 +18,12 @@ namespace {
 
 constexpr uint8_t kMagic = 0x54;
 constexpr uint8_t kVersion = 1;
+// Side datagrams (UdpLink::sendSide()): this, the version in the high
+// nibble (the low one for later), the sender's nonce (as in Header), then
+// the payload.
+constexpr uint8_t kSideMagic = 0x55;
+constexpr uint8_t kSideVersion = 1;
+constexpr size_t kSideHeader = 6;
 constexpr size_t kHeader = 20;
 constexpr unsigned kMaxFragments = 64;
 
@@ -661,9 +667,53 @@ void UdpLink::handleAck(const PeerAddress& from, const uint8_t* data, size_t len
     }
 }
 
+void UdpLink::onSide(SideFn fn) { onSide_ = std::move(fn); }
+
+void UdpLink::setMicros(std::function<uint64_t()> micros) { micros_ = std::move(micros); }
+
+uint64_t UdpLink::micros() const { return micros_ ? micros_() : uint64_t(now()) * 1000u; }
+
+bool UdpLink::sendSide(const PeerAddress& to, const uint8_t* data, size_t len, uint64_t* sentUs) {
+    if (len > options_.fragmentSize || (len && !data)) return false;
+    MutexGuard guard(mutex_);
+    if (!running_) return false;
+    uint8_t head[kSideHeader];
+    head[0] = kSideMagic;
+    head[1] = static_cast<uint8_t>(kSideVersion << 4);
+    put32(head + 2, nonce_);
+    bool ok = sendDatagram(to, head, sizeof(head), data, len);
+    if (sentUs) *sentUs = micros();
+    if (ok) stats_.sideSent++;
+    return ok;
+}
+
+void UdpLink::sideDatagram(const PeerAddress& from, const uint8_t* data, size_t len, uint64_t rxUs) {
+    if (len < kSideHeader || (data[1] >> 4) != kSideVersion) {
+        MutexGuard guard(mutex_);
+        stats_.dropped++;
+        return;
+    }
+    {
+        MutexGuard guard(mutex_);
+        if (!running_ || get32(data + 2) == nonce_) return;  // our own broadcast, looped back
+        stats_.received++;
+        if (!onSide_) {
+            stats_.dropped++;
+            return;
+        }
+        stats_.sideReceived++;
+    }
+    onSide_(from, endpoint_.deviceOf(from), data + kSideHeader, len - kSideHeader, rxUs);
+}
+
 void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len) {
+    packet(from, data, len, len && data[0] == kSideMagic ? micros() : 0);
+}
+
+void UdpLink::packet(const PeerAddress& from, const uint8_t* data, size_t len, uint64_t rxUs) {
     Header h;
     if (!running_) return;
+    if (len && data[0] == kSideMagic) return sideDatagram(from, data, len, rxUs);
     if (!readHeader(data, len, h)) {
         MutexGuard guard(mutex_);
         stats_.dropped++;

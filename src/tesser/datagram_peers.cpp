@@ -388,6 +388,21 @@ PeerAddress DatagramEndpoint::deviceOf(const PeerAddress& peer) const {
     return kind_ == TransportKind::NowTP ? peer : PeerAddress();
 }
 
+bool DatagramEndpoint::peerOf(const PeerAddress& device, PeerAddress& peer) const {
+    if (!device.length) return false;
+    MutexGuard guard(mutex_);
+    const detail::PeerTable::Peer* best = nullptr;
+    for (const detail::PeerTable::Peer& k : peers_.peers()) {
+        if (!k.known || !(k.device == device)) continue;
+        if (!best || (k.online && !best->online) ||
+            (k.online == best->online && static_cast<int32_t>(k.heardMs - best->heardMs) > 0)) {
+            best = &k;
+        }
+    }
+    if (best) peer = best->peer;
+    return best != nullptr;
+}
+
 void watchDevices(std::vector<DatagramEndpoint*> endpoints, DatagramEndpoint::PeerLossHandler lost) {
     auto shared = std::make_shared<std::vector<DatagramEndpoint*>>(std::move(endpoints));
     for (DatagramEndpoint* ep : *shared) {

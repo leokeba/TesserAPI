@@ -245,6 +245,9 @@ public:
     bool deviceOnline(const PeerAddress& device) const;
     // The device behind `peer` (empty when unknown).
     PeerAddress deviceOf(const PeerAddress& peer) const;
+    // The other way: the peer `device` was last heard from, online ones
+    // first (over NowTP, the device itself once heard). False when none.
+    bool peerOf(const PeerAddress& device, PeerAddress& peer) const;
 
     // ---- discovery ------------------------------------------------------
     // Mounts every TesserAPI peer reported by peerSeen() under `parent`, an

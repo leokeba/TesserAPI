@@ -82,6 +82,8 @@ public:
         uint32_t duplicates = 0;   // messages received again (acknowledged, not delivered)
         uint32_t dropped = 0;      // malformed datagrams, refused or evicted messages, new peers without room
         uint32_t refused = 0;      // datagrams the adapter didn't send (its buffers full, an interface UDP mustn't use)
+        uint32_t sideSent = 0;     // side datagrams (also counted in sent)
+        uint32_t sideReceived = 0; // side datagrams delivered (also counted in received)
     };
 
     // The endpoint options the link uses by default: a deeper queue (a
@@ -156,6 +158,39 @@ public:
     // Mounts every advertising peer under `parent` (docs/DESIGN.md section
     // 14.1), and asks the networks for them.
     void mountPeers(Object& parent, uint32_t mirrorIntervalMs = 0);
+
+    // ---- side channel (docs/DESIGN.md section 10.7) -----------------------
+    // Datagrams of another protocol on the link's socket, outside its
+    // messages: a network clock's exchanges, which need when each datagram
+    // left and arrived. Each goes alone, unreliable, unsplit (up to
+    // Options::fragmentSize bytes), behind a 6-byte header no node predating
+    // it accepts (they drop it as malformed).
+    //
+    // Gets a side datagram: the peer's address, its device (as advertised;
+    // empty until heard), the bytes, and when it arrived (the µs clock, read
+    // by the adapter as it took the datagram off the socket, before any
+    // queue). Runs in the adapter's receive task, without the link's lock:
+    // quick, no blocking. Set it before start().
+    using SideFn = std::function<void(const PeerAddress& from, const PeerAddress& device, const uint8_t* data,
+                                      size_t len, uint64_t rxUs)>;
+    void onSide(SideFn fn);
+    // Sends `data` to `to` (empty: every local network) now, from the
+    // calling task. `sentUs`, if given, gets the µs clock as the adapter
+    // returns (after sendto()). False when not running, too long, or the
+    // adapter refused it.
+    bool sendSide(const PeerAddress& to, const uint8_t* data, size_t len, uint64_t* sentUs = nullptr);
+    // The µs clock for side datagrams' times (esp_timer_get_time() on
+    // target, which UdpTransport sets). Without one, the link's ms clock ×
+    // 1000. Set it before start().
+    void setMicros(std::function<uint64_t()> micros);
+    uint64_t micros() const;
+    // A datagram that arrived at `rxUs` (the µs clock): side datagrams get
+    // it, the link's own ignore it.
+    void packet(const PeerAddress& from, const uint8_t* data, size_t len, uint64_t rxUs);
+    // Address ↔ device, as advertised (DatagramEndpoint::deviceOf(),
+    // peerOf()).
+    PeerAddress deviceOf(const PeerAddress& peer) const { return endpoint_.deviceOf(peer); }
+    bool addressOf(const PeerAddress& device, PeerAddress& address) const { return endpoint_.peerOf(device, address); }
 
     // ---- client ---------------------------------------------------------
     // Writes `bodyJson` to `path` on every node behind `to` at once: one
@@ -251,6 +286,7 @@ private:
     // messages (its own first) while the budget or the heap refuses.
     Reservation makeRoom(const PeerAddress& from, size_t bytes);
     uint32_t now() const { return clock_ ? clock_() : 0; }
+    void sideDatagram(const PeerAddress& from, const uint8_t* data, size_t len, uint64_t rxUs);
 
     PartsFn send_;
     DatagramEndpoint::ClockFn clock_;
@@ -277,6 +313,9 @@ private:
     bool advertising_ = false;
     uint32_t hash_ = 0;
     uint32_t advertisedMs_ = 0;
+    // side channel: set before start(), read without mutex_
+    SideFn onSide_;
+    std::function<uint64_t()> micros_;
 };
 
 }  // namespace tesser

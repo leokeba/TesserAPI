@@ -799,6 +799,93 @@ TEST(udp_restarted_peer) {
     CHECK_EQ(p.call(tesser::Op::Get, "/lamp/on").body, "false");
 }
 
+TEST(udp_side_channel) {
+    // Datagrams of another protocol on the link's socket (a network clock's
+    // exchanges), with when each left and arrived (docs/DESIGN.md section
+    // 10.7).
+    Pair p;
+    uint64_t serverUs = 5000000, clientUs = 7000000;
+    p.server.setMicros([&] { return serverUs; });
+    p.client.setMicros([&] { return clientUs; });
+    struct Got {
+        PeerAddress from, device;
+        std::string data;
+        uint64_t rxUs;
+    };
+    std::vector<Got> atServer, atClient;
+    p.server.onSide([&](const PeerAddress& from, const PeerAddress& device, const uint8_t* d, size_t n, uint64_t rx) {
+        atServer.push_back(Got{from, device, std::string(reinterpret_cast<const char*>(d), n), rx});
+    });
+    p.client.onSide([&](const PeerAddress& from, const PeerAddress& device, const uint8_t* d, size_t n, uint64_t rx) {
+        atClient.push_back(Got{from, device, std::string(reinterpret_cast<const char*>(d), n), rx});
+    });
+
+    uint64_t sent = 0;
+    CHECK(p.client.sendSide(ip(2), reinterpret_cast<const uint8_t*>("ping"), 4, &sent));
+    CHECK_EQ(sent, 7000000u);
+    serverUs = 5000250;
+    p.net.run();
+    CHECK_EQ(atServer.size(), 1u);
+    if (atServer.size() == 1) {
+        CHECK(atServer[0].from == ip(1));
+        CHECK_EQ(atServer[0].device.length, 0);  // the client doesn't advertise
+        CHECK_EQ(atServer[0].data, "ping");
+        CHECK_EQ(atServer[0].rxUs, 5000250u);  // the adapter didn't stamp it: the link's µs clock
+    }
+    // An adapter's own stamp wins.
+    const uint8_t raw[] = {0x55, 0x10, 0x01, 0x02, 0x03, 0x04, 'x'};
+    p.server.packet(ip(9), raw, sizeof(raw), 1234);
+    CHECK_EQ(atServer.size(), 2u);
+    if (atServer.size() == 2) CHECK_EQ(atServer[1].rxUs, 1234u);
+
+    // The server advertises its device: the client learns it, both ways.
+    const uint8_t mac[6] = {0xc8, 0xf0, 0x9e, 0xf4, 0xa6, 0x7c};
+    p.server.setDeviceId(mac);
+    p.server.advertise();
+    p.net.run();
+    PeerAddress device = PeerAddress::fromBytes(mac, 6), at;
+    CHECK(p.client.deviceOf(ip(2)) == device);
+    CHECK(p.client.addressOf(device, at));
+    CHECK(at == ip(2));
+    CHECK(!p.client.addressOf(PeerAddress::fromBytes(raw, 6), at));
+
+    // A broadcast goes once (not broadcastCopies times: the protocol on
+    // top decides): the client hears it, the server not its own copy.
+    uint32_t sideSent = p.server.stats().sideSent;
+    CHECK(p.server.sendSide(PeerAddress(), reinterpret_cast<const uint8_t*>("beacon"), 6));
+    p.net.run();
+    CHECK_EQ(p.server.stats().sideSent - sideSent, 1u);
+    CHECK_EQ(atServer.size(), 2u);
+    CHECK_EQ(atClient.size(), 1u);
+    if (atClient.size() == 1) {
+        CHECK(atClient[0].device == device);
+        CHECK_EQ(atClient[0].data, "beacon");
+    }
+
+    // Too long, or not running: not sent.
+    std::vector<uint8_t> big(UdpLink::Options().fragmentSize + 1, 0);
+    CHECK(!p.client.sendSide(ip(2), big.data(), big.size()));
+    big.pop_back();
+    CHECK(p.client.sendSide(ip(2), big.data(), big.size()));
+    p.net.run();
+    CHECK_EQ(atServer.size(), 3u);
+
+    // A node without a handler drops them; the link's own messages are
+    // unaffected throughout.
+    p.server.onSide(nullptr);
+    uint32_t dropped = p.server.stats().dropped;
+    CHECK(p.client.sendSide(ip(2), reinterpret_cast<const uint8_t*>("x"), 1));
+    p.net.run();
+    CHECK_EQ(p.server.stats().dropped - dropped, 1u);
+    CHECK_EQ(p.call(tesser::Op::Get, "/lamp/on").body, "false");
+    // A wrong version is malformed.
+    const uint8_t v2[] = {0x55, 0x20, 0, 0, 0, 0};
+    p.client.packet(ip(2), v2, sizeof(v2), 1);
+    CHECK_EQ(atClient.size(), 1u);
+    p.client.stop();
+    CHECK(!p.client.sendSide(ip(2), reinterpret_cast<const uint8_t*>("x"), 1));
+}
+
 TEST(udp_malformed) {
     Pair p;
     uint32_t dropped = p.server.stats().dropped;
