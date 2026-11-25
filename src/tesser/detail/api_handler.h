@@ -255,6 +255,7 @@ private:
     bool partial_ = false;
     bool filling_ = false;  // validating or filling an action's object argument
     bool hashing_ = false;  // rendering a schema for view=hash
+    bool paramDefaults_ = false;  // rendering an action's params: each value's current is its "default"
     int inList_ = 0;        // rendering a list's prototype: no yieldPoint()
     std::vector<std::unique_ptr<Node>> temps_;  // list and array elements on the request path
     std::vector<Node*> containers_;             // lists and arrays the path went through

@@ -70,16 +70,17 @@ struct Fixture {
 
 TEST(object_arg_schema) {
     Fixture f;
+    // Each field carries its default: the value in the default-constructed argument.
     CHECK_EQ(cases::get(f.api, "/helio/add", cases::schema()).body,
              "{\"type\":\"action\",\"arg\":\"object\",\"params\":{\"type\":\"object\",\"children\":{"
-             "\"name\":{\"type\":\"string\",\"writable\":true},"
-             "\"az\":{\"type\":\"number\",\"writable\":true,\"min\":0,\"max\":360,\"unit\":\"°\"},"
-             "\"el\":{\"type\":\"number\",\"writable\":true,\"min\":-90,\"max\":90}}}}");
+             "\"name\":{\"type\":\"string\",\"writable\":true,\"default\":\"New target\"},"
+             "\"az\":{\"type\":\"number\",\"writable\":true,\"min\":0,\"max\":360,\"default\":180,\"unit\":\"°\"},"
+             "\"el\":{\"type\":\"number\",\"writable\":true,\"min\":-90,\"max\":90,\"default\":30}}}}");
     CHECK_EQ(cases::get(f.api, "/helio/broadcast", cases::schema()).body,
              "{\"type\":\"action\",\"arg\":\"object\",\"params\":{\"type\":\"object\",\"children\":{"
-             "\"msg\":{\"type\":\"string\",\"writable\":true},"
-             "\"retries\":{\"type\":\"integer\",\"writable\":true,\"min\":0,\"max\":10},"
-             "\"options\":{\"type\":\"object\",\"children\":{\"reliable\":{\"type\":\"boolean\",\"writable\":true}}}}},"
+             "\"msg\":{\"type\":\"string\",\"writable\":true,\"default\":\"\"},"
+             "\"retries\":{\"type\":\"integer\",\"writable\":true,\"min\":0,\"max\":10,\"default\":3},"
+             "\"options\":{\"type\":\"object\",\"children\":{\"reliable\":{\"type\":\"boolean\",\"writable\":true,\"default\":true}}}}},"
              "\"returns\":\"integer\"}");
     // Typed deferred actions report their argument.
     std::string later = cases::get(f.api, "/helio/addLater", cases::schema(0)).body;

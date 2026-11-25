@@ -369,6 +369,13 @@ void Handler::schemaAttributes(JsonWriter& w, const Node& n) {
                 w.key("secret");
                 w.boolean(true);
             }
+            // Inside an action's params the value is a default-constructed
+            // argument, so its current state is the default the form starts
+            // from (docs/DESIGN.md section 7). Secrets are never filled.
+            if (paramDefaults_ && !v.isSecret()) {
+                w.key("default");
+                v.write(w);
+            }
             break;
         }
         case NodeType::Action: {
@@ -380,7 +387,9 @@ void Handler::schemaAttributes(JsonWriter& w, const Node& n) {
             }
             if (std::unique_ptr<Object> params = a.params()) {
                 w.key("params");
+                paramDefaults_ = true;
                 renderSchema(w, *params, api_.config().maxDepth, Filter());
+                paramDefaults_ = false;
             }
             if (const NodeMeta* m = a.meta(); m && m->hasRange()) {
                 w.key("min");

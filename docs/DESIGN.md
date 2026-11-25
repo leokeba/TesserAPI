@@ -160,7 +160,7 @@ o.action("add", [](const Target& t) { targets.add(t); });   // POST /helio/add {
 
 - **Filling:** for each call, a default `T` is described into a temporary object, and the body is validated and applied to it like a patch (§6.3), then the action gets the `T`. Fields the body omits keep their defaults; `null` or no body gives the default `T`. So the fields' ranges, lengths, enums and nested objects all apply, and an error names the field: `{"error": "invalid_value", "path": "/helio/add/az"}`.
 - **In a patch,** the argument is validated with the rest in pass 1, so a bad field leaves the whole patch unapplied.
-- **Schema:** `"arg": "object"`, and `"params"` holds the object schema of the fields, for forms.
+- **Schema:** `"arg": "object"`, and `"params"` holds the object schema of the fields, for forms. Each field carries its `"default"`, the value in the default-constructed argument (§7), so a form starts from it; secrets carry none.
 - **Cost:** nothing at rest beyond the action node: the object is built per call.
 
 **Typed deferred actions.** An action taking an argument (a value type or an object argument) and then a `tesser::Call&` is deferred like a `Call&`-only one, with its argument converted and validated first:
@@ -446,7 +446,7 @@ GET /lamp?view=schema
 ```
 
 - **Types:** `object`, `boolean`, `integer`, `number`, `string`, `action`, `event`, `custom`, `list` (§4.4), `array` (§4.5), `remote` (§14).
-- **Optional keys:** `writable` (only when true; values, arrays, lists and custom nodes), `min`, `max` (values and action arguments), `persist`, `description`, `arg`, `params` (an object argument's schema, §4.2), `returns` and `deferred` (actions), `maxLength` (`char[N]`), `enum`, `secret` (§4.1), `access` (the node's own write level when it isn't `public`, §13), and the presentation keys of §7.1.
+- **Optional keys:** `writable` (only when true; values, arrays, lists and custom nodes), `min`, `max` (values and action arguments), `persist`, `description`, `arg`, `params` (an object argument's schema, §4.2, its value fields with their `default`), `returns` and `deferred` (actions), `maxLength` (`char[N]`), `enum`, `secret` (§4.1), `access` (the node's own write level when it isn't `public`, §13), and the presentation keys of §7.1.
 - `depth`, `keys` and the shape apply to `children` the same way.
 - A schema leaf is always an object containing `"type"`. Children are always under `"children"`, so a child named `type` can't be confused with a descriptor.
 - Schema output is compiled out with `TESSER_NO_SCHEMA` when flash is tight.
