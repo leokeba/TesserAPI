@@ -165,6 +165,27 @@ TEST(relay_envelope_upload) {
     CHECK_EQ(r.gateway.pending(), 0);
 }
 
+TEST(relay_counts_as_transferring) {
+    // A relayed transfer is the gateway's transfer too (Api::transferring()).
+    Rig r;
+    CHECK(!r.gateway.transferring());
+    CHECK(r.ask("{\"id\":1,\"op\":\"upload\",\"path\":\"/dev/big\",\"size\":3000,\"data\":\"" +
+                b64(r.big.substr(0, 1500)) + "\"}")
+              .find("\"received\":1500") != std::string::npos);
+    CHECK(r.gateway.transferring());
+    r.gateway.config().transferIdleMs = 1;
+    uint32_t t0 = tesser::millis32();
+    while (tesser::millis32() - t0 < 3) {
+    }
+    CHECK(!r.gateway.transferring());
+    r.gateway.config().transferIdleMs = 30000;
+    CHECK(r.gateway.transferring());
+    CHECK_EQ(r.ask("{\"id\":2,\"op\":\"upload\",\"path\":\"/dev/big\",\"offset\":1500,\"data\":\"" +
+                   b64(r.big.substr(1500)) + "\"}"),
+             "{\"id\":2,\"status\":\"ok\",\"body\":null}");
+    CHECK(!r.gateway.transferring());
+}
+
 TEST(relay_upload_survives_an_undelivered_reply) {
     // The device's reply to one chunk is lost (NowTP reports it
     // undelivered): the gateway's transfer stays open on the device, and

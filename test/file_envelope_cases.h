@@ -422,6 +422,29 @@ TEST(file_envelope_idle_takeover) {
              "{\"status\":\"ok\",\"body\":{\"bytes\":4}}");
 }
 
+TEST(file_envelope_transferring) {
+    // transferring(): a transfer under way, not one abandoned.
+    Fixture f;
+    Line a(f.api);
+    CHECK(!f.api.transferring());
+    CHECK(a.send("{\"op\":\"upload\",\"path\":\"/sys/firmware\",\"size\":8,\"data\":\"YWJjZA==\"}")
+              .find("\"received\":4") != std::string::npos);
+    CHECK(f.api.transferring());
+    // Idle for transferIdleMs: abandoned, though it holds its path until
+    // taken over.
+    f.api.config().transferIdleMs = 1;
+    uint32_t t0 = tesser::millis32();
+    while (tesser::millis32() - t0 < 3) {
+    }
+    CHECK(!f.api.transferring());
+    f.api.config().transferIdleMs = 0;  // never idle
+    CHECK(f.api.transferring());
+    f.api.config().transferIdleMs = 30000;
+    CHECK(a.send("{\"op\":\"upload\",\"path\":\"/sys/firmware\",\"offset\":4,\"data\":\"YWJjZA==\"}")
+              .find("\"error\"") == std::string::npos);  // finished
+    CHECK(!f.api.transferring());
+}
+
 TEST(file_envelope_websocket) {
     // handleEnvelope() (WebSocket) takes the session of the connection.
     Fixture f;

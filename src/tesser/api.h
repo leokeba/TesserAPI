@@ -359,6 +359,12 @@ public:
     // for Config::transferIdleMs is taken over.
     bool claimTransfer(std::string_view path, TransferHolder* holder);
     void releaseTransfer(std::string_view path);
+    // Whether a file transfer, local or relayed (docs/DESIGN.md sections
+    // 4.6 and 14), is under way: in a call, or one that has moved bytes
+    // within Config::transferIdleMs. An abandoned one doesn't count. For
+    // optional work that would compete with it for the heap (TesserKIT's
+    // automatic release check). Any task.
+    bool transferring() const;
 
     // Under the API lock. A handler that lets go of the lock mid-reply
     // (docs/DESIGN.md section 9) brackets the release with these; a node

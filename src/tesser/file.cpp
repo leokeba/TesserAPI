@@ -132,6 +132,15 @@ bool FileTransfer::expireIfIdle(uint32_t nowMs, uint32_t idleMs) {
     return idle;
 }
 
+bool FileTransfer::activeWithin(uint32_t nowMs, uint32_t idleMs) {
+    // Locked: in a call (or being destroyed), so active. Never waits, as
+    // in expireIfIdle().
+    if (!mutex_.tryLock()) return true;
+    bool active = claimed_ && (!idleMs || nowMs - activeMs_ < idleMs);
+    mutex_.unlock();
+    return active;
+}
+
 FileTransfer::Open FileTransfer::open(std::string_view path, const Client& client, Op op, uint64_t size,
                                       std::string_view filename, Reply& reply) {
     MutexGuard transferGuard(mutex_);

@@ -236,6 +236,15 @@ bool Api::claimTransfer(std::string_view path, TransferHolder* holder) {
     return true;
 }
 
+bool Api::transferring() const {
+    MutexGuard guard(mutex_);
+    uint32_t now = millis32();
+    for (const Transfer& t : transfers_) {
+        if (t.holder && t.holder->activeWithin(now, config_.transferIdleMs)) return true;
+    }
+    return false;
+}
+
 void Api::releaseTransfer(std::string_view path) {
     MutexGuard guard(mutex_);
     for (size_t i = 0; i < transfers_.size(); i++) {

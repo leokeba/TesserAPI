@@ -25,6 +25,9 @@ public:
     // Under the API lock: ends the transfer if it has been idle for `idleMs`
     // (0: never) and isn't busy. True if it did, releasing its claim.
     virtual bool expireIfIdle(uint32_t nowMs, uint32_t idleMs) = 0;
+    // Under the API lock: the transfer is in a call, or has moved bytes
+    // within the last `idleMs` (0: at any time since it opened).
+    virtual bool activeWithin(uint32_t nowMs, uint32_t idleMs) = 0;
 
 protected:
     ~TransferHolder() = default;
@@ -173,6 +176,8 @@ public:
     // if it has been idle for `idleMs` (0: never) and isn't busy. True if it
     // did, releasing its claim.
     bool expireIfIdle(uint32_t nowMs, uint32_t idleMs) override;
+    // Used by Api::transferring(), under the API lock.
+    bool activeWithin(uint32_t nowMs, uint32_t idleMs) override;
 
 private:
     Open open(std::string_view path, const Client& client, Op op, uint64_t size, std::string_view filename,

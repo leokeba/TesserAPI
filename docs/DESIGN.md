@@ -295,6 +295,7 @@ api.object("sys").file("backup").contentType("application/json").readAccess(tess
   ```
 - **Transports:** HTTP moves the raw bytes (§10.2); the message transports (serial, Bluetooth, WebSocket, NowTP) move them in base64 chunks, one `upload` or `download` envelope each (§10.1.1). Below a remote node, a gateway relays the transfer to the remote node (§14).
 - **Abandoned transfers:** a transfer that has moved nothing for `Config::transferIdleMs` (30 s by default; 0 is never) is taken over by the next one to its path, from any client and transport: an unfinished upload is aborted, and its client gets `timeout` on its next chunk. A message transport has no connection to lose, so this is how a client that went quiet stops blocking the path.
+- **Under way:** `api.transferring()` is true while a transfer, local or relayed (§14), is in a call or has moved bytes within `transferIdleMs`; an abandoned one doesn't count. It is for optional work that would compete with a transfer for the heap: TesserKIT holds its automatic release check (a TLS session of about 40 KB) until it is false, since a gateway relaying a firmware image has measured 25 KB free with both at once. Any task.
 - **Generic core:** `tesser::FileTransfer` does the work (resolution, access, size, one transfer at a time, the reply), host-tested; the HTTP transport only moves bytes, and `tesser::FileSession` drives it from envelopes.
 
 ### 4.7 Names and the tree's lifetime

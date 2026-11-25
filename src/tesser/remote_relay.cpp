@@ -212,6 +212,13 @@ public:
         return idle;
     }
 
+    bool activeWithin(uint32_t nowMs, uint32_t idleMs) override {
+        if (!mutex_.tryLock()) return true;  // in a call: active
+        bool active = claimed_ && (inFlight_ || !idleMs || nowMs - activeMs_ < idleMs);
+        mutex_.unlock();
+        return active;
+    }
+
 private:
     // What the transfer is doing with the peer: one call at a time, each a
     // stage of a transfer.
