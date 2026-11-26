@@ -26,3 +26,5 @@ build-fuzz/test/fuzz/fuzz_request -max_len=4096 -max_total_time=1200 \
 ```
 
 A crash leaves `crash-<sha1>` in the current directory; `build-fuzz/test/fuzz/fuzz_request crash-<sha1>` replays it. Each crash found becomes a host test case beside the code it concerns, with its fix.
+
+CI (`.github/workflows/ci.yml`, job `fuzz-smoke`) builds these on every push and runs each harness for 60 s on the seeds: a harness that stops building, or a shallow crash, fails the push.

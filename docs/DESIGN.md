@@ -1357,7 +1357,7 @@ Optional transports (NowTP) compile only when their dependency is present: `__ha
    - `test/e2e_routes.py`, on two boards that reach each other over UDP and NowTP: streamed sets in order while one board's UDP goes off and on (§14.3)
    - `test/e2e_persist.py`, which reboots the board through the serial port
 4. **Transport conformance:** `test/conformance.py` sends the same request vectors through serial, HTTP, WebSocket and NowTP (both directions), and every transport must give the same results.
-5. **CI:** host tests, plus ESP-IDF 5.1 / 5.4 / 5.5 / latest × ESP32 / ESP32-C3 (test firmware and examples), plus Arduino-ESP32 3.x × ESP32 / ESP32-C3 (example sketches).
+5. **CI:** host tests, the libFuzzer harnesses built with clang and each run for 60 s on `test/fuzz/seeds.py`'s seeds, plus ESP-IDF 5.1 / 5.4 / 5.5 / latest × ESP32 / ESP32-C3 (test firmware and examples), plus Arduino-ESP32 3.x × ESP32 / ESP32-C3 (example sketches).
 
 ## 18. Roadmap
 

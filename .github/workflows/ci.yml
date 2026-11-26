@@ -72,12 +72,32 @@ jobs:
             - name: ArduinoJson
             - source-url: https://github.com/leokeba/NowTP.git
 
+  # A harness that stops building, or a shallow crash, shows up on push:
+  # each is run for 60 s on the seeds (test/fuzz/README.md).
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the libFuzzer harnesses (clang, ASan + UBSan)
+        run: |
+          cmake -S . -B build-fuzz -DTESSER_FUZZ=ON -DTESSER_BUILD_TESTS=OFF \
+                -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_FLAGS=-O1
+          cmake --build build-fuzz -j
+      - name: Run each harness for 60 s on the seeds
+        run: |
+          python3 test/fuzz/seeds.py build-fuzz/seeds
+          for bin in build-fuzz/test/fuzz/fuzz_*; do
+            h=${bin##*/fuzz_}
+            mkdir -p build-fuzz/corpus/$h
+            $bin -max_len=4096 -max_total_time=60 build-fuzz/corpus/$h build-fuzz/seeds/$h
+          done
+
   # Each push to main that passes becomes a release (DESIGN.md §16): a patch
   # bump unless a commit since the last tag has a "Release: minor" or
   # "Release: major" trailer. The manifests are stamped on a commit only the
   # tag points at; main gets none.
   release:
-    needs: [host-tests, esp-idf, arduino]
+    needs: [host-tests, esp-idf, arduino, fuzz-smoke]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     concurrency:
       group: release
