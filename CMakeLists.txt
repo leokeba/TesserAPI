@@ -110,6 +110,7 @@ project(tesserapi CXX)
 
 option(TESSER_BUILD_TESTS "Build host-side tests" ON)
 option(TESSER_SANITIZE "Build tests with ASan/UBSan" ON)
+option(TESSER_FUZZ "Build the libFuzzer harnesses in test/fuzz (clang)" OFF)
 
 include(FetchContent)
 FetchContent_Declare(arduinojson
@@ -142,4 +143,8 @@ if(TESSER_BUILD_TESTS)
         endforeach()
     endif()
     add_test(NAME tesser_tests COMMAND tesser_tests)
+endif()
+
+if(TESSER_FUZZ)
+    add_subdirectory(test/fuzz)
 endif()

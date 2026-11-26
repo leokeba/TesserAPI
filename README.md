@@ -137,6 +137,7 @@ api.mount("right", rightMotor);
 ## Testing
 
 - **Host:** 114 test cases under ASan and UBSan (`cmake -S . -B build && cmake --build build && ./build/tesser_tests`).
+- **Fuzzing:** libFuzzer harnesses for what a client controls (JSON, request envelopes, file transfers, HTTP text), with clang: `cmake -S . -B build-fuzz -DTESSER_FUZZ=ON -DTESSER_BUILD_TESTS=OFF -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_FLAGS=-O1 && cmake --build build-fuzz -j`, then `build-fuzz/test/fuzz/fuzz_request corpus/`. See [test/fuzz/README.md](test/fuzz/README.md).
 - **On the chip:** the same cases run on target (`test/hardware`).
 - **End to end:** scripts drive two boards over serial, HTTP, WebSocket and ESP-NOW. The same conformance vectors must give the same results on every transport and through a gateway. Persistence is checked across a real reboot. See [docs/DESIGN.md §17](docs/DESIGN.md#17-testing).
 - **CI** builds ESP-IDF 5.1 to latest and Arduino-ESP32 3.x for the ESP32 and the ESP32-C3. Hardware testing so far used classic ESP32 boards and an ESP32-S3; the C3 is built but not yet run.
