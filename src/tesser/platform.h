@@ -100,8 +100,9 @@ private:
     void unlocking();
     std::recursive_mutex mutex_;
     std::atomic<std::thread::id> owner_{};
-    uint8_t rank_;
-    const char* name_;
+    // Read only by the lock check (TESSER_LOCK_CHECK), off with NDEBUG.
+    [[maybe_unused]] uint8_t rank_;
+    [[maybe_unused]] const char* name_;
 #endif
     int depth_ = 0;  // changed by the holder only
 };

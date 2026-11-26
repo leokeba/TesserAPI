@@ -13,7 +13,7 @@ The HTTP query parser itself is ESP-IDF's (`httpd_query_key_value`) and isn't bu
 
 ## Running
 
-clang with libFuzzer is needed (any clang ≥ 14; the official LLVM release tarball works without installing). Leave `NDEBUG` off: the lock-order checks stay on, and a release build of the library trips clang's `-Wunused-private-field`.
+clang with libFuzzer is needed (any clang ≥ 14; the official LLVM release tarball works without installing). The lock-order checks (`TESSER_LOCK_CHECK`) stay on unless `NDEBUG` is set.
 
 ```sh
 cmake -S . -B build-fuzz -DTESSER_FUZZ=ON -DTESSER_BUILD_TESTS=OFF \
