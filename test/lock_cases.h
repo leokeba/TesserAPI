@@ -26,6 +26,11 @@ TEST(lock_ranks_checked) {
     tesser::Mutex api(tesser::kRankApi, "test api");
     tesser::Mutex remote(tesser::kRankRemote, "test remote");
     tesser::Mutex plain;  // unranked: never checked
+    // Fresh instances for the violation below: reusing api and remote would
+    // also trip TSan's global lock-order graph (a potential deadlock), a false
+    // positive here — the inversion is deliberate. Same ranks, same check.
+    tesser::Mutex api2(tesser::kRankApi, "test api 2");
+    tesser::Mutex remote2(tesser::kRankRemote, "test remote 2");
     {
         tesser::MutexGuard a(api);
         tesser::MutexGuard r(remote);
@@ -34,8 +39,8 @@ TEST(lock_ranks_checked) {
     }
     CHECK_EQ(g_violations.load(), 0);
     {
-        tesser::MutexGuard r(remote);
-        tesser::MutexGuard a(api);  // the API lock after a remote node's
+        tesser::MutexGuard r(remote2);
+        tesser::MutexGuard a(api2);  // the API lock after a remote node's
     }
     CHECK_EQ(g_violations.load(), 1);
     tesser::setLockOrderHandler(nullptr);
