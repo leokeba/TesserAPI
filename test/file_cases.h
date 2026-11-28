@@ -13,6 +13,10 @@ using tesser::Api;
 using tesser::FileTransfer;
 using tesser::Status;
 
+// The free heap an upload case makes the library see (fileFreeProbe).
+inline size_t g_fileFree = SIZE_MAX;
+inline size_t fileFreeProbe() { return g_fileFree; }
+
 // Collects an upload; can fail on a given chunk.
 struct Ram {
     std::string data;
@@ -220,6 +224,41 @@ TEST(file_text_upload) {
     CHECK_EQ(upload(f.api, "/sys/config", "nope", f.admin()),
              "invalid_value {\"error\":\"invalid_value\",\"path\":\"/sys/config\",\"message\":\"not JSON\"}");
     CHECK(upload(f.api, "/sys/config", std::string(16385, ' '), f.admin()).find("too_large") != std::string::npos);
+}
+
+// An announced size that doesn't fit in a 32-bit size_t is refused on every
+// architecture: on the ESP32, where size_t is 32 bits, casting it truncated
+// to a small number, and the upload was accepted with a reservation for the
+// wrong bytes. Found by running the host tests with a 32-bit size_t.
+TEST(file_upload_announced_size_beyond_32bit) {
+    Fixture f;
+    std::string stored;
+    f.api.object("sys").file("big")
+        .text([] { return ""; }, [&stored](std::string_view t, tesser::JsonWriter&) {
+            stored.assign(t);
+            return tesser::Check::ok();
+        })
+        .maxSize(0);  // no limit: the announced size alone decides
+    // A board's heap, as the memory cases set it: a floor and free bytes far
+    // short of the announced size. Restored after.
+    struct Heap {
+        size_t floorBefore = tesser::heapFloor();
+        Heap() {
+            g_fileFree = 1u << 20;
+            tesser::setFreeHeapProbe(&fileFreeProbe);
+            tesser::setHeapFloor(65536);
+        }
+        ~Heap() {
+            tesser::setFreeHeapProbe(nullptr);
+            tesser::setHeapFloor(floorBefore);
+        }
+    } heap;
+    FileTransfer t(f.api);
+    tesser::StringReply reply;
+    CHECK(t.openUpload("/sys/big", f.admin(), 0x100000000ULL, reply) != FileTransfer::Open::Ok);
+    CHECK_EQ(reply.status, Status::Busy);
+    CHECK(reply.body.find("not enough memory") != std::string::npos);
+    CHECK(stored.empty());
 }
 
 TEST(file_backup_and_restore) {

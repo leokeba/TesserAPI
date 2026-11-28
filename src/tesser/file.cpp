@@ -47,6 +47,11 @@ public:
     // heap can't.
     bool reserve(uint64_t size) {
         if (size <= 256) return true;
+        // Checked before the cast: on the ESP32, where size_t is 32 bits, an
+        // announced size of 2^32 or more would truncate to a small reservation
+        // that passes, and the upload would be accepted with room for the
+        // wrong bytes.
+        if (size > SIZE_MAX) return false;
         Reservation room = memoryBudget().reserve(static_cast<size_t>(size), 0, true, true,
                                                   mallocPool(static_cast<size_t>(size)));
         if (!room) return false;
