@@ -3,6 +3,7 @@
 #pragma once
 
 #include <deque>
+#include <mutex>
 #include <string>
 
 #include "core_cases.h"
@@ -27,6 +28,7 @@ struct Net {
         Delivery delivery;
     };
     std::deque<Frame> frames;
+    std::mutex mutex;  // the link: sender() and run() may run on different threads
     std::vector<std::pair<PeerAddress, DatagramEndpoint*>> nodes;
     uint32_t clock = 1000;
     bool dropAll = false;
@@ -34,22 +36,28 @@ struct Net {
     DatagramEndpoint::SendFn sender(PeerAddress self) {
         return [this, self](const PeerAddress& to, const std::string& m, Delivery d) {
             tesser::testing::HeapExempt link;  // the link's buffers (heap_cases.h)
-            if (!dropAll) frames.push_back(Frame{self, to, m, d});
+            if (!dropAll) {
+                std::lock_guard<std::mutex> lock(mutex);
+                frames.push_back(Frame{self, to, m, d});
+            }
             return true;
         };
     }
     DatagramEndpoint::ClockFn clockFn() {
         return [this] { return clock; };
     }
-    // Delivers and processes until quiet.
+    // Delivers and processes until quiet. The link's lock is only held while
+    // popping, so a reply sent from within a delivery can re-enter sender().
     void run() {
         for (int round = 0; round < 20; round++) {
             bool any = false;
-            while (!frames.empty()) {
+            while (true) {
                 Frame f;
                 {
                     tesser::testing::HeapExempt link;
-                    f = frames.front();
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (frames.empty()) break;
+                    f = std::move(frames.front());
                     frames.pop_front();
                 }
                 for (auto& n : nodes) {
