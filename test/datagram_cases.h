@@ -33,12 +33,33 @@ struct Net {
     uint32_t clock = 1000;
     bool dropAll = false;
 
+    // A link down between two endpoints: its frames are lost, as with
+    // dropAll, but only on that pair. Models a route going offline — nothing
+    // flows it, so no endpoint re-onlines it from traffic.
+    std::vector<std::pair<PeerAddress, PeerAddress>> downLinks;  // mutex held
+    bool linkDown(const PeerAddress& a, const PeerAddress& b) const {  // mutex held
+        for (const auto& l : downLinks)
+            if ((l.first == a && l.second == b) || (l.first == b && l.second == a)) return true;
+        return false;
+    }
+    void setLinkDown(const PeerAddress& a, const PeerAddress& b, bool down) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (size_t i = 0; i < downLinks.size(); i++) {
+            if ((downLinks[i].first == a && downLinks[i].second == b) ||
+                (downLinks[i].first == b && downLinks[i].second == a)) {
+                if (!down) downLinks.erase(downLinks.begin() + static_cast<std::ptrdiff_t>(i));
+                return;
+            }
+        }
+        if (down) downLinks.emplace_back(a, b);
+    }
+
     DatagramEndpoint::SendFn sender(PeerAddress self) {
         return [this, self](const PeerAddress& to, const std::string& m, Delivery d) {
             tesser::testing::HeapExempt link;  // the link's buffers (heap_cases.h)
             if (!dropAll) {
                 std::lock_guard<std::mutex> lock(mutex);
-                frames.push_back(Frame{self, to, m, d});
+                if (!linkDown(self, to)) frames.push_back(Frame{self, to, m, d});
             }
             return true;
         };

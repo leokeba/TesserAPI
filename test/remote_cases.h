@@ -237,6 +237,98 @@ TEST(remote_upstream_follows_subscribers) {
     CHECK_EQ(r.device.api.subscriptionCount(), 0u);
 }
 
+// A second way to the device (UDP, preferred), for a route changing under a
+// forwarded subscription or a mirror.
+struct TwoRoutes : Rig {
+    tesser::DatagramEndpoint deviceUdp{&device.api, tesser::TransportKind::Udp, net.sender(addr(4)), net.clockFn()};
+    tesser::DatagramEndpoint gatewayUdp{&gateway, tesser::TransportKind::Udp, net.sender(addr(3)), net.clockFn()};
+    TwoRoutes() {
+        deviceUdp.trust([](const tesser::PeerAddress&) { return true; });
+        net.nodes.push_back({addr(3), &gatewayUdp});
+        net.nodes.push_back({addr(4), &deviceUdp});
+        kitchen.routeOrder({tesser::TransportKind::Udp, tesser::TransportKind::NowTP});
+        kitchen.addRoute(gatewayUdp, addr(4));
+    }
+};
+
+TEST(remote_upstream_rerouted) {
+    // A subscription below a remote node survives the route changing under it:
+    // the upstream is renewed on the new route at once, and notifications are
+    // taken from the route in use only (docs/DESIGN.md section 14.3).
+    TwoRoutes r;
+    CHECK(r.kitchen.endpoint() == &r.gatewayUdp);  // UDP preferred
+    subscription_cases::FakeSubscriber client;
+    CHECK_EQ(subscribeWaiting(r, &client, "/kitchen/lamp"), "{\"on\":false,\"brightness\":128,\"label\":\"desk\"}");
+    CHECK_EQ(r.device.api.subscriptionCount(), 1u);
+
+    // The route in use goes offline — nothing flows it — and the upstream
+    // re-subscribes on NowTP.
+    r.kitchen.setRouteOnline(&r.gatewayUdp, addr(4), false, r.net.clock);
+    r.net.setLinkDown(addr(3), addr(4), true);
+    CHECK(r.kitchen.endpoint() == &r.gatewayEnd);
+    r.net.run();
+    // The lost route's subscription ends on its own (the device drops it when
+    // it loses the peer): until then it is there too, though nothing flows it.
+    CHECK_EQ(r.device.api.subscriptionCount(), 2u);
+
+    // A change on the device still reaches the client, through NowTP, once:
+    // the copy that would go by UDP is lost in transit, not relayed twice.
+    cases::set(r.device.api, "/lamp/on", "true");
+    r.device.api.poll(1000);
+    r.net.run();
+    CHECK_EQ(client.messages.size(), 1u);
+    CHECK_EQ(client.last(), "{\"op\":\"change\",\"path\":\"/kitchen/lamp\",\"body\":{\"on\":true}}");
+
+    // The first route comes back: the preferred one is in use again, and the
+    // other's subscription is dropped. One change per change, no duplicates.
+    r.kitchen.setRouteOnline(&r.gatewayUdp, addr(4), true, r.net.clock);
+    r.net.setLinkDown(addr(3), addr(4), false);
+    r.net.run();
+    CHECK(r.kitchen.endpoint() == &r.gatewayUdp);
+    CHECK_EQ(r.device.api.subscriptionCount(), 1u);
+    cases::set(r.device.api, "/lamp/brightness", "50");
+    r.device.api.poll(2000);
+    r.net.run();
+    CHECK_EQ(client.messages.size(), 2u);
+    CHECK_EQ(client.last(), "{\"op\":\"change\",\"path\":\"/kitchen/lamp\",\"body\":{\"brightness\":50}}");
+}
+
+TEST(remote_mirror_rerouted) {
+    // A mirrored node re-mirrors on the new route at once, and drops the old
+    // subscription when it switches back (docs/DESIGN.md section 14.3).
+    TwoRoutes r;
+    r.kitchen.mirror(0, 30000);
+    r.net.run();
+    CHECK(r.kitchen.hasCopy());
+    CHECK_EQ(r.device.api.subscriptionCount(), 1u);
+
+    // The route in use goes offline — nothing flows it — and the mirror
+    // re-subscribes on NowTP.
+    r.kitchen.setRouteOnline(&r.gatewayUdp, addr(4), false, r.net.clock);
+    r.net.setLinkDown(addr(3), addr(4), true);
+    r.net.run();
+    CHECK(r.kitchen.hasCopy());
+    CHECK_EQ(r.device.api.subscriptionCount(), 2u);
+
+    // A change still updates the copy, through NowTP.
+    cases::set(r.device.api, "/lamp/brightness", "42");
+    r.device.api.poll(1000);
+    r.net.run();
+    CHECK(r.ask("{\"id\":1,\"op\":\"get\",\"path\":\"/\",\"keys\":\"kitchen\"}").find("\"brightness\":42") != std::string::npos);
+
+    // The first route comes back: the copy is taken again over UDP, and the
+    // other's subscription is dropped.
+    r.kitchen.setRouteOnline(&r.gatewayUdp, addr(4), true, r.net.clock);
+    r.net.setLinkDown(addr(3), addr(4), false);
+    r.net.run();
+    CHECK(r.kitchen.hasCopy());
+    CHECK_EQ(r.device.api.subscriptionCount(), 1u);
+    cases::set(r.device.api, "/lamp/on", "true");
+    r.device.api.poll(2000);
+    r.net.run();
+    CHECK(r.ask("{\"id\":2,\"op\":\"get\",\"path\":\"/\",\"keys\":\"kitchen\"}").find("\"on\":true") != std::string::npos);
+}
+
 #if !defined(ESP_PLATFORM)
 // Host only: its helper thread waits in 1 ms sleeps, which ESP-IDF turns into
 // busy waits that starve the test task pinned to the same core.
